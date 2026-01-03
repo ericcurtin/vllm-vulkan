@@ -4,10 +4,9 @@ VulkanWorker - Per-device worker for vLLM Vulkan backend.
 This module implements the worker that manages model execution on a single Vulkan device.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import vllm_vulkan
-from vllm_vulkan.platform import VulkanPlatform
 
 
 class VulkanWorker:
@@ -30,7 +29,7 @@ class VulkanWorker:
         cache_config: Any,
         local_rank: int = 0,
         rank: int = 0,
-        distributed_init_method: Optional[str] = None,
+        distributed_init_method: str | None = None,
     ):
         """
         Initialize the Vulkan worker.
@@ -59,9 +58,9 @@ class VulkanWorker:
         self._init_device()
 
         # Model and cache will be initialized later
-        self.model = None
-        self.model_runner = None
-        self.kv_cache = None
+        self.model: Any = None
+        self.model_runner: Any = None
+        self.kv_cache: Any = None
 
     def _init_device(self) -> None:
         """Initialize the Vulkan device."""
@@ -102,7 +101,7 @@ class VulkanWorker:
         self,
         block_size: int,
         gpu_memory_utilization: float = 0.9,
-    ) -> Tuple[int, int]:
+    ) -> tuple[int, int]:
         """
         Profile memory to determine available KV cache blocks.
 
@@ -127,12 +126,12 @@ class VulkanWorker:
         dtype_bytes = 2  # Assume float16
 
         block_memory = (
-            2 *  # K and V
-            num_layers *
-            block_size *
-            num_heads *
-            head_dim *
-            dtype_bytes
+            2  # K and V
+            * num_layers
+            * block_size
+            * num_heads
+            * head_dim
+            * dtype_bytes
         )
 
         num_gpu_blocks = available // block_memory if block_memory > 0 else 0
@@ -168,11 +167,11 @@ class VulkanWorker:
 
     def execute_model(
         self,
-        seq_group_metadata_list: List[Any],
-        blocks_to_swap_in: Dict[int, int],
-        blocks_to_swap_out: Dict[int, int],
-        blocks_to_copy: Dict[int, List[int]],
-    ) -> Optional[List[Any]]:
+        seq_group_metadata_list: list[Any],
+        blocks_to_swap_in: dict[int, int],
+        blocks_to_swap_out: dict[int, int],
+        blocks_to_copy: dict[int, list[int]],
+    ) -> list[Any] | None:
         """
         Execute a batch of sequences.
 
@@ -192,13 +191,14 @@ class VulkanWorker:
         self._execute_cache_ops(blocks_to_swap_in, blocks_to_swap_out, blocks_to_copy)
 
         # Execute forward pass
-        return self.model_runner.execute_model(seq_group_metadata_list)
+        result = self.model_runner.execute_model(seq_group_metadata_list)
+        return list(result) if result is not None else None
 
     def _execute_cache_ops(
         self,
-        blocks_to_swap_in: Dict[int, int],
-        blocks_to_swap_out: Dict[int, int],
-        blocks_to_copy: Dict[int, List[int]],
+        blocks_to_swap_in: dict[int, int],
+        blocks_to_swap_out: dict[int, int],
+        blocks_to_copy: dict[int, list[int]],
     ) -> None:
         """Execute cache operations (swap and copy)."""
         if self.kv_cache is None:
@@ -222,7 +222,7 @@ class VulkanWorker:
         if self.kv_cache is not None:
             num_blocks = self.kv_cache.num_total_blocks()
             if num_blocks > 0:
-                return self.kv_cache.total_capacity() // num_blocks
+                return int(self.kv_cache.total_capacity() // num_blocks)
         return 0
 
     def synchronize(self) -> None:
