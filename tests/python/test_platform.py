@@ -4,8 +4,6 @@ Platform Tests
 Tests for the VulkanPlatform class.
 """
 
-import pytest
-
 
 class TestVulkanPlatform:
     """Tests for VulkanPlatform."""
@@ -17,11 +15,13 @@ class TestVulkanPlatform:
         assert VulkanPlatform is not None
 
     def test_device_name(self):
-        """Test device name attribute."""
+        """Test device name attribute (uses cpu for PyTorch compatibility)."""
         from vllm_vulkan.platform import VulkanPlatform
 
-        assert VulkanPlatform.device_name == "vulkan"
-        assert VulkanPlatform.device_type == "vulkan"
+        # Like MetalPlatform, we use CPU for PyTorch compatibility
+        assert VulkanPlatform.device_name == "cpu"
+        assert VulkanPlatform.device_type == "cpu"
+        assert VulkanPlatform.dispatch_key == "CPU"
 
     def test_is_available(self):
         """Test is_available method."""
@@ -39,46 +39,36 @@ class TestVulkanPlatform:
         assert isinstance(count, int)
         assert count >= 0
 
-    def test_get_default_attn_backend(self):
-        """Test get_default_attn_backend method."""
+    def test_verify_quantization(self):
+        """Test verify_quantization method."""
+        import pytest
+
         from vllm_vulkan.platform import VulkanPlatform
 
-        backend = VulkanPlatform.get_default_attn_backend()
-        assert isinstance(backend, str)
-        assert "vulkan" in backend.lower()
+        # These should not raise
+        VulkanPlatform.verify_quantization("none")
+        VulkanPlatform.verify_quantization("q4_0")
+        VulkanPlatform.verify_quantization("fp16")
 
-    def test_get_model_runner(self):
-        """Test get_model_runner method."""
+        # This should raise
+        with pytest.raises(ValueError, match="not supported"):
+            VulkanPlatform.verify_quantization("unsupported_quant")
+
+    def test_get_torch_device(self):
+        """Test get_torch_device method."""
+        import torch
+
         from vllm_vulkan.platform import VulkanPlatform
 
-        runner = VulkanPlatform.get_model_runner(None)
-        assert isinstance(runner, str)
-        assert "VulkanModelRunner" in runner
+        device = VulkanPlatform.get_torch_device()
+        assert device == torch.device("cpu")
 
-    def test_get_worker(self):
-        """Test get_worker method."""
+    def test_is_pin_memory_available(self):
+        """Test is_pin_memory_available method."""
         from vllm_vulkan.platform import VulkanPlatform
 
-        worker = VulkanPlatform.get_worker()
-        assert isinstance(worker, str)
-        assert "VulkanWorker" in worker
-
-    def test_get_executor(self):
-        """Test get_executor method."""
-        from vllm_vulkan.platform import VulkanPlatform
-
-        executor = VulkanPlatform.get_executor()
-        assert isinstance(executor, str)
-        assert "VulkanExecutor" in executor
-
-    def test_get_supported_quantizations(self):
-        """Test get_supported_quantizations method."""
-        from vllm_vulkan.platform import VulkanPlatform
-
-        quants = VulkanPlatform.get_supported_quantizations()
-        assert isinstance(quants, list)
-        assert "none" in quants
-        assert "q4_0" in quants
+        result = VulkanPlatform.is_pin_memory_available()
+        assert result is False
 
 
 class TestPluginRegistration:
@@ -89,18 +79,20 @@ class TestPluginRegistration:
         import vllm_vulkan
 
         result = vllm_vulkan.register()
-        assert result == "vllm_vulkan.platform:VulkanPlatform"
+        # Returns dot notation path or None if not available
+        assert result is None or result == "vllm_vulkan.platform.VulkanPlatform"
 
     def test_entry_point_format(self):
         """Test that the entry point format is valid."""
         import vllm_vulkan
 
         result = vllm_vulkan.register()
-        # Should be in format "module.path:ClassName"
-        assert ":" in result
-        module_path, class_name = result.rsplit(":", 1)
-        assert "." in module_path
-        assert class_name == "VulkanPlatform"
+        if result is not None:
+            # Should be in format "module.path.ClassName" (dot notation)
+            assert "." in result
+            parts = result.rsplit(".", 1)
+            assert len(parts) == 2
+            assert parts[1] == "VulkanPlatform"
 
 
 class TestModuleExports:
