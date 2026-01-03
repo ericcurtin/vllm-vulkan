@@ -7,7 +7,6 @@ Benchmark attention performance on Vulkan backend.
 
 import argparse
 import time
-from typing import List, Tuple
 
 import vllm_vulkan
 
@@ -18,7 +17,7 @@ def create_attention_inputs(
     num_heads: int,
     head_dim: int,
     device_idx: int = 0,
-) -> Tuple[any, any, any]:
+) -> tuple[any, any, any]:
     """Create input tensors for attention benchmark."""
     if not vllm_vulkan._RUST_AVAILABLE:
         raise RuntimeError("Vulkan backend not available")
@@ -170,9 +169,9 @@ def benchmark_paged_attention(
 
 
 def run_benchmarks(
-    batch_sizes: List[int],
-    seq_lens: List[int],
-    context_lens: List[int],
+    batch_sizes: list[int],
+    seq_lens: list[int],
+    context_lens: list[int],
     num_heads: int = 32,
     head_dim: int = 128,
     block_size: int = 16,
@@ -280,15 +279,11 @@ def main():
     parser.add_argument(
         "--num-heads", type=int, default=32, help="Number of attention heads"
     )
-    parser.add_argument(
-        "--head-dim", type=int, default=128, help="Head dimension"
-    )
+    parser.add_argument("--head-dim", type=int, default=128, help="Head dimension")
     parser.add_argument(
         "--block-size", type=int, default=16, help="KV cache block size"
     )
-    parser.add_argument(
-        "--device", type=int, default=0, help="Device index to use"
-    )
+    parser.add_argument("--device", type=int, default=0, help="Device index to use")
 
     args = parser.parse_args()
 

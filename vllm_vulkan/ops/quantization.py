@@ -5,10 +5,9 @@ This module provides quantization and dequantization operations
 for the Vulkan backend, supporting ggml quantization formats.
 """
 
-from typing import Any, Optional, Tuple
+from typing import Any
 
 import vllm_vulkan
-
 
 # Supported quantization formats
 SUPPORTED_QUANT_FORMATS = [
@@ -142,11 +141,11 @@ def get_quant_bytes_per_element(quant_type: str) -> float:
         Bytes per element (approximate)
     """
     bytes_per_element = {
-        "q4_0": 0.5,   # 4 bits + scale
+        "q4_0": 0.5,  # 4 bits + scale
         "q4_1": 0.5625,  # 4 bits + scale + min
         "q5_0": 0.625,  # 5 bits + scale
         "q5_1": 0.6875,  # 5 bits + scale + min
-        "q8_0": 1.0,    # 8 bits + scale
+        "q8_0": 1.0,  # 8 bits + scale
         "q8_1": 1.0625,  # 8 bits + scale + min
         "f16": 2.0,
         "f32": 4.0,
@@ -170,7 +169,7 @@ def is_quantized_dtype(dtype: str) -> bool:
 def quantize_weight_for_vulkan(
     weight: Any,
     quant_type: str,
-) -> Tuple[Any, Any]:
+) -> tuple[Any, Any]:
     """
     Quantize a weight tensor for use with Vulkan backend.
 
@@ -200,7 +199,7 @@ def quantize_weight_for_vulkan(
 
 def load_quantized_weight(
     data: bytes,
-    shape: Tuple[int, ...],
+    shape: tuple[int, ...],
     quant_type: str,
     device_idx: int = 0,
 ) -> Any:

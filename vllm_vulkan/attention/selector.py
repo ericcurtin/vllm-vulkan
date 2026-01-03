@@ -4,8 +4,6 @@ Attention Backend Selector
 This module provides logic for selecting the appropriate attention backend.
 """
 
-from typing import Optional, Type
-
 import vllm_vulkan
 from vllm_vulkan.attention.backend import (
     VulkanAttentionBackend,
@@ -17,11 +15,11 @@ def get_attn_backend(
     num_heads: int,
     head_size: int,
     num_kv_heads: int,
-    sliding_window: Optional[int] = None,
+    sliding_window: int | None = None,
     dtype: str = "float16",
     block_size: int = 16,
     use_flash_attn: bool = True,
-) -> Type[VulkanAttentionBackend]:
+) -> type[VulkanAttentionBackend]:
     """
     Select the appropriate attention backend.
 
@@ -45,8 +43,7 @@ def get_attn_backend(
     supported_sizes = VulkanAttentionBackend.get_supported_head_sizes()
     if head_size not in supported_sizes:
         raise ValueError(
-            f"Head size {head_size} not supported. "
-            f"Supported sizes: {supported_sizes}"
+            f"Head size {head_size} not supported. Supported sizes: {supported_sizes}"
         )
 
     # Try flash attention first if requested
@@ -61,7 +58,7 @@ def which_attn_to_use(
     num_heads: int,
     head_size: int,
     num_kv_heads: int,
-    sliding_window: Optional[int] = None,
+    sliding_window: int | None = None,
     dtype: str = "float16",
 ) -> str:
     """

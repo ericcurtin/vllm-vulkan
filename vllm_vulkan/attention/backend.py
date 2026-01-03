@@ -5,7 +5,7 @@ This module provides the attention backend implementation for vLLM.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Type
+from typing import Any
 
 import vllm_vulkan
 
@@ -29,18 +29,18 @@ class VulkanAttentionMetadata:
     num_prefills: int = 0
 
     # Sequence lengths for each sequence
-    seq_lens: List[int] = field(default_factory=list)
+    seq_lens: list[int] = field(default_factory=list)
 
     # Context lengths for decode
-    context_lens: List[int] = field(default_factory=list)
+    context_lens: list[int] = field(default_factory=list)
 
     # Block tables for paged attention
     # Shape: [num_seqs, max_blocks_per_seq]
-    block_tables: Optional[Any] = None
+    block_tables: Any | None = None
 
     # Slot mapping for cache storage
     # Maps tokens to cache slots
-    slot_mapping: Optional[Any] = None
+    slot_mapping: Any | None = None
 
     # Maximum sequence length in this batch
     max_seq_len: int = 0
@@ -52,10 +52,10 @@ class VulkanAttentionMetadata:
     max_decode_seq_len: int = 0
 
     # Query start locations (for variable length sequences)
-    query_start_loc: Optional[Any] = None
+    query_start_loc: Any | None = None
 
     # Sequence start locations
-    seq_start_loc: Optional[Any] = None
+    seq_start_loc: Any | None = None
 
     # Use flash attention
     use_flash_attn: bool = True
@@ -108,10 +108,10 @@ class VulkanAttentionMetadataBuilder:
         self.device_idx = device_idx
 
         # Accumulated data
-        self._seq_lens: List[int] = []
-        self._context_lens: List[int] = []
-        self._block_tables: List[List[int]] = []
-        self._slot_mapping: List[int] = []
+        self._seq_lens: list[int] = []
+        self._context_lens: list[int] = []
+        self._block_tables: list[list[int]] = []
+        self._slot_mapping: list[int] = []
         self._num_prefill_tokens = 0
         self._num_decode_tokens = 0
         self._num_prefills = 0
@@ -121,8 +121,8 @@ class VulkanAttentionMetadataBuilder:
         seq_len: int,
         context_len: int,
         is_prefill: bool,
-        block_table: Optional[List[int]] = None,
-        slot_mapping: Optional[List[int]] = None,
+        block_table: list[int] | None = None,
+        slot_mapping: list[int] | None = None,
     ) -> None:
         """
         Add a sequence to the batch.
@@ -206,8 +206,8 @@ class VulkanAttentionImpl:
         head_dim: int,
         num_kv_heads: int,
         scale: float,
-        alibi_slopes: Optional[List[float]] = None,
-        sliding_window: Optional[int] = None,
+        alibi_slopes: list[float] | None = None,
+        sliding_window: int | None = None,
     ):
         """
         Initialize the attention implementation.
@@ -235,7 +235,7 @@ class VulkanAttentionImpl:
         query: Any,
         key: Any,
         value: Any,
-        kv_cache: Optional[Tuple[Any, Any]],
+        kv_cache: tuple[Any, Any] | None,
         attn_metadata: VulkanAttentionMetadata,
     ) -> Any:
         """
@@ -269,16 +269,14 @@ class VulkanAttentionImpl:
             )
         else:
             # Decode: use paged attention
-            return self._decode_attention(
-                query_tensor, kv_cache, attn_metadata
-            )
+            return self._decode_attention(query_tensor, kv_cache, attn_metadata)
 
     def _prefill_attention(
         self,
         query: Any,
         key: Any,
         value: Any,
-        kv_cache: Optional[Tuple[Any, Any]],
+        kv_cache: tuple[Any, Any] | None,
         attn_metadata: VulkanAttentionMetadata,
     ) -> Any:
         """Compute prefill attention."""
@@ -307,7 +305,7 @@ class VulkanAttentionImpl:
     def _decode_attention(
         self,
         query: Any,
-        kv_cache: Optional[Tuple[Any, Any]],
+        kv_cache: tuple[Any, Any] | None,
         attn_metadata: VulkanAttentionMetadata,
     ) -> Any:
         """Compute decode attention using paged KV cache."""
@@ -319,9 +317,7 @@ class VulkanAttentionImpl:
         # Flatten block tables for paged attention
         if attn_metadata.block_tables is not None:
             block_tables_flat = [
-                item
-                for sublist in attn_metadata.block_tables
-                for item in sublist
+                item for sublist in attn_metadata.block_tables for item in sublist
             ]
         else:
             block_tables_flat = []
@@ -349,29 +345,29 @@ class VulkanAttentionBackend:
     name: str = "vulkan"
 
     @staticmethod
-    def get_impl_cls() -> Type[VulkanAttentionImpl]:
+    def get_impl_cls() -> type[VulkanAttentionImpl]:
         """Get the attention implementation class."""
         return VulkanAttentionImpl
 
     @staticmethod
-    def get_metadata_cls() -> Type[VulkanAttentionMetadata]:
+    def get_metadata_cls() -> type[VulkanAttentionMetadata]:
         """Get the metadata class."""
         return VulkanAttentionMetadata
 
     @staticmethod
-    def get_builder_cls() -> Type[VulkanAttentionMetadataBuilder]:
+    def get_builder_cls() -> type[VulkanAttentionMetadataBuilder]:
         """Get the metadata builder class."""
         return VulkanAttentionMetadataBuilder
 
     @staticmethod
-    def get_supported_head_sizes() -> List[int]:
+    def get_supported_head_sizes() -> list[int]:
         """Get supported head dimensions."""
         return [64, 80, 96, 112, 128, 256]
 
     @staticmethod
     def is_available() -> bool:
         """Check if the backend is available."""
-        return vllm_vulkan.is_available()
+        return bool(vllm_vulkan.is_available())
 
 
 class VulkanFlashAttentionBackend(VulkanAttentionBackend):
@@ -392,6 +388,6 @@ class VulkanFlashAttentionBackend(VulkanAttentionBackend):
         # Check for device capabilities
         try:
             device_info = vllm_vulkan.get_device_info(0)
-            return device_info.get("supports_fp16", False)
+            return bool(device_info.get("supports_fp16", False))
         except Exception:
             return False
