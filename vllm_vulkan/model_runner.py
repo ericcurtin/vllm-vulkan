@@ -4,7 +4,7 @@ VulkanModelRunner - Model execution for vLLM Vulkan backend.
 This module implements the model runner that orchestrates forward passes.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import vllm_vulkan
 
@@ -68,8 +68,8 @@ class VulkanModelRunner:
 
     def prepare_inputs(
         self,
-        seq_group_metadata_list: List[Any],
-    ) -> Dict[str, Any]:
+        seq_group_metadata_list: list[Any],
+    ) -> dict[str, Any]:
         """
         Prepare inputs for the forward pass.
 
@@ -128,8 +128,8 @@ class VulkanModelRunner:
 
     def execute_model(
         self,
-        seq_group_metadata_list: List[Any],
-    ) -> Optional[List[Any]]:
+        seq_group_metadata_list: list[Any],
+    ) -> list[Any] | None:
         """
         Execute the model forward pass.
 
@@ -143,7 +143,7 @@ class VulkanModelRunner:
             raise RuntimeError("Model not loaded. Call load_model() first.")
 
         # Prepare inputs
-        inputs = self.prepare_inputs(seq_group_metadata_list)
+        _inputs = self.prepare_inputs(seq_group_metadata_list)  # noqa: F841
 
         # Execute forward pass
         # In real implementation, this would:
@@ -156,7 +156,7 @@ class VulkanModelRunner:
         batch_size = len(seq_group_metadata_list)
         outputs = []
 
-        for i in range(batch_size):
+        for _ in range(batch_size):
             output = {
                 "logits": None,  # Would be actual logits tensor
                 "hidden_states": None,
@@ -191,4 +191,6 @@ class VulkanModelRunner:
         # 3. Compile Vulkan command buffers
 
     def __repr__(self) -> str:
-        return f"VulkanModelRunner(device={self.device_idx}, loaded={self.model_loaded})"
+        return (
+            f"VulkanModelRunner(device={self.device_idx}, loaded={self.model_loaded})"
+        )

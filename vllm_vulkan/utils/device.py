@@ -4,12 +4,12 @@ Device Utilities
 This module provides utility functions for Vulkan device management.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import vllm_vulkan
 
 
-def get_device_properties(device_idx: int = 0) -> Dict[str, Any]:
+def get_device_properties(device_idx: int = 0) -> dict[str, Any]:
     """
     Get all properties for a Vulkan device.
 
@@ -47,7 +47,7 @@ def get_device_properties(device_idx: int = 0) -> Dict[str, Any]:
         }
 
 
-def get_device_memory_info(device_idx: int = 0) -> Tuple[int, int]:
+def get_device_memory_info(device_idx: int = 0) -> tuple[int, int]:
     """
     Get memory information for a device.
 
@@ -63,7 +63,7 @@ def get_device_memory_info(device_idx: int = 0) -> Tuple[int, int]:
         return (0, 0)
 
 
-def get_device_compute_capability(device_idx: int = 0) -> Tuple[int, int]:
+def get_device_compute_capability(device_idx: int = 0) -> tuple[int, int]:
     """
     Get compute capability for a device.
 
@@ -103,7 +103,7 @@ def is_device_available(device_idx: int = 0) -> bool:
         return False
 
 
-def synchronize_device(device_idx: Optional[int] = None) -> None:
+def synchronize_device(device_idx: int | None = None) -> None:
     """
     Synchronize a device (wait for all operations to complete).
 
@@ -137,7 +137,7 @@ def get_device_count() -> int:
     return vllm_vulkan.get_device_count()
 
 
-def list_devices() -> List[Dict[str, Any]]:
+def list_devices() -> list[dict[str, Any]]:
     """
     List all available Vulkan devices with their properties.
 
@@ -170,7 +170,7 @@ def get_best_device() -> int:
         return 0
 
     # Sort by criteria
-    def device_score(d: Dict[str, Any]) -> Tuple[int, int, str]:
+    def device_score(d: dict[str, Any]) -> tuple[int, int, str]:
         # Discrete GPUs get higher priority
         type_score = 1 if d.get("device_type") == "discrete" else 0
         # More memory is better

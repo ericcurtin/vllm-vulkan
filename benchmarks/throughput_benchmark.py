@@ -7,7 +7,6 @@ Benchmark token generation throughput on Vulkan backend.
 
 import argparse
 import time
-from typing import List, Optional
 
 import vllm_vulkan
 
@@ -30,7 +29,7 @@ def simulate_prefill(
         return 0.0
 
     # Create tensors
-    hidden_size = num_heads * head_dim
+    _hidden_size = num_heads * head_dim  # noqa: F841
     shape = [batch_size, prompt_len, num_heads, head_dim]
 
     query = vllm_vulkan.VulkanTensor(shape, "f32", device_idx)
@@ -155,9 +154,17 @@ def benchmark_throughput(
     total_prompt_tokens = batch_size * prompt_len
     total_generated_tokens = batch_size * generation_len
 
-    prefill_tokens_per_second = total_prompt_tokens / prefill_time if prefill_time > 0 else 0
-    decode_tokens_per_second = total_generated_tokens / total_decode_time if total_decode_time > 0 else 0
-    overall_tokens_per_second = (total_prompt_tokens + total_generated_tokens) / total_time if total_time > 0 else 0
+    prefill_tokens_per_second = (
+        total_prompt_tokens / prefill_time if prefill_time > 0 else 0
+    )
+    decode_tokens_per_second = (
+        total_generated_tokens / total_decode_time if total_decode_time > 0 else 0
+    )
+    overall_tokens_per_second = (
+        (total_prompt_tokens + total_generated_tokens) / total_time
+        if total_time > 0
+        else 0
+    )
 
     return {
         "batch_size": batch_size,
@@ -170,13 +177,15 @@ def benchmark_throughput(
         "prefill_tokens_per_second": prefill_tokens_per_second,
         "decode_tokens_per_second": decode_tokens_per_second,
         "overall_tokens_per_second": overall_tokens_per_second,
-        "avg_decode_step_ms": (total_decode_time / generation_len) * 1000 if generation_len > 0 else 0,
+        "avg_decode_step_ms": (total_decode_time / generation_len) * 1000
+        if generation_len > 0
+        else 0,
     }
 
 
 def run_benchmarks(
-    batch_sizes: List[int],
-    prompt_lens: List[int],
+    batch_sizes: list[int],
+    prompt_lens: list[int],
     generation_len: int,
     num_heads: int = 32,
     head_dim: int = 128,
@@ -261,15 +270,11 @@ def main():
     parser.add_argument(
         "--num-heads", type=int, default=32, help="Number of attention heads"
     )
-    parser.add_argument(
-        "--head-dim", type=int, default=128, help="Head dimension"
-    )
+    parser.add_argument("--head-dim", type=int, default=128, help="Head dimension")
     parser.add_argument(
         "--num-layers", type=int, default=32, help="Number of transformer layers"
     )
-    parser.add_argument(
-        "--device", type=int, default=0, help="Device index to use"
-    )
+    parser.add_argument("--device", type=int, default=0, help="Device index to use")
 
     args = parser.parse_args()
 

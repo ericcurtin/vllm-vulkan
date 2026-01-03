@@ -6,11 +6,11 @@ This module provides distributed communication primitives for multi-GPU inferenc
 
 from vllm_vulkan.distributed.communicator import (
     VulkanDistributedCommunicator,
+    barrier,
+    get_rank,
+    get_world_size,
     init_distributed,
     is_initialized,
-    get_world_size,
-    get_rank,
-    barrier,
 )
 
 __all__ = [
