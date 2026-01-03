@@ -49,9 +49,17 @@ fn generate_ggml_bindings(ggml_dir: &PathBuf, out_dir: &PathBuf) {
         return;
     }
 
+    // Convert paths to UTF-8 strings, with clear error messages
+    let header_str = header_path.to_str().expect(
+        "ggml header path must be valid UTF-8. Non-UTF8 paths are not supported."
+    );
+    let ggml_dir_str = ggml_dir.to_str().expect(
+        "ggml directory path must be valid UTF-8. Non-UTF8 paths are not supported."
+    );
+
     let bindings = bindgen::Builder::default()
-        .header(header_path.to_string_lossy())
-        .clang_arg(format!("-I{}/include", ggml_dir.display()))
+        .header(header_str)
+        .clang_arg(format!("-I{}/include", ggml_dir_str))
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .allowlist_function("ggml_.*")
         .allowlist_type("ggml_.*")

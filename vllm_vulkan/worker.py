@@ -220,7 +220,9 @@ class VulkanWorker:
     def get_cache_block_size_bytes(self) -> int:
         """Get the size of a KV cache block in bytes."""
         if self.kv_cache is not None:
-            return self.kv_cache.total_capacity() // self.kv_cache.num_total_blocks()
+            num_blocks = self.kv_cache.num_total_blocks()
+            if num_blocks > 0:
+                return self.kv_cache.total_capacity() // num_blocks
         return 0
 
     def synchronize(self) -> None:

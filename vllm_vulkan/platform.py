@@ -11,6 +11,13 @@ import vllm_vulkan
 if TYPE_CHECKING:
     import torch
 
+# Module path constants for component classes
+_ATTENTION_BACKEND_PATH = "vllm_vulkan.attention.backend:VulkanAttentionBackend"
+_FLASH_ATTENTION_BACKEND_PATH = "vllm_vulkan.attention.backend:VulkanFlashAttentionBackend"
+_MODEL_RUNNER_PATH = "vllm_vulkan.model_runner:VulkanModelRunner"
+_WORKER_PATH = "vllm_vulkan.worker:VulkanWorker"
+_EXECUTOR_PATH = "vllm_vulkan.executor:VulkanExecutor"
+
 
 class VulkanPlatform:
     """
@@ -76,8 +83,8 @@ class VulkanPlatform:
             String path to the attention backend class
         """
         if selected_backend and selected_backend.lower() == "flash_attn":
-            return "vllm_vulkan.attention.backend:VulkanFlashAttentionBackend"
-        return "vllm_vulkan.attention.backend:VulkanAttentionBackend"
+            return _FLASH_ATTENTION_BACKEND_PATH
+        return _ATTENTION_BACKEND_PATH
 
     @classmethod
     def get_model_runner(cls, model_config: Any, **kwargs) -> str:
@@ -87,7 +94,7 @@ class VulkanPlatform:
         Returns:
             String path to the model runner class
         """
-        return "vllm_vulkan.model_runner:VulkanModelRunner"
+        return _MODEL_RUNNER_PATH
 
     @classmethod
     def get_worker(cls, **kwargs) -> str:
@@ -97,7 +104,7 @@ class VulkanPlatform:
         Returns:
             String path to the worker class
         """
-        return "vllm_vulkan.worker:VulkanWorker"
+        return _WORKER_PATH
 
     @classmethod
     def get_executor(cls, **kwargs) -> str:
@@ -107,7 +114,7 @@ class VulkanPlatform:
         Returns:
             String path to the executor class
         """
-        return "vllm_vulkan.executor:VulkanExecutor"
+        return _EXECUTOR_PATH
 
     @classmethod
     def synchronize(cls) -> None:

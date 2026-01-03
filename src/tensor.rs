@@ -46,15 +46,47 @@ impl TensorDtype {
         }
     }
 
+    /// Get the element size in bytes.
+    ///
+    /// Note: For quantized types, this returns a minimum size of 1 byte per element.
+    /// For more accurate memory calculations with quantized types, use `block_size_bytes()`
+    /// which accounts for the actual block-based storage format.
     pub fn element_size(&self) -> usize {
         match self {
             TensorDtype::F32 | TensorDtype::I32 => 4,
             TensorDtype::F16 | TensorDtype::BF16 | TensorDtype::I16 => 2,
             TensorDtype::I8 => 1,
-            // Quantized types have variable element sizes
-            TensorDtype::Q4_0 | TensorDtype::Q4_1 => 1, // ~0.5 bytes per element
-            TensorDtype::Q5_0 | TensorDtype::Q5_1 => 1, // ~0.625 bytes per element
-            TensorDtype::Q8_0 | TensorDtype::Q8_1 => 1, // 1 byte per element
+            // Quantized types: minimum allocation unit is 1 byte
+            // Actual storage is more compact but we use 1 for safe allocation
+            TensorDtype::Q4_0 | TensorDtype::Q4_1 => 1,
+            TensorDtype::Q5_0 | TensorDtype::Q5_1 => 1,
+            TensorDtype::Q8_0 | TensorDtype::Q8_1 => 1,
+        }
+    }
+
+    /// Get the ggml block size for quantized types (number of elements per block).
+    pub fn block_elements(&self) -> usize {
+        match self {
+            TensorDtype::Q4_0 | TensorDtype::Q4_1 => 32,
+            TensorDtype::Q5_0 | TensorDtype::Q5_1 => 32,
+            TensorDtype::Q8_0 | TensorDtype::Q8_1 => 32,
+            _ => 1, // Non-quantized types: 1 element per "block"
+        }
+    }
+
+    /// Get the size in bytes for a block of elements.
+    /// For quantized types, this gives a more accurate memory calculation.
+    pub fn block_size_bytes(&self) -> usize {
+        match self {
+            TensorDtype::F32 | TensorDtype::I32 => 4,
+            TensorDtype::F16 | TensorDtype::BF16 | TensorDtype::I16 => 2,
+            TensorDtype::I8 => 1,
+            TensorDtype::Q4_0 => 18,  // 32 * 4 bits / 8 + 2 bytes scale = 18 bytes
+            TensorDtype::Q4_1 => 20,  // 32 * 4 bits / 8 + 2 bytes scale + 2 bytes min = 20 bytes
+            TensorDtype::Q5_0 => 22,  // 32 * 5 bits / 8 + 2 bytes scale ≈ 22 bytes
+            TensorDtype::Q5_1 => 24,  // 32 * 5 bits / 8 + 4 bytes metadata ≈ 24 bytes
+            TensorDtype::Q8_0 => 34,  // 32 * 8 bits / 8 + 2 bytes scale = 34 bytes
+            TensorDtype::Q8_1 => 36,  // 32 * 8 bits / 8 + 4 bytes metadata = 36 bytes
         }
     }
 
@@ -103,11 +135,16 @@ impl VulkanTensor {
         let num_elements: usize = shape.iter().product();
         let size = num_elements * tensor_dtype.element_size();
 
-        // Calculate strides (row-major)
-        let mut strides = vec![1usize; shape.len()];
-        for i in (0..shape.len() - 1).rev() {
-            strides[i] = strides[i + 1] * shape[i + 1];
-        }
+        // Calculate strides (row-major order)
+        let strides = if shape.is_empty() {
+            Vec::new()
+        } else {
+            let mut strides = vec![1usize; shape.len()];
+            for i in (0..shape.len().saturating_sub(1)).rev() {
+                strides[i] = strides[i + 1] * shape[i + 1];
+            }
+            strides
+        };
 
         let data = TensorData {
             data: vec![0u8; size],
@@ -139,11 +176,16 @@ impl VulkanTensor {
             );
         }
 
-        // Calculate strides
-        let mut strides = vec![1usize; shape.len()];
-        for i in (0..shape.len().saturating_sub(1)).rev() {
-            strides[i] = strides[i + 1] * shape[i + 1];
-        }
+        // Calculate strides (row-major order)
+        let strides = if shape.is_empty() {
+            Vec::new()
+        } else {
+            let mut strides = vec![1usize; shape.len()];
+            for i in (0..shape.len().saturating_sub(1)).rev() {
+                strides[i] = strides[i + 1] * shape[i + 1];
+            }
+            strides
+        };
 
         let tensor_data = TensorData {
             data,
