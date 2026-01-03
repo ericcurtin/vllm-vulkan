@@ -121,7 +121,7 @@ print(outputs[0].outputs[0].text)
             device_idx=0,
         )
 
-        print(f"\nCommunicator created:")
+        print("\nCommunicator created:")
         print(f"  World size: {communicator.world_size}")
         print(f"  Rank: {communicator.rank}")
         print(f"  Device: {communicator.device_idx}")

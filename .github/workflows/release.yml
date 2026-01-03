@@ -1,0 +1,22 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Build and Release
+      run: ./scripts/release.sh
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
