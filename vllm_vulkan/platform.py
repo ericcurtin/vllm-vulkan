@@ -4,7 +4,7 @@ VulkanPlatform - Main platform class for vLLM Vulkan backend.
 This module implements the Platform interface required by vLLM for hardware backends.
 """
 
-from typing import TYPE_CHECKING, Any, Optional, Tuple, Type
+from typing import TYPE_CHECKING, Any
 
 import vllm_vulkan
 
@@ -59,7 +59,7 @@ class VulkanPlatform:
         return vllm_vulkan.get_device_count()
 
     @classmethod
-    def get_current_memory_usage(cls, device_id: int = 0) -> Tuple[int, int]:
+    def get_current_memory_usage(cls, device_id: int = 0) -> tuple[int, int]:
         """
         Get current memory usage for a device.
 
@@ -72,7 +72,7 @@ class VulkanPlatform:
             return (0, 0)
 
     @classmethod
-    def get_default_attn_backend(cls, selected_backend: Optional[str] = None) -> str:
+    def get_default_attn_backend(cls, selected_backend: str | None = None) -> str:
         """
         Get the default attention backend for this platform.
 
@@ -122,7 +122,7 @@ class VulkanPlatform:
         vllm_vulkan.synchronize()
 
     @classmethod
-    def get_device_capability(cls, device_id: int = 0) -> Optional[Tuple[int, int]]:
+    def get_device_capability(cls, device_id: int = 0) -> tuple[int, int] | None:
         """
         Get device compute capability.
 

@@ -4,8 +4,8 @@ Model Runner Tests
 Tests for the VulkanModelRunner class.
 """
 
+
 import pytest
-from unittest.mock import MagicMock
 
 
 class MockModelConfig:

@@ -7,7 +7,6 @@ Benchmark token generation throughput on Vulkan backend.
 
 import argparse
 import time
-from typing import List, Optional
 
 import vllm_vulkan
 
@@ -30,7 +29,7 @@ def simulate_prefill(
         return 0.0
 
     # Create tensors
-    hidden_size = num_heads * head_dim
+    _hidden_size = num_heads * head_dim  # noqa: F841
     shape = [batch_size, prompt_len, num_heads, head_dim]
 
     query = vllm_vulkan.VulkanTensor(shape, "f32", device_idx)
@@ -175,8 +174,8 @@ def benchmark_throughput(
 
 
 def run_benchmarks(
-    batch_sizes: List[int],
-    prompt_lens: List[int],
+    batch_sizes: list[int],
+    prompt_lens: list[int],
     generation_len: int,
     num_heads: int = 32,
     head_dim: int = 128,

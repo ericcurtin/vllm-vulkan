@@ -4,10 +4,9 @@ VulkanWorker - Per-device worker for vLLM Vulkan backend.
 This module implements the worker that manages model execution on a single Vulkan device.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import vllm_vulkan
-from vllm_vulkan.platform import VulkanPlatform
 
 
 class VulkanWorker:
@@ -30,7 +29,7 @@ class VulkanWorker:
         cache_config: Any,
         local_rank: int = 0,
         rank: int = 0,
-        distributed_init_method: Optional[str] = None,
+        distributed_init_method: str | None = None,
     ):
         """
         Initialize the Vulkan worker.
@@ -102,7 +101,7 @@ class VulkanWorker:
         self,
         block_size: int,
         gpu_memory_utilization: float = 0.9,
-    ) -> Tuple[int, int]:
+    ) -> tuple[int, int]:
         """
         Profile memory to determine available KV cache blocks.
 
@@ -168,11 +167,11 @@ class VulkanWorker:
 
     def execute_model(
         self,
-        seq_group_metadata_list: List[Any],
-        blocks_to_swap_in: Dict[int, int],
-        blocks_to_swap_out: Dict[int, int],
-        blocks_to_copy: Dict[int, List[int]],
-    ) -> Optional[List[Any]]:
+        seq_group_metadata_list: list[Any],
+        blocks_to_swap_in: dict[int, int],
+        blocks_to_swap_out: dict[int, int],
+        blocks_to_copy: dict[int, list[int]],
+    ) -> list[Any] | None:
         """
         Execute a batch of sequences.
 
@@ -196,9 +195,9 @@ class VulkanWorker:
 
     def _execute_cache_ops(
         self,
-        blocks_to_swap_in: Dict[int, int],
-        blocks_to_swap_out: Dict[int, int],
-        blocks_to_copy: Dict[int, List[int]],
+        blocks_to_swap_in: dict[int, int],
+        blocks_to_swap_out: dict[int, int],
+        blocks_to_copy: dict[int, list[int]],
     ) -> None:
         """Execute cache operations (swap and copy)."""
         if self.kv_cache is None:

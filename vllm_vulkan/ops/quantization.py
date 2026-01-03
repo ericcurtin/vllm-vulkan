@@ -5,10 +5,9 @@ This module provides quantization and dequantization operations
 for the Vulkan backend, supporting ggml quantization formats.
 """
 
-from typing import Any, Optional, Tuple
+from typing import Any
 
 import vllm_vulkan
-
 
 # Supported quantization formats
 SUPPORTED_QUANT_FORMATS = [
@@ -170,7 +169,7 @@ def is_quantized_dtype(dtype: str) -> bool:
 def quantize_weight_for_vulkan(
     weight: Any,
     quant_type: str,
-) -> Tuple[Any, Any]:
+) -> tuple[Any, Any]:
     """
     Quantize a weight tensor for use with Vulkan backend.
 
@@ -200,7 +199,7 @@ def quantize_weight_for_vulkan(
 
 def load_quantized_weight(
     data: bytes,
-    shape: Tuple[int, ...],
+    shape: tuple[int, ...],
     quant_type: str,
     device_idx: int = 0,
 ) -> Any:
