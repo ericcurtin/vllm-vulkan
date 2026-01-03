@@ -4,12 +4,12 @@ Device Utilities
 This module provides utility functions for Vulkan device management.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import vllm_vulkan
 
 
-def get_device_properties(device_idx: int = 0) -> Dict[str, Any]:
+def get_device_properties(device_idx: int = 0) -> dict[str, Any]:
     """
     Get all properties for a Vulkan device.
 
@@ -30,7 +30,8 @@ def get_device_properties(device_idx: int = 0) -> Dict[str, Any]:
         - max_compute_work_group_size: Max work group sizes [x, y, z]
     """
     try:
-        return vllm_vulkan.get_device_info(device_idx)
+        result = vllm_vulkan.get_device_info(device_idx)
+        return dict(result) if result else {}
     except Exception as e:
         return {
             "name": "Unknown",
@@ -47,7 +48,7 @@ def get_device_properties(device_idx: int = 0) -> Dict[str, Any]:
         }
 
 
-def get_device_memory_info(device_idx: int = 0) -> Tuple[int, int]:
+def get_device_memory_info(device_idx: int = 0) -> tuple[int, int]:
     """
     Get memory information for a device.
 
@@ -58,12 +59,13 @@ def get_device_memory_info(device_idx: int = 0) -> Tuple[int, int]:
         Tuple of (used_bytes, total_bytes)
     """
     try:
-        return vllm_vulkan.get_memory_info(device_idx)
+        used, total = vllm_vulkan.get_memory_info(device_idx)
+        return (int(used), int(total))
     except Exception:
         return (0, 0)
 
 
-def get_device_compute_capability(device_idx: int = 0) -> Tuple[int, int]:
+def get_device_compute_capability(device_idx: int = 0) -> tuple[int, int]:
     """
     Get compute capability for a device.
 
@@ -97,13 +99,13 @@ def is_device_available(device_idx: int = 0) -> bool:
         True if device is available
     """
     try:
-        device_count = vllm_vulkan.get_device_count()
-        return device_idx < device_count
+        device_count = int(vllm_vulkan.get_device_count())
+        return bool(device_idx < device_count)
     except Exception:
         return False
 
 
-def synchronize_device(device_idx: Optional[int] = None) -> None:
+def synchronize_device(device_idx: int | None = None) -> None:
     """
     Synchronize a device (wait for all operations to complete).
 
@@ -134,10 +136,10 @@ def get_device_count() -> int:
     Returns:
         Number of devices
     """
-    return vllm_vulkan.get_device_count()
+    return int(vllm_vulkan.get_device_count())
 
 
-def list_devices() -> List[Dict[str, Any]]:
+def list_devices() -> list[dict[str, Any]]:
     """
     List all available Vulkan devices with their properties.
 
@@ -170,7 +172,7 @@ def get_best_device() -> int:
         return 0
 
     # Sort by criteria
-    def device_score(d: Dict[str, Any]) -> Tuple[int, int, str]:
+    def device_score(d: dict[str, Any]) -> tuple[int, int, str]:
         # Discrete GPUs get higher priority
         type_score = 1 if d.get("device_type") == "discrete" else 0
         # More memory is better
@@ -180,7 +182,7 @@ def get_best_device() -> int:
         return (type_score, memory_score, api_version)
 
     sorted_devices = sorted(devices, key=device_score, reverse=True)
-    return sorted_devices[0].get("index", 0)
+    return int(sorted_devices[0].get("index", 0))
 
 
 def set_current_device(device_idx: int) -> None:
@@ -209,7 +211,7 @@ def get_device_name(device_idx: int = 0) -> str:
         Device name string
     """
     props = get_device_properties(device_idx)
-    return props.get("name", f"Vulkan Device {device_idx}")
+    return str(props.get("name", f"Vulkan Device {device_idx}"))
 
 
 def supports_dtype(device_idx: int, dtype: str) -> bool:
@@ -233,11 +235,11 @@ def supports_dtype(device_idx: int, dtype: str) -> bool:
 
     # F16 support
     if dtype_lower in ("f16", "float16"):
-        return props.get("supports_fp16", False)
+        return bool(props.get("supports_fp16", False))
 
     # INT8 support
     if dtype_lower in ("i8", "int8", "q8_0", "q8_1"):
-        return props.get("supports_int8", False)
+        return bool(props.get("supports_int8", False))
 
     # Quantized types are generally supported if the device works
     if dtype_lower.startswith("q"):
