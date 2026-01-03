@@ -1,0 +1,36 @@
+[package]
+name = "vllm_vulkan"
+version = "0.1.0"
+edition = "2021"
+description = "vLLM Vulkan backend using ggml-vulkan"
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/ericcurtin/vllm-vulkan"
+keywords = ["vllm", "vulkan", "gpu", "inference", "llm"]
+categories = ["science", "development-tools::ffi"]
+
+[lib]
+name = "vllm_vulkan_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"] }
+numpy = "0.22"
+ash = "0.38"
+parking_lot = "0.12"
+thiserror = "2.0"
+log = "0.4"
+env_logger = "0.11"
+
+[build-dependencies]
+bindgen = "0.70"
+cmake = "0.1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+
+[features]
+default = []
+vulkan-debug = []
