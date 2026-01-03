@@ -4,8 +4,6 @@ Platform Tests
 Tests for the VulkanPlatform class.
 """
 
-import pytest
-
 
 class TestVulkanPlatform:
     """Tests for VulkanPlatform."""
