@@ -10,13 +10,13 @@ from vllm_vulkan.ops.attention import (
     paged_attention_v2,
 )
 from vllm_vulkan.ops.cache import (
-    reshape_and_cache,
     copy_blocks,
+    reshape_and_cache,
     swap_blocks,
 )
 from vllm_vulkan.ops.quantization import (
-    quantize_tensor,
     dequantize_tensor,
+    quantize_tensor,
 )
 
 __all__ = [
