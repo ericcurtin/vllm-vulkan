@@ -4,7 +4,7 @@ Attention Operations
 This module provides Python wrappers for Vulkan attention kernels.
 """
 
-from typing import Any, List, Optional
+from typing import Any
 
 import vllm_vulkan
 
@@ -13,9 +13,9 @@ def flash_attention(
     query: Any,
     key: Any,
     value: Any,
-    scale: Optional[float] = None,
+    scale: float | None = None,
     causal: bool = True,
-    softmax_cap: Optional[float] = None,
+    softmax_cap: float | None = None,
 ) -> Any:
     """
     Compute flash attention.
@@ -66,7 +66,7 @@ def paged_attention_v1(
     context_lens: Any,
     block_size: int,
     max_context_len: int,
-    alibi_slopes: Optional[Any] = None,
+    alibi_slopes: Any | None = None,
     kv_cache_dtype: str = "auto",
 ) -> None:
     """
@@ -111,7 +111,7 @@ def paged_attention_v1(
         context_lens_list = list(context_lens)
 
     # Call paged attention
-    result = vllm_vulkan.paged_attention(
+    _result = vllm_vulkan.paged_attention(  # noqa: F841
         query=query,
         key_cache=key_cache,
         value_cache=value_cache,
@@ -139,7 +139,7 @@ def paged_attention_v2(
     context_lens: Any,
     block_size: int,
     max_context_len: int,
-    alibi_slopes: Optional[Any] = None,
+    alibi_slopes: Any | None = None,
     kv_cache_dtype: str = "auto",
 ) -> None:
     """
@@ -214,7 +214,7 @@ def batched_rotary_embedding(
     cos_sin_cache: Any,
     is_neox: bool = True,
     rot_dim: int = 64,
-    cos_sin_cache_offsets: Optional[Any] = None,
+    cos_sin_cache_offsets: Any | None = None,
 ) -> None:
     """
     Apply batched rotary position embeddings.
