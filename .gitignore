@@ -191,6 +191,13 @@ cython_debug/
 # Ruff stuff:
 .ruff_cache/
 
+# Rust build artifacts
+target/
+Cargo.lock
+
+# ggml build artifacts
+ggml/build/
+
 # PyPI configuration file
 .pypirc
 
