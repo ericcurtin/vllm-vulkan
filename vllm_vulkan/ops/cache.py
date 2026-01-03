@@ -4,7 +4,7 @@ KV Cache Operations
 This module provides cache management operations for the Vulkan backend.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import vllm_vulkan
 
@@ -89,9 +89,9 @@ def reshape_and_cache_flash(
 
 
 def copy_blocks(
-    key_caches: List[Any],
-    value_caches: List[Any],
-    block_mapping: Dict[int, List[int]],
+    key_caches: list[Any],
+    value_caches: list[Any],
+    block_mapping: dict[int, list[int]],
 ) -> None:
     """
     Copy cache blocks (for forking sequences).
@@ -109,9 +109,7 @@ def copy_blocks(
 
     # Convert block_mapping to list of tuples
     block_mapping_list = [
-        (src, dst)
-        for src, dsts in block_mapping.items()
-        for dst in dsts
+        (src, dst) for src, dsts in block_mapping.items() for dst in dsts
     ]
 
     # Call Rust implementation
@@ -127,7 +125,7 @@ def swap_blocks(
     src_value_cache: Any,
     dst_key_cache: Any,
     dst_value_cache: Any,
-    block_mapping: Dict[int, int],
+    block_mapping: dict[int, int],
 ) -> None:
     """
     Swap cache blocks between GPU and CPU.
@@ -166,7 +164,7 @@ def allocate_kv_cache(
     head_dim: int,
     device_idx: int = 0,
     dtype: str = "float16",
-) -> Tuple[Any, Any]:
+) -> tuple[Any, Any]:
     """
     Allocate KV cache tensors.
 

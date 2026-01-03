@@ -5,7 +5,7 @@ This module provides distributed communication primitives for multi-GPU
 inference using Vulkan.
 """
 
-from typing import Any, List, Optional
+from typing import Any
 
 import vllm_vulkan
 
@@ -29,8 +29,8 @@ class VulkanDistributedCommunicator:
         self,
         world_size: int,
         rank: int,
-        local_rank: Optional[int] = None,
-        device_idx: Optional[int] = None,
+        local_rank: int | None = None,
+        device_idx: int | None = None,
     ):
         """
         Initialize the communicator.
@@ -152,7 +152,7 @@ class VulkanDistributedCommunicator:
 
     def recv(
         self,
-        shape: List[int],
+        shape: list[int],
         src: int,
         dtype: str = "f32",
     ) -> Any:
@@ -183,7 +183,7 @@ class VulkanDistributedCommunicator:
 def init_distributed(
     world_size: int = 1,
     rank: int = 0,
-    local_rank: Optional[int] = None,
+    local_rank: int | None = None,
     backend: str = "vulkan",
 ) -> VulkanDistributedCommunicator:
     """
@@ -236,7 +236,7 @@ def get_local_rank() -> int:
     return _LOCAL_RANK
 
 
-def get_communicator() -> Optional[VulkanDistributedCommunicator]:
+def get_communicator() -> VulkanDistributedCommunicator | None:
     """Get the global communicator."""
     return _COMMUNICATOR
 
