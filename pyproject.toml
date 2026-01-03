@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "vLLM Vulkan backend using ggml-vulkan"
 readme = "README.md"
 license = {text = "Apache-2.0"}
-requires-python = ">=3.9"
+requires-python = ">=3.12,<3.13"
 authors = [
     {name = "vLLM-Vulkan Contributors"}
 ]
@@ -13,17 +13,12 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Rust",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "vllm>=0.6.0",
-    "torch>=2.0",
+    # vllm and torch are installed separately via install.sh to avoid CUDA dependencies
     "numpy>=1.24",
 ]
 
@@ -44,7 +39,7 @@ Repository = "https://github.com/ericcurtin/vllm-vulkan"
 Issues = "https://github.com/ericcurtin/vllm-vulkan/issues"
 
 [build-system]
-requires = ["maturin>=1.0,<2.0"]
+requires = ["maturin>=1.4,<2.0"]
 build-backend = "maturin"
 
 [tool.maturin]
@@ -54,14 +49,14 @@ module-name = "vllm_vulkan._vllm_vulkan_rs"
 
 [tool.ruff]
 line-length = 88
-target-version = "py39"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]
 ignore = ["E501"]
 
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.12"
 warn_return_any = true
 warn_unused_configs = true
 ignore_missing_imports = true

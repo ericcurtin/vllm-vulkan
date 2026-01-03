@@ -4,7 +4,7 @@ VulkanPlatform - Main platform class for vLLM Vulkan backend.
 This module implements the Platform interface required by vLLM for hardware backends.
 """
 
-from typing import TYPE_CHECKING, Any, Optional, Tuple, Type
+from typing import TYPE_CHECKING, Any
 
 import vllm_vulkan
 
@@ -13,7 +13,9 @@ if TYPE_CHECKING:
 
 # Module path constants for component classes
 _ATTENTION_BACKEND_PATH = "vllm_vulkan.attention.backend:VulkanAttentionBackend"
-_FLASH_ATTENTION_BACKEND_PATH = "vllm_vulkan.attention.backend:VulkanFlashAttentionBackend"
+_FLASH_ATTENTION_BACKEND_PATH = (
+    "vllm_vulkan.attention.backend:VulkanFlashAttentionBackend"
+)
 _MODEL_RUNNER_PATH = "vllm_vulkan.model_runner:VulkanModelRunner"
 _WORKER_PATH = "vllm_vulkan.worker:VulkanWorker"
 _EXECUTOR_PATH = "vllm_vulkan.executor:VulkanExecutor"
@@ -35,7 +37,7 @@ class VulkanPlatform:
         """Get the name of a Vulkan device."""
         try:
             info = vllm_vulkan.get_device_info(device_id)
-            return info.get("name", f"Vulkan Device {device_id}")
+            return str(info.get("name", f"Vulkan Device {device_id}"))
         except Exception:
             return f"Vulkan Device {device_id}"
 
@@ -44,22 +46,22 @@ class VulkanPlatform:
         """Get total memory for a device in bytes."""
         try:
             _, total = vllm_vulkan.get_memory_info(device_id)
-            return total
+            return int(total)
         except Exception:
             return 0
 
     @classmethod
     def is_available(cls) -> bool:
         """Check if Vulkan is available."""
-        return vllm_vulkan.is_available()
+        return bool(vllm_vulkan.is_available())
 
     @classmethod
     def get_device_count(cls) -> int:
         """Get the number of Vulkan devices."""
-        return vllm_vulkan.get_device_count()
+        return int(vllm_vulkan.get_device_count())
 
     @classmethod
-    def get_current_memory_usage(cls, device_id: int = 0) -> Tuple[int, int]:
+    def get_current_memory_usage(cls, device_id: int = 0) -> tuple[int, int]:
         """
         Get current memory usage for a device.
 
@@ -67,12 +69,13 @@ class VulkanPlatform:
             Tuple of (used_bytes, total_bytes)
         """
         try:
-            return vllm_vulkan.get_memory_info(device_id)
+            used, total = vllm_vulkan.get_memory_info(device_id)
+            return (int(used), int(total))
         except Exception:
             return (0, 0)
 
     @classmethod
-    def get_default_attn_backend(cls, selected_backend: Optional[str] = None) -> str:
+    def get_default_attn_backend(cls, selected_backend: str | None = None) -> str:
         """
         Get the default attention backend for this platform.
 
@@ -122,7 +125,7 @@ class VulkanPlatform:
         vllm_vulkan.synchronize()
 
     @classmethod
-    def get_device_capability(cls, device_id: int = 0) -> Optional[Tuple[int, int]]:
+    def get_device_capability(cls, device_id: int = 0) -> tuple[int, int] | None:
         """
         Get device compute capability.
 
@@ -211,7 +214,7 @@ class VulkanPlatform:
         pass
 
     @classmethod
-    def get_device_properties(cls, device_id: int = 0) -> dict:
+    def get_device_properties(cls, device_id: int = 0) -> dict[Any, Any]:
         """
         Get all properties for a device.
 
@@ -222,7 +225,8 @@ class VulkanPlatform:
             Dictionary of device properties
         """
         try:
-            return vllm_vulkan.get_device_info(device_id)
+            result = vllm_vulkan.get_device_info(device_id)
+            return dict(result) if result else {}
         except Exception:
             return {}
 
