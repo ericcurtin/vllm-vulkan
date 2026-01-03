@@ -5,32 +5,39 @@ This module provides the entry point for vLLM's plugin system and exposes
 the main functionality of the Vulkan backend.
 """
 
-from typing import TYPE_CHECKING
-
 __version__ = "0.1.0"
 
 # Try to import the Rust extension, fall back to stubs if not available
 try:
     from vllm_vulkan._vllm_vulkan_rs import (
-        __version__ as _rs_version,
-        __vulkan_available__,
-        is_available,
-        get_device_count,
-        enumerate_devices,
-        get_device_info,
-        synchronize,
-        get_memory_info,
-        VulkanDevice,
-        VulkanBuffer,
-        VulkanBackend,
-        VulkanTensor,
-        VulkanGraph,
         PagedKVCache,
+        VulkanBackend,
+        VulkanBuffer,
         VulkanCommunicator,
-        flash_attention_py as flash_attention,
-        paged_attention_py as paged_attention,
-        reshape_and_cache_py as reshape_and_cache,
+        VulkanDevice,
+        VulkanGraph,
+        VulkanTensor,
+        __vulkan_available__,
+        enumerate_devices,
+        get_device_count,
+        get_device_info,
+        get_memory_info,
+        is_available,
+        synchronize,
+    )
+    from vllm_vulkan._vllm_vulkan_rs import (
         copy_blocks_py as copy_blocks,
+    )
+    from vllm_vulkan._vllm_vulkan_rs import (
+        flash_attention_py as flash_attention,
+    )
+    from vllm_vulkan._vllm_vulkan_rs import (
+        paged_attention_py as paged_attention,
+    )
+    from vllm_vulkan._vllm_vulkan_rs import (
+        reshape_and_cache_py as reshape_and_cache,
+    )
+    from vllm_vulkan._vllm_vulkan_rs import (
         swap_blocks_py as swap_blocks,
     )
 
@@ -65,7 +72,7 @@ except ImportError:
         raise RuntimeError("Vulkan not available")
 
 
-def register() -> str:
+def register() -> str | None:
     """
     Register the Vulkan platform plugin with vLLM.
 
@@ -73,9 +80,13 @@ def register() -> str:
     It returns the fully qualified path to the VulkanPlatform class.
 
     Returns:
-        str: The path to the VulkanPlatform class.
+        str: The path to the VulkanPlatform class, or None if not available.
     """
-    return "vllm_vulkan.platform:VulkanPlatform"
+    from vllm_vulkan.platform import VulkanPlatform
+
+    if VulkanPlatform.is_available():
+        return "vllm_vulkan.platform.VulkanPlatform"
+    return None
 
 
 # Public API
