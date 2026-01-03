@@ -4,8 +4,6 @@ Attention Backend Tests
 Tests for the Vulkan attention backend.
 """
 
-import pytest
-
 
 class TestAttentionMetadata:
     """Tests for VulkanAttentionMetadata."""
