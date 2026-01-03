@@ -4,7 +4,7 @@ VulkanModelRunner - Model execution for vLLM Vulkan backend.
 This module implements the model runner that orchestrates forward passes.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import vllm_vulkan
 
@@ -68,8 +68,8 @@ class VulkanModelRunner:
 
     def prepare_inputs(
         self,
-        seq_group_metadata_list: List[Any],
-    ) -> Dict[str, Any]:
+        seq_group_metadata_list: list[Any],
+    ) -> dict[str, Any]:
         """
         Prepare inputs for the forward pass.
 
@@ -128,8 +128,8 @@ class VulkanModelRunner:
 
     def execute_model(
         self,
-        seq_group_metadata_list: List[Any],
-    ) -> Optional[List[Any]]:
+        seq_group_metadata_list: list[Any],
+    ) -> list[Any] | None:
         """
         Execute the model forward pass.
 

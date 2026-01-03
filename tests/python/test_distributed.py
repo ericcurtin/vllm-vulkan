@@ -4,7 +4,6 @@ Distributed Tests
 Tests for the Vulkan distributed communication module.
 """
 
-import pytest
 
 
 class TestCommunicator:
@@ -61,8 +60,8 @@ class TestDistributedModule:
     def test_get_world_size(self):
         """Test get_world_size function."""
         from vllm_vulkan.distributed import (
-            init_distributed,
             get_world_size,
+            init_distributed,
         )
 
         init_distributed(world_size=4, rank=0)
@@ -70,14 +69,14 @@ class TestDistributedModule:
 
     def test_get_rank(self):
         """Test get_rank function."""
-        from vllm_vulkan.distributed import init_distributed, get_rank
+        from vllm_vulkan.distributed import get_rank, init_distributed
 
         init_distributed(world_size=4, rank=2)
         assert get_rank() == 2
 
     def test_barrier(self):
         """Test barrier function."""
-        from vllm_vulkan.distributed import init_distributed, barrier
+        from vllm_vulkan.distributed import barrier, init_distributed
 
         init_distributed(world_size=1, rank=0)
         # Should not raise

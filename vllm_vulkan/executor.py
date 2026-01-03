@@ -4,7 +4,7 @@ VulkanExecutor - Execution orchestration for vLLM Vulkan backend.
 This module implements the executor that manages workers across devices.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import vllm_vulkan
 from vllm_vulkan.worker import VulkanWorker
@@ -27,9 +27,9 @@ class VulkanExecutor:
         parallel_config: Any,
         scheduler_config: Any,
         device_config: Any,
-        lora_config: Optional[Any] = None,
-        speculative_config: Optional[Any] = None,
-        load_config: Optional[Any] = None,
+        lora_config: Any | None = None,
+        speculative_config: Any | None = None,
+        load_config: Any | None = None,
     ):
         """
         Initialize the Vulkan executor.
@@ -54,8 +54,8 @@ class VulkanExecutor:
         self.load_config = load_config
 
         # Workers list
-        self.workers: List[VulkanWorker] = []
-        self.driver_worker: Optional[VulkanWorker] = None
+        self.workers: list[VulkanWorker] = []
+        self.driver_worker: VulkanWorker | None = None
 
         # Initialize workers
         self._init_workers()
@@ -99,7 +99,7 @@ class VulkanExecutor:
             worker.init_model()
             worker.load_model()
 
-    def determine_num_available_blocks(self) -> Tuple[int, int]:
+    def determine_num_available_blocks(self) -> tuple[int, int]:
         """
         Determine the number of available KV cache blocks.
 
@@ -126,11 +126,11 @@ class VulkanExecutor:
 
     def execute_model(
         self,
-        seq_group_metadata_list: List[Any],
-        blocks_to_swap_in: Dict[int, int],
-        blocks_to_swap_out: Dict[int, int],
-        blocks_to_copy: Dict[int, List[int]],
-    ) -> Optional[List[Any]]:
+        seq_group_metadata_list: list[Any],
+        blocks_to_swap_in: dict[int, int],
+        blocks_to_swap_out: dict[int, int],
+        blocks_to_copy: dict[int, list[int]],
+    ) -> list[Any] | None:
         """
         Execute model on all workers.
 
@@ -165,7 +165,7 @@ class VulkanExecutor:
         # LoRA support to be implemented
         return False
 
-    def list_loras(self) -> List[int]:
+    def list_loras(self) -> list[int]:
         """List loaded LoRA adapters."""
         return []
 

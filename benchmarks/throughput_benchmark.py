@@ -7,7 +7,6 @@ Benchmark token generation throughput on Vulkan backend.
 
 import argparse
 import time
-from typing import List, Optional
 
 import vllm_vulkan
 
@@ -175,8 +174,8 @@ def benchmark_throughput(
 
 
 def run_benchmarks(
-    batch_sizes: List[int],
-    prompt_lens: List[int],
+    batch_sizes: list[int],
+    prompt_lens: list[int],
     generation_len: int,
     num_heads: int = 32,
     head_dim: int = 128,
