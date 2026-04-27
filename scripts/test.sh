@@ -70,8 +70,12 @@ smoke_tests() {
 }
 
 installs() {
-  section "Installing vllm"
-  ./install.sh
+  if is_macos; then
+    section "Installing vllm"
+    ./install.sh
+    # shellcheck source=/dev/null
+    source .venv-vllm-vulkan/bin/activate
+  fi
 }
 
 main() {
@@ -86,8 +90,6 @@ main() {
   setup_dev_env
 
   installs
-  # shellcheck source=/dev/null
-  source .venv-vllm-vulkan/bin/activate
 
   section "Verifying package import"
   python -c "import vllm_vulkan; print('vllm_vulkan imported successfully')"

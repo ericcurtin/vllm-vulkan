@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for VulkanConfig."""
 
-import os
-
 import pytest
 
 from vllm_vulkan.config import VulkanConfig, get_config, reset_config
