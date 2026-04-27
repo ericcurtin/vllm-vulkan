@@ -9,12 +9,10 @@ main() {
   # shellcheck source=lib.sh disable=SC1091
   source "${script_dir}/lib.sh"
 
-  # Only set up uv and venv, skip installing dependencies (avoids CUDA)
-  ensure_uv
-  ensure_venv ".venv-vllm-vulkan"
+  setup_dev_env
 
   local version
-  version=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
+  version=$(get_version)
   echo "Building version: $version"
 
   section "Building wheel"

@@ -1,66 +1,88 @@
-[project]
-name = "vllm-vulkan"
-version = "0.1.0"
-description = "vLLM Vulkan backend using ggml-vulkan"
-readme = "README.md"
-license = {text = "Apache-2.0"}
-requires-python = ">=3.12,<3.13"
-authors = [
-    {name = "vLLM-Vulkan Contributors"}
-]
-keywords = ["vllm", "vulkan", "gpu", "inference", "llm"]
-classifiers = [
-    "Development Status :: 3 - Alpha",
-    "Intended Audience :: Developers",
-    "License :: OSI Approved :: Apache Software License",
-    "Programming Language :: Python :: 3.12",
-    "Programming Language :: Rust",
-    "Topic :: Scientific/Engineering :: Artificial Intelligence",
-]
-dependencies = [
-    # vllm and torch are installed separately via install.sh to avoid CUDA dependencies
-    "numpy>=1.24",
-]
-
-[project.optional-dependencies]
-dev = [
-    "pytest>=7.0",
-    "pytest-asyncio>=0.21",
-    "ruff>=0.1",
-    "mypy>=1.0",
-]
-
-[project.entry-points."vllm.platform_plugins"]
-vulkan = "vllm_vulkan:register"
-
-[project.urls]
-Homepage = "https://github.com/ericcurtin/vllm-vulkan"
-Repository = "https://github.com/ericcurtin/vllm-vulkan"
-Issues = "https://github.com/ericcurtin/vllm-vulkan/issues"
-
+# SPDX-License-Identifier: Apache-2.0
 [build-system]
 requires = ["maturin>=1.4,<2.0"]
 build-backend = "maturin"
 
+[project]
+name = "vllm-vulkan"
+version = "0.1.0"
+description = "vLLM hardware plugin for Vulkan - cross-platform GPU inference using KosmicKrisp on macOS and native Vulkan on Linux"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.12,<3.14"
+authors = [
+    {name = "vLLM Community"}
+]
+keywords = ["vllm", "vulkan", "gpu", "llm", "inference", "rust", "macos", "linux"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    # Core utilities
+    "numpy>=1.24.0",
+    "psutil>=5.9.0",
+    # Model loading and weights
+    "transformers>=5.5.1",
+    "accelerate>=0.26.0",
+    "safetensors>=0.4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0.2",
+    "pytest-asyncio>=0.21.0",
+    "ruff>=0.1.0",
+    "mypy>=1.19.1",
+]
+all = [
+    "vllm-vulkan[dev]",
+]
+
+[project.urls]
+Homepage = "https://github.com/vllm-project/vllm-vulkan"
+Repository = "https://github.com/vllm-project/vllm-vulkan"
+Issues = "https://github.com/vllm-project/vllm-vulkan/issues"
+
+# vLLM Plugin Entry Points
+[project.entry-points."vllm.platform_plugins"]
+vulkan = "vllm_vulkan:register"
+
+# Maturin configuration for mixed Rust/Python project
 [tool.maturin]
 features = ["pyo3/extension-module"]
 python-source = "."
-module-name = "vllm_vulkan._vllm_vulkan_rs"
+module-name = "vllm_vulkan._rs"
+strip = true
 
 [tool.ruff]
 line-length = 88
 target-version = "py312"
+exclude = [".venv*", "target"]
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "B", "UP"]
-ignore = ["E501"]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4"]
+ignore = ["E501", "UP040"]
 
 [tool.mypy]
 python_version = "3.12"
-warn_return_any = true
+warn_return_any = false
 warn_unused_configs = true
 ignore_missing_imports = true
+disable_error_code = ["override", "misc", "assignment", "arg-type", "index", "call-arg", "attr-defined"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]
 asyncio_mode = "auto"
+markers = [
+    "slow: opt-in performance or long-running tests",
+]

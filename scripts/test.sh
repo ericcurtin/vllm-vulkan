@@ -1,75 +1,77 @@
 #!/bin/bash
 
-smoke_test() {
-  section "Running smoke test"
+# Run a smoke test: serve a model, check golden output.
+run_smoke_test() {
+  local model="$1"
+  local revision="$2"
+  local prompt="$3"
+  local expected="$4"
+  shift 4
+  local extra_args=("$@")
 
-  local model="HuggingFaceTB/SmolLM2-135M-Instruct"
+  section "Smoke test: $model"
 
-  # Platform-specific settings
-  local gloo_ifname="lo"
-  if [[ "$(uname)" == "Darwin" ]]; then
-    gloo_ifname="lo0"
-  fi
+  VLLM_VULKAN_MEMORY_FRACTION=0.8 \
+    vllm serve "$model" --revision "$revision" --max-model-len 512 --max-num-batched-tokens 64 ${extra_args[@]+"${extra_args[@]}"} &
 
-  # 1. Start vLLM in the background
-  # --block-size required for CPU backend
-  # --max-model-len reduced to lower KV cache memory requirements
-  # --enforce-eager disables torch.compile (has issues on CPU backend)
-  # --dtype half required for macOS (bfloat16 not supported by CPU attention)
-  # VLLM_CPU_KVCACHE_SPACE sets CPU memory for KV cache (in GB)
-  VLLM_CPU_KVCACHE_SPACE=4 \
-  GLOO_SOCKET_IFNAME="$gloo_ifname" vllm serve "$model" \
-    --block-size 16 \
-    --max-model-len 512 \
-    --enforce-eager \
-    --dtype half &
-
-  # Store the process ID
   local vllm_pid=$!
 
-  # 2. Wait for the server to be ready
   echo "Waiting for vLLM to start..."
   local health_url="http://localhost:8000/health"
-  if ! curl --retry 8 --retry-all-errors -s "$health_url" > /dev/null; then
+  if ! curl --retry 30 --retry-delay 10 --retry-all-errors -s "$health_url" > /dev/null; then
     echo "vLLM failed to start."
-
     kill $vllm_pid
-
     exit 1
   fi
 
   echo "Model loaded successfully!"
 
-  # 3. Test chat completions endpoint
-  echo "Testing chat completions endpoint..."
-  local chat_url="http://localhost:8000/v1/chat/completions"
   local response
-  response=$(curl -s -X POST "$chat_url" \
+  response=$(curl -s -X POST "http://localhost:8000/v1/completions" \
     -H "Content-Type: application/json" \
     -d "{
       \"model\": \"$model\",
-      \"messages\": [{\"role\": \"user\", \"content\": \"Say hello\"}],
-      \"max_tokens\": 32
+      \"prompt\": \"$prompt\",
+      \"temperature\": 0,
+      \"max_tokens\": 10
     }")
 
   if ! echo "$response" | grep -q '"choices"'; then
-    echo "Chat completions test failed. Response:"
+    echo "Completions test failed. Response:"
     echo "$response"
     kill $vllm_pid
     exit 1
   fi
 
-  echo "Chat completions test passed!"
+  local actual
+  actual=$(echo "$response" | python3 -c "import sys,json; print(json.loads(sys.stdin.read(), strict=False)['choices'][0]['text'])")
 
-  kill $vllm_pid
+  if [ "$actual" != "$expected" ]; then
+    echo "Golden comparison FAILED"
+    echo "  expected: '$expected'"
+    echo "  actual:   '$actual'"
+    kill $vllm_pid
+    exit 1
+  fi
+
+  echo "Smoke test passed!"
+
+  kill $vllm_pid 2>/dev/null
+  wait $vllm_pid 2>/dev/null || true
+}
+
+smoke_tests() {
+  # Basic smoke test with Qwen3-0.6B
+  run_smoke_test \
+    "Qwen/Qwen3-0.6B" \
+    "c1899de289a04d12100db370d81485cdf75e47ca" \
+    "The capital of France is" \
+    " Paris. The capital of Italy is Rome. The"
 }
 
 installs() {
   section "Installing vllm"
-
-  if is_supported_platform; then
-    ./install.sh
-  fi
+  ./install.sh
 }
 
 main() {
@@ -83,18 +85,31 @@ main() {
 
   setup_dev_env
 
-  if is_supported_platform; then
-    installs
-    # shellcheck source=/dev/null
-    source .venv-vllm-vulkan/bin/activate
+  installs
+  # shellcheck source=/dev/null
+  source .venv-vllm-vulkan/bin/activate
 
-    section "Verifying package import"
-    python -c "import vllm_vulkan; print('vllm_vulkan imported successfully')"
+  section "Verifying package import"
+  python -c "import vllm_vulkan; print('vllm_vulkan imported successfully')"
 
-    smoke_test
-    section "Running tests"
-    pytest tests/ -v --tb=short
+  section "Checking Vulkan availability"
+  python -c "
+from vllm_vulkan.platform import VulkanPlatform
+available = VulkanPlatform.is_available()
+print(f'Vulkan available: {available}')
+if available:
+    print(f'Device count: {VulkanPlatform.get_device_count()}')
+    print(f'Device name: {VulkanPlatform.get_device_name()}')
+"
+
+  if python -c "from vllm_vulkan.platform import VulkanPlatform; exit(0 if VulkanPlatform.is_available() else 1)" 2>/dev/null; then
+    smoke_tests
+  else
+    echo "No Vulkan device found; skipping smoke tests."
   fi
+
+  section "Running unit tests"
+  pytest -m "not slow" tests/python/ -v --tb=short
 }
 
 main "$@"

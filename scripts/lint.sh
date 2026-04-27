@@ -3,28 +3,19 @@
 installs() {
   section "Installing lint tools"
 
-  if is_supported_platform; then
+  if is_macos; then
     if ! command -v shellcheck &> /dev/null; then
-      if [ "$(uname)" = "Darwin" ]; then
-        brew install shellcheck
-      else
-        sudo apt-get install -y shellcheck || true
-      fi
+      brew install shellcheck
     fi
-
     if ! command -v ruff &> /dev/null; then
-      if [ "$(uname)" = "Darwin" ]; then
-        brew install ruff
-      else
-        uv tool install ruff || true
-      fi
+      brew install ruff
     fi
   fi
 }
 
 linters() {
   section "Running shellcheck"
-  shellcheck -- *.sh scripts/*.sh
+  shellcheck -- scripts/*.sh install.sh
 
   section "Running ruff linter"
   ruff check .

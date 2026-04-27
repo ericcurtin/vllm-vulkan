@@ -1,117 +1,74 @@
-//! Build script for vllm-vulkan
+// SPDX-License-Identifier: Apache-2.0
+//! Build script for vllm-vulkan.
 //!
-//! This script compiles ggml with Vulkan backend support and generates
-//! Rust FFI bindings using bindgen.
-
-use std::env;
-use std::path::PathBuf;
+//! Platform routing:
+//!   macOS (aarch64 / x86_64) — link against KosmicKrisp's MoltenVK-based
+//!     Vulkan ICD. KosmicKrisp ships a `libvulkan.dylib` (or a symlink to
+//!     `libMoltenVK.dylib`) that translates Vulkan calls to Metal.
+//!
+//!   Linux (x86_64 / aarch64) — link against the system `libvulkan.so`
+//!     installed via the distro Vulkan loader (e.g. `libvulkan-dev` on
+//!     Debian/Ubuntu).
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=ggml/");
 
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let ggml_dir = PathBuf::from("ggml");
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
-    // Check if ggml submodule exists
-    if !ggml_dir.exists() {
-        println!("cargo:warning=ggml submodule not found. Please run: git submodule update --init --recursive");
-        // Create stub bindings for development without ggml
-        generate_stub_bindings(&out_dir);
-        return;
+    match target_os.as_str() {
+        "macos" => link_macos(),
+        "linux" => link_linux(),
+        other => {
+            println!(
+                "cargo:warning=vllm-vulkan: unsupported target OS '{other}'. \
+                 Only macOS (via KosmicKrisp) and Linux are supported."
+            );
+        }
     }
-
-    // Build ggml with Vulkan support using CMake
-    let dst = cmake::Config::new(&ggml_dir)
-        .define("GGML_VULKAN", "ON")
-        .define("GGML_STATIC", "ON")
-        .define("BUILD_SHARED_LIBS", "OFF")
-        .define("CMAKE_BUILD_TYPE", "Release")
-        .build();
-
-    // Link to ggml
-    println!("cargo:rustc-link-search=native={}/lib", dst.display());
-    println!("cargo:rustc-link-lib=static=ggml");
-
-    // Link to Vulkan
-    println!("cargo:rustc-link-lib=vulkan");
-
-    // Generate bindings
-    generate_ggml_bindings(&ggml_dir, &out_dir);
 }
 
-fn generate_ggml_bindings(ggml_dir: &PathBuf, out_dir: &PathBuf) {
-    let header_path = ggml_dir.join("include").join("ggml.h");
+// ─── macOS ───────────────────────────────────────────────────────────────────
 
-    if !header_path.exists() {
-        println!("cargo:warning=ggml.h not found, generating stub bindings");
-        generate_stub_bindings(out_dir);
-        return;
+fn link_macos() {
+    // KosmicKrisp installs its Vulkan loader as:
+    //   /usr/local/lib/libvulkan.dylib  (Intel Homebrew prefix)
+    //   /opt/homebrew/lib/libvulkan.dylib  (Apple-Silicon Homebrew prefix)
+    //
+    // The package is installable via:
+    //   brew install KosmicKrisp/tap/kosmic-krisp
+    // (or equivalently via MoltenVK: brew install molten-vk)
+    //
+    // We probe the two Homebrew prefixes first; if neither is found we fall
+    // back to whatever the linker finds on the default search path (e.g. an
+    // SDK-provided stub or a user-managed install).
+
+    let homebrew_prefixes = ["/opt/homebrew", "/usr/local"];
+
+    for prefix in &homebrew_prefixes {
+        let lib_dir = format!("{prefix}/lib");
+        if std::path::Path::new(&lib_dir).join("libvulkan.dylib").exists()
+            || std::path::Path::new(&lib_dir).join("libMoltenVK.dylib").exists()
+        {
+            println!("cargo:rustc-link-search=native={lib_dir}");
+            println!("cargo:rerun-if-changed={lib_dir}/libvulkan.dylib");
+            break;
+        }
     }
 
-    // Convert paths to UTF-8 strings, with clear error messages
-    let header_str = header_path.to_str().expect(
-        "ggml header path must be valid UTF-8. Non-UTF8 paths are not supported."
-    );
-    let ggml_dir_str = ggml_dir.to_str().expect(
-        "ggml directory path must be valid UTF-8. Non-UTF8 paths are not supported."
-    );
+    // Prefer libvulkan (KosmicKrisp / MoltenVK loader); fall back to MoltenVK directly.
+    println!("cargo:rustc-link-lib=dylib=vulkan");
 
-    let bindings = bindgen::Builder::default()
-        .header(header_str)
-        .clang_arg(format!("-I{}/include", ggml_dir_str))
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
-        .allowlist_function("ggml_.*")
-        .allowlist_type("ggml_.*")
-        .allowlist_var("GGML_.*")
-        .derive_debug(true)
-        .derive_default(true)
-        .generate()
-        .expect("Unable to generate ggml bindings");
-
-    bindings
-        .write_to_file(out_dir.join("ggml_bindings.rs"))
-        .expect("Couldn't write ggml bindings!");
+    // Metal and IOKit are required by MoltenVK / KosmicKrisp.
+    println!("cargo:rustc-link-lib=framework=Metal");
+    println!("cargo:rustc-link-lib=framework=Foundation");
+    println!("cargo:rustc-link-lib=framework=QuartzCore");
+    println!("cargo:rustc-link-lib=framework=IOKit");
+    println!("cargo:rustc-link-lib=framework=IOSurface");
 }
 
-fn generate_stub_bindings(out_dir: &PathBuf) {
-    // Generate stub bindings for development/CI without ggml
-    let stub = r#"
-//! Stub ggml bindings for development without ggml submodule
-//! Run `git submodule update --init --recursive` to get the real bindings
+// ─── Linux ───────────────────────────────────────────────────────────────────
 
-#![allow(dead_code)]
-#![allow(non_camel_case_types)]
-#![allow(non_upper_case_globals)]
-
-// Stub types
-pub type ggml_context = std::ffi::c_void;
-pub type ggml_tensor = std::ffi::c_void;
-pub type ggml_cgraph = std::ffi::c_void;
-pub type ggml_backend_t = *mut std::ffi::c_void;
-pub type ggml_backend_buffer_t = *mut std::ffi::c_void;
-pub type ggml_backend_buffer_type_t = *mut std::ffi::c_void;
-
-// Tensor types
-pub const GGML_TYPE_F32: i32 = 0;
-pub const GGML_TYPE_F16: i32 = 1;
-pub const GGML_TYPE_Q4_0: i32 = 2;
-pub const GGML_TYPE_Q4_1: i32 = 3;
-pub const GGML_TYPE_Q5_0: i32 = 6;
-pub const GGML_TYPE_Q5_1: i32 = 7;
-pub const GGML_TYPE_Q8_0: i32 = 8;
-pub const GGML_TYPE_Q8_1: i32 = 9;
-
-// Backend types
-pub const GGML_BACKEND_TYPE_CPU: i32 = 0;
-pub const GGML_BACKEND_TYPE_GPU: i32 = 1;
-pub const GGML_BACKEND_TYPE_GPU_SPLIT: i32 = 2;
-
-// Maximum dimensions
-pub const GGML_MAX_DIMS: usize = 4;
-pub const GGML_MAX_NODES: usize = 16384;
-"#;
-
-    std::fs::write(out_dir.join("ggml_bindings.rs"), stub)
-        .expect("Couldn't write stub bindings!");
+fn link_linux() {
+    // Standard Vulkan loader; provided by libvulkan-dev / vulkan-loader.
+    println!("cargo:rustc-link-lib=dylib=vulkan");
 }

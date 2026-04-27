@@ -68,8 +68,7 @@ download_and_install_wheel() {
 
   success "Downloaded wheel"
 
-  # Install vllm-vulkan package
-  if ! uv pip install --upgrade "$wheel_path"; then
+  if ! uv pip install "$wheel_path"; then
     error "Failed to install ${package_name}."
     exit 1
   fi
@@ -77,15 +76,35 @@ download_and_install_wheel() {
   success "Installed ${package_name}"
 }
 
+install_system_vulkan_deps() {
+  if is_macos; then
+    section "Installing KosmicKrisp / MoltenVK (macOS Vulkan translation layer)"
+    if ! brew list molten-vk &>/dev/null 2>&1; then
+      if ! brew install molten-vk; then
+        error "Failed to install MoltenVK via Homebrew."
+        echo "Please install KosmicKrisp or MoltenVK manually and re-run." >&2
+        exit 1
+      fi
+    fi
+    success "MoltenVK/KosmicKrisp present"
+  else
+    section "Checking Vulkan loader (Linux)"
+    if ! ldconfig -p 2>/dev/null | grep -q libvulkan || ! [ -f /usr/include/vulkan/vulkan.h ] 2>/dev/null; then
+      echo "Vulkan loader not found. Install it with:"
+      echo "  Debian/Ubuntu: sudo apt-get install -y libvulkan-dev"
+      echo "  Fedora/RHEL:   sudo dnf install -y vulkan-loader-devel"
+      echo ""
+    fi
+  fi
+}
+
 main() {
   set -eu -o pipefail
 
-  local repo_owner="ericcurtin"
+  local repo_owner="vllm-project"
   local repo_name="vllm-vulkan"
   local package_name="vllm-vulkan"
 
-  # Source shared library functions
-  # Try local lib.sh first (when running ./install.sh), fall back to remote (when piped from curl)
   local local_lib=""
   if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
     local script_dir
@@ -97,7 +116,6 @@ main() {
     # shellcheck source=/dev/null
     source "$local_lib"
   else
-    # Fetch from remote (curl | bash case)
     local lib_url="https://raw.githubusercontent.com/$repo_owner/$repo_name/main/scripts/lib.sh"
     local lib_tmp
     lib_tmp=$(mktemp)
@@ -111,6 +129,8 @@ main() {
     rm -f "$lib_tmp"
   fi
 
+  install_system_vulkan_deps
+
   if ! ensure_uv; then
     exit 1
   fi
@@ -122,18 +142,18 @@ main() {
 
   ensure_venv "$venv"
 
-  local vllm_v="0.13.0"
+  # Install vLLM CPU build (no CUDA dependencies)
+  local vllm_v="0.19.1"
   local url_base="https://github.com/vllm-project/vllm/releases/download"
   local filename="vllm-$vllm_v.tar.gz"
-  curl -OL $url_base/v$vllm_v/$filename
-  tar xf $filename
-  cd vllm-$vllm_v
-  uv pip install -r requirements/cpu.txt --index-strategy unsafe-best-match --extra-index-url https://download.pytorch.org/whl/cpu
-  # Install build dependencies and build with --no-build-isolation to use CPU PyTorch
-  uv pip install setuptools setuptools_scm cmake ninja
-  VLLM_TARGET_DEVICE=cpu uv pip install . --no-build-isolation
+  curl -OL "$url_base/v$vllm_v/$filename"
+  tar xf "$filename"
+  cd "vllm-$vllm_v"
+
+  uv pip install -r requirements/cpu.txt --index-strategy unsafe-best-match
+  CXXFLAGS="-Wno-parentheses" uv pip install .
   cd -
-  rm -rf vllm-$vllm_v*
+  rm -rf "vllm-$vllm_v"*
 
   if [[ -n "$local_lib" && -f "$local_lib" ]]; then
     uv pip install .
@@ -155,12 +175,8 @@ main() {
   echo ""
   success "Installation complete!"
   echo ""
-  echo "To use vllm, activate the virtual environment:"
+  echo "Activate the virtual environment:"
   echo "  source $venv/bin/activate"
-  echo ""
-  echo "Or add the venv to your PATH:"
-  echo "  export PATH=\"$venv/bin:\$PATH\""
 }
 
 main "$@"
-

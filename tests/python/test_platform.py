@@ -1,127 +1,84 @@
-"""
-Platform Tests
+# SPDX-License-Identifier: Apache-2.0
+"""Tests for VulkanPlatform."""
 
-Tests for the VulkanPlatform class.
-"""
+import platform as py_platform
 
+import pytest
 
-class TestVulkanPlatform:
-    """Tests for VulkanPlatform."""
-
-    def test_import(self):
-        """Test that the platform can be imported."""
-        from vllm_vulkan.platform import VulkanPlatform
-
-        assert VulkanPlatform is not None
-
-    def test_device_name(self):
-        """Test device name attribute (uses cpu for PyTorch compatibility)."""
-        from vllm_vulkan.platform import VulkanPlatform
-
-        # Like MetalPlatform, we use CPU for PyTorch compatibility
-        assert VulkanPlatform.device_name == "cpu"
-        assert VulkanPlatform.device_type == "cpu"
-        assert VulkanPlatform.dispatch_key == "CPU"
-
-    def test_is_available(self):
-        """Test is_available method."""
-        from vllm_vulkan.platform import VulkanPlatform
-
-        # Should return a boolean
-        result = VulkanPlatform.is_available()
-        assert isinstance(result, bool)
-
-    def test_get_device_count(self):
-        """Test get_device_count method."""
-        from vllm_vulkan.platform import VulkanPlatform
-
-        count = VulkanPlatform.get_device_count()
-        assert isinstance(count, int)
-        assert count >= 0
-
-    def test_verify_quantization(self):
-        """Test verify_quantization method."""
-        import pytest
-
-        from vllm_vulkan.platform import VulkanPlatform
-
-        # These should not raise
-        VulkanPlatform.verify_quantization("none")
-        VulkanPlatform.verify_quantization("q4_0")
-        VulkanPlatform.verify_quantization("fp16")
-
-        # This should raise
-        with pytest.raises(ValueError, match="not supported"):
-            VulkanPlatform.verify_quantization("unsupported_quant")
-
-    def test_get_torch_device(self):
-        """Test get_torch_device method."""
-        import torch
-
-        from vllm_vulkan.platform import VulkanPlatform
-
-        device = VulkanPlatform.get_torch_device()
-        assert device == torch.device("cpu")
-
-    def test_is_pin_memory_available(self):
-        """Test is_pin_memory_available method."""
-        from vllm_vulkan.platform import VulkanPlatform
-
-        result = VulkanPlatform.is_pin_memory_available()
-        assert result is False
+from vllm_vulkan.config import reset_config
+from vllm_vulkan.platform import VulkanPlatform
 
 
-class TestPluginRegistration:
-    """Tests for plugin registration."""
-
-    def test_register_function(self):
-        """Test that register() returns correct path."""
-        import vllm_vulkan
-
-        result = vllm_vulkan.register()
-        # Returns dot notation path or None if not available
-        assert result is None or result == "vllm_vulkan.platform.VulkanPlatform"
-
-    def test_entry_point_format(self):
-        """Test that the entry point format is valid."""
-        import vllm_vulkan
-
-        result = vllm_vulkan.register()
-        if result is not None:
-            # Should be in format "module.path.ClassName" (dot notation)
-            assert "." in result
-            parts = result.rsplit(".", 1)
-            assert len(parts) == 2
-            assert parts[1] == "VulkanPlatform"
+@pytest.fixture(autouse=True)
+def _reset():
+    reset_config()
+    yield
+    reset_config()
 
 
-class TestModuleExports:
-    """Tests for module exports."""
+def test_is_available_returns_bool():
+    result = VulkanPlatform.is_available()
+    assert isinstance(result, bool)
 
-    def test_version(self):
-        """Test version is exported."""
-        import vllm_vulkan
 
-        assert hasattr(vllm_vulkan, "__version__")
-        assert isinstance(vllm_vulkan.__version__, str)
+def test_get_device_count_non_negative():
+    count = VulkanPlatform.get_device_count()
+    assert count >= 0
 
-    def test_is_available_exported(self):
-        """Test is_available is exported."""
-        import vllm_vulkan
 
-        assert hasattr(vllm_vulkan, "is_available")
-        assert callable(vllm_vulkan.is_available)
+def test_get_device_name_returns_string():
+    if VulkanPlatform.get_device_count() > 0:
+        name = VulkanPlatform.get_device_name(0)
+        assert isinstance(name, str)
+        assert len(name) > 0
 
-    def test_get_device_count_exported(self):
-        """Test get_device_count is exported."""
-        import vllm_vulkan
 
-        assert hasattr(vllm_vulkan, "get_device_count")
-        assert callable(vllm_vulkan.get_device_count)
+def test_get_device_total_memory_positive(monkeypatch):
+    monkeypatch.setenv("VLLM_VULKAN_MEMORY_FRACTION", "0.5")
+    reset_config()
+    total = VulkanPlatform.get_device_total_memory()
+    assert total > 0
 
-    def test_enumerate_devices_exported(self):
-        """Test enumerate_devices is exported."""
-        import vllm_vulkan
 
-        assert hasattr(vllm_vulkan, "enumerate_devices")
-        assert callable(vllm_vulkan.enumerate_devices)
+def test_get_device_available_memory_non_negative(monkeypatch):
+    monkeypatch.setenv("VLLM_VULKAN_MEMORY_FRACTION", "0.5")
+    reset_config()
+    available = VulkanPlatform.get_device_available_memory()
+    assert available >= 0
+
+
+def test_get_device_capability():
+    cap = VulkanPlatform.get_device_capability()
+    assert cap.major >= 0
+    assert cap.minor >= 0
+
+
+def test_current_device():
+    device = VulkanPlatform.current_device()
+    assert device >= 0
+
+
+def test_is_pin_memory_available():
+    assert VulkanPlatform.is_pin_memory_available() is False
+
+
+def test_get_torch_device():
+    import torch
+
+    device = VulkanPlatform.get_torch_device()
+    assert device == torch.device("cpu")
+
+
+def test_unsupported_platform_not_available(monkeypatch):
+    """Verify the platform returns False on unsupported OSes."""
+    monkeypatch.setattr(py_platform, "system", lambda: "Windows")
+    # Force re-check — is_available probes the platform each call.
+    result = VulkanPlatform.is_available()
+    assert result is False
+
+
+def test_register_returns_class_path_or_none():
+    import vllm_vulkan
+
+    result = vllm_vulkan._register()
+    assert result is None or result == "vllm_vulkan.platform.VulkanPlatform"
