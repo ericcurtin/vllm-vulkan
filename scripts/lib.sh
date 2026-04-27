@@ -49,14 +49,20 @@ install_dev_deps() {
 ensure_vulkan() {
   # Install the Vulkan loader/headers needed to compile the Rust extension.
   # Must be called before maturin/cargo runs (i.e. before install_dev_deps).
+  #
+  # We check for the unversioned linker stub (libvulkan.so) rather than the
+  # runtime library (libvulkan.so.1), because the linker needs -lvulkan which
+  # resolves via the unversioned symlink provided by the -dev package.
   if is_macos; then
     if ! brew list molten-vk &>/dev/null 2>&1; then
       section "Installing KosmicKrisp / MoltenVK (macOS Vulkan translation layer)"
       brew install molten-vk
     fi
   else
-    if ! ldconfig -p 2>/dev/null | grep -q libvulkan; then
-      section "Installing Vulkan loader (Linux)"
+    # Ubuntu 24.04 ships libvulkan1 (runtime) by default, but the linker needs
+    # libvulkan.so (the unversioned symlink) from libvulkan-dev.
+    if ! find /usr/lib /usr/lib64 /usr/local/lib -name "libvulkan.so" 2>/dev/null | grep -q .; then
+      section "Installing Vulkan dev headers (Linux)"
       sudo apt-get update -qq
       sudo apt-get install -y libvulkan-dev
     fi
