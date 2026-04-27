@@ -46,8 +46,26 @@ install_dev_deps() {
   uv pip install -e ".[dev]"
 }
 
+ensure_vulkan() {
+  # Install the Vulkan loader/headers needed to compile the Rust extension.
+  # Must be called before maturin/cargo runs (i.e. before install_dev_deps).
+  if is_macos; then
+    if ! brew list molten-vk &>/dev/null 2>&1; then
+      section "Installing KosmicKrisp / MoltenVK (macOS Vulkan translation layer)"
+      brew install molten-vk
+    fi
+  else
+    if ! ldconfig -p 2>/dev/null | grep -q libvulkan; then
+      section "Installing Vulkan loader (Linux)"
+      sudo apt-get update -qq
+      sudo apt-get install -y libvulkan-dev
+    fi
+  fi
+}
+
 setup_dev_env() {
   ensure_uv
+  ensure_vulkan
   ensure_venv ".venv-vllm-vulkan"
   install_dev_deps
 }

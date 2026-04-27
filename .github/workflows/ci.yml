@@ -39,17 +39,6 @@ jobs:
       with:
         submodules: recursive
 
-    - name: Install Vulkan dev headers (Linux)
-      if: runner.os == 'Linux'
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y libvulkan-dev libnuma-dev
-
-    - name: Install KosmicKrisp / MoltenVK (macOS)
-      if: runner.os == 'macOS'
-      run: |
-        brew install molten-vk
-
     - name: Cache HuggingFace models
       uses: actions/cache@v4
       with:
