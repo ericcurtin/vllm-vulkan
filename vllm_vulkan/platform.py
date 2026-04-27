@@ -19,10 +19,39 @@ from typing import TYPE_CHECKING
 
 import psutil
 import torch
-from vllm.platforms.interface import DeviceCapability, Platform, PlatformEnum
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from vllm_vulkan.config import get_config
+
+# vllm is an optional runtime dependency when using the plugin standalone
+# (e.g. running unit tests without a full vllm install).  Import the base
+# classes at module level only when available; otherwise define lightweight
+# stubs so the module can still be imported.
+try:
+    from vllm.platforms.interface import DeviceCapability, Platform, PlatformEnum
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    _VLLM_AVAILABLE = True
+except ModuleNotFoundError:
+    _VLLM_AVAILABLE = False
+
+    class Platform:  # type: ignore[no-redef]
+        pass
+
+    class PlatformEnum:  # type: ignore[no-redef]
+        OOT = "OOT"
+
+    class DeviceCapability:  # type: ignore[no-redef]
+        def __init__(self, major: int = 0, minor: int = 0) -> None:
+            self.major = major
+            self.minor = minor
+
+    class AttentionBackendEnum:  # type: ignore[no-redef]
+        CPU_ATTN = None
+
+        @staticmethod
+        def get_path() -> str:
+            return ""
+
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig

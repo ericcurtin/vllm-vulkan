@@ -5,8 +5,10 @@ import platform as py_platform
 
 import pytest
 
-from vllm_vulkan.config import reset_config
-from vllm_vulkan.platform import VulkanPlatform
+pytest.importorskip("vllm", reason="vllm not installed; skipping platform tests")
+
+from vllm_vulkan.config import reset_config  # noqa: E402
+from vllm_vulkan.platform import VulkanPlatform  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
