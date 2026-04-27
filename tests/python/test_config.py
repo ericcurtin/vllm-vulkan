@@ -27,10 +27,10 @@ def test_default_config_from_env(monkeypatch):
 
 
 def test_memory_fraction_validation():
-    with pytest.raises(ValueError, match="memory_fraction"):
+    with pytest.raises(ValueError, match="MEMORY_FRACTION"):
         VulkanConfig(memory_fraction=0.0, block_size=16, debug=False, device_index=0)
 
-    with pytest.raises(ValueError, match="memory_fraction"):
+    with pytest.raises(ValueError, match="MEMORY_FRACTION"):
         VulkanConfig(memory_fraction=1.5, block_size=16, debug=False, device_index=0)
 
     # Boundary values
@@ -39,15 +39,15 @@ def test_memory_fraction_validation():
 
 
 def test_block_size_validation():
-    with pytest.raises(ValueError, match="block_size"):
+    with pytest.raises(ValueError, match="BLOCK_SIZE"):
         VulkanConfig(memory_fraction=0.9, block_size=0, debug=False, device_index=0)
 
-    with pytest.raises(ValueError, match="block_size"):
+    with pytest.raises(ValueError, match="BLOCK_SIZE"):
         VulkanConfig(memory_fraction=0.9, block_size=-1, debug=False, device_index=0)
 
 
 def test_device_index_validation():
-    with pytest.raises(ValueError, match="device_index"):
+    with pytest.raises(ValueError, match="DEVICE_INDEX"):
         VulkanConfig(memory_fraction=0.9, block_size=16, debug=False, device_index=-1)
 
 
