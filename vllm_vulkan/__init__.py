@@ -54,6 +54,7 @@ def _apply_macos_defaults() -> None:
 
 # ─── Lazy imports ────────────────────────────────────────────────────────────
 
+
 def __getattr__(name: str):  # noqa: ANN001, ANN201
     """Lazy import module components to avoid loading vLLM at import time."""
     if name == "VulkanConfig":
@@ -87,6 +88,7 @@ __all__ = [
 
 
 # ─── Plugin entry point ───────────────────────────────────────────────────────
+
 
 def _register() -> str | None:
     """Register the Vulkan platform plugin with vLLM.

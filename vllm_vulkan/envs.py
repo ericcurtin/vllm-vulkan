@@ -33,9 +33,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable verbose debug logging (default False).
     "VLLM_VULKAN_DEBUG": lambda: os.getenv("VLLM_VULKAN_DEBUG", "0") == "1",
     # Which Vulkan physical device index to use (default 0).
-    "VLLM_VULKAN_DEVICE_INDEX": lambda: int(
-        os.getenv("VLLM_VULKAN_DEVICE_INDEX", "0")
-    ),
+    "VLLM_VULKAN_DEVICE_INDEX": lambda: int(os.getenv("VLLM_VULKAN_DEVICE_INDEX", "0")),
 }
 
 

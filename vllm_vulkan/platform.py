@@ -155,7 +155,10 @@ class VulkanPlatform(Platform):
         parallel_config.disable_custom_all_reduce = True
 
         # Block size minimum — CPU attention requires a multiple of 16.
-        if cache_config.block_size is None or cache_config.block_size < config.block_size:
+        if (
+            cache_config.block_size is None
+            or cache_config.block_size < config.block_size
+        ):
             cache_config.block_size = config.block_size
 
         # CPU KV cache space (required by CPUWorker).
@@ -181,7 +184,10 @@ class VulkanPlatform(Platform):
         attn_selector_config: "AttentionSelectorConfig",
     ) -> str:
         if selected_backend and selected_backend != AttentionBackendEnum.CPU_ATTN:
-            logger.info("Cannot use %s backend on Vulkan; falling back to CPU_ATTN.", selected_backend)
+            logger.info(
+                "Cannot use %s backend on Vulkan; falling back to CPU_ATTN.",
+                selected_backend,
+            )
         if attn_selector_config.use_mla:
             raise NotImplementedError("MLA attention is not supported on Vulkan.")
         if attn_selector_config.use_sparse:

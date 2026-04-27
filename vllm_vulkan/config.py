@@ -28,8 +28,7 @@ class VulkanConfig:
             )
         if self.device_index < 0:
             raise ValueError(
-                f"Invalid VLLM_VULKAN_DEVICE_INDEX={self.device_index}. "
-                "Must be >= 0."
+                f"Invalid VLLM_VULKAN_DEVICE_INDEX={self.device_index}. Must be >= 0."
             )
 
     @classmethod

@@ -92,19 +92,22 @@ main() {
   installs
 
   section "Verifying package import"
-  python -c "import vllm_vulkan; print('vllm_vulkan imported successfully')"
+  python -c "import vllm_vulkan._rs; print('vllm_vulkan imported successfully')"
 
   section "Checking Vulkan availability"
   python -c "
-from vllm_vulkan.platform import VulkanPlatform
-available = VulkanPlatform.is_available()
+from vllm_vulkan._rs import is_available, get_device_count, get_device_info
+available = is_available()
 print(f'Vulkan available: {available}')
 if available:
-    print(f'Device count: {VulkanPlatform.get_device_count()}')
-    print(f'Device name: {VulkanPlatform.get_device_name()}')
+    count = get_device_count()
+    print(f'Device count: {count}')
+    if count > 0:
+        info = get_device_info(0)
+        print(f'Device name: {info.get(\"name\", \"unknown\")}')
 "
 
-  if python -c "from vllm_vulkan.platform import VulkanPlatform; exit(0 if VulkanPlatform.is_available() else 1)" 2>/dev/null; then
+  if python -c "from vllm_vulkan._rs import is_available; exit(0 if is_available() else 1)" 2>/dev/null; then
     smoke_tests
   else
     echo "No Vulkan device found; skipping smoke tests."
