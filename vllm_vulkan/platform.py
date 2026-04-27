@@ -211,6 +211,7 @@ class VulkanPlatform(Platform):
         cls,
         selected_backend: "AttentionBackendEnum",
         attn_selector_config: "AttentionSelectorConfig",
+        **kwargs: object,
     ) -> str:
         if selected_backend and selected_backend != AttentionBackendEnum.CPU_ATTN:
             logger.info(
