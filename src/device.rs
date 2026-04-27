@@ -71,7 +71,10 @@ struct VkPhysicalDeviceMemoryProperties {
     memory_heaps: [[u8; 16]; 16], // VkMemoryHeap: size(u64) + flags(u32) + pad(u32)
 }
 
-#[link(name = "vulkan")]
+// On macOS, Homebrew's molten-vk ships libMoltenVK.dylib (no libvulkan.dylib).
+// On Linux the standard Vulkan loader is libvulkan.so.
+#[cfg_attr(target_os = "macos", link(name = "MoltenVK"))]
+#[cfg_attr(not(target_os = "macos"), link(name = "vulkan"))]
 extern "C" {
     fn vkCreateInstance(
         create_info: *const VkInstanceCreateInfo,
