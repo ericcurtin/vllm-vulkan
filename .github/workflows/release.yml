@@ -16,6 +16,11 @@ jobs:
       with:
         submodules: recursive
 
+    - name: Install Vulkan loader
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y libvulkan-dev
+
     - name: Build and Release
       run: ./scripts/release.sh
       env:

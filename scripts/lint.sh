@@ -10,6 +10,13 @@ installs() {
     if ! command -v ruff &> /dev/null; then
       brew install ruff
     fi
+  else
+    # Linux: Vulkan loader headers are required to build the Rust extension.
+    if ! ldconfig -p 2>/dev/null | grep -q libvulkan; then
+      section "Installing Vulkan loader (Linux)"
+      sudo apt-get update -qq
+      sudo apt-get install -y libvulkan-dev
+    fi
   fi
 }
 

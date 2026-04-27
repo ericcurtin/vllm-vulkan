@@ -70,5 +70,28 @@ fn link_macos() {
 
 fn link_linux() {
     // Standard Vulkan loader; provided by libvulkan-dev / vulkan-loader.
+    //
+    // Probe common library paths so we can emit a helpful diagnostic when the
+    // package is missing rather than a cryptic linker error.
+    let search_paths = [
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/lib/aarch64-linux-gnu",
+        "/usr/lib",
+        "/usr/local/lib",
+    ];
+
+    let found = search_paths.iter().any(|dir| {
+        std::path::Path::new(dir).join("libvulkan.so").exists()
+            || std::path::Path::new(dir).join("libvulkan.so.1").exists()
+    });
+
+    if !found {
+        println!(
+            "cargo:warning=libvulkan not found. \
+             Install it with: sudo apt-get install -y libvulkan-dev  \
+             (Debian/Ubuntu) or sudo dnf install -y vulkan-loader-devel (Fedora/RHEL)"
+        );
+    }
+
     println!("cargo:rustc-link-lib=dylib=vulkan");
 }
