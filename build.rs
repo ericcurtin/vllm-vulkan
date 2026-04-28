@@ -30,9 +30,10 @@ fn main() {
 // ─── macOS ───────────────────────────────────────────────────────────────────
 
 fn link_macos() {
-    // KosmicKrisp installs libvulkan.dylib to /usr/local/lib.
-    // Probe standard install locations and link the Vulkan loader.
-    let search_paths = ["/usr/local/lib", "/opt/homebrew/lib", "/usr/local/lib"];
+    // Probe standard locations for libvulkan.dylib:
+    //   /opt/homebrew/lib — Homebrew vulkan-loader (CI / dev builds)
+    //   /usr/local/lib    — KosmicKrisp end-user install (install.sh)
+    let search_paths = ["/opt/homebrew/lib", "/usr/local/lib"];
 
     let mut linked = false;
     for lib_dir in &search_paths {

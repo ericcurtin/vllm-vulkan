@@ -158,16 +158,20 @@ install_kosmickrisp() {
 }
 
 ensure_vulkan() {
-  # Install the Vulkan loader/headers needed to compile the Rust extension.
+  # Install the Vulkan headers/loader needed to compile the Rust extension.
   # Must be called before maturin/cargo runs (i.e. before install_dev_deps).
   #
-  # On macOS: install KosmicKrisp (Mesa/Zink software Vulkan driver) which
-  # provides libvulkan.dylib directly.
+  # On macOS: install vulkan-headers + vulkan-loader via Homebrew. This is
+  # fast and sufficient for compilation. The full KosmicKrisp runtime driver
+  # is only needed at runtime and is installed separately by install.sh.
   # On Linux: we check for the unversioned linker stub (libvulkan.so) rather
   # than the runtime library (libvulkan.so.1), because the linker needs
   # -lvulkan which resolves via the unversioned symlink in the -dev package.
   if is_macos; then
-    install_kosmickrisp
+    if ! brew list vulkan-loader &>/dev/null 2>&1; then
+      section "Installing Vulkan headers and loader (macOS)"
+      brew install vulkan-headers vulkan-loader
+    fi
   else
     # Ubuntu 24.04 ships libvulkan1 (runtime) by default, but the linker needs
     # libvulkan.so (the unversioned symlink) from libvulkan-dev.
