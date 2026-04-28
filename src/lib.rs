@@ -9,6 +9,7 @@
 //! package `vllm_vulkan`.
 
 mod device;
+mod ggml;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -77,6 +78,93 @@ fn get_memory_info(device_idx: usize) -> PyResult<(u64, u64)> {
     device::memory_info(device_idx).map_err(PyRuntimeError::new_err)
 }
 
+/// Run a small FP32 matrix multiplication through ggml's Vulkan backend.
+///
+/// Inputs are Python nested sequences with standard shapes:
+///   a: (m, k)
+///   b: (k, n)
+/// The return value is a nested list with shape (m, n).
+#[pyfunction]
+#[pyo3(signature = (a, b, device_idx = 0))]
+fn vulkan_matmul(a: Vec<Vec<f32>>, b: Vec<Vec<f32>>, device_idx: usize) -> PyResult<Vec<Vec<f32>>> {
+    let (a_flat, b_transposed, m, k, n) =
+        flatten_matmul_inputs(&a, &b).map_err(pyo3::exceptions::PyValueError::new_err)?;
+    let result = ggml::vulkan_matmul_f32(&a_flat, &b_transposed, m, k, n, device_idx)
+        .map_err(PyRuntimeError::new_err)?;
+
+    Ok(result.output.chunks(n).map(|row| row.to_vec()).collect())
+}
+
+/// Run Vulkan matmul and return `(output, backend_name)`.
+///
+/// This is a diagnostic API for tests and backend bring-up. It lets tests
+/// assert that ggml assigned the matmul result to the Vulkan backend instead
+/// of silently falling back to CPU.
+#[pyfunction]
+#[pyo3(signature = (a, b, device_idx = 0))]
+fn vulkan_matmul_with_backend(
+    a: Vec<Vec<f32>>,
+    b: Vec<Vec<f32>>,
+    device_idx: usize,
+) -> PyResult<(Vec<Vec<f32>>, String)> {
+    let (a_flat, b_transposed, m, k, n) =
+        flatten_matmul_inputs(&a, &b).map_err(pyo3::exceptions::PyValueError::new_err)?;
+    let result = ggml::vulkan_matmul_f32(&a_flat, &b_transposed, m, k, n, device_idx)
+        .map_err(PyRuntimeError::new_err)?;
+    let output = result.output.chunks(n).map(|row| row.to_vec()).collect();
+
+    Ok((output, result.backend_name))
+}
+
+fn flatten_matmul_inputs(
+    a: &[Vec<f32>],
+    b: &[Vec<f32>],
+) -> Result<(Vec<f32>, Vec<f32>, usize, usize, usize), String> {
+    let m = a.len();
+    let k = a
+        .first()
+        .map(Vec::len)
+        .ok_or_else(|| "left matrix must have at least one row".to_string())?;
+
+    if k == 0 {
+        return Err("left matrix must have at least one column".to_string());
+    }
+
+    if a.iter().any(|row| row.len() != k) {
+        return Err("left matrix rows must all have the same length".to_string());
+    }
+
+    if b.len() != k {
+        return Err(format!(
+            "shape mismatch: left matrix is ({m}, {k}) but right matrix has {} row(s)",
+            b.len()
+        ));
+    }
+
+    let n = b
+        .first()
+        .map(Vec::len)
+        .ok_or_else(|| "right matrix must have at least one row".to_string())?;
+
+    if n == 0 {
+        return Err("right matrix must have at least one column".to_string());
+    }
+
+    if b.iter().any(|row| row.len() != n) {
+        return Err("right matrix rows must all have the same length".to_string());
+    }
+
+    let a_flat = a.iter().flat_map(|row| row.iter().copied()).collect();
+    let mut b_transposed = vec![0.0; n * k];
+    for row in 0..k {
+        for col in 0..n {
+            b_transposed[col * k + row] = b[row][col];
+        }
+    }
+
+    Ok((a_flat, b_transposed, m, k, n))
+}
+
 // ─── PyO3 module ────────────────────────────────────────────────────────────
 
 /// Python-visible module `vllm_vulkan._rs`.
@@ -90,6 +178,8 @@ fn _rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_device_info, m)?)?;
     m.add_function(wrap_pyfunction!(synchronize, m)?)?;
     m.add_function(wrap_pyfunction!(get_memory_info, m)?)?;
+    m.add_function(wrap_pyfunction!(vulkan_matmul, m)?)?;
+    m.add_function(wrap_pyfunction!(vulkan_matmul_with_backend, m)?)?;
 
     m.add_class::<VulkanDevice>()?;
 

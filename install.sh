@@ -205,14 +205,41 @@ install_kosmickrisp() {
 install_system_vulkan_deps() {
   if is_macos; then
     install_kosmickrisp
+    section "Installing Vulkan build dependencies (macOS)"
+    local missing=()
+    for pkg in vulkan-headers vulkan-loader shaderc spirv-headers; do
+      if ! brew list "$pkg" &>/dev/null 2>&1; then
+        missing+=("$pkg")
+      fi
+    done
+    if [[ "${#missing[@]}" -gt 0 ]]; then
+      if ! brew install "${missing[@]}"; then
+        error "Failed to install Vulkan build dependencies via Homebrew."
+        echo "Please install manually: brew install vulkan-headers vulkan-loader shaderc spirv-headers" >&2
+        exit 1
+      fi
+    fi
+    success "Vulkan build dependencies present"
   else
-    section "Checking Vulkan loader (Linux)"
-    if ! ldconfig -p 2>/dev/null | grep -q libvulkan || ! [ -f /usr/include/vulkan/vulkan.h ] 2>/dev/null; then
-      echo "Vulkan loader not found. Install it with:"
-      echo "  Debian/Ubuntu: sudo apt-get install -y libvulkan-dev"
-      echo "  Fedora/RHEL:   sudo dnf install -y vulkan-loader-devel"
+    section "Installing Vulkan build dependencies (Linux)"
+    if command -v apt-get &>/dev/null; then
+      sudo apt-get update -qq
+      sudo apt-get install -y build-essential cmake libvulkan-dev glslc spirv-headers
+    elif command -v dnf &>/dev/null; then
+      sudo dnf install -y cmake gcc-c++ make vulkan-loader-devel glslc spirv-headers
+    else
+      echo "Could not detect apt-get or dnf. Install these packages manually:"
+      echo "  Debian/Ubuntu: sudo apt-get install -y build-essential cmake libvulkan-dev glslc spirv-headers"
+      echo "  Fedora/RHEL:   sudo dnf install -y cmake gcc-c++ make vulkan-loader-devel glslc spirv-headers"
       echo ""
     fi
+  fi
+}
+
+ensure_submodules_for_source_install() {
+  if [[ -f ".gitmodules" && -d ".git" ]]; then
+    section "Initializing git submodules"
+    git submodule update --init --recursive
   fi
 }
 
@@ -245,6 +272,10 @@ main() {
     # shellcheck source=/dev/null
     source "$lib_tmp"
     rm -f "$lib_tmp"
+  fi
+
+  if [[ -n "$local_lib" && -f "$local_lib" ]]; then
+    ensure_submodules_for_source_install
   fi
 
   install_system_vulkan_deps

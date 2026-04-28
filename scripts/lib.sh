@@ -157,8 +157,16 @@ install_kosmickrisp() {
   success "KosmicKrisp built and installed"
 }
 
+ensure_submodules() {
+  if [ -f ".gitmodules" ] && [ -d ".git" ]; then
+    section "Initializing git submodules"
+    git submodule update --init --recursive
+  fi
+}
+
 ensure_vulkan() {
-  # Install the Vulkan headers/loader needed to compile the Rust extension.
+  # Install the Vulkan loader/headers and shader tooling needed to compile
+  # ggml's Vulkan backend from source.
   # Must be called before maturin/cargo runs (i.e. before install_dev_deps).
   #
   # On macOS: install vulkan-headers + vulkan-loader via Homebrew. This is
@@ -168,23 +176,35 @@ ensure_vulkan() {
   # than the runtime library (libvulkan.so.1), because the linker needs
   # -lvulkan which resolves via the unversioned symlink in the -dev package.
   if is_macos; then
-    if ! brew list vulkan-loader &>/dev/null 2>&1; then
-      section "Installing Vulkan headers and loader (macOS)"
-      brew install vulkan-headers vulkan-loader
+    section "Checking Vulkan build dependencies (macOS)"
+    local missing=()
+    for pkg in vulkan-headers vulkan-loader shaderc spirv-headers; do
+      if ! brew list "$pkg" &>/dev/null 2>&1; then
+        missing+=("$pkg")
+      fi
+    done
+    if [ "${#missing[@]}" -gt 0 ]; then
+      brew install "${missing[@]}"
     fi
+    success "Vulkan build dependencies present"
   else
-    # Ubuntu 24.04 ships libvulkan1 (runtime) by default, but the linker needs
-    # libvulkan.so (the unversioned symlink) from libvulkan-dev.
-    if ! find /usr/lib /usr/lib64 /usr/local/lib -name "libvulkan.so" 2>/dev/null | grep -q .; then
-      section "Installing Vulkan dev headers (Linux)"
+    section "Checking Vulkan build dependencies (Linux)"
+    if command -v apt-get &>/dev/null; then
       sudo apt-get update -qq
-      sudo apt-get install -y libvulkan-dev
+      sudo apt-get install -y build-essential cmake libvulkan-dev glslc spirv-headers
+    elif command -v dnf &>/dev/null; then
+      sudo dnf install -y cmake gcc-c++ make vulkan-loader-devel glslc spirv-headers
+    else
+      echo "Could not detect apt-get or dnf. Install these packages manually:"
+      echo "  Debian/Ubuntu: sudo apt-get install -y build-essential cmake libvulkan-dev glslc spirv-headers"
+      echo "  Fedora/RHEL:   sudo dnf install -y cmake gcc-c++ make vulkan-loader-devel glslc spirv-headers"
     fi
   fi
 }
 
 setup_dev_env() {
   ensure_uv
+  ensure_submodules
   ensure_vulkan
   ensure_venv ".venv-vllm-vulkan"
   install_dev_deps
