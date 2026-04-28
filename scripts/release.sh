@@ -9,14 +9,11 @@ main() {
   # shellcheck source=lib.sh disable=SC1091
   source "${script_dir}/lib.sh"
 
-  setup_dev_env
+  ensure_uv
 
   local version
   version=$(get_version)
   echo "Building version: $version"
-
-  section "Building wheel"
-  uv build
 
   local tag
   tag="v${version}-$(date +%Y%m%d-%H%M%S)"
