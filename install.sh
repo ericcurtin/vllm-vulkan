@@ -26,6 +26,18 @@ fetch_latest_release() {
 
 extract_wheel_url() {
   local release_data="$1"
+  local os_tag
+  local arch_tag
+
+  case "$(uname -s)" in
+    Darwin) os_tag="macosx" ;;
+    *)      os_tag="linux"  ;;
+  esac
+
+  case "$(uname -m)" in
+    arm64|aarch64) arch_tag="arm64\|aarch64" ;;
+    *)             arch_tag="x86_64\|amd64"  ;;
+  esac
 
   python3 -c "
 import sys
@@ -33,9 +45,11 @@ import json
 try:
     data = json.loads('''$release_data''')
     assets = data.get('assets', [])
+    os_tag = '$os_tag'
+    arch_tags = '$arch_tag'.split('\|')
     for asset in assets:
         name = asset.get('name', '')
-        if name.endswith('.whl'):
+        if name.endswith('.whl') and os_tag in name and any(a in name for a in arch_tags):
             print(asset.get('browser_download_url', ''))
             break
 except Exception as e:
