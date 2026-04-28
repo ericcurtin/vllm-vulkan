@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """VulkanPlatform — vLLM Platform interface for the Vulkan backend.
 
-On macOS, Vulkan is provided by KosmicKrisp (a community MoltenVK fork that
-translates Vulkan API calls to Metal). On Linux, the system Vulkan loader
+On macOS, Vulkan is provided by KosmicKrisp (Mesa/Zink software Vulkan driver
+that translates Vulkan API calls to Metal). On Linux, the system Vulkan loader
 exposes native GPU drivers.
 
 Availability matrix:
-  macOS  aarch64  — KosmicKrisp required (brew install kosmic-krisp / molten-vk)
+  macOS  aarch64  — KosmicKrisp required (installed by install.sh)
   macOS  x86_64   — KosmicKrisp required (less common)
   Linux  x86_64   — native Vulkan driver required
   Linux  aarch64  — native Vulkan driver required

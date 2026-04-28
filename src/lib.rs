@@ -2,7 +2,7 @@
 //! vLLM-Vulkan Rust extension.
 //!
 //! On macOS, Vulkan calls are translated to Metal by KosmicKrisp
-//! (a community-maintained MoltenVK fork).  On Linux x86_64 and aarch64,
+//! (Mesa/Zink software Vulkan driver).  On Linux x86_64 and aarch64,
 //! native Vulkan is used directly.
 //!
 //! The PyO3 module `_rs` is the bridge between this crate and the Python

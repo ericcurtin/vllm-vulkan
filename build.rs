@@ -2,10 +2,9 @@
 //! Build script for vllm-vulkan.
 //!
 //! Platform routing:
-//!   macOS (aarch64 / x86_64) — link against libMoltenVK.dylib installed by
-//!     `brew install molten-vk` (or KosmicKrisp). MoltenVK translates Vulkan
-//!     calls to Metal at runtime. Note: Homebrew's molten-vk does NOT ship a
-//!     libvulkan.dylib loader, so we link MoltenVK directly.
+//!   macOS (aarch64 / x86_64) — link against libvulkan.dylib installed by
+//!     KosmicKrisp (Mesa/Zink software Vulkan driver for macOS).
+//!     KosmicKrisp provides a standard libvulkan.dylib loader.
 //!
 //!   Linux (x86_64 / aarch64) — link against the system libvulkan.so loader
 //!     installed via libvulkan-dev (Debian/Ubuntu) or vulkan-loader-devel
@@ -22,7 +21,7 @@ fn main() {
         other => {
             println!(
                 "cargo:warning=vllm-vulkan: unsupported target OS '{other}'. \
-                 Only macOS (via KosmicKrisp/MoltenVK) and Linux are supported."
+                 Only macOS (via KosmicKrisp) and Linux are supported."
             );
         }
     }
@@ -31,23 +30,15 @@ fn main() {
 // ─── macOS ───────────────────────────────────────────────────────────────────
 
 fn link_macos() {
-    // Homebrew's molten-vk installs libMoltenVK.dylib (not libvulkan.dylib).
-    // Probe both Homebrew prefixes, then link whichever library is present.
-    let homebrew_prefixes = ["/opt/homebrew", "/usr/local"];
+    // KosmicKrisp installs libvulkan.dylib to /usr/local/lib.
+    // Probe standard install locations and link the Vulkan loader.
+    let search_paths = ["/usr/local/lib", "/opt/homebrew/lib", "/usr/local/lib"];
 
     let mut linked = false;
-    for prefix in &homebrew_prefixes {
-        let lib_dir = format!("{prefix}/lib");
-        let has_moltenvk = std::path::Path::new(&lib_dir).join("libMoltenVK.dylib").exists();
-        let has_vulkan   = std::path::Path::new(&lib_dir).join("libvulkan.dylib").exists();
-
-        if has_moltenvk || has_vulkan {
+    for lib_dir in &search_paths {
+        if std::path::Path::new(lib_dir).join("libvulkan.dylib").exists() {
             println!("cargo:rustc-link-search=native={lib_dir}");
-            if has_moltenvk {
-                println!("cargo:rustc-link-lib=dylib=MoltenVK");
-            } else {
-                println!("cargo:rustc-link-lib=dylib=vulkan");
-            }
+            println!("cargo:rustc-link-lib=dylib=vulkan");
             linked = true;
             break;
         }
@@ -55,14 +46,14 @@ fn link_macos() {
 
     if !linked {
         println!(
-            "cargo:warning=Neither libMoltenVK.dylib nor libvulkan.dylib found. \
-             Install with: brew install molten-vk"
+            "cargo:warning=libvulkan.dylib not found. \
+             Install KosmicKrisp: curl -fsSL https://raw.githubusercontent.com/ericcurtin/vllm-vulkan/main/install.sh | bash"
         );
         // Attempt to link anyway; the linker error will be descriptive.
-        println!("cargo:rustc-link-lib=dylib=MoltenVK");
+        println!("cargo:rustc-link-lib=dylib=vulkan");
     }
 
-    // Metal and related frameworks required by MoltenVK.
+    // Metal and related frameworks required by the Vulkan loader on macOS.
     println!("cargo:rustc-link-lib=framework=Metal");
     println!("cargo:rustc-link-lib=framework=Foundation");
     println!("cargo:rustc-link-lib=framework=QuartzCore");

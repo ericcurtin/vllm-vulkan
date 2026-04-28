@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Vulkan device enumeration and management.
 //!
-//! On macOS, Vulkan calls are translated to Metal by KosmicKrisp (MoltenVK fork).
+//! On macOS, Vulkan calls are translated to Metal by KosmicKrisp (Mesa/Zink).
 //! On Linux, native Vulkan is used directly.
 
 use std::ffi::{c_char, CStr};
@@ -71,10 +71,9 @@ struct VkPhysicalDeviceMemoryProperties {
     memory_heaps: [[u8; 16]; 16], // VkMemoryHeap: size(u64) + flags(u32) + pad(u32)
 }
 
-// On macOS, Homebrew's molten-vk ships libMoltenVK.dylib (no libvulkan.dylib).
+// On macOS, KosmicKrisp ships libvulkan.dylib to /usr/local/lib.
 // On Linux the standard Vulkan loader is libvulkan.so.
-#[cfg_attr(target_os = "macos", link(name = "MoltenVK"))]
-#[cfg_attr(not(target_os = "macos"), link(name = "vulkan"))]
+#[link(name = "vulkan")]
 extern "C" {
     fn vkCreateInstance(
         create_info: *const VkInstanceCreateInfo,
