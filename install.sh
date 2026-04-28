@@ -101,7 +101,7 @@ install_system_vulkan_deps() {
 main() {
   set -eu -o pipefail
 
-  local repo_owner="vllm-project"
+  local repo_owner="ericcurtin"
   local repo_name="vllm-vulkan"
   local package_name="vllm-vulkan"
 
