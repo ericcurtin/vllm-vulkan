@@ -127,8 +127,8 @@ install_kosmickrisp() {
   local LLVM_DIR
   LLVM_DIR="$(brew --prefix llvm@21)"
 
-  # Python build deps (--break-system-packages needed on macOS with PEP 668)
-  python3 -m pip install --quiet --break-system-packages mako packaging pyyaml
+  # Python build deps
+  uv pip install --quiet mako packaging pyyaml
 
   local build_dir
   build_dir=$(mktemp -d)
