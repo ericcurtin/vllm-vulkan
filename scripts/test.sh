@@ -70,12 +70,10 @@ smoke_tests() {
 }
 
 installs() {
-  if is_macos; then
-    section "Installing vllm"
-    ./install.sh
-    # shellcheck source=/dev/null
-    source .venv-vllm-vulkan/bin/activate
-  fi
+  # install.sh runs a full KosmicKrisp source build which is unsuitable for CI.
+  # setup_dev_env (called above) already installed vulkan-loader via brew and
+  # built the extension; nothing extra is needed here.
+  :
 }
 
 main() {

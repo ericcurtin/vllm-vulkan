@@ -59,8 +59,8 @@ install_kosmickrisp() {
   section "Building KosmicKrisp from source (macOS Vulkan via Mesa/Zink)"
 
   # Pinned upstream refs — update these to pick up new Mesa/Vulkan releases.
-  local MESA_REF="vulkan-sdk-1.4.321.0"
-  local VULKAN_SDK_REF="vulkan-sdk-1.4.321.0"
+  local MESA_REF="vulkan-sdk-1.4.341.0"
+  local VULKAN_SDK_REF="vulkan-sdk-1.4.341.0"
   local SPIRV_REF="v21.1.4"
 
   local MESA_REPO="https://gitlab.freedesktop.org/aitor/mesa.git"
