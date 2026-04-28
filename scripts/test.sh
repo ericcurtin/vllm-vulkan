@@ -69,13 +69,6 @@ smoke_tests() {
     " Paris. The capital of Italy is Rome. The"
 }
 
-installs() {
-  # install.sh runs a full KosmicKrisp source build which is unsuitable for CI.
-  # setup_dev_env (called above) already installed vulkan-loader via brew and
-  # built the extension; nothing extra is needed here.
-  :
-}
-
 main() {
   set -eu -o pipefail
 
@@ -86,8 +79,6 @@ main() {
   source "${script_dir}/lib.sh"
 
   setup_dev_env
-
-  installs
 
   section "Verifying package import"
   python -c "import vllm_vulkan._rs; print('vllm_vulkan imported successfully')"

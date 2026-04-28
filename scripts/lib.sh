@@ -84,7 +84,7 @@ install_kosmickrisp() {
   LLVM_DIR="$(brew --prefix llvm@21)"
 
   # Python build deps
-  uv pip install --quiet mako packaging pyyaml
+  uv pip install mako packaging pyyaml
 
   local build_dir
   build_dir=$(mktemp -d)
