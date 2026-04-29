@@ -10,7 +10,7 @@
 //!  - Creates `VkDevice` + `VkQueue`s on demand
 //!  - Provides the `DeviceInfo` struct exposed to Python
 
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, c_char};
 use std::sync::OnceLock;
 
 use ash::vk;
@@ -64,7 +64,7 @@ unsafe fn init_vulkan() -> Option<VkState> {
         .map(|e| unsafe { CStr::from_ptr(e.extension_name.as_ptr()) })
         .collect();
 
-    let mut enabled_exts: Vec<*const u8> = Vec::new();
+    let mut enabled_exts: Vec<*const c_char> = Vec::new();
     let portability_ext = c"VK_KHR_portability_enumeration";
     let debug_utils_ext = ash::ext::debug_utils::NAME;
 
@@ -308,7 +308,7 @@ impl ComputeDevice {
         let ext_storage8 = c"VK_KHR_8bit_storage";
         let ext_portability = c"VK_KHR_portability_subset";
 
-        let mut exts: Vec<*const u8> = Vec::new();
+        let mut exts: Vec<*const c_char> = Vec::new();
         if available_names.contains(&&*ext_16bit)   { exts.push(ext_16bit.as_ptr()); }
         if available_names.contains(&&*ext_storage8) { exts.push(ext_storage8.as_ptr()); }
         if available_names.contains(&&*ext_portability) { exts.push(ext_portability.as_ptr()); }
