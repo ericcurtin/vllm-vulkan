@@ -213,7 +213,8 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-# Compiled SPIR-V shader binaries and generated C++ wrappers
+# Compiled SPIR-V shaders and generated C++ wrappers — built from source by
+# scripts/compile_shaders.sh (invoked automatically by build.rs at cargo build time)
 shaders/spirv/*.spv
 shaders/spirv/*.cpp
 shaders/spirv/*.hpp
