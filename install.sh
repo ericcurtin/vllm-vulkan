@@ -93,14 +93,6 @@ download_and_install_wheel() {
 install_system_vulkan_deps() {
   if is_macos; then
     install_kosmickrisp
-  else
-    section "Checking Vulkan loader (Linux)"
-    if ! ldconfig -p 2>/dev/null | grep -q libvulkan || ! [ -f /usr/include/vulkan/vulkan.h ] 2>/dev/null; then
-      echo "Vulkan loader not found. Install it with:"
-      echo "  Debian/Ubuntu: sudo apt-get install -y libvulkan-dev"
-      echo "  Fedora/RHEL:   sudo dnf install -y vulkan-loader-devel"
-      echo ""
-    fi
   fi
 }
 
