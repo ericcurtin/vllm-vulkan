@@ -213,7 +213,6 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-# Compiled SPIR-V shader binaries and generated C++ wrappers
-shaders/spirv/*.spv
+# Generated C++ shader wrappers (large build artifacts, not needed at runtime)
 shaders/spirv/*.cpp
 shaders/spirv/*.hpp

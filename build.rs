@@ -42,26 +42,47 @@ fn compile_shaders() {
     let shader_dir = Path::new(&manifest_dir).join("shaders");
     let spirv_dir = shader_dir.join("spirv");
 
-    // If pre-compiled SPIR-V files already exist in shaders/spirv/, just copy
-    // them to OUT_DIR so include_bytes! can find them.
-    if spirv_dir.exists() && spirv_dir.read_dir().map(|mut d| d.next().is_some()).unwrap_or(false) {
-        let out_spirv = Path::new(&out_dir).join("spirv");
-        fs::create_dir_all(&out_spirv).ok();
-        for entry in fs::read_dir(&spirv_dir).unwrap().flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("spv") {
-                let dst = out_spirv.join(path.file_name().unwrap());
-                if !dst.exists() {
-                    fs::copy(&path, &dst).ok();
-                }
-            }
-        }
-        println!("cargo:warning=vllm-vulkan: using pre-compiled SPIR-V from shaders/spirv/");
-        return;
+    // Copy pre-compiled SPIR-V files from shaders/spirv/ to OUT_DIR so that
+    // include_bytes! can find them at compile time.
+    let out_spirv = Path::new(&out_dir).join("spirv");
+    fs::create_dir_all(&out_spirv).expect("failed to create spirv output dir");
+
+    let spv_count = fs::read_dir(&spirv_dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| {
+                    e.path().extension().and_then(|x| x.to_str()) == Some("spv")
+                })
+                .count()
+        })
+        .unwrap_or(0);
+
+    if spv_count == 0 {
+        panic!(
+            "vllm-vulkan: no pre-compiled SPIR-V shaders found in shaders/spirv/.\n\
+             Run scripts/compile_shaders.sh to build them, or check out the\n\
+             repository with the shader .spv files present."
+        );
     }
 
-    // No pre-compiled shaders found; try to compile them on the fly.
-    println!("cargo:warning=vllm-vulkan: pre-compiled SPIR-V not found; skipping shader compilation. Run scripts/compile_shaders.sh to build them.");
+    let mut copied = 0usize;
+    for entry in fs::read_dir(&spirv_dir).unwrap().flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("spv") {
+            let dst = out_spirv.join(path.file_name().unwrap());
+            if !dst.exists() {
+                fs::copy(&path, &dst).unwrap_or_else(|e| {
+                    panic!("failed to copy {}: {e}", path.display())
+                });
+                copied += 1;
+            }
+        }
+    }
+
+    println!(
+        "cargo:warning=vllm-vulkan: {} SPIR-V shaders ready ({} copied to OUT_DIR)",
+        spv_count, copied
+    );
 }
 
 // ─── macOS ────────────────────────────────────────────────────────────────────
