@@ -212,3 +212,8 @@ ggml/build/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Compiled SPIR-V shader binaries and generated C++ wrappers
+shaders/spirv/*.spv
+shaders/spirv/*.cpp
+shaders/spirv/*.hpp

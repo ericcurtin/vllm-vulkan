@@ -112,6 +112,15 @@ def _register() -> str | None:
     except Exception:
         pass
 
+    # Apply pure-Python fallbacks for vllm._C operations that are unavailable
+    # when vLLM is used from its Python source tree without C extensions.
+    try:
+        from vllm_vulkan.patches import apply_patches
+
+        apply_patches()
+    except Exception:
+        pass
+
     from vllm_vulkan.platform import VulkanPlatform
 
     if VulkanPlatform.is_available():

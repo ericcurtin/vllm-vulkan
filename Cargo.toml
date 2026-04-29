@@ -6,6 +6,7 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "High-performance Rust extension for vLLM Vulkan"
+build = "build.rs"
 
 [lib]
 name = "_rs"
@@ -17,6 +18,21 @@ parking_lot = "0.12"
 thiserror = "2.0"
 log = "0.4"
 env_logger = "0.11"
+# Vulkan bindings — safe wrappers around the raw Vulkan API
+ash = { version = "0.38", features = ["loaded"] }
+# Heap allocation for large data without stack overflow
+bytemuck = { version = "1.14", features = ["derive"] }
+# SafeTensors weight loading
+safetensors = "0.4"
+# Memory-mapped file I/O (zero-copy weight loading)
+memmap2 = "0.9"
+# Half-precision float support (bfloat16)
+half = { version = "2.3", features = ["num-traits"] }
+# SIMD-optimized matrix multiplication (uses NEON on ARM)
+matrixmultiply = "0.3"
+
+[build-dependencies]
+# No additional build deps needed; build.rs uses std::process::Command
 
 [profile.release]
 lto = true

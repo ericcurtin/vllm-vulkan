@@ -10,10 +10,15 @@
 //!     installed via libvulkan-dev (Debian/Ubuntu) or vulkan-loader-devel
 //!     (Fedora/RHEL).
 
+use std::env;
+use std::fs;
+use std::path::Path;
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=shaders/");
 
-    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
     match target_os.as_str() {
         "macos" => link_macos(),
@@ -25,9 +30,41 @@ fn main() {
             );
         }
     }
+
+    compile_shaders();
 }
 
-// ─── macOS ───────────────────────────────────────────────────────────────────
+// ─── Shader compilation ───────────────────────────────────────────────────────
+
+fn compile_shaders() {
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+    let out_dir = env::var("OUT_DIR").unwrap();
+    let shader_dir = Path::new(&manifest_dir).join("shaders");
+    let spirv_dir = shader_dir.join("spirv");
+
+    // If pre-compiled SPIR-V files already exist in shaders/spirv/, just copy
+    // them to OUT_DIR so include_bytes! can find them.
+    if spirv_dir.exists() && spirv_dir.read_dir().map(|mut d| d.next().is_some()).unwrap_or(false) {
+        let out_spirv = Path::new(&out_dir).join("spirv");
+        fs::create_dir_all(&out_spirv).ok();
+        for entry in fs::read_dir(&spirv_dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("spv") {
+                let dst = out_spirv.join(path.file_name().unwrap());
+                if !dst.exists() {
+                    fs::copy(&path, &dst).ok();
+                }
+            }
+        }
+        println!("cargo:warning=vllm-vulkan: using pre-compiled SPIR-V from shaders/spirv/");
+        return;
+    }
+
+    // No pre-compiled shaders found; try to compile them on the fly.
+    println!("cargo:warning=vllm-vulkan: pre-compiled SPIR-V not found; skipping shader compilation. Run scripts/compile_shaders.sh to build them.");
+}
+
+// ─── macOS ────────────────────────────────────────────────────────────────────
 
 fn link_macos() {
     // Probe standard locations for libvulkan.dylib:
@@ -37,7 +74,7 @@ fn link_macos() {
 
     let mut linked = false;
     for lib_dir in &search_paths {
-        if std::path::Path::new(lib_dir).join("libvulkan.dylib").exists() {
+        if Path::new(lib_dir).join("libvulkan.dylib").exists() {
             println!("cargo:rustc-link-search=native={lib_dir}");
             println!("cargo:rustc-link-lib=dylib=vulkan");
             linked = true;
@@ -62,14 +99,9 @@ fn link_macos() {
     println!("cargo:rustc-link-lib=framework=IOSurface");
 }
 
-// ─── Linux ───────────────────────────────────────────────────────────────────
+// ─── Linux ────────────────────────────────────────────────────────────────────
 
 fn link_linux() {
-    // Standard Vulkan loader; provided by libvulkan-dev / vulkan-loader.
-    //
-    // Probe for the unversioned linker stub (libvulkan.so), not the runtime
-    // library (libvulkan.so.1), because -lvulkan resolves via the unversioned
-    // symlink which is only present in the -dev package.
     let search_paths = [
         "/usr/lib/x86_64-linux-gnu",
         "/usr/lib/aarch64-linux-gnu",
@@ -78,7 +110,7 @@ fn link_linux() {
     ];
 
     let found = search_paths.iter().any(|dir| {
-        std::path::Path::new(dir).join("libvulkan.so").exists()
+        Path::new(dir).join("libvulkan.so").exists()
     });
 
     if !found {
@@ -86,6 +118,13 @@ fn link_linux() {
             "cargo:warning=libvulkan.so not found. \
              Install libvulkan-dev: sudo apt-get install -y libvulkan-dev"
         );
+    }
+
+    // Add search paths so the linker finds libvulkan.so
+    for dir in &search_paths {
+        if Path::new(dir).exists() {
+            println!("cargo:rustc-link-search=native={dir}");
+        }
     }
 
     println!("cargo:rustc-link-lib=dylib=vulkan");

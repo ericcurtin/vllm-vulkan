@@ -1,184 +1,126 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Vulkan device enumeration and management.
+//! Vulkan device enumeration and management using the `ash` crate.
 //!
 //! On macOS, Vulkan calls are translated to Metal by KosmicKrisp (Mesa/Zink).
 //! On Linux, native Vulkan is used directly.
+//!
+//! This module:
+//!  - Initialises a `VkInstance` (once, lazily) via `ash::Entry::load()`
+//!  - Enumerates `VkPhysicalDevice`s and queries their properties
+//!  - Creates `VkDevice` + `VkQueue`s on demand
+//!  - Provides the `DeviceInfo` struct exposed to Python
 
-use std::ffi::{c_char, CStr};
-use std::mem;
+use std::ffi::{CStr, CString};
 use std::sync::OnceLock;
 
-// OnceLock is used for the global Vulkan instance singleton (SAFE_INSTANCE).
+use ash::vk;
+use log::{debug, warn};
 
-use pyo3::exceptions::PyRuntimeError;
-use pyo3::prelude::*;
+// ─── Lazy global Vulkan instance ─────────────────────────────────────────────
 
-// ────────────────────────────────────────────────────────────────────────────
-// Vulkan FFI (only the handful of symbols we need)
-// ────────────────────────────────────────────────────────────────────────────
-
-type VkInstance = *mut std::ffi::c_void;
-type VkPhysicalDevice = *mut std::ffi::c_void;
-type VkResult = i32;
-
-const VK_SUCCESS: i32 = 0;
-const VK_STRUCTURE_TYPE_APPLICATION_INFO: u32 = 0;
-const VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO: u32 = 1;
-const VK_API_VERSION_1_2: u32 = (1 << 22) | (2 << 12);
-
-#[repr(C)]
-struct VkApplicationInfo {
-    s_type: u32,
-    p_next: *const std::ffi::c_void,
-    p_application_name: *const c_char,
-    application_version: u32,
-    p_engine_name: *const c_char,
-    engine_version: u32,
-    api_version: u32,
+struct VkState {
+    _entry: ash::Entry,
+    instance: ash::Instance,
+    physical_devices: Vec<vk::PhysicalDevice>,
 }
 
-#[repr(C)]
-struct VkInstanceCreateInfo {
-    s_type: u32,
-    p_next: *const std::ffi::c_void,
-    flags: u32,
-    p_application_info: *const VkApplicationInfo,
-    enabled_layer_count: u32,
-    pp_enabled_layer_names: *const *const c_char,
-    enabled_extension_count: u32,
-    pp_enabled_extension_names: *const *const c_char,
+// Safety: we hold no non-Send data; the raw pointers inside ash types are
+// safe to share across threads as long as we don't mutate them concurrently
+// (which our read-only enumeration does not do).
+unsafe impl Send for VkState {}
+unsafe impl Sync for VkState {}
+
+static VK_STATE: OnceLock<Option<VkState>> = OnceLock::new();
+
+fn get_state() -> Option<&'static VkState> {
+    VK_STATE
+        .get_or_init(|| unsafe { init_vulkan() })
+        .as_ref()
 }
 
-#[repr(C)]
-struct VkPhysicalDeviceProperties {
-    api_version: u32,
-    driver_version: u32,
-    vendor_id: u32,
-    device_id: u32,
-    device_type: u32,
-    device_name: [u8; 256],
-    pipeline_cache_uuid: [u8; 16],
-    limits: [u8; 504], // VkPhysicalDeviceLimits is large; approximate
-    sparse_properties: [u8; 20],
-}
+unsafe fn init_vulkan() -> Option<VkState> {
+    // Load the Vulkan loader library (libvulkan.so / MoltenVK.dylib).
+    let entry = match ash::Entry::load() {
+        Ok(e) => e,
+        Err(e) => {
+            debug!("Cannot load Vulkan loader: {e}");
+            return None;
+        }
+    };
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct VkPhysicalDeviceMemoryProperties {
-    memory_type_count: u32,
-    memory_types: [u8; 256],
-    memory_heap_count: u32,
-    memory_heaps: [[u8; 16]; 16], // VkMemoryHeap: size(u64) + flags(u32) + pad(u32)
-}
+    // Application info (version 1.2 minimum).
+    let app_name = CString::new("vllm-vulkan").unwrap();
+    let app_info = vk::ApplicationInfo::default()
+        .application_name(&app_name)
+        .application_version(vk::make_api_version(0, 0, 1, 0))
+        .api_version(vk::API_VERSION_1_2);
 
-// On macOS, KosmicKrisp ships libvulkan.dylib to /usr/local/lib.
-// On Linux the standard Vulkan loader is libvulkan.so.
-#[link(name = "vulkan")]
-extern "C" {
-    fn vkCreateInstance(
-        create_info: *const VkInstanceCreateInfo,
-        allocator: *const std::ffi::c_void,
-        instance: *mut VkInstance,
-    ) -> VkResult;
+    // Enumerate available instance extensions.
+    let available_exts = entry
+        .enumerate_instance_extension_properties(None)
+        .unwrap_or_default();
+    let available_ext_names: Vec<&CStr> = available_exts
+        .iter()
+        .map(|e| unsafe { CStr::from_ptr(e.extension_name.as_ptr()) })
+        .collect();
 
-    fn vkDestroyInstance(instance: VkInstance, allocator: *const std::ffi::c_void);
+    let mut enabled_exts: Vec<*const u8> = Vec::new();
+    let portability_ext = c"VK_KHR_portability_enumeration";
+    let debug_utils_ext = ash::ext::debug_utils::NAME;
 
-    fn vkEnumeratePhysicalDevices(
-        instance: VkInstance,
-        count: *mut u32,
-        devices: *mut VkPhysicalDevice,
-    ) -> VkResult;
+    let mut has_portability = false;
+    if available_ext_names.iter().any(|n| *n == portability_ext) {
+        enabled_exts.push(portability_ext.as_ptr());
+        has_portability = true;
+    }
+    // Debug utils for validation layers (optional).
+    if available_ext_names.iter().any(|n| *n == debug_utils_ext) {
+        enabled_exts.push(debug_utils_ext.as_ptr());
+    }
 
-    fn vkGetPhysicalDeviceProperties(
-        device: VkPhysicalDevice,
-        properties: *mut VkPhysicalDeviceProperties,
+    let mut flags = vk::InstanceCreateFlags::empty();
+    if has_portability {
+        flags |= vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
+    }
+
+    let create_info = vk::InstanceCreateInfo::default()
+        .application_info(&app_info)
+        .enabled_extension_names(&enabled_exts)
+        .flags(flags);
+
+    let instance = match entry.create_instance(&create_info, None) {
+        Ok(i) => i,
+        Err(e) => {
+            debug!("vkCreateInstance failed: {e}");
+            return None;
+        }
+    };
+
+    let physical_devices = instance
+        .enumerate_physical_devices()
+        .unwrap_or_default();
+
+    if physical_devices.is_empty() {
+        debug!("No Vulkan physical devices found.");
+        // Don't destroy instance; it's cheap and we may re-enumerate later.
+        return None;
+    }
+
+    debug!(
+        "Vulkan instance created. {} physical device(s) found.",
+        physical_devices.len()
     );
 
-    fn vkGetPhysicalDeviceMemoryProperties(
-        device: VkPhysicalDevice,
-        properties: *mut VkPhysicalDeviceMemoryProperties,
-    );
+    Some(VkState {
+        _entry: entry,
+        instance,
+        physical_devices,
+    })
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Global Vulkan instance (created once, never destroyed)
-// ────────────────────────────────────────────────────────────────────────────
+// ─── Public DeviceInfo ───────────────────────────────────────────────────────
 
-// Safety: VkInstance is an opaque pointer; we only create it once and share
-// it read-only across threads after that.
-unsafe impl Send for SafeInstance {}
-unsafe impl Sync for SafeInstance {}
-
-struct SafeInstance(VkInstance);
-
-static SAFE_INSTANCE: OnceLock<Option<SafeInstance>> = OnceLock::new();
-
-fn get_instance() -> Option<VkInstance> {
-    let holder = SAFE_INSTANCE.get_or_init(|| unsafe { create_instance() });
-    holder.as_ref().map(|si| si.0)
-}
-
-unsafe fn create_instance() -> Option<SafeInstance> {
-    let app_name = b"vllm-vulkan\0";
-    let engine_name = b"vllm-vulkan-rs\0";
-
-    let app_info = VkApplicationInfo {
-        s_type: VK_STRUCTURE_TYPE_APPLICATION_INFO,
-        p_next: std::ptr::null(),
-        p_application_name: app_name.as_ptr() as *const c_char,
-        application_version: 1,
-        p_engine_name: engine_name.as_ptr() as *const c_char,
-        engine_version: 1,
-        api_version: VK_API_VERSION_1_2,
-    };
-
-    let create_info = VkInstanceCreateInfo {
-        s_type: VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-        p_next: std::ptr::null(),
-        flags: 0,
-        p_application_info: &app_info,
-        enabled_layer_count: 0,
-        pp_enabled_layer_names: std::ptr::null(),
-        enabled_extension_count: 0,
-        pp_enabled_extension_names: std::ptr::null(),
-    };
-
-    let mut instance: VkInstance = std::ptr::null_mut();
-    let result = vkCreateInstance(&create_info, std::ptr::null(), &mut instance);
-    if result == VK_SUCCESS && !instance.is_null() {
-        Some(SafeInstance(instance))
-    } else {
-        log::warn!("vkCreateInstance failed (result={}); Vulkan unavailable", result);
-        None
-    }
-}
-
-fn enumerate_physical_devices_raw() -> Vec<VkPhysicalDevice> {
-    let Some(instance) = get_instance() else {
-        return vec![];
-    };
-    unsafe {
-        let mut count: u32 = 0;
-        if vkEnumeratePhysicalDevices(instance, &mut count, std::ptr::null_mut()) != VK_SUCCESS
-            || count == 0
-        {
-            return vec![];
-        }
-        let mut devices = vec![std::ptr::null_mut::<std::ffi::c_void>(); count as usize];
-        if vkEnumeratePhysicalDevices(instance, &mut count, devices.as_mut_ptr()) != VK_SUCCESS {
-            return vec![];
-        }
-        devices.truncate(count as usize);
-        devices
-    }
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-// Public device info types
-// ────────────────────────────────────────────────────────────────────────────
-
-/// Parsed information about a single Vulkan physical device.
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone)]
 pub struct DeviceInfo {
     pub name: String,
     pub vendor_id: u32,
@@ -188,135 +130,258 @@ pub struct DeviceInfo {
     pub total_memory_bytes: u64,
 }
 
-fn device_type_str(ty: u32) -> &'static str {
-    match ty {
-        0 => "other",
-        1 => "integrated_gpu",
-        2 => "discrete_gpu",
-        3 => "virtual_gpu",
-        4 => "cpu",
-        _ => "unknown",
+fn device_type_str(t: vk::PhysicalDeviceType) -> &'static str {
+    match t {
+        vk::PhysicalDeviceType::DISCRETE_GPU => "discrete",
+        vk::PhysicalDeviceType::INTEGRATED_GPU => "integrated",
+        vk::PhysicalDeviceType::VIRTUAL_GPU => "virtual",
+        vk::PhysicalDeviceType::CPU => "cpu",
+        _ => "other",
     }
 }
 
 fn api_version_str(v: u32) -> String {
-    format!("{}.{}.{}", (v >> 22) & 0x7f, (v >> 12) & 0x3ff, v & 0xfff)
+    format!(
+        "{}.{}.{}",
+        vk::api_version_major(v),
+        vk::api_version_minor(v),
+        vk::api_version_patch(v)
+    )
 }
 
-fn total_memory(mem_props: &VkPhysicalDeviceMemoryProperties) -> u64 {
-    // Each heap is { size: u64, flags: u32, _pad: u32 } = 16 bytes.
-    // We sum heaps that have the DEVICE_LOCAL flag (bit 0).
-    let count = mem_props.memory_heap_count.min(16) as usize;
-    let mut total: u64 = 0;
-    for i in 0..count {
+fn total_device_memory(instance: &ash::Instance, pd: vk::PhysicalDevice) -> u64 {
+    let mem_props = unsafe { instance.get_physical_device_memory_properties(pd) };
+    let mut total = 0u64;
+    for i in 0..mem_props.memory_heap_count as usize {
         let heap = &mem_props.memory_heaps[i];
-        let size = u64::from_le_bytes(heap[0..8].try_into().unwrap_or([0; 8]));
-        let flags = u32::from_le_bytes(heap[8..12].try_into().unwrap_or([0; 4]));
-        if flags & 1 != 0 {
-            total += size;
+        if heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL) {
+            total += heap.size;
         }
     }
-    // Unified-memory devices (e.g. Apple Silicon via KosmicKrisp) report heap
-    // without DEVICE_LOCAL. Fall back to the largest heap in that case.
+    // If nothing flagged as device-local (UMA), fall back to largest heap.
     if total == 0 {
-        for i in 0..count {
-            let heap = &mem_props.memory_heaps[i];
-            let size = u64::from_le_bytes(heap[0..8].try_into().unwrap_or([0; 8]));
-            total = total.max(size);
-        }
+        total = (0..mem_props.memory_heap_count as usize)
+            .map(|i| mem_props.memory_heaps[i].size)
+            .max()
+            .unwrap_or(0);
     }
     total
 }
 
+// ─── Public API ──────────────────────────────────────────────────────────────
+
+pub fn is_vulkan_available() -> bool {
+    get_state().is_some()
+}
+
+pub fn device_count() -> usize {
+    get_state()
+        .map(|s| s.physical_devices.len())
+        .unwrap_or(0)
+}
+
 pub fn enumerate_devices() -> Vec<DeviceInfo> {
-    enumerate_physical_devices_raw()
-        .into_iter()
-        .map(|phys| unsafe {
-            let mut props: VkPhysicalDeviceProperties = mem::zeroed();
-            vkGetPhysicalDeviceProperties(phys, &mut props);
-
-            let mut mem_props: VkPhysicalDeviceMemoryProperties = mem::zeroed();
-            vkGetPhysicalDeviceMemoryProperties(phys, &mut mem_props);
-
-            // Device name is a null-terminated UTF-8 string.
-            let name = CStr::from_bytes_until_nul(&props.device_name)
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| "Unknown".to_string());
-
+    let Some(state) = get_state() else {
+        return Vec::new();
+    };
+    state
+        .physical_devices
+        .iter()
+        .map(|&pd| {
+            let props = unsafe { state.instance.get_physical_device_properties(pd) };
+            let name = unsafe {
+                CStr::from_ptr(props.device_name.as_ptr())
+                    .to_string_lossy()
+                    .into_owned()
+            };
             DeviceInfo {
                 name,
                 vendor_id: props.vendor_id,
-                device_type: device_type_str(props.device_type).to_string(),
+                device_type: device_type_str(props.device_type).to_owned(),
                 api_version: api_version_str(props.api_version),
                 driver_version: props.driver_version,
-                total_memory_bytes: total_memory(&mem_props),
+                total_memory_bytes: total_device_memory(&state.instance, pd),
             }
         })
         .collect()
 }
 
-pub fn is_vulkan_available() -> bool {
-    !enumerate_physical_devices_raw().is_empty()
-}
+pub fn memory_info(device_idx: usize) -> Result<(u64, u64), String> {
+    let state = get_state().ok_or_else(|| "Vulkan not available".to_owned())?;
+    let &pd = state
+        .physical_devices
+        .get(device_idx)
+        .ok_or_else(|| format!("no device at index {device_idx}"))?;
 
-pub fn device_count() -> usize {
-    enumerate_physical_devices_raw().len()
+    let total = total_device_memory(&state.instance, pd);
+    // Without creating a VkDevice + VK_EXT_memory_budget, "used" is unknown.
+    Ok((0, total))
 }
 
 pub fn synchronize_all() -> Result<(), String> {
-    // Vulkan has no global sync; the Python layer synchronises per-queue.
+    // Without an active VkDevice/VkQueue, there is nothing to synchronise.
+    // A future implementation will call vkDeviceWaitIdle on each open device.
     Ok(())
 }
 
-pub fn memory_info(device_idx: usize) -> Result<(u64, u64), String> {
-    let devs = enumerate_devices();
-    let info = devs
-        .get(device_idx)
-        .ok_or_else(|| format!("device index {} out of range", device_idx))?;
-    // Without a VkDevice we cannot query actual used bytes; return (0, total).
-    Ok((0, info.total_memory_bytes))
+// ─── Logical device access (for compute) ─────────────────────────────────────
+
+/// A Vulkan logical device with a compute queue.
+pub struct ComputeDevice {
+    pub instance: ash::Instance,
+    pub physical_device: vk::PhysicalDevice,
+    pub device: ash::Device,
+    pub compute_queue: vk::Queue,
+    pub compute_queue_family: u32,
+    // Capabilities
+    pub fp16: bool,
+    pub subgroup_size: u32,
+    pub max_workgroup_invocations: u32,
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// PyO3 class
-// ────────────────────────────────────────────────────────────────────────────
+// ComputeDevice does NOT implement Drop — ownership of `device` is transferred
+// to ComputeEngine, which handles cleanup via its own Drop impl.
 
-/// A Vulkan physical device handle exposed to Python.
+impl ComputeDevice {
+    /// Create a logical device for the physical device at `idx`.
+    pub fn create(idx: usize) -> Result<Self, String> {
+        let state = get_state().ok_or("Vulkan not available")?;
+        let &pd = state
+            .physical_devices
+            .get(idx)
+            .ok_or_else(|| format!("no device at index {idx}"))?;
+
+        let instance = &state.instance;
+
+        // Find a compute queue family.
+        let queue_families =
+            unsafe { instance.get_physical_device_queue_family_properties(pd) };
+        let compute_family = queue_families
+            .iter()
+            .enumerate()
+            .find(|(_, qf)| qf.queue_flags.contains(vk::QueueFlags::COMPUTE))
+            .map(|(i, _)| i as u32)
+            .ok_or("No compute queue family found")?;
+
+        let priorities = [1.0f32];
+        let queue_ci = vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(compute_family)
+            .queue_priorities(&priorities);
+
+        // Query device capabilities.
+        let props = unsafe { instance.get_physical_device_properties(pd) };
+
+        // Enable fp16 if the device supports it.
+        // We query the features into local structs, then extract raw copies.
+        let (fp16, has_float64) = unsafe {
+            let mut features16 = vk::PhysicalDevice16BitStorageFeatures::default();
+            let p16 = &mut features16 as *mut vk::PhysicalDevice16BitStorageFeatures;
+            let mut features2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut *p16);
+            instance.get_physical_device_features2(pd, &mut features2);
+            // Read results from the raw pointers — safe because Vulkan has
+            // filled the structs and we are still within the unsafe block.
+            let fp16_val = (*p16).storage_buffer16_bit_access == vk::TRUE;
+            let f64_val  = features2.features.shader_float64 == vk::TRUE;
+            (fp16_val, f64_val)
+        };
+        let fp16 = fp16 || has_float64; // rough heuristic
+
+        let device_features = vk::PhysicalDeviceFeatures {
+            shader_float64: if has_float64 { vk::TRUE } else { vk::FALSE },
+            shader_int64: vk::TRUE,
+            shader_int16: vk::TRUE,
+            ..Default::default()
+        };
+
+        // Build extension list.
+        let available = unsafe {
+            instance
+                .enumerate_device_extension_properties(pd)
+                .unwrap_or_default()
+        };
+        let available_names: Vec<&CStr> = available
+            .iter()
+            .map(|e| unsafe { CStr::from_ptr(e.extension_name.as_ptr()) })
+            .collect();
+
+        let ext_16bit = c"VK_KHR_16bit_storage";
+        let ext_storage8 = c"VK_KHR_8bit_storage";
+        let ext_portability = c"VK_KHR_portability_subset";
+
+        let mut exts: Vec<*const u8> = Vec::new();
+        if available_names.contains(&&*ext_16bit)   { exts.push(ext_16bit.as_ptr()); }
+        if available_names.contains(&&*ext_storage8) { exts.push(ext_storage8.as_ptr()); }
+        if available_names.contains(&&*ext_portability) { exts.push(ext_portability.as_ptr()); }
+
+        let device_ci = vk::DeviceCreateInfo::default()
+            .queue_create_infos(std::slice::from_ref(&queue_ci))
+            .enabled_extension_names(&exts)
+            .enabled_features(&device_features);
+
+        let device = unsafe { instance.create_device(pd, &device_ci, None) }
+            .map_err(|e| format!("vkCreateDevice: {e}"))?;
+
+        let compute_queue = unsafe { device.get_device_queue(compute_family, 0) };
+
+        let subgroup_props = {
+            let mut sp = vk::PhysicalDeviceSubgroupProperties::default();
+            let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut sp);
+            unsafe { instance.get_physical_device_properties2(pd, &mut p2) };
+            sp
+        };
+
+        Ok(ComputeDevice {
+            instance: instance.clone(),
+            physical_device: pd,
+            device,
+            compute_queue,
+            compute_queue_family: compute_family,
+            fp16,
+            subgroup_size: subgroup_props.subgroup_size,
+            max_workgroup_invocations: props.limits.max_compute_work_group_invocations,
+        })
+    }
+}
+
+// ─── Python-exposed VulkanDevice ─────────────────────────────────────────────
+
+use pyo3::prelude::*;
+
 #[pyclass]
 pub struct VulkanDevice {
-    #[pyo3(get)]
     pub index: usize,
-    #[pyo3(get)]
-    pub name: String,
-    #[pyo3(get)]
-    pub device_type: String,
-    #[pyo3(get)]
-    pub api_version: String,
-    #[pyo3(get)]
-    pub total_memory_bytes: u64,
+    info: DeviceInfo,
 }
 
 #[pymethods]
 impl VulkanDevice {
-    #[new]
-    pub fn new(index: usize) -> PyResult<Self> {
-        let devs = enumerate_devices();
-        let info = devs
-            .get(index)
-            .ok_or_else(|| PyRuntimeError::new_err(format!("no Vulkan device at index {index}")))?;
-        Ok(Self {
-            index,
-            name: info.name.clone(),
-            device_type: info.device_type.clone(),
-            api_version: info.api_version.clone(),
-            total_memory_bytes: info.total_memory_bytes,
-        })
-    }
+    #[getter]
+    fn index(&self) -> usize { self.index }
+    #[getter]
+    fn name(&self) -> &str { &self.info.name }
+    #[getter]
+    fn device_type(&self) -> &str { &self.info.device_type }
+    #[getter]
+    fn api_version(&self) -> &str { &self.info.api_version }
+    #[getter]
+    fn total_memory_bytes(&self) -> u64 { self.info.total_memory_bytes }
 
     fn __repr__(&self) -> String {
         format!(
-            "VulkanDevice(index={}, name={:?}, type={}, vk={})",
-            self.index, self.name, self.device_type, self.api_version
+            "VulkanDevice(index={}, name={:?}, type={}, memory={:.1}GB)",
+            self.index,
+            self.info.name,
+            self.info.device_type,
+            self.info.total_memory_bytes as f64 / 1e9,
         )
+    }
+}
+
+impl VulkanDevice {
+    pub fn new(index: usize) -> Option<Self> {
+        enumerate_devices()
+            .into_iter()
+            .nth(index)
+            .map(|info| VulkanDevice { index, info })
     }
 }

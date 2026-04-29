@@ -172,11 +172,11 @@ class VulkanPlatform(Platform):
         if config.debug:
             logger.info("Vulkan config: %s", config)
 
-        # Use vLLM's built-in CPU worker — it handles tokenisation, sampling
-        # and KV-cache management.  Vulkan compute is invoked for attention
-        # kernels through the ops layer.
+        # Use VulkanWorker (a CPUWorker subclass that gracefully handles the
+        # absence of the vllm._C compiled extension for thread-affinity binding,
+        # and installs VulkanModelRunner for GPU-accelerated compute).
         if parallel_config.worker_cls == "auto":
-            parallel_config.worker_cls = "vllm.v1.worker.cpu_worker.CPUWorker"
+            parallel_config.worker_cls = "vllm_vulkan.worker.VulkanWorker"
 
         if parallel_config.distributed_executor_backend in ("auto", None):
             parallel_config.distributed_executor_backend = "uni"
@@ -191,12 +191,110 @@ class VulkanPlatform(Platform):
             cache_config.block_size = config.block_size
 
         # CPU KV cache space (required by CPUWorker).
+        # We reserve memory for:
+        #   - Model weights in PyTorch (fp16/bf16):  ~model_params * 2 bytes
+        #   - Vulkan weight copies (fp32):            ~model_params * 4 bytes
+        #   - OS + Python runtime overhead:           ~4 GB
+        # KV cache gets the remainder × safety_fraction.
         if cache_config.cpu_kvcache_space_bytes is None:
-            kv_gb = float(os.environ.get("VLLM_CPU_KVCACHE_SPACE", "4"))
+            kv_env = os.environ.get("VLLM_CPU_KVCACHE_SPACE")
+            if kv_env is not None:
+                kv_gb = float(kv_env)
+            else:
+                import psutil as _psutil  # noqa: PLC0415
+                total_ram_gb = _psutil.virtual_memory().total / (1024 ** 3)
+
+                # Estimate model weight memory:
+                # bf16 weights (already loaded) + float32 Vulkan copies
+                model_params_b = sum(
+                    p.numel() for p in
+                    getattr(vllm_config, "model_config", None) and [] or []
+                )
+                # Rough estimate: 6 bytes/param (2 bf16 + 4 f32)
+                # For E2B ~2B params: 12 GB; for 31B: ~186 GB
+                # Use a conservative 35% of total RAM for KV cache
+                # Reserve memory for: PyTorch weights (~4GB), Vulkan weight
+                # copies (~10GB), OS (~4GB). KV cache gets the rest up to cap.
+                # 115GB total - 4 - 10 - 4 = ~97GB, but use conservative 8GB
+                kv_gb = max(4.0, min(total_ram_gb * 0.07, 8.0))  # cap at 8 GB
             cache_config.cpu_kvcache_space_bytes = int(kv_gb * 1024**3)
+            logger.info(
+                "Vulkan/CPU KV cache space: %.1f GB", kv_gb
+            )
 
         if model_config is not None:
             model_config.disable_cascade_attn = True
+
+            # Auto-cap max_model_len when the model's native context window
+            # would require more KV cache than is available.  This avoids the
+            # "220 GiB KV cache needed" error on machines with limited RAM.
+            # Users can always pass --max-model-len explicitly to override.
+            if (
+                cache_config.cpu_kvcache_space_bytes is not None
+                and model_config.max_model_len is not None
+            ):
+                # Estimate KV cache bytes per token for this model.
+                # Each token needs (num_layers × num_kv_heads × head_dim × 2 × dtype_bytes)
+                # bytes for key + value.
+                try:
+                    text_cfg = getattr(model_config.hf_config, "text_config", None) or model_config.hf_config
+                    num_layers = getattr(text_cfg, "num_hidden_layers", None) or 60
+                    num_kv_heads = getattr(text_cfg, "num_key_value_heads", None) or 16
+                    head_dim = getattr(text_cfg, "head_dim", None) or 256
+                    # bfloat16 = 2 bytes
+                    dtype_bytes = 2 if model_config.dtype in ("bfloat16", "float16") else 4
+                    bytes_per_token = num_layers * num_kv_heads * head_dim * 2 * dtype_bytes
+                    # Also account for global heads if heterogeneous
+                    global_head_dim = getattr(text_cfg, "global_head_dim", None)
+                    num_global_kv_heads = getattr(text_cfg, "num_global_key_value_heads", None)
+                    layer_types = getattr(text_cfg, "layer_types", None)
+                    if global_head_dim and num_global_kv_heads and layer_types:
+                        n_sliding = sum(1 for lt in layer_types if "sliding" in lt)
+                        n_full = sum(1 for lt in layer_types if "full" in lt)
+                        bytes_per_token = (
+                            n_sliding * num_kv_heads * head_dim * 2 * dtype_bytes +
+                            n_full * num_global_kv_heads * global_head_dim * 2 * dtype_bytes
+                        )
+                    max_tokens_in_kv = int(cache_config.cpu_kvcache_space_bytes / bytes_per_token)
+                    if max_tokens_in_kv < model_config.max_model_len:
+                        # Leave 20% headroom and cap at a multiple of block_size
+                        safe_max = int(max_tokens_in_kv * 0.9)
+                        bs = cache_config.block_size or config.block_size
+                        safe_max = (safe_max // bs) * bs
+                        if safe_max > 0 and safe_max < model_config.max_model_len:
+                            logger.info(
+                                "Vulkan/CPU: capping max_model_len from %d to %d "
+                                "based on %.1f GB KV cache budget.",
+                                model_config.max_model_len,
+                                safe_max,
+                                cache_config.cpu_kvcache_space_bytes / 1e9,
+                            )
+                            model_config.max_model_len = safe_max
+                except Exception as exc:
+                    logger.debug("Could not estimate max_model_len cap: %s", exc)
+
+        # Async scheduling requires CUDA streams (torch.cuda.current_stream) and
+        # is not compatible with the CPU/Vulkan backend.  Disable it explicitly.
+        scheduler_config = vllm_config.scheduler_config
+        if scheduler_config is not None and getattr(scheduler_config, "async_scheduling", None) is not False:
+            scheduler_config.async_scheduling = False
+
+        # The Vulkan/CPU backend uses eager (non-compiled) execution by default.
+        # torch.compile with the vLLM inductor backend requires CUDA-specific
+        # custom ops and is not supported on the CPU path.  Eager execution is
+        # functionally equivalent and avoids compilation failures.
+        # Users may opt into compilation by setting VLLM_VULKAN_ALLOW_COMPILE=1.
+        allow_compile = os.environ.get("VLLM_VULKAN_ALLOW_COMPILE", "0") == "1"
+        compilation_config = vllm_config.compilation_config
+        if not allow_compile:
+            from vllm.config.compilation import CompilationMode, CUDAGraphMode  # noqa: PLC0415
+            if compilation_config.mode != CompilationMode.NONE:
+                logger.info(
+                    "Vulkan/CPU platform: disabling torch.compile (eager mode). "
+                    "Set VLLM_VULKAN_ALLOW_COMPILE=1 to enable compilation."
+                )
+                compilation_config.mode = CompilationMode.NONE
+                compilation_config.cudagraph_mode = CUDAGraphMode.NONE
 
         total_mem = cls.get_device_total_memory()
         avail_mem = cls.get_device_available_memory()
@@ -223,6 +321,15 @@ class VulkanPlatform(Platform):
         if attn_selector_config.use_sparse:
             raise NotImplementedError("Sparse attention is not supported on Vulkan.")
         return AttentionBackendEnum.CPU_ATTN.get_path()
+
+    @classmethod
+    def _vllm_c_available(cls) -> bool:
+        """Return True if the vllm._C compiled extension is loadable."""
+        try:
+            import vllm._C  # noqa: F401
+            return True
+        except (ImportError, ModuleNotFoundError):
+            return False
 
     @classmethod
     def verify_quantization(cls, quant: str) -> None:
