@@ -7,6 +7,7 @@ RUN dnf install -y \
         cargo \
         vulkan-loader-devel \
         vulkan-headers \
+        glslang \
         gcc \
         g++ \
         cmake \
