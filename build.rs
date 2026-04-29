@@ -111,11 +111,17 @@ fn compile_shaders() {
 // ─── macOS ────────────────────────────────────────────────────────────────────
 
 fn link_macos() {
-    let search_paths = ["/opt/homebrew/lib", "/usr/local/lib"];
+    let home = env::var("HOME").unwrap_or_default();
+    let home_local_lib = format!("{home}/.local/lib");
+    let search_paths: Vec<String> = vec![
+        home_local_lib,
+        "/opt/homebrew/lib".to_string(),
+        "/usr/local/lib".to_string(),
+    ];
 
     let mut linked = false;
     for lib_dir in &search_paths {
-        if Path::new(lib_dir).join("libvulkan.dylib").exists() {
+        if Path::new(lib_dir.as_str()).join("libvulkan.dylib").exists() {
             println!("cargo:rustc-link-search=native={lib_dir}");
             println!("cargo:rustc-link-lib=dylib=vulkan");
             linked = true;

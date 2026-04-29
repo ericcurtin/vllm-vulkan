@@ -47,7 +47,7 @@ install_dev_deps() {
 }
 
 install_kosmickrisp() {
-  local install_dir="/usr/local"
+  local install_dir="${KOSMICKRISP_INSTALL_DIR:-$HOME/.local}"
   local lib_dir="$install_dir/lib"
   local icd_dir="$install_dir/share/vulkan/icd.d"
 
@@ -148,13 +148,13 @@ install_kosmickrisp() {
   ninja -C "$src_dir/mesa-build" "-j$NCPU"
   meson install -C "$src_dir/mesa-build"
 
-  # Install into /usr/local
-  sudo mkdir -p "$lib_dir" "$icd_dir"
-  sudo cp "$stage_dir/lib/"*.dylib "$lib_dir/"
-  sudo cp "$stage_dir/share/vulkan/icd.d/"*.json "$icd_dir/"
+  # Install into user-writable directory (no sudo required)
+  mkdir -p "$lib_dir" "$icd_dir"
+  cp "$stage_dir/lib/"*.dylib "$lib_dir/"
+  cp "$stage_dir/share/vulkan/icd.d/"*.json "$icd_dir/"
 
   rm -rf "$build_dir"
-  success "KosmicKrisp built and installed"
+  success "KosmicKrisp built and installed to $install_dir"
 }
 
 ensure_vulkan() {
