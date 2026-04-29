@@ -148,7 +148,7 @@ main() {
   tar xf "$filename"
   cd "vllm-$vllm_v"
 
-  uv pip install -r requirements/cpu.txt --index-strategy unsafe-best-match
+  uv pip install -r requirements/cpu.txt --index-strategy unsafe-best-match --extra-index-url=https://download.pytorch.org/whl/cpu
   CXXFLAGS="-Wno-parentheses" uv pip install .
   cd -
   rm -rf "vllm-$vllm_v"*
