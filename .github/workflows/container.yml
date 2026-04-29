@@ -6,7 +6,7 @@ on:
 
 jobs:
   build-and-push:
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-25.10
     permissions:
       contents: read
       packages: write

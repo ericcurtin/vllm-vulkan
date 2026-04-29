@@ -184,9 +184,7 @@ ensure_vulkan() {
     if ! find /usr/lib /usr/lib64 /usr/local/lib -name "libvulkan.so" 2>/dev/null | grep -q .; then
       need_vulkan=1
     fi
-    # Check for a sufficiently new glslangValidator — GL_EXT_integer_dot_product
-    # requires version 16.0+. Ubuntu 24.04's glslang-tools ships 15.1.0 which
-    # lacks it, so we need the LunarG SDK version.
+
     if ! command -v glslangValidator &>/dev/null; then
       need_glslang=1
     else
@@ -207,40 +205,9 @@ ensure_vulkan() {
       if [ "$need_vulkan" -eq 1 ]; then
         sudo apt-get install -y libvulkan-dev
       fi
+
       if [ "$need_glslang" -eq 1 ]; then
-        # Ubuntu's glslang-tools (15.1.0) lacks GL_EXT_integer_dot_product.
-        # Install glslang from the Vulkan SDK apt repo (LunarG) which ships 16+.
-        local codename
-        # shellcheck disable=SC1091
-        codename="$(. /etc/os-release && echo "${UBUNTU_CODENAME:-noble}")"
-        local lunarg_key="/etc/apt/trusted.gpg.d/lunarg.asc"
-        local lunarg_list="/etc/apt/sources.list.d/lunarg-vulkan.list"
-        wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc \
-          | sudo tee "${lunarg_key}" > /dev/null
-        echo "deb https://packages.lunarg.com/vulkan ${codename} main" \
-          | sudo tee "${lunarg_list}" > /dev/null
-        sudo apt-get update -qq
-        # Force install the LunarG version even if Ubuntu's version sorts higher.
-        # LunarG's 15.3.0~rc1 has dotPacked4x8EXT (GL_EXT_integer_dot_product)
-        # support; Ubuntu 24.04's glslang-tools 15.1.0 does not.
-        # Find the first lunarg version of glslang-tools in the apt version table.
-        # apt-cache policy shows versions like "     15.3.0~rc1-1lunarg24.04-1 500"
-        # followed by a line with the repo URL containing "lunarg".
-        # We look for version lines (matching a version pattern) that appear
-        # immediately before a lunarg URL line.
-        # Extract the lunarg version from the apt version table.
-        # Version table lines look like "     15.3.0~rc1-1lunarg24.04-1 500"
-        # (leading spaces, version, priority). We grep for lines starting with
-        # whitespace followed by a version number containing "lunarg".
-        local lunarg_ver=""
-        lunarg_ver="$(apt-cache policy glslang-tools 2>/dev/null \
-          | grep -E '^\s+[0-9]+\.[0-9]+.*lunarg' | head -1 \
-          | sed 's/^[[:space:]]*//' | cut -d' ' -f1 || true)"
-        if [ -n "${lunarg_ver}" ]; then
-          sudo apt-get install -y "glslang-tools=${lunarg_ver}"
-        else
-          sudo apt-get install -y glslang-tools
-        fi
+        sudo apt-get install -y glslang-tools
       fi
     fi
   fi
