@@ -4,15 +4,14 @@
 //! Platform routing:
 //!   macOS (aarch64 / x86_64) — link against libvulkan.dylib installed by
 //!     KosmicKrisp (Mesa/Zink software Vulkan driver for macOS).
-//!     KosmicKrisp provides a standard libvulkan.dylib loader.
 //!
 //!   Linux (x86_64 / aarch64) — link against the system libvulkan.so loader
-//!     installed via libvulkan-dev (Debian/Ubuntu) or vulkan-loader-devel
-//!     (Fedora/RHEL).
+//!     installed via libvulkan-dev (Debian/Ubuntu).
 
 use std::env;
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -26,7 +25,7 @@ fn main() {
         other => {
             println!(
                 "cargo:warning=vllm-vulkan: unsupported target OS '{other}'. \
-                 Only macOS (via KosmicKrisp) and Linux are supported."
+                 Only macOS and Linux are supported."
             );
         }
     }
@@ -39,37 +38,79 @@ fn main() {
 fn compile_shaders() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let out_dir = env::var("OUT_DIR").unwrap();
-    let shader_dir = Path::new(&manifest_dir).join("shaders");
-    let spirv_dir = shader_dir.join("spirv");
+    let spirv_src = Path::new(&manifest_dir).join("shaders").join("spirv");
+    let out_spirv = Path::new(&out_dir).join("spirv");
 
-    // If pre-compiled SPIR-V files already exist in shaders/spirv/, just copy
-    // them to OUT_DIR so include_bytes! can find them.
-    if spirv_dir.exists() && spirv_dir.read_dir().map(|mut d| d.next().is_some()).unwrap_or(false) {
-        let out_spirv = Path::new(&out_dir).join("spirv");
-        fs::create_dir_all(&out_spirv).ok();
-        for entry in fs::read_dir(&spirv_dir).unwrap().flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("spv") {
-                let dst = out_spirv.join(path.file_name().unwrap());
-                if !dst.exists() {
-                    fs::copy(&path, &dst).ok();
-                }
-            }
-        }
-        println!("cargo:warning=vllm-vulkan: using pre-compiled SPIR-V from shaders/spirv/");
+    fs::create_dir_all(&out_spirv).expect("failed to create OUT_DIR/spirv");
+
+    // Count already-compiled .spv files in OUT_DIR (incremental rebuild).
+    let compiled: Vec<_> = fs::read_dir(&out_spirv)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| {
+                    e.path().extension().and_then(|x| x.to_str()) == Some("spv")
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if !compiled.is_empty() {
+        println!(
+            "cargo:warning=vllm-vulkan: {} SPIR-V shaders already in OUT_DIR, skipping compilation",
+            compiled.len()
+        );
         return;
     }
 
-    // No pre-compiled shaders found; try to compile them on the fly.
-    println!("cargo:warning=vllm-vulkan: pre-compiled SPIR-V not found; skipping shader compilation. Run scripts/compile_shaders.sh to build them.");
+    // Run compile_shaders.sh to build the .spv files into OUT_DIR/spirv.
+    let compile_script = Path::new(&manifest_dir)
+        .join("scripts")
+        .join("compile_shaders.sh");
+
+    println!("cargo:warning=vllm-vulkan: compiling SPIR-V shaders...");
+
+    let status = Command::new("bash")
+        .arg(&compile_script)
+        .arg(&out_spirv)
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            let count = fs::read_dir(&out_spirv)
+                .map(|rd| rd.flatten().count())
+                .unwrap_or(0);
+            println!("cargo:warning=vllm-vulkan: compiled {count} SPIR-V shaders");
+        }
+        Ok(s) => {
+            panic!(
+                "compile_shaders.sh failed with exit code {s}.\n\
+                 Install glslangValidator:\n\
+                   Ubuntu/Debian: sudo apt-get install -y glslang-tools\n\
+                   macOS:         brew install glslang"
+            );
+        }
+        Err(e) => {
+            panic!("failed to run compile_shaders.sh: {e}");
+        }
+    }
+
+    // Also copy to shaders/spirv/ so they're available for subsequent builds
+    // without re-running the shader compiler.
+    fs::create_dir_all(&spirv_src).ok();
+    for entry in fs::read_dir(&out_spirv).unwrap().flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("spv") {
+            let dst = spirv_src.join(path.file_name().unwrap());
+            if !dst.exists() {
+                fs::copy(&path, &dst).ok();
+            }
+        }
+    }
 }
 
 // ─── macOS ────────────────────────────────────────────────────────────────────
 
 fn link_macos() {
-    // Probe standard locations for libvulkan.dylib:
-    //   /opt/homebrew/lib — Homebrew vulkan-loader (CI / dev builds)
-    //   /usr/local/lib    — KosmicKrisp end-user install (install.sh)
     let search_paths = ["/opt/homebrew/lib", "/usr/local/lib"];
 
     let mut linked = false;
@@ -87,11 +128,9 @@ fn link_macos() {
             "cargo:warning=libvulkan.dylib not found. \
              Install KosmicKrisp: curl -fsSL https://raw.githubusercontent.com/ericcurtin/vllm-vulkan/main/install.sh | bash"
         );
-        // Attempt to link anyway; the linker error will be descriptive.
         println!("cargo:rustc-link-lib=dylib=vulkan");
     }
 
-    // Metal and related frameworks required by the Vulkan loader on macOS.
     println!("cargo:rustc-link-lib=framework=Metal");
     println!("cargo:rustc-link-lib=framework=Foundation");
     println!("cargo:rustc-link-lib=framework=QuartzCore");
@@ -109,9 +148,9 @@ fn link_linux() {
         "/usr/local/lib",
     ];
 
-    let found = search_paths.iter().any(|dir| {
-        Path::new(dir).join("libvulkan.so").exists()
-    });
+    let found = search_paths
+        .iter()
+        .any(|dir| Path::new(dir).join("libvulkan.so").exists());
 
     if !found {
         println!(
@@ -120,7 +159,6 @@ fn link_linux() {
         );
     }
 
-    // Add search paths so the linker finds libvulkan.so
     for dir in &search_paths {
         if Path::new(dir).exists() {
             println!("cargo:rustc-link-search=native={dir}");

@@ -202,13 +202,14 @@ class VulkanPlatform(Platform):
                 kv_gb = float(kv_env)
             else:
                 import psutil as _psutil  # noqa: PLC0415
-                total_ram_gb = _psutil.virtual_memory().total / (1024 ** 3)
+
+                total_ram_gb = _psutil.virtual_memory().total / (1024**3)
 
                 # Estimate model weight memory:
                 # bf16 weights (already loaded) + float32 Vulkan copies
-                model_params_b = sum(
-                    p.numel() for p in
-                    getattr(vllm_config, "model_config", None) and [] or []
+                _model_params_b = sum(
+                    p.numel()
+                    for p in getattr(vllm_config, "model_config", None) and [] or []
                 )
                 # Rough estimate: 6 bytes/param (2 bf16 + 4 f32)
                 # For E2B ~2B params: 12 GB; for 31B: ~186 GB
@@ -218,9 +219,7 @@ class VulkanPlatform(Platform):
                 # 115GB total - 4 - 10 - 4 = ~97GB, but use conservative 8GB
                 kv_gb = max(4.0, min(total_ram_gb * 0.07, 8.0))  # cap at 8 GB
             cache_config.cpu_kvcache_space_bytes = int(kv_gb * 1024**3)
-            logger.info(
-                "Vulkan/CPU KV cache space: %.1f GB", kv_gb
-            )
+            logger.info("Vulkan/CPU KV cache space: %.1f GB", kv_gb)
 
         if model_config is not None:
             model_config.disable_cascade_attn = True
@@ -237,25 +236,40 @@ class VulkanPlatform(Platform):
                 # Each token needs (num_layers × num_kv_heads × head_dim × 2 × dtype_bytes)
                 # bytes for key + value.
                 try:
-                    text_cfg = getattr(model_config.hf_config, "text_config", None) or model_config.hf_config
+                    text_cfg = (
+                        getattr(model_config.hf_config, "text_config", None)
+                        or model_config.hf_config
+                    )
                     num_layers = getattr(text_cfg, "num_hidden_layers", None) or 60
                     num_kv_heads = getattr(text_cfg, "num_key_value_heads", None) or 16
                     head_dim = getattr(text_cfg, "head_dim", None) or 256
                     # bfloat16 = 2 bytes
-                    dtype_bytes = 2 if model_config.dtype in ("bfloat16", "float16") else 4
-                    bytes_per_token = num_layers * num_kv_heads * head_dim * 2 * dtype_bytes
+                    dtype_bytes = (
+                        2 if model_config.dtype in ("bfloat16", "float16") else 4
+                    )
+                    bytes_per_token = (
+                        num_layers * num_kv_heads * head_dim * 2 * dtype_bytes
+                    )
                     # Also account for global heads if heterogeneous
                     global_head_dim = getattr(text_cfg, "global_head_dim", None)
-                    num_global_kv_heads = getattr(text_cfg, "num_global_key_value_heads", None)
+                    num_global_kv_heads = getattr(
+                        text_cfg, "num_global_key_value_heads", None
+                    )
                     layer_types = getattr(text_cfg, "layer_types", None)
                     if global_head_dim and num_global_kv_heads and layer_types:
                         n_sliding = sum(1 for lt in layer_types if "sliding" in lt)
                         n_full = sum(1 for lt in layer_types if "full" in lt)
                         bytes_per_token = (
-                            n_sliding * num_kv_heads * head_dim * 2 * dtype_bytes +
-                            n_full * num_global_kv_heads * global_head_dim * 2 * dtype_bytes
+                            n_sliding * num_kv_heads * head_dim * 2 * dtype_bytes
+                            + n_full
+                            * num_global_kv_heads
+                            * global_head_dim
+                            * 2
+                            * dtype_bytes
                         )
-                    max_tokens_in_kv = int(cache_config.cpu_kvcache_space_bytes / bytes_per_token)
+                    max_tokens_in_kv = int(
+                        cache_config.cpu_kvcache_space_bytes / bytes_per_token
+                    )
                     if max_tokens_in_kv < model_config.max_model_len:
                         # Leave 20% headroom and cap at a multiple of block_size
                         safe_max = int(max_tokens_in_kv * 0.9)
@@ -276,7 +290,10 @@ class VulkanPlatform(Platform):
         # Async scheduling requires CUDA streams (torch.cuda.current_stream) and
         # is not compatible with the CPU/Vulkan backend.  Disable it explicitly.
         scheduler_config = vllm_config.scheduler_config
-        if scheduler_config is not None and getattr(scheduler_config, "async_scheduling", None) is not False:
+        if (
+            scheduler_config is not None
+            and getattr(scheduler_config, "async_scheduling", None) is not False
+        ):
             scheduler_config.async_scheduling = False
 
         # The Vulkan/CPU backend uses eager (non-compiled) execution by default.
@@ -287,7 +304,11 @@ class VulkanPlatform(Platform):
         allow_compile = os.environ.get("VLLM_VULKAN_ALLOW_COMPILE", "0") == "1"
         compilation_config = vllm_config.compilation_config
         if not allow_compile:
-            from vllm.config.compilation import CompilationMode, CUDAGraphMode  # noqa: PLC0415
+            from vllm.config.compilation import (  # noqa: PLC0415
+                CompilationMode,
+                CUDAGraphMode,
+            )
+
             if compilation_config.mode != CompilationMode.NONE:
                 logger.info(
                     "Vulkan/CPU platform: disabling torch.compile (eager mode). "
@@ -327,6 +348,7 @@ class VulkanPlatform(Platform):
         """Return True if the vllm._C compiled extension is loadable."""
         try:
             import vllm._C  # noqa: F401
+
             return True
         except (ImportError, ModuleNotFoundError):
             return False

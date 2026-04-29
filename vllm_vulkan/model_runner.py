@@ -4,14 +4,13 @@
 Two modes:
   1. VLLM_VULKAN_RUST_MODEL=1 (default): Use the Rust VulkanModel for the
      forward pass. Much faster than mode 2 due to batched GPU dispatch.
-     
+
   2. VLLM_VULKAN_RUST_MODEL=0: Patch individual PyTorch modules (RMSNorm,
      Linear) to dispatch to Vulkan via Python. Slower but useful for debugging.
 """
 
 import logging
 import os
-from typing import Any
 
 import torch
 import torch.nn as nn
@@ -26,8 +25,9 @@ class VulkanWorker:
     """CPUWorker subclass that uses our Rust VulkanModel for GPU inference."""
 
     def __new__(cls, vllm_config, device):
-        from vllm.v1.worker.cpu_worker import CPUWorker  # noqa: PLC0415
         import types  # noqa: PLC0415
+
+        from vllm.v1.worker.cpu_worker import CPUWorker  # noqa: PLC0415
 
         worker = CPUWorker.__new__(CPUWorker)
         CPUWorker.__init__(worker, vllm_config, device)
@@ -40,11 +40,12 @@ class VulkanWorker:
 
 def _safe_init_device(self) -> None:
     """Same as CPUWorker.init_device but skips the vllm._C call."""
-    from vllm.platforms import CpuArchEnum, current_platform  # noqa: PLC0415
-    from vllm.utils.torch_utils import set_random_seed  # noqa: PLC0415
-    from vllm import envs  # noqa: PLC0415
     import platform  # noqa: PLC0415
     import sys  # noqa: PLC0415
+
+    from vllm import envs  # noqa: PLC0415
+    from vllm.platforms import CpuArchEnum, current_platform  # noqa: PLC0415
+    from vllm.utils.torch_utils import set_random_seed  # noqa: PLC0415
 
     def check_preloaded_libs(name: str) -> None:
         if name not in os.environ.get("LD_PRELOAD", ""):
@@ -60,7 +61,8 @@ def _safe_init_device(self) -> None:
         cpu_arch = current_platform.get_cpu_architecture()
         if cpu_arch in (CpuArchEnum.POWERPC, CpuArchEnum.S390X):
             self.local_omp_cpuid = self._get_autobind_cpu_ids(
-                lambda cpus: [cpu for cpu in cpus if cpu.id % 8 < 4])
+                lambda cpus: [cpu for cpu in cpus if cpu.id % 8 < 4]
+            )
         elif cpu_arch == CpuArchEnum.X86:
             self.local_omp_cpuid = self._get_autobind_cpu_ids(lambda cpus: cpus[-1:])
         elif cpu_arch == CpuArchEnum.ARM:
@@ -75,7 +77,8 @@ def _safe_init_device(self) -> None:
         if local_dp_rank is not None:
             world_size = self.parallel_config.world_size
             omp_cpuids_list = omp_cpuids_list[
-                local_dp_rank * world_size:(local_dp_rank + 1) * world_size]
+                local_dp_rank * world_size : (local_dp_rank + 1) * world_size
+            ]
         self.local_omp_cpuid = omp_cpuids_list[self.rank]
 
     if self.local_omp_cpuid != "nobind":
@@ -85,25 +88,36 @@ def _safe_init_device(self) -> None:
             logger.info("vllm._C not available; skipping CPU thread-affinity binding.")
 
     def skip_set_num_threads(x: int) -> None:
-        logger.warning("CPU backend doesn't allow `torch.set_num_threads` after binding.")
+        logger.warning(
+            "CPU backend doesn't allow `torch.set_num_threads` after binding."
+        )
+
     torch.set_num_threads = skip_set_num_threads
 
     os.environ["VLLM_DIST_IDENT"] = self.distributed_init_method.split(":")[-1]
 
-    from vllm.v1.worker.gpu_worker import init_worker_distributed_environment  # noqa: PLC0415
-    init_worker_distributed_environment(
-        self.vllm_config, self.rank, self.distributed_init_method,
-        self.local_rank, current_platform.dist_backend)
+    from vllm.v1.worker.gpu_worker import (
+        init_worker_distributed_environment,  # noqa: PLC0415
+    )
 
-    from vllm.utils.torch_utils import set_random_seed  # noqa: PLC0415
+    init_worker_distributed_environment(
+        self.vllm_config,
+        self.rank,
+        self.distributed_init_method,
+        self.local_rank,
+        current_platform.dist_backend,
+    )
+
     set_random_seed(self.model_config.seed)
 
     # Model runner: use our Rust-native runner if enabled.
     if _USE_RUST_MODEL:
         from vllm_vulkan.model_runner import _VulkanCPUModelRunner  # noqa: PLC0415
+
         self.model_runner = _VulkanCPUModelRunner(self.vllm_config, torch.device("cpu"))
     else:
         from vllm.v1.worker.cpu_model_runner import CPUModelRunner  # noqa: PLC0415
+
         self.model_runner = CPUModelRunner(self.vllm_config, torch.device("cpu"))
 
 
@@ -117,6 +131,7 @@ class _VulkanCPUModelRunner:
 
     def __init__(self, vllm_config, device):
         from vllm.v1.worker.cpu_model_runner import CPUModelRunner  # noqa: PLC0415
+
         self._runner = CPUModelRunner(vllm_config, device)
         self._rust_model = None
         self._vllm_config = vllm_config
@@ -135,7 +150,8 @@ class _VulkanCPUModelRunner:
             self._rust_model = _load_rust_vulkan_model(self._vllm_config)
             if self._rust_model is not None:
                 _patch_model_with_rust_forward(
-                    self._runner.model, self._rust_model, self._vllm_config)
+                    self._runner.model, self._rust_model, self._vllm_config
+                )
                 logger.info("Rust VulkanModel patched into PyTorch model forward.")
         except Exception as exc:
             logger.warning("Failed to load Rust VulkanModel: %s", exc)
@@ -167,9 +183,12 @@ def _load_rust_vulkan_model(vllm_config):
     model_name = vllm_config.model_config.model
     try:
         import huggingface_hub  # noqa: PLC0415
+
         local_dir = huggingface_hub.snapshot_download(
-            model_name, local_files_only=True, ignore_patterns=["*.bin", "*.gguf"])
+            model_name, local_files_only=True, ignore_patterns=["*.bin", "*.gguf"]
+        )
         import glob  # noqa: PLC0415
+
         st_files = sorted(glob.glob(f"{local_dir}/*.safetensors"))
     except Exception:
         st_files = []
@@ -183,8 +202,11 @@ def _load_rust_vulkan_model(vllm_config):
     logger.info("Loading Rust VulkanModel from %s (max_seq=%d)", st_path, max_seq)
 
     rust_model = VulkanModel(st_path, max_seq_len=max_seq, device_idx=0)
-    logger.info("Rust VulkanModel: %d layers, GPU=%s",
-                rust_model.num_layers(), rust_model.has_gpu())
+    logger.info(
+        "Rust VulkanModel: %d layers, GPU=%s",
+        rust_model.num_layers(),
+        rust_model.has_gpu(),
+    )
     return rust_model
 
 
@@ -207,18 +229,26 @@ def _patch_model_with_rust_forward(pytorch_model, rust_model, vllm_config):
 def _apply_module_hooks(model: nn.Module, rust_model) -> None:
     """Apply Vulkan dispatch hooks to RMSNorm and Linear modules."""
     counts = {"rms_norm": 0, "linear": 0}
-    for name, module in model.named_modules():
+    for _name, module in model.named_modules():
         cls_name = type(module).__name__
         if cls_name == "RMSNorm":
             _wrap_rms_norm(module)
             counts["rms_norm"] += 1
-        elif cls_name in ("Linear", "RowParallelLinear", "ColumnParallelLinear",
-                          "QKVParallelLinear", "MergedColumnParallelLinear",
-                          "ReplicatedLinear"):
+        elif cls_name in (
+            "Linear",
+            "RowParallelLinear",
+            "ColumnParallelLinear",
+            "QKVParallelLinear",
+            "MergedColumnParallelLinear",
+            "ReplicatedLinear",
+        ):
             _wrap_linear(module)
             counts["linear"] += 1
-    logger.info("Patched: %d RMSNorm, %d Linear modules for Vulkan dispatch.",
-                counts["rms_norm"], counts["linear"])
+    logger.info(
+        "Patched: %d RMSNorm, %d Linear modules for Vulkan dispatch.",
+        counts["rms_norm"],
+        counts["linear"],
+    )
 
     # Pre-upload all weights to GPU.
     try:
@@ -277,18 +307,26 @@ def _wrap_rms_norm(module: nn.Module) -> None:
 
 def _wrap_linear(module: nn.Module) -> None:
     orig = module.forward
-    _returns_tuple = getattr(module, "return_bias", False) or getattr(module, "skip_bias_add", False)
+    _returns_tuple = getattr(module, "return_bias", False) or getattr(
+        module, "skip_bias_add", False
+    )
 
     def vk_forward(x: torch.Tensor, *args, **kwargs):
         from vllm_vulkan import vulkan_ops  # noqa: PLC0415
 
         if not vulkan_ops.is_ready() or args or kwargs:
             return orig(x, *args, **kwargs)
-        if os.environ.get("VLLM_VULKAN_DISABLE_OPS") or os.environ.get("VLLM_VULKAN_DISABLE_LINEAR"):
+        if os.environ.get("VLLM_VULKAN_DISABLE_OPS") or os.environ.get(
+            "VLLM_VULKAN_DISABLE_LINEAR"
+        ):
             return orig(x, *args, **kwargs)
 
         weight = getattr(module, "weight", None)
-        if weight is None or weight.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        if weight is None or weight.dtype not in (
+            torch.float32,
+            torch.float16,
+            torch.bfloat16,
+        ):
             return orig(x, *args, **kwargs)
 
         bias = getattr(module, "bias", None)
@@ -300,7 +338,9 @@ def _wrap_linear(module: nn.Module) -> None:
             return orig(x, *args, **kwargs)
 
         if _returns_tuple:
-            output_bias = module.bias if getattr(module, "skip_bias_add", False) else None
+            output_bias = (
+                module.bias if getattr(module, "skip_bias_add", False) else None
+            )
             return result, output_bias
         return result
 

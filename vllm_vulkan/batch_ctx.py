@@ -13,11 +13,7 @@ This gives us near-zero per-op submit overhead for sequences of compatible ops.
 from __future__ import annotations
 
 import logging
-import struct
 from typing import TYPE_CHECKING
-
-import torch
-import numpy as np
 
 if TYPE_CHECKING:
     from vllm_vulkan._rs import VulkanContext
@@ -31,7 +27,7 @@ MAX_PENDING = 128
 class BatchContext:
     """Accumulates Vulkan ops and flushes them in one vkQueueSubmit."""
 
-    def __init__(self, ctx: "VulkanContext") -> None:
+    def __init__(self, ctx: VulkanContext) -> None:
         self._ctx = ctx
         # Each entry: (shader, bindings, output_size, pc, workgroups, barrier_after)
         # output_sizes is a list for multi-output shaders
@@ -48,10 +44,14 @@ class BatchContext:
         push_constants: bytes,
         workgroups: tuple[int, int, int],
         barrier_after: bool = False,
-    ) -> "list[_OutputFuture]":
+    ) -> list[_OutputFuture]:
         """Add an op to the pending batch. Returns futures for each output."""
-        self._ops.append((shader, bindings, output_sizes, push_constants, workgroups, barrier_after))
-        futures = [_OutputFuture(self, len(self._ops) - 1, i) for i in range(len(output_sizes))]
+        self._ops.append(
+            (shader, bindings, output_sizes, push_constants, workgroups, barrier_after)
+        )
+        futures = [
+            _OutputFuture(self, len(self._ops) - 1, i) for i in range(len(output_sizes))
+        ]
         self._futures.append(futures)
         if len(self._ops) >= MAX_PENDING:
             self.flush()
@@ -63,8 +63,8 @@ class BatchContext:
             return
         results = self._ctx.execute_batch(self._ops)
         # Deliver results to futures.
-        for op_idx, (op_results, futures) in enumerate(zip(results, self._futures)):
-            for out_idx, (data_bytes, future) in enumerate(zip(op_results, futures)):
+        for op_results, futures in zip(results, self._futures, strict=False):
+            for data_bytes, future in zip(op_results, futures, strict=False):
                 future._data = data_bytes
         self._ops.clear()
         self._futures.clear()
@@ -75,6 +75,7 @@ class BatchContext:
 
 class _OutputFuture:
     """Handle to an output buffer that will be filled after flush()."""
+
     __slots__ = ("_ctx", "_op_idx", "_out_idx", "_data")
 
     def __init__(self, ctx: BatchContext, op_idx: int, out_idx: int) -> None:
@@ -87,14 +88,14 @@ class _OutputFuture:
 
 # ─── Global batch context (one per thread / worker) ──────────────────────────
 
-_batch_ctx: "BatchContext | None" = None
+_batch_ctx: BatchContext | None = None
 
 
-def get_batch_ctx() -> "BatchContext | None":
+def get_batch_ctx() -> BatchContext | None:
     return _batch_ctx
 
 
-def set_batch_ctx(ctx: "BatchContext") -> None:
+def set_batch_ctx(ctx: BatchContext) -> None:
     global _batch_ctx
     _batch_ctx = ctx
 

@@ -14,7 +14,6 @@ import platform
 import sys
 
 import torch
-
 from vllm.v1.worker.cpu_worker import CPUWorker
 
 logger = logging.getLogger(__name__)
@@ -31,11 +30,10 @@ class VulkanWorker(CPUWorker):
     """
 
     def init_device(self) -> None:  # type: ignore[override]
+        from vllm import envs
         from vllm.platforms import CpuArchEnum, current_platform
         from vllm.utils.torch_utils import set_random_seed
-        from vllm.v1.worker.cpu_model_runner import CPUModelRunner
         from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
-        from vllm import envs
 
         # ── library presence checks ───────────────────────────────────────
         def check_preloaded_libs(name: str) -> None:
@@ -68,9 +66,7 @@ class VulkanWorker(CPUWorker):
                     lambda cpus: cpus[-1:]
                 )
             elif cpu_arch == CpuArchEnum.ARM:
-                self.local_omp_cpuid = self._get_autobind_cpu_ids(
-                    lambda cpus: cpus
-                )
+                self.local_omp_cpuid = self._get_autobind_cpu_ids(lambda cpus: cpus)
             else:
                 self.local_omp_cpuid = "nobind"
         elif omp_cpuids == "nobind":
@@ -81,7 +77,7 @@ class VulkanWorker(CPUWorker):
             if local_dp_rank is not None:
                 world_size = self.parallel_config.world_size
                 omp_cpuids_list = omp_cpuids_list[
-                    local_dp_rank * world_size: (local_dp_rank + 1) * world_size
+                    local_dp_rank * world_size : (local_dp_rank + 1) * world_size
                 ]
             self.local_omp_cpuid = omp_cpuids_list[self.rank]
 
@@ -112,9 +108,7 @@ class VulkanWorker(CPUWorker):
         torch.set_num_threads = skip_set_num_threads
 
         # Unique identifier for creating allreduce shared memory.
-        os.environ["VLLM_DIST_IDENT"] = (
-            self.distributed_init_method.split(":")[-1]
-        )
+        os.environ["VLLM_DIST_IDENT"] = self.distributed_init_method.split(":")[-1]
 
         # Initialise the distributed environment.
         init_worker_distributed_environment(
@@ -131,6 +125,5 @@ class VulkanWorker(CPUWorker):
         # Construct the model runner.
         # _VulkanCPUModelRunner wraps CPUModelRunner and loads the Rust VulkanModel.
         from vllm_vulkan.model_runner import _VulkanCPUModelRunner  # noqa: PLC0415
-        self.model_runner = _VulkanCPUModelRunner(
-            self.vllm_config, torch.device("cpu")
-        )
+
+        self.model_runner = _VulkanCPUModelRunner(self.vllm_config, torch.device("cpu"))

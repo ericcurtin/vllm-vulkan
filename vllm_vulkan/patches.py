@@ -16,7 +16,7 @@ import logging
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    pass
+    import torch
 
 logger = logging.getLogger(__name__)
 
@@ -44,17 +44,17 @@ def apply_patches() -> None:
 def _pure_python_compute_slot_mapping(
     num_tokens: int,
     max_num_tokens: int,
-    query_start_loc: "torch.Tensor",  # [num_reqs + 1], int32
-    positions: "torch.Tensor",  # [num_tokens], int64
-    block_table: "torch.Tensor",  # [max_num_reqs, max_num_blocks_per_req], int32
+    query_start_loc: torch.Tensor,  # [num_reqs + 1], int32
+    positions: torch.Tensor,  # [num_tokens], int64
+    block_table: torch.Tensor,  # [max_num_reqs, max_num_blocks_per_req], int32
     block_table_stride: int,
     block_size: int,
-    slot_mapping: "torch.Tensor",  # [max_num_tokens], int64
-    TOTAL_CP_WORLD_SIZE: int = 1,
-    TOTAL_CP_RANK: int = 0,
-    CP_KV_CACHE_INTERLEAVE_SIZE: int = 1,
-    PAD_ID: int = -1,
-    BLOCK_SIZE: int = 1024,
+    slot_mapping: torch.Tensor,  # [max_num_tokens], int64
+    TOTAL_CP_WORLD_SIZE: int = 1,  # noqa: N803
+    TOTAL_CP_RANK: int = 0,  # noqa: N803
+    CP_KV_CACHE_INTERLEAVE_SIZE: int = 1,  # noqa: N803
+    PAD_ID: int = -1,  # noqa: N803
+    BLOCK_SIZE: int = 1024,  # noqa: N803
 ) -> None:
     """Pure-PyTorch implementation of ``vllm._C.compute_slot_mapping_kernel_impl``.
 
@@ -68,8 +68,6 @@ def _pure_python_compute_slot_mapping(
     consistent with the original C++ implementation.
     """
     assert TOTAL_CP_WORLD_SIZE == 1, "Context Parallelism is not supported on CPU."
-
-    import torch  # noqa: PLC0415
 
     num_reqs = query_start_loc.shape[0] - 1
 
@@ -110,6 +108,7 @@ def _patch_cpu_triton_utils() -> None:
     """Monkey-patch ``vllm.utils.cpu_triton_utils`` if ``vllm._C`` is absent."""
     try:
         import vllm._C  # noqa: PLC0415, F401
+
         # If we reach here, the C extension IS available — no patch needed.
         return
     except (ImportError, ModuleNotFoundError):
@@ -132,6 +131,7 @@ def _patch_cpu_triton_utils() -> None:
     # Also patch the reference inside block_table if already imported
     try:
         import vllm.v1.worker.block_table as _bt  # noqa: PLC0415
+
         if hasattr(_bt, "_compute_slot_mapping_kernel"):
             _bt._compute_slot_mapping_kernel = _cpu_utils.compute_slot_mapping_kernel
     except ImportError:

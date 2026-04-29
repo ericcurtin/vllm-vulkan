@@ -15,15 +15,12 @@ API:
 """
 
 import argparse
-import json
-import time
-import uuid
-import os
 import glob
 import logging
-from typing import Optional
+import os
+import time
+import uuid
 
-import torch
 from transformers import AutoTokenizer
 
 logger = logging.getLogger(__name__)
@@ -40,6 +37,7 @@ def find_safetensors(model_name_or_path: str) -> str:
     # Try HuggingFace cache
     try:
         import huggingface_hub
+
         local_dir = huggingface_hub.snapshot_download(
             model_name_or_path,
             local_files_only=True,
@@ -59,16 +57,18 @@ def greedy_sample(logits: list[float]) -> int:
     return max(range(len(logits)), key=lambda i: logits[i])
 
 
-def temperature_sample(logits: list[float], temperature: float = 1.0,
-                       top_p: float = 1.0, top_k: int = 64) -> int:
+def temperature_sample(
+    logits: list[float], temperature: float = 1.0, top_p: float = 1.0, top_k: int = 64
+) -> int:
     """Sample from logits with temperature, top-p, and top-k filtering."""
-    import math, random
+    import math
+    import random
 
     if temperature == 0.0:
         return greedy_sample(logits)
 
     # Apply temperature
-    scaled = [l / temperature for l in logits]
+    scaled = [v / temperature for v in logits]
 
     # Softmax
     max_l = max(scaled)
@@ -79,7 +79,9 @@ def temperature_sample(logits: list[float], temperature: float = 1.0,
     # Top-k filtering
     if top_k > 0:
         top_k = min(top_k, len(probs))
-        top_k_indices = sorted(range(len(probs)), key=lambda i: probs[i], reverse=True)[:top_k]
+        top_k_indices = sorted(range(len(probs)), key=lambda i: probs[i], reverse=True)[
+            :top_k
+        ]
         top_k_probs = [probs[i] for i in top_k_indices]
         total_k = sum(top_k_probs)
         top_k_probs = [p / total_k for p in top_k_probs]
@@ -88,8 +90,9 @@ def temperature_sample(logits: list[float], temperature: float = 1.0,
         top_k_probs = probs
 
     # Top-p (nucleus) filtering
-    sorted_indices = sorted(range(len(top_k_probs)),
-                             key=lambda i: top_k_probs[i], reverse=True)
+    sorted_indices = sorted(
+        range(len(top_k_probs)), key=lambda i: top_k_probs[i], reverse=True
+    )
     cumsum = 0.0
     nucleus = []
     for idx in sorted_indices:
@@ -105,7 +108,7 @@ def temperature_sample(logits: list[float], temperature: float = 1.0,
     # Sample
     r = random.random()
     cumsum = 0.0
-    for i, p in zip(nucleus, nucleus_probs):
+    for i, p in zip(nucleus, nucleus_probs, strict=False):
         cumsum += p
         if r <= cumsum:
             return top_k_indices[i]
@@ -127,7 +130,8 @@ def generate(
     """
     # Format prompt using the tokenizer's chat template.
     prompt = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True)
+        messages, tokenize=False, add_generation_prompt=True
+    )
     input_ids = tokenizer.encode(prompt, return_tensors="pt")[0].tolist()
 
     # Reset and prefill KV cache.
@@ -144,7 +148,7 @@ def generate(
         next_token = temperature_sample(logits, temperature, top_p, top_k)
 
     # Decode: generate new tokens.
-    generated_ids = []
+    generated_ids: list[int] = []
     pos = len(input_ids)
     eos_token_id = tokenizer.eos_token_id
     stop_tokens = {eos_token_id, 106}  # 106 = <end_of_turn> in Gemma
@@ -172,9 +176,10 @@ def generate(
 
 def make_app(model_name: str, model, tokenizer):
     """Create the FastAPI application."""
+    import asyncio
+
     from fastapi import FastAPI
     from fastapi.responses import JSONResponse
-    import asyncio
 
     app = FastAPI(title="vllm-vulkan API server")
 
@@ -186,12 +191,14 @@ def make_app(model_name: str, model, tokenizer):
     async def list_models():
         return {
             "object": "list",
-            "data": [{
-                "id": model_name,
-                "object": "model",
-                "created": int(time.time()),
-                "owned_by": "vllm-vulkan",
-            }]
+            "data": [
+                {
+                    "id": model_name,
+                    "object": "model",
+                    "created": int(time.time()),
+                    "owned_by": "vllm-vulkan",
+                }
+            ],
         }
 
     @app.post("/v1/chat/completions")
@@ -206,25 +213,29 @@ def make_app(model_name: str, model, tokenizer):
             t0 = time.perf_counter()
             text, n_prompt, n_gen = await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: generate(model, tokenizer, messages, max_tokens,
-                                  temperature, top_p, top_k)
+                lambda: generate(
+                    model, tokenizer, messages, max_tokens, temperature, top_p, top_k
+                ),
             )
             elapsed = time.perf_counter() - t0
             tok_per_sec = n_gen / elapsed if elapsed > 0 else 0
 
-            logger.info("Generated %d tokens in %.1fs = %.1f tok/s",
-                        n_gen, elapsed, tok_per_sec)
+            logger.info(
+                "Generated %d tokens in %.1fs = %.1f tok/s", n_gen, elapsed, tok_per_sec
+            )
 
             return {
                 "id": f"chatcmpl-{uuid.uuid4().hex[:16]}",
                 "object": "chat.completion",
                 "created": int(time.time()),
                 "model": model_name,
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": text},
-                    "finish_reason": "stop",
-                }],
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": text},
+                        "finish_reason": "stop",
+                    }
+                ],
                 "usage": {
                     "prompt_tokens": n_prompt,
                     "completion_tokens": n_gen,
@@ -235,15 +246,16 @@ def make_app(model_name: str, model, tokenizer):
             logger.exception("Error in chat completion")
             return JSONResponse(
                 status_code=500,
-                content={"error": {"message": str(e), "type": "InternalServerError"}}
+                content={"error": {"message": str(e), "type": "InternalServerError"}},
             )
 
     return app
 
 
 def main():
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s [%(levelname)s] %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+    )
 
     parser = argparse.ArgumentParser(description="vllm-vulkan standalone server")
     parser.add_argument("model", help="Model name or path (e.g. google/gemma-4-E2B-it)")
@@ -262,13 +274,19 @@ def main():
     logger.info("Loading VulkanModel from %s...", st_path)
 
     from vllm_vulkan._rs import VulkanModel
+
     t0 = time.perf_counter()
-    model = VulkanModel(st_path, max_seq_len=args.max_seq_len,
-                        device_idx=args.device_idx)
+    model = VulkanModel(
+        st_path, max_seq_len=args.max_seq_len, device_idx=args.device_idx
+    )
     elapsed = time.perf_counter() - t0
 
-    logger.info("Model loaded in %.1fs: %d layers, GPU=%s",
-                elapsed, model.num_layers(), model.has_gpu())
+    logger.info(
+        "Model loaded in %.1fs: %d layers, GPU=%s",
+        elapsed,
+        model.num_layers(),
+        model.has_gpu(),
+    )
 
     # Quick test.
     logger.info("Running test forward pass...")
@@ -279,6 +297,7 @@ def main():
 
     # Start server.
     import uvicorn
+
     app = make_app(args.model, model, tokenizer)
     logger.info("Starting server on %s:%d", args.host, args.port)
     uvicorn.run(app, host=args.host, port=args.port)
