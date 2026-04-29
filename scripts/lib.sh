@@ -158,27 +158,88 @@ install_kosmickrisp() {
 }
 
 ensure_vulkan() {
-  # Install the Vulkan headers/loader needed to compile the Rust extension.
+  # Install the Vulkan headers/loader and GLSL shader compiler needed to build.
   # Must be called before maturin/cargo runs (i.e. before install_dev_deps).
   #
-  # On macOS: install vulkan-headers + vulkan-loader via Homebrew. This is
-  # fast and sufficient for compilation. The full KosmicKrisp runtime driver
-  # is only needed at runtime and is installed separately by install.sh.
-  # On Linux: we check for the unversioned linker stub (libvulkan.so) rather
-  # than the runtime library (libvulkan.so.1), because the linker needs
-  # -lvulkan which resolves via the unversioned symlink in the -dev package.
+  # On macOS: vulkan-headers + vulkan-loader + glslang (provides glslangValidator)
+  # On Linux: libvulkan-dev + glslang-tools (provides glslangValidator)
   if is_macos; then
+    local brew_pkgs=()
     if ! brew list vulkan-loader &>/dev/null 2>&1; then
-      section "Installing Vulkan headers and loader (macOS)"
-      brew install vulkan-headers vulkan-loader
+      brew_pkgs+=(vulkan-headers vulkan-loader)
+    fi
+    if ! command -v glslangValidator &>/dev/null; then
+      brew_pkgs+=(glslang)
+    fi
+    if [ ${#brew_pkgs[@]} -gt 0 ]; then
+      section "Installing Vulkan tools (macOS): ${brew_pkgs[*]}"
+      brew install "${brew_pkgs[@]}"
     fi
   else
+    local need_vulkan=0
+    local need_glslang=0
+
     # Ubuntu 24.04 ships libvulkan1 (runtime) by default, but the linker needs
     # libvulkan.so (the unversioned symlink) from libvulkan-dev.
     if ! find /usr/lib /usr/lib64 /usr/local/lib -name "libvulkan.so" 2>/dev/null | grep -q .; then
-      section "Installing Vulkan dev headers (Linux)"
+      need_vulkan=1
+    fi
+    # Check for a sufficiently new glslangValidator — GL_EXT_integer_dot_product
+    # requires version 16.0+. Ubuntu 24.04's glslang-tools ships 15.1.0 which
+    # lacks it, so we need the LunarG SDK version.
+    if ! command -v glslangValidator &>/dev/null; then
+      need_glslang=1
+    else
+      local glslang_ver_str
+      glslang_ver_str="$(glslangValidator --version 2>&1 | head -1)"
+      # Version string: "Glslang Version: 11:15.1.0" — extract the major number
+      local glslang_major
+      glslang_major="$(echo "${glslang_ver_str}" | sed 's/.*:\([0-9]*\)\..*/\1/')"
+      if [ "${glslang_major:-0}" -lt 16 ] 2>/dev/null; then
+        need_glslang=1
+      fi
+    fi
+
+    if [ "$need_vulkan" -eq 1 ] || [ "$need_glslang" -eq 1 ]; then
+      section "Installing Vulkan tools (Linux)"
       sudo apt-get update -qq
-      sudo apt-get install -y libvulkan-dev
+      if [ "$need_vulkan" -eq 1 ]; then
+        sudo apt-get install -y libvulkan-dev
+      fi
+      if [ "$need_glslang" -eq 1 ]; then
+        # Ubuntu's glslang-tools (15.1.0) lacks GL_EXT_integer_dot_product.
+        # Install glslang from the Vulkan SDK apt repo (LunarG) which ships 16+.
+        local codename
+        codename="$(. /etc/os-release && echo "${UBUNTU_CODENAME:-noble}")"
+        local lunarg_key="/etc/apt/trusted.gpg.d/lunarg.asc"
+        local lunarg_list="/etc/apt/sources.list.d/lunarg-vulkan.list"
+        wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc \
+          | sudo tee "${lunarg_key}" > /dev/null
+        echo "deb https://packages.lunarg.com/vulkan ${codename} main" \
+          | sudo tee "${lunarg_list}" > /dev/null
+        sudo apt-get update -qq
+        # Force install the LunarG version even if Ubuntu's version sorts higher.
+        # LunarG's 15.3.0~rc1 has dotPacked4x8EXT (GL_EXT_integer_dot_product)
+        # support; Ubuntu 24.04's glslang-tools 15.1.0 does not.
+        # Find the first lunarg version of glslang-tools in the apt version table.
+        # apt-cache policy shows versions like "     15.3.0~rc1-1lunarg24.04-1 500"
+        # followed by a line with the repo URL containing "lunarg".
+        # We look for version lines (matching a version pattern) that appear
+        # immediately before a lunarg URL line.
+        # Extract the lunarg version from the apt version table.
+        # Version table lines look like "     15.3.0~rc1-1lunarg24.04-1 500"
+        # (leading spaces, version, priority). We grep for lines starting with
+        # whitespace followed by a version number containing "lunarg".
+        local lunarg_ver=""
+        lunarg_ver="$(apt-cache policy glslang-tools 2>/dev/null \
+          | grep -E '^\s+[0-9]+\.[0-9]+.*lunarg' | head -1 \
+          | sed 's/^[[:space:]]*//' | cut -d' ' -f1 || true)"
+        if [ -n "${lunarg_ver}" ]; then
+          sudo apt-get install -y "glslang-tools=${lunarg_ver}"
+        else
+          sudo apt-get install -y glslang-tools
+        fi
+      fi
     fi
   fi
 }
