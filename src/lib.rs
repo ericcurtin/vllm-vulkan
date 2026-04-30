@@ -754,7 +754,9 @@ fn include_all_shaders() -> std::collections::HashMap<String, Vec<u8>> {
     spv!("paged_kv_write_f16");
     spv!("paged_kv_write_f32");
     spv!("paged_attn_decode_f16");
+    spv!("paged_attn_decode_f16_coop");
     spv!("paged_attn_decode_f32");
+    spv!("paged_attn_decode_f32_coop");
 
     map
 }

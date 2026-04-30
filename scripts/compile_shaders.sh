@@ -345,7 +345,9 @@ echo "=== Paged KV cache ==="
 compile "paged_kv_write_f16" "paged_kv_write_f16.comp"
 compile "paged_kv_write_f32" "paged_kv_write_f32.comp"
 compile "paged_attn_decode_f16" "paged_attn_decode_f16.comp"
+compile "paged_attn_decode_f16_coop" "paged_attn_decode_f16_coop.comp"
 compile "paged_attn_decode_f32" "paged_attn_decode_f32.comp"
+compile "paged_attn_decode_f32_coop" "paged_attn_decode_f32_coop.comp"
 
 # ── Summary ────────────────────────────────────────────────────────────────────
 echo ""

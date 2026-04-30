@@ -19,6 +19,8 @@ _PAGED_KV_WRITE_SHADER = "paged_kv_write_f32"
 _PAGED_ATTN_DECODE_SHADER = "paged_attn_decode_f32"
 _PAGED_KV_WRITE_F16_SHADER = "paged_kv_write_f16"
 _PAGED_ATTN_DECODE_F16_SHADER = "paged_attn_decode_f16"
+_PAGED_ATTN_DECODE_COOP_SHADER = "paged_attn_decode_f32_coop"
+_PAGED_ATTN_DECODE_F16_COOP_SHADER = "paged_attn_decode_f16_coop"
 _PAGED_KV_WRITE_WORKGROUP_SIZE = 256
 _PAGED_ATTN_DECODE_WORKGROUP_SIZE = 256
 
@@ -178,6 +180,7 @@ def paged_attn_decode_f16(
         seq_len=seq_len,
         scale=scale,
         shader_name=_PAGED_ATTN_DECODE_F16_SHADER,
+        coop_shader_name=_PAGED_ATTN_DECODE_F16_COOP_SHADER,
         dtype_size=2,
     )
 
@@ -209,6 +212,7 @@ def paged_attn_decode_f32(
         seq_len=seq_len,
         scale=scale,
         shader_name=_PAGED_ATTN_DECODE_SHADER,
+        coop_shader_name=_PAGED_ATTN_DECODE_COOP_SHADER,
         dtype_size=4,
     )
 
@@ -223,9 +227,14 @@ def _paged_attn_decode(
     seq_len: int,
     scale: float | None,
     shader_name: str,
+    coop_shader_name: str,
     dtype_size: int,
 ) -> torch.Tensor:
-    if shader_name not in ctx.available_shaders():
+    available_shaders = ctx.available_shaders()
+    dispatch_shader_name = (
+        coop_shader_name if coop_shader_name in available_shaders else shader_name
+    )
+    if dispatch_shader_name not in available_shaders:
         raise RuntimeError(f"{shader_name} shader is not available")
 
     spec = layout.layer_spec(layer_index)
@@ -273,17 +282,24 @@ def _paged_attn_decode(
         scale=scale if scale is not None else 1.0 / math.sqrt(spec.head_size),
     )
     total_elements = num_q_heads * spec.head_size
-    workgroups = (
-        math.ceil(total_elements / _PAGED_ATTN_DECODE_WORKGROUP_SIZE),
-        1,
-        1,
-    )
+    if dispatch_shader_name == coop_shader_name:
+        workgroups = (
+            num_q_heads,
+            math.ceil(spec.head_size / _PAGED_ATTN_DECODE_WORKGROUP_SIZE),
+            1,
+        )
+    else:
+        workgroups = (
+            math.ceil(total_elements / _PAGED_ATTN_DECODE_WORKGROUP_SIZE),
+            1,
+            1,
+        )
     output_nbytes = total_elements * np.dtype(np.float32).itemsize
 
     results = ctx.execute_batch(
         [
             (
-                shader_name,
+                dispatch_shader_name,
                 [
                     _tensor_to_bytes(q_f32),
                     blocks.tobytes(),
