@@ -164,7 +164,58 @@ class _VulkanCPUModelRunner:
         return self._runner.execute_model(*args, **kwargs)
 
     def initialize_kv_cache(self, *args, **kwargs):
+        self._patch_kv_sharing_in_runner()
         return self._runner.initialize_kv_cache(*args, **kwargs)
+
+    def _patch_kv_sharing_in_runner(self) -> None:
+        """Monkey-patch maybe_add_kv_sharing_layers_to_kv_cache_groups on the
+        inner runner to also populate UniformTypeKVCacheSpecs.kv_cache_specs
+        for KV-sharing layers.
+
+        Background: vLLM's initialize_attn_backend looks up every layer name
+        from kv_cache_group.layer_names in UniformTypeKVCacheSpecs.kv_cache_specs.
+        For KV-sharing layers (e.g. Gemma4 layers 15-34), vLLM's
+        maybe_add_kv_sharing_layers_to_kv_cache_groups appends them to
+        layer_names but does NOT add them to kv_cache_specs, causing a KeyError.
+        This patch fixes that by copying the target layer's spec.
+        """
+        try:
+            from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs  # noqa: PLC0415
+        except ImportError:
+            return
+
+        runner = self._runner
+        orig_method = runner.__class__.maybe_add_kv_sharing_layers_to_kv_cache_groups
+
+        def _patched_maybe_add_kv_sharing_layers_to_kv_cache_groups(
+            self_inner, kv_cache_config
+        ):
+            # Call the original implementation first (appends to layer_names).
+            orig_method(self_inner, kv_cache_config)
+
+            # Then fix up UniformTypeKVCacheSpecs.kv_cache_specs to include
+            # the KV-sharing layers, using the target layer's spec.
+            shared = getattr(self_inner, "shared_kv_cache_layers", {})
+            if not shared:
+                return
+            for group in kv_cache_config.kv_cache_groups:
+                spec = group.kv_cache_spec
+                if not isinstance(spec, UniformTypeKVCacheSpecs):
+                    continue
+                for layer_name, target_name in shared.items():
+                    if layer_name not in spec.kv_cache_specs and target_name in spec.kv_cache_specs:
+                        spec.kv_cache_specs[layer_name] = spec.kv_cache_specs[target_name]
+                        logger.debug(
+                            "KV-sharing fix: added kv_cache_specs[%s] = spec of %s",
+                            layer_name,
+                            target_name,
+                        )
+
+        import types  # noqa: PLC0415
+
+        runner.maybe_add_kv_sharing_layers_to_kv_cache_groups = types.MethodType(
+            _patched_maybe_add_kv_sharing_layers_to_kv_cache_groups, runner
+        )
 
     def get_kv_cache_spec(self, *args, **kwargs):
         return self._runner.get_kv_cache_spec(*args, **kwargs)
