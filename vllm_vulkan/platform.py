@@ -21,6 +21,7 @@ import psutil
 import torch
 
 from vllm_vulkan.config import get_config
+from vllm_vulkan.kv_layout import infer_kv_layer_specs
 
 # vllm is an optional runtime dependency when using the plugin standalone
 # (e.g. running unit tests without a full vllm install).  Import the base
@@ -232,41 +233,17 @@ class VulkanPlatform(Platform):
                 cache_config.cpu_kvcache_space_bytes is not None
                 and model_config.max_model_len is not None
             ):
-                # Estimate KV cache bytes per token for this model.
-                # Each token needs (num_layers × num_kv_heads × head_dim × 2 × dtype_bytes)
-                # bytes for key + value.
+                # Estimate KV cache bytes per token using the same paged KV
+                # layout contract that Vulkan attention kernels will consume.
                 try:
-                    text_cfg = (
-                        getattr(model_config.hf_config, "text_config", None)
-                        or model_config.hf_config
+                    specs = infer_kv_layer_specs(
+                        model_config.hf_config,
+                        block_size=cache_config.block_size or config.block_size,
+                        dtype=model_config.dtype,
                     )
-                    num_layers = getattr(text_cfg, "num_hidden_layers", None) or 60
-                    num_kv_heads = getattr(text_cfg, "num_key_value_heads", None) or 16
-                    head_dim = getattr(text_cfg, "head_dim", None) or 256
-                    # bfloat16 = 2 bytes
-                    dtype_bytes = (
-                        2 if model_config.dtype in ("bfloat16", "float16") else 4
+                    bytes_per_token = sum(
+                        spec.bytes_per_token for spec in specs
                     )
-                    bytes_per_token = (
-                        num_layers * num_kv_heads * head_dim * 2 * dtype_bytes
-                    )
-                    # Also account for global heads if heterogeneous
-                    global_head_dim = getattr(text_cfg, "global_head_dim", None)
-                    num_global_kv_heads = getattr(
-                        text_cfg, "num_global_key_value_heads", None
-                    )
-                    layer_types = getattr(text_cfg, "layer_types", None)
-                    if global_head_dim and num_global_kv_heads and layer_types:
-                        n_sliding = sum(1 for lt in layer_types if "sliding" in lt)
-                        n_full = sum(1 for lt in layer_types if "full" in lt)
-                        bytes_per_token = (
-                            n_sliding * num_kv_heads * head_dim * 2 * dtype_bytes
-                            + n_full
-                            * num_global_kv_heads
-                            * global_head_dim
-                            * 2
-                            * dtype_bytes
-                        )
                     max_tokens_in_kv = int(
                         cache_config.cpu_kvcache_space_bytes / bytes_per_token
                     )

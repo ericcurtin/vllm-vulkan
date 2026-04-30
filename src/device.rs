@@ -271,20 +271,25 @@ impl ComputeDevice {
         // Query device capabilities.
         let props = unsafe { instance.get_physical_device_properties(pd) };
 
-        // Enable fp16 if the device supports it.
-        // We query the features into local structs, then extract raw copies.
-        let (fp16, has_float64) = unsafe {
+        // f16 KV-cache shaders need both f16 storage buffers and f16 shader
+        // arithmetic/conversion.
+        let (storage_buffer_16_bit_access, shader_float16, has_float64) = unsafe {
             let mut features16 = vk::PhysicalDevice16BitStorageFeatures::default();
+            let mut float16_int8 = vk::PhysicalDeviceShaderFloat16Int8Features::default();
             let p16 = &mut features16 as *mut vk::PhysicalDevice16BitStorageFeatures;
-            let mut features2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut *p16);
+            let pf16 = &mut float16_int8 as *mut vk::PhysicalDeviceShaderFloat16Int8Features;
+            let mut features2 = vk::PhysicalDeviceFeatures2::default()
+                .push_next(&mut *pf16)
+                .push_next(&mut *p16);
             instance.get_physical_device_features2(pd, &mut features2);
             // Read results from the raw pointers — safe because Vulkan has
             // filled the structs and we are still within the unsafe block.
-            let fp16_val = (*p16).storage_buffer16_bit_access == vk::TRUE;
+            let storage16_val = (*p16).storage_buffer16_bit_access == vk::TRUE;
+            let shader_f16_val = (*pf16).shader_float16 == vk::TRUE;
             let f64_val  = features2.features.shader_float64 == vk::TRUE;
-            (fp16_val, f64_val)
+            (storage16_val, shader_f16_val, f64_val)
         };
-        let fp16 = fp16 || has_float64; // rough heuristic
+        let fp16 = storage_buffer_16_bit_access && shader_float16;
 
         let device_features = vk::PhysicalDeviceFeatures {
             shader_float64: if has_float64 { vk::TRUE } else { vk::FALSE },
@@ -305,18 +310,35 @@ impl ComputeDevice {
             .collect();
 
         let ext_16bit = c"VK_KHR_16bit_storage";
+        let ext_float16_int8 = c"VK_KHR_shader_float16_int8";
         let ext_storage8 = c"VK_KHR_8bit_storage";
         let ext_portability = c"VK_KHR_portability_subset";
 
         let mut exts: Vec<*const c_char> = Vec::new();
         if available_names.contains(&&*ext_16bit)   { exts.push(ext_16bit.as_ptr()); }
+        if available_names.contains(&&*ext_float16_int8) { exts.push(ext_float16_int8.as_ptr()); }
         if available_names.contains(&&*ext_storage8) { exts.push(ext_storage8.as_ptr()); }
         if available_names.contains(&&*ext_portability) { exts.push(ext_portability.as_ptr()); }
 
-        let device_ci = vk::DeviceCreateInfo::default()
+        let mut enabled_features16 = vk::PhysicalDevice16BitStorageFeatures {
+            storage_buffer16_bit_access: if storage_buffer_16_bit_access { vk::TRUE } else { vk::FALSE },
+            ..Default::default()
+        };
+        let mut enabled_float16_int8 = vk::PhysicalDeviceShaderFloat16Int8Features {
+            shader_float16: if shader_float16 { vk::TRUE } else { vk::FALSE },
+            ..Default::default()
+        };
+
+        let mut device_ci = vk::DeviceCreateInfo::default()
             .queue_create_infos(std::slice::from_ref(&queue_ci))
             .enabled_extension_names(&exts)
             .enabled_features(&device_features);
+        if storage_buffer_16_bit_access {
+            device_ci = device_ci.push_next(&mut enabled_features16);
+        }
+        if shader_float16 {
+            device_ci = device_ci.push_next(&mut enabled_float16_int8);
+        }
 
         let device = unsafe { instance.create_device(pd, &device_ci, None) }
             .map_err(|e| format!("vkCreateDevice: {e}"))?;

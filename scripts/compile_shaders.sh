@@ -339,6 +339,14 @@ echo "=== Quantization utils ==="
 compile "quantize_q8_1_x4" "quantize_q8_1.comp" \
   DATA_A_F32=1 A_TYPE=float D_TYPE=float FLOAT_TYPE=float QBLOCK_X4=1 RMS_NORM_ROPE_FUSION=0
 
+# ── Paged KV cache ────────────────────────────────────────────────────────────
+echo ""
+echo "=== Paged KV cache ==="
+compile "paged_kv_write_f16" "paged_kv_write_f16.comp"
+compile "paged_kv_write_f32" "paged_kv_write_f32.comp"
+compile "paged_attn_decode_f16" "paged_attn_decode_f16.comp"
+compile "paged_attn_decode_f32" "paged_attn_decode_f32.comp"
+
 # ── Summary ────────────────────────────────────────────────────────────────────
 echo ""
 if [ "${FAILED}" -gt 0 ]; then
