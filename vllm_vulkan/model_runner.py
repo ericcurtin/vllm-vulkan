@@ -180,7 +180,7 @@ class _VulkanCPUModelRunner:
         This patch fixes that by copying the target layer's spec.
         """
         try:
-            from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs  # noqa: PLC0415
+            from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs  # noqa: PLC0415, I001
         except ImportError:
             return
 
