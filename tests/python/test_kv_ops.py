@@ -21,6 +21,7 @@ from vllm_vulkan.kv_ops import (  # noqa: E402
 def _require_vulkan_context():
     if not _rs.is_available():
         pytest.skip("no Vulkan device available")
+
     try:
         return _rs.VulkanContext(0)
     except RuntimeError as exc:
@@ -29,6 +30,7 @@ def _require_vulkan_context():
 
 def test_paged_kv_write_f32_round_trips_gpu_cache_slots():
     ctx = _require_vulkan_context()
+
     assert "paged_kv_write_f32" in ctx.available_shaders()
 
     spec = KVCacheLayerSpec(
@@ -56,6 +58,7 @@ def test_paged_kv_write_f32_round_trips_gpu_cache_slots():
             for head_element in range(spec.head_size):
                 k_offset = layout.slot_offset(0, slot, kv_head, head_element, "k") // 4
                 v_offset = layout.slot_offset(0, slot, kv_head, head_element, "v") // 4
+
                 assert cache_view[k_offset] == pytest.approx(
                     float(k[token_index, kv_head, head_element])
                 )
@@ -64,12 +67,14 @@ def test_paged_kv_write_f32_round_trips_gpu_cache_slots():
                 )
 
     untouched_slot = 1
+
     assert cache_view[layout.slot_offset(0, untouched_slot, 0, 0, "k") // 4] == 0.0
     assert cache_view[layout.slot_offset(0, untouched_slot, 0, 0, "v") // 4] == 0.0
 
 
 def test_paged_kv_write_f16_round_trips_gpu_cache_slots():
     ctx = _require_vulkan_context()
+
     if "paged_kv_write_f16" not in ctx.available_shaders():
         pytest.skip("paged_kv_write_f16 shader is unavailable")
 
@@ -98,6 +103,7 @@ def test_paged_kv_write_f16_round_trips_gpu_cache_slots():
             for head_element in range(spec.head_size):
                 k_offset = layout.slot_offset(0, slot, kv_head, head_element, "k") // 2
                 v_offset = layout.slot_offset(0, slot, kv_head, head_element, "v") // 2
+
                 assert cache_view[k_offset] == pytest.approx(
                     float(k[token_index, kv_head, head_element])
                 )
@@ -121,7 +127,9 @@ def test_paged_kv_write_f32_validates_slot_capacity():
     v = torch.zeros_like(k)
 
     with pytest.raises(ValueError, match="outside capacity"):
-        paged_kv_write_f32(ctx, layout, cache, 0, k, v, [layout.capacity_tokens_per_layer])
+        paged_kv_write_f32(
+            ctx, layout, cache, 0, k, v, [layout.capacity_tokens_per_layer]
+        )
 
 
 def test_paged_kv_write_f32_rejects_empty_tokens():

@@ -85,12 +85,14 @@ def test_paged_kv_layout_exposes_attention_load_strides():
     layout = VulkanPagedKVLayout((spec,), num_blocks=2)
 
     k_strides = layout.k_plane_strides_for_attn_load(0, 1)
+
     assert k_strides.base_offset == spec.bytes_per_block
     assert k_strides.token_stride == spec.bytes_per_token_per_plane
     assert k_strides.kv_head_stride == spec.head_size * spec.dtype_size
     assert k_strides.head_element_stride == spec.dtype_size
 
     v_strides = layout.v_plane_strides_for_attn_load(0, 1)
+
     assert v_strides.base_offset == spec.bytes_per_block + spec.plane_bytes_per_block
     assert v_strides.token_stride == k_strides.token_stride
     assert v_strides.kv_head_stride == k_strides.kv_head_stride
@@ -109,10 +111,13 @@ def test_layout_rejects_invalid_indices():
 
     with pytest.raises(ValueError, match="physical_block_id"):
         layout.block_base_offset(0, 1)
+
     with pytest.raises(ValueError, match="token_offset_in_block"):
         layout.token_offset(0, 0, 16, 0, 0, "k")
+
     with pytest.raises(ValueError, match="kv_head"):
         layout.token_offset(0, 0, 0, 2, 0, "k")
+
     with pytest.raises(ValueError, match="head_element"):
         layout.token_offset(0, 0, 0, 0, 4, "k")
 

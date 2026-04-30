@@ -57,16 +57,9 @@ void main() {
     const uint kv_head = q_head / gqa_ratio;
     const uint q_base = q_head * p.head_size;
 
-    float max_logit = -3.402823466e+38;
-    for (uint token_idx = 0; token_idx < p.seq_len; token_idx++) {
-        const uint k_base = kv_base_for_token(token_idx, kv_head);
-        float dot = 0.0;
-        for (uint d = 0; d < p.head_size; d++) {
-            dot += q[q_base + d] * float(cache[k_base + d]);
-        }
-        max_logit = max(max_logit, dot * p.scale);
-    }
-
+    // Online softmax keeps the numerically stable max/sum state while scanning
+    // K/V once instead of recomputing every QK dot product in a second pass.
+    float running_max = -3.402823466e+38;
     float denom = 0.0;
     float acc = 0.0;
     for (uint token_idx = 0; token_idx < p.seq_len; token_idx++) {
@@ -75,10 +68,16 @@ void main() {
         for (uint d = 0; d < p.head_size; d++) {
             dot += q[q_base + d] * float(cache[kv_base + d]);
         }
-        const float weight = exp(dot * p.scale - max_logit);
+        const float logit = dot * p.scale;
+        const float new_max = max(running_max, logit);
+        const float old_scale = exp(running_max - new_max);
+        const float weight = exp(logit - new_max);
+        denom = denom * old_scale;
+        acc = acc * old_scale;
         denom += weight;
         acc += weight * float(
             cache[kv_base + p.plane_elements_per_block + head_element]);
+        running_max = new_max;
     }
 
     output_data[global_idx] = denom > 0.0 ? acc / denom : 0.0;
