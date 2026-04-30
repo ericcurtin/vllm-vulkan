@@ -13,6 +13,7 @@ monkey-patch the relevant vLLM modules.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -21,6 +22,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _patches_applied = False
+
+_TEMPLATES_DIR = Path(__file__).parent
 
 
 def apply_patches() -> None:
@@ -34,6 +37,11 @@ def apply_patches() -> None:
         _patch_cpu_triton_utils()
     except Exception as exc:
         logger.warning("Failed to apply vllm._C patches: %s", exc)
+
+    try:
+        _register_gemma4_chat_template()
+    except Exception as exc:
+        logger.warning("Failed to register gemma4 chat template fallback: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -136,3 +144,50 @@ def _patch_cpu_triton_utils() -> None:
             _bt._compute_slot_mapping_kernel = _cpu_utils.compute_slot_mapping_kernel
     except ImportError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Patch: register gemma4 chat template fallback
+# ---------------------------------------------------------------------------
+
+
+def _register_gemma4_chat_template() -> None:
+    """Register a chat template fallback for gemma4 base models.
+
+    Gemma4 base models (e.g. google/gemma-4-E2B) do not include a chat
+    template in their tokenizer_config.json.  As of transformers v4.44,
+    vLLM requires a chat template for the /v1/chat/completions endpoint.
+
+    This registers the standard Gemma4 instruction-tuned chat template as a
+    fallback so that base models can be used with the chat completions API.
+    The template is identical to the one shipped with google/gemma-4-E2B-it.
+    """
+    try:
+        from vllm.transformers_utils.chat_templates import (  # noqa: PLC0415
+            get_chat_template_fallback_path,
+        )
+        from vllm.transformers_utils.chat_templates.registry import (  # noqa: PLC0415
+            register_chat_template_fallback_path,
+        )
+    except ImportError:
+        logger.debug("vllm chat template registry not available; skip gemma4 patch.")
+        return
+
+    # Only register if gemma4 does not already have a fallback.
+    if get_chat_template_fallback_path("gemma4", "") is not None:
+        return
+
+    template_path = _TEMPLATES_DIR / "template_gemma4.jinja"
+    if not template_path.exists():
+        logger.warning(
+            "gemma4 chat template file not found at %s; skip registration.",
+            template_path,
+        )
+        return
+
+    register_chat_template_fallback_path("gemma4", template_path)
+    logger.info(
+        "Registered gemma4 chat template fallback for base models "
+        "(e.g. google/gemma-4-E2B) from %s.",
+        template_path,
+    )
