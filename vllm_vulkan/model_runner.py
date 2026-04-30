@@ -203,8 +203,13 @@ class _VulkanCPUModelRunner:
                 if not isinstance(spec, UniformTypeKVCacheSpecs):
                     continue
                 for layer_name, target_name in shared.items():
-                    if layer_name not in spec.kv_cache_specs and target_name in spec.kv_cache_specs:
-                        spec.kv_cache_specs[layer_name] = spec.kv_cache_specs[target_name]
+                    if (
+                        layer_name not in spec.kv_cache_specs
+                        and target_name in spec.kv_cache_specs
+                    ):
+                        spec.kv_cache_specs[layer_name] = spec.kv_cache_specs[
+                            target_name
+                        ]
                         logger.debug(
                             "KV-sharing fix: added kv_cache_specs[%s] = spec of %s",
                             layer_name,
