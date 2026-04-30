@@ -318,7 +318,7 @@ class VulkanPlatform(Platform):
             raise NotImplementedError("MLA attention is not supported on Vulkan.")
         if attn_selector_config.use_sparse:
             raise NotImplementedError("Sparse attention is not supported on Vulkan.")
-        return AttentionBackendEnum.CPU_ATTN.get_path()
+        return "vllm_vulkan.attention.VulkanAttentionBackend"
 
     @classmethod
     def _vllm_c_available(cls) -> bool:
