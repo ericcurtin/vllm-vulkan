@@ -48,6 +48,22 @@ When building engineering plans from requirements:
 3. Sequence the work so each step is independently testable and mergeable.
 4. Call out risks, unknowns, and decisions that need stakeholder input.
 
+## Confidence Score
+
+A 0–5 rating that tells you at a glance whether the PR is ready to merge.
+Calculate this score based on the severity and quantity of issues found, the
+complexity of changes, and how well the code aligns with the codebase patterns.
+
+**The code review summary MUST include this score.**
+
+| Score | Meaning               | Action             |
+|-------|-----------------------|--------------------|
+| 5/5   | Production ready      | Merge              |
+| 4/5   | Minor polish needed   | Merge after fixes  |
+| 3/5   | Implementation issues | Address feedback   |
+| 2/5   | Significant bugs      | Needs rework       |
+| 0–1/5 | Critical problems     | Major rethink      |
+
 ## Principles
 
 - Don't nitpick style unless it harms readability. Trust the project's existing
