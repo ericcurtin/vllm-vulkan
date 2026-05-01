@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for Vulkan paged KV-cache operations."""
+"""GPU correctness tests for Vulkan paged KV-cache operations."""
 
 from __future__ import annotations
+
+from collections.abc import Callable
 
 import numpy as np
 import pytest
@@ -28,36 +30,100 @@ def _require_vulkan_context():
         pytest.skip(f"VulkanContext unavailable: {exc}")
 
 
-def test_paged_kv_write_f32_round_trips_gpu_cache_slots():
-    ctx = _require_vulkan_context()
+def _require_shader(ctx, *shader_names: str) -> None:
+    available = set(ctx.available_shaders())
+    if not any(name in available for name in shader_names):
+        pytest.skip(f"none of {shader_names!r} are available")
 
-    assert "paged_kv_write_f32" in ctx.available_shaders()
+
+def _make_layout(dtype_size: int) -> tuple[KVCacheLayerSpec, VulkanPagedKVLayout]:
+    spec = KVCacheLayerSpec(
+        layer_index=0,
+        num_kv_heads=2,
+        head_size=8,
+        block_size=4,
+        dtype_size=dtype_size,
+    )
+    return spec, VulkanPagedKVLayout((spec,), num_blocks=4)
+
+
+def _slot_mapping_from_block_table(
+    block_table: torch.Tensor, seq_len: int, block_size: int
+) -> torch.Tensor:
+    slots = [
+        int(block_table[token_idx // block_size]) * block_size + token_idx % block_size
+        for token_idx in range(seq_len)
+    ]
+    return torch.tensor(slots, dtype=torch.int64)
+
+
+def _attention_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    k_ref = k.float()
+    v_ref = v.float()
+    gqa_ratio = q.shape[0] // k_ref.shape[1]
+    rows = []
+    for q_head in range(q.shape[0]):
+        kv_head = q_head // gqa_ratio
+        scores = (k_ref[:, kv_head, :] * q[q_head]).sum(dim=-1) * scale
+        weights = torch.softmax(scores, dim=-1)
+        rows.append((weights[:, None] * v_ref[:, kv_head, :]).sum(dim=0))
+    return torch.stack(rows)
+
+
+@pytest.mark.parametrize(
+    ("torch_dtype", "numpy_dtype", "dtype_size", "write_fn", "shader_name"),
+    [
+        (torch.float32, np.float32, 4, paged_kv_write_f32, "paged_kv_write_f32"),
+        (torch.float16, np.float16, 2, paged_kv_write_f16, "paged_kv_write_f16"),
+    ],
+)
+def test_paged_kv_write_round_trips_gpu_cache_slots(
+    torch_dtype: torch.dtype,
+    numpy_dtype: np.dtype,
+    dtype_size: int,
+    write_fn: Callable,
+    shader_name: str,
+):
+    ctx = _require_vulkan_context()
+    _require_shader(ctx, shader_name)
 
     spec = KVCacheLayerSpec(
         layer_index=0,
         num_kv_heads=2,
         head_size=4,
         block_size=4,
-        dtype_size=4,
+        dtype_size=dtype_size,
     )
     layout = VulkanPagedKVLayout((spec,), num_blocks=3)
     cache = ctx.alloc_activation(layout.total_bytes)
     ctx.update_activation(cache, bytes(layout.total_bytes))
 
-    k = torch.arange(3 * spec.num_kv_heads * spec.head_size, dtype=torch.float32)
-    k = k.reshape(3, spec.num_kv_heads, spec.head_size)
+    k = torch.arange(
+        3 * spec.num_kv_heads * spec.head_size,
+        dtype=torch_dtype,
+    ).reshape(3, spec.num_kv_heads, spec.head_size)
     v = k + 1000
     slot_mapping = torch.tensor([0, 5, 10], dtype=torch.int64)
 
-    paged_kv_write_f32(ctx, layout, cache, 0, k, v, slot_mapping)
+    write_fn(ctx, layout, cache, 0, k, v, slot_mapping)
 
-    raw = ctx.read_activation(cache)
-    cache_view = np.frombuffer(raw, dtype=np.float32)
+    cache_view = np.frombuffer(ctx.read_activation(cache), dtype=numpy_dtype)
     for token_index, slot in enumerate(slot_mapping.tolist()):
         for kv_head in range(spec.num_kv_heads):
             for head_element in range(spec.head_size):
-                k_offset = layout.slot_offset(0, slot, kv_head, head_element, "k") // 4
-                v_offset = layout.slot_offset(0, slot, kv_head, head_element, "v") // 4
+                k_offset = (
+                    layout.slot_offset(0, slot, kv_head, head_element, "k")
+                    // dtype_size
+                )
+                v_offset = (
+                    layout.slot_offset(0, slot, kv_head, head_element, "v")
+                    // dtype_size
+                )
 
                 assert cache_view[k_offset] == pytest.approx(
                     float(k[token_index, kv_head, head_element])
@@ -67,53 +133,20 @@ def test_paged_kv_write_f32_round_trips_gpu_cache_slots():
                 )
 
     untouched_slot = 1
-
-    assert cache_view[layout.slot_offset(0, untouched_slot, 0, 0, "k") // 4] == 0.0
-    assert cache_view[layout.slot_offset(0, untouched_slot, 0, 0, "v") // 4] == 0.0
-
-
-def test_paged_kv_write_f16_round_trips_gpu_cache_slots():
-    ctx = _require_vulkan_context()
-
-    if "paged_kv_write_f16" not in ctx.available_shaders():
-        pytest.skip("paged_kv_write_f16 shader is unavailable")
-
-    spec = KVCacheLayerSpec(
-        layer_index=0,
-        num_kv_heads=2,
-        head_size=4,
-        block_size=4,
-        dtype_size=2,
+    assert (
+        cache_view[layout.slot_offset(0, untouched_slot, 0, 0, "k") // dtype_size]
+        == 0.0
     )
-    layout = VulkanPagedKVLayout((spec,), num_blocks=3)
-    cache = ctx.alloc_activation(layout.total_bytes)
-    ctx.update_activation(cache, bytes(layout.total_bytes))
-
-    k = torch.arange(3 * spec.num_kv_heads * spec.head_size, dtype=torch.float16)
-    k = k.reshape(3, spec.num_kv_heads, spec.head_size)
-    v = k + 1000
-    slot_mapping = torch.tensor([0, 5, 10], dtype=torch.int64)
-
-    paged_kv_write_f16(ctx, layout, cache, 0, k, v, slot_mapping)
-
-    raw = ctx.read_activation(cache)
-    cache_view = np.frombuffer(raw, dtype=np.float16)
-    for token_index, slot in enumerate(slot_mapping.tolist()):
-        for kv_head in range(spec.num_kv_heads):
-            for head_element in range(spec.head_size):
-                k_offset = layout.slot_offset(0, slot, kv_head, head_element, "k") // 2
-                v_offset = layout.slot_offset(0, slot, kv_head, head_element, "v") // 2
-
-                assert cache_view[k_offset] == pytest.approx(
-                    float(k[token_index, kv_head, head_element])
-                )
-                assert cache_view[v_offset] == pytest.approx(
-                    float(v[token_index, kv_head, head_element])
-                )
+    assert (
+        cache_view[layout.slot_offset(0, untouched_slot, 0, 0, "v") // dtype_size]
+        == 0.0
+    )
 
 
-def test_paged_kv_write_f32_validates_slot_capacity():
+def test_paged_kv_write_validates_slots_and_empty_inputs():
     ctx = _require_vulkan_context()
+    _require_shader(ctx, "paged_kv_write_f32")
+
     spec = KVCacheLayerSpec(
         layer_index=0,
         num_kv_heads=1,
@@ -131,127 +164,90 @@ def test_paged_kv_write_f32_validates_slot_capacity():
             ctx, layout, cache, 0, k, v, [layout.capacity_tokens_per_layer]
         )
 
-
-def test_paged_kv_write_f32_rejects_empty_tokens():
-    ctx = _require_vulkan_context()
-    spec = KVCacheLayerSpec(
-        layer_index=0,
-        num_kv_heads=1,
-        head_size=2,
-        block_size=4,
-        dtype_size=4,
-    )
-    layout = VulkanPagedKVLayout((spec,), num_blocks=1)
-    cache = ctx.alloc_activation(layout.total_bytes)
-    k = torch.zeros((0, spec.num_kv_heads, spec.head_size), dtype=torch.float32)
-    v = torch.zeros_like(k)
-
+    empty_k = torch.zeros((0, spec.num_kv_heads, spec.head_size), dtype=torch.float32)
     with pytest.raises(ValueError, match="at least one token"):
-        paged_kv_write_f32(ctx, layout, cache, 0, k, v, [])
+        paged_kv_write_f32(
+            ctx, layout, cache, 0, empty_k, torch.zeros_like(empty_k), []
+        )
 
 
-def test_paged_attn_decode_f32_matches_torch_reference():
+@pytest.mark.parametrize(
+    (
+        "torch_dtype",
+        "dtype_size",
+        "write_fn",
+        "decode_fn",
+        "write_shader",
+        "decode_shaders",
+        "seed",
+        "rtol",
+        "atol",
+    ),
+    [
+        (
+            torch.float32,
+            4,
+            paged_kv_write_f32,
+            paged_attn_decode_f32,
+            "paged_kv_write_f32",
+            ("paged_attn_decode_f32", "paged_attn_decode_f32_coop"),
+            0,
+            1e-4,
+            1e-4,
+        ),
+        (
+            torch.float16,
+            2,
+            paged_kv_write_f16,
+            paged_attn_decode_f16,
+            "paged_kv_write_f16",
+            ("paged_attn_decode_f16", "paged_attn_decode_f16_coop"),
+            1,
+            5e-3,
+            5e-3,
+        ),
+    ],
+)
+def test_paged_attn_decode_matches_torch_reference(
+    torch_dtype: torch.dtype,
+    dtype_size: int,
+    write_fn: Callable,
+    decode_fn: Callable,
+    write_shader: str,
+    decode_shaders: tuple[str, ...],
+    seed: int,
+    rtol: float,
+    atol: float,
+):
     ctx = _require_vulkan_context()
-    assert "paged_kv_write_f32" in ctx.available_shaders()
-    assert "paged_attn_decode_f32" in ctx.available_shaders()
+    _require_shader(ctx, write_shader)
+    _require_shader(ctx, *decode_shaders)
 
-    spec = KVCacheLayerSpec(
-        layer_index=0,
-        num_kv_heads=2,
-        head_size=8,
-        block_size=4,
-        dtype_size=4,
-    )
-    layout = VulkanPagedKVLayout((spec,), num_blocks=4)
+    spec, layout = _make_layout(dtype_size)
     cache = ctx.alloc_activation(layout.total_bytes)
     ctx.update_activation(cache, bytes(layout.total_bytes))
 
     seq_len = 6
     block_table = torch.tensor([2, 0], dtype=torch.int64)
-    slot_mapping = torch.tensor(
-        [
-            int(block_table[token_idx // spec.block_size]) * spec.block_size
-            + token_idx % spec.block_size
-            for token_idx in range(seq_len)
-        ],
-        dtype=torch.int64,
-    )
+    slot_mapping = _slot_mapping_from_block_table(block_table, seq_len, spec.block_size)
 
-    torch.manual_seed(0)
-    k = torch.randn(seq_len, spec.num_kv_heads, spec.head_size, dtype=torch.float32)
+    torch.manual_seed(seed)
+    k = torch.randn(seq_len, spec.num_kv_heads, spec.head_size, dtype=torch_dtype)
     v = torch.randn_like(k)
     q = torch.randn(4, spec.head_size, dtype=torch.float32)
     scale = spec.head_size**-0.5
 
-    paged_kv_write_f32(ctx, layout, cache, 0, k, v, slot_mapping)
-    out = paged_attn_decode_f32(ctx, layout, cache, 0, q, block_table, seq_len, scale)
+    write_fn(ctx, layout, cache, 0, k, v, slot_mapping)
+    out = decode_fn(ctx, layout, cache, 0, q, block_table, seq_len, scale)
 
-    expected_rows = []
-    gqa_ratio = q.shape[0] // spec.num_kv_heads
-    for q_head in range(q.shape[0]):
-        kv_head = q_head // gqa_ratio
-        scores = (k[:, kv_head, :] * q[q_head]).sum(dim=-1) * scale
-        weights = torch.softmax(scores, dim=-1)
-        expected_rows.append((weights[:, None] * v[:, kv_head, :]).sum(dim=0))
-    expected = torch.stack(expected_rows)
-
-    torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
+    expected = _attention_reference(q, k, v, scale)
+    torch.testing.assert_close(out, expected, rtol=rtol, atol=atol)
 
 
-def test_paged_attn_decode_f16_matches_torch_reference():
+def test_paged_attn_decode_validates_block_table():
     ctx = _require_vulkan_context()
-    if "paged_kv_write_f16" not in ctx.available_shaders():
-        pytest.skip("paged_kv_write_f16 shader is unavailable")
-    if "paged_attn_decode_f16" not in ctx.available_shaders():
-        pytest.skip("paged_attn_decode_f16 shader is unavailable")
+    _require_shader(ctx, "paged_attn_decode_f32", "paged_attn_decode_f32_coop")
 
-    spec = KVCacheLayerSpec(
-        layer_index=0,
-        num_kv_heads=2,
-        head_size=8,
-        block_size=4,
-        dtype_size=2,
-    )
-    layout = VulkanPagedKVLayout((spec,), num_blocks=4)
-    cache = ctx.alloc_activation(layout.total_bytes)
-    ctx.update_activation(cache, bytes(layout.total_bytes))
-
-    seq_len = 6
-    block_table = torch.tensor([2, 0], dtype=torch.int64)
-    slot_mapping = torch.tensor(
-        [
-            int(block_table[token_idx // spec.block_size]) * spec.block_size
-            + token_idx % spec.block_size
-            for token_idx in range(seq_len)
-        ],
-        dtype=torch.int64,
-    )
-
-    torch.manual_seed(1)
-    k = torch.randn(seq_len, spec.num_kv_heads, spec.head_size, dtype=torch.float16)
-    v = torch.randn_like(k)
-    q = torch.randn(4, spec.head_size, dtype=torch.float32)
-    scale = spec.head_size**-0.5
-
-    paged_kv_write_f16(ctx, layout, cache, 0, k, v, slot_mapping)
-    out = paged_attn_decode_f16(ctx, layout, cache, 0, q, block_table, seq_len, scale)
-
-    k_ref = k.float()
-    v_ref = v.float()
-    expected_rows = []
-    gqa_ratio = q.shape[0] // spec.num_kv_heads
-    for q_head in range(q.shape[0]):
-        kv_head = q_head // gqa_ratio
-        scores = (k_ref[:, kv_head, :] * q[q_head]).sum(dim=-1) * scale
-        weights = torch.softmax(scores, dim=-1)
-        expected_rows.append((weights[:, None] * v_ref[:, kv_head, :]).sum(dim=0))
-    expected = torch.stack(expected_rows)
-
-    torch.testing.assert_close(out, expected, rtol=5e-3, atol=5e-3)
-
-
-def test_paged_attn_decode_f32_validates_block_table():
-    ctx = _require_vulkan_context()
     spec = KVCacheLayerSpec(
         layer_index=0,
         num_kv_heads=1,

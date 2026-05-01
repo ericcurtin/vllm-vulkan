@@ -202,3 +202,47 @@ def test_vulkan_attention_backend_mirrors_prefill_kv_before_decode():
     assert impl._last_vulkan_decode_used is True
     assert result is output
     torch.testing.assert_close(output, expected, rtol=5e-3, atol=5e-3)
+
+
+def test_vulkan_attention_backend_rejects_unsupported_decode_features():
+    num_heads = 2
+    num_kv_heads = 1
+    head_size = 8
+    block_size = 4
+
+    impl = VulkanAttentionBackendImpl(
+        num_heads=num_heads,
+        head_size=head_size,
+        scale=head_size**-0.5,
+        num_kv_heads=num_kv_heads,
+        alibi_slopes=None,
+        sliding_window=block_size,
+        kv_cache_dtype="auto",
+        logits_soft_cap=None,
+        attn_type=AttentionType.DECODER,
+        kv_sharing_target_layer_name=None,
+    )
+    metadata = CPUAttentionMetadata(
+        isa="vec16",
+        num_actual_tokens=1,
+        max_query_len=1,
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        max_seq_len=1,
+        seq_lens=torch.tensor([1], dtype=torch.int32),
+        block_table=torch.tensor([[0]], dtype=torch.int32),
+        slot_mapping=torch.tensor([0], dtype=torch.int64),
+        scheduler_metadata=None,
+        causal=True,
+    )
+
+    assert not impl._supports_vulkan_decode(
+        key=torch.zeros(1, num_kv_heads, head_size, dtype=torch.float16),
+        value=torch.zeros(1, num_kv_heads, head_size, dtype=torch.float16),
+        kv_cache=torch.zeros(
+            (2, 1, num_kv_heads, block_size, head_size),
+            dtype=torch.float16,
+        ),
+        attn_metadata=metadata,
+        output=torch.empty(1, num_heads, head_size),
+        num_actual_tokens=1,
+    )

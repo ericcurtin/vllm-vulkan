@@ -23,6 +23,7 @@ _PAGED_ATTN_DECODE_COOP_SHADER = "paged_attn_decode_f32_coop"
 _PAGED_ATTN_DECODE_F16_COOP_SHADER = "paged_attn_decode_f16_coop"
 _PAGED_KV_WRITE_WORKGROUP_SIZE = 256
 _PAGED_ATTN_DECODE_WORKGROUP_SIZE = 256
+_F32_NBYTES = np.dtype(np.float32).itemsize
 
 
 def paged_kv_write_f16(
@@ -97,19 +98,10 @@ def _paged_kv_write(
     dtype: torch.dtype,
     dtype_size: int,
 ) -> None:
-    if shader_name not in ctx.available_shaders():
-        raise RuntimeError(f"{shader_name} shader is not available")
-
     spec = layout.layer_spec(layer_index)
-    if spec.dtype_size != dtype_size:
-        raise ValueError(
-            f"{shader_name} requires a {dtype_size}-byte KV-cache layout"
-        )
-    if cache.nbytes < layout.total_bytes:
-        raise ValueError(
-            f"cache buffer has {cache.nbytes} bytes, "
-            f"expected at least {layout.total_bytes}"
-        )
+    _require_shader(ctx, shader_name)
+    _validate_cache_buffer(cache, layout)
+    _validate_layout_dtype(spec.dtype_size, dtype_size, shader_name)
 
     k_cpu = k.detach().to(dtype=dtype, device="cpu").contiguous()
     v_cpu = v.detach().to(dtype=dtype, device="cpu").contiguous()
@@ -230,23 +222,10 @@ def _paged_attn_decode(
     coop_shader_name: str,
     dtype_size: int,
 ) -> torch.Tensor:
-    available_shaders = ctx.available_shaders()
-    dispatch_shader_name = (
-        coop_shader_name if coop_shader_name in available_shaders else shader_name
-    )
-    if dispatch_shader_name not in available_shaders:
-        raise RuntimeError(f"{shader_name} shader is not available")
-
     spec = layout.layer_spec(layer_index)
-    if spec.dtype_size != dtype_size:
-        raise ValueError(
-            f"{shader_name} requires a {dtype_size}-byte KV-cache layout"
-        )
-    if cache.nbytes < layout.total_bytes:
-        raise ValueError(
-            f"cache buffer has {cache.nbytes} bytes, "
-            f"expected at least {layout.total_bytes}"
-        )
+    dispatch_shader_name = _select_decode_shader(ctx, shader_name, coop_shader_name)
+    _validate_cache_buffer(cache, layout)
+    _validate_layout_dtype(spec.dtype_size, dtype_size, shader_name)
     if seq_len <= 0:
         raise ValueError("seq_len must be > 0")
     if seq_len > layout.capacity_tokens_per_layer:
@@ -259,10 +238,9 @@ def _paged_attn_decode(
         raise ValueError(f"Q must be rank-2, got rank {q_f32.ndim}")
 
     num_q_heads = q_f32.shape[0]
-    expected_shape = (num_q_heads, spec.head_size)
-    if tuple(q_f32.shape) != expected_shape:
+    if q_f32.shape[1] != spec.head_size:
         raise ValueError(
-            f"Q shape {tuple(q_f32.shape)} does not match {expected_shape}"
+            f"Q head size {q_f32.shape[1]} does not match {spec.head_size}"
         )
     if num_q_heads <= 0:
         raise ValueError("Q must contain at least one query head")
@@ -294,7 +272,7 @@ def _paged_attn_decode(
             1,
             1,
         )
-    output_nbytes = total_elements * np.dtype(np.float32).itemsize
+    output_nbytes = total_elements * _F32_NBYTES
 
     results = ctx.execute_batch(
         [
@@ -314,6 +292,39 @@ def _paged_attn_decode(
     )
     output = np.frombuffer(results[0][0], dtype=np.float32).copy()
     return torch.from_numpy(output.reshape(num_q_heads, spec.head_size))
+
+
+def _require_shader(ctx: VulkanContext, shader_name: str) -> None:
+    if shader_name not in ctx.available_shaders():
+        raise RuntimeError(f"{shader_name} shader is not available")
+
+
+def _select_decode_shader(
+    ctx: VulkanContext, shader_name: str, coop_shader_name: str
+) -> str:
+    available_shaders = ctx.available_shaders()
+    if coop_shader_name in available_shaders:
+        return coop_shader_name
+    if shader_name in available_shaders:
+        return shader_name
+    raise RuntimeError(f"{shader_name} shader is not available")
+
+
+def _validate_cache_buffer(cache: GpuTensor, layout: VulkanPagedKVLayout) -> None:
+    if cache.nbytes < layout.total_bytes:
+        raise ValueError(
+            f"cache buffer has {cache.nbytes} bytes, "
+            f"expected at least {layout.total_bytes}"
+        )
+
+
+def _validate_layout_dtype(
+    actual_dtype_size: int, expected_dtype_size: int, shader_name: str
+) -> None:
+    if actual_dtype_size != expected_dtype_size:
+        raise ValueError(
+            f"{shader_name} requires a {expected_dtype_size}-byte KV-cache layout"
+        )
 
 
 def _paged_kv_write_pc(

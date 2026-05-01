@@ -9,7 +9,6 @@ Vulkan paged KV cache. Unsupported cases fall back to CPU_ATTN.
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -22,6 +21,7 @@ from vllm.v1.attention.backends.cpu_attn import (
     CPUAttentionMetadata,
 )
 
+from vllm_vulkan import envs
 from vllm_vulkan.kv_layout import KVCacheLayerSpec, VulkanPagedKVLayout
 
 if TYPE_CHECKING:
@@ -182,46 +182,17 @@ class VulkanAttentionBackendImpl(CPUAttentionBackendImpl):
         output: torch.Tensor,
         num_actual_tokens: int,
     ) -> bool:
-        if os.environ.get("VLLM_VULKAN_DISABLE_ATTN"):
+        if envs.VLLM_VULKAN_DISABLE_ATTN:
             return False
 
-        is_supported_decode_batch = (
-            self.attn_type == AttentionType.DECODER
-            and not attn_metadata.use_sdpa_prefill
-            and attn_metadata.causal
-        )
-        if not is_supported_decode_batch:
-            return False
-
-        has_supported_kv_update = (
-            self.kv_sharing_target_layer_name is None
-            and key is not None
-            and value is not None
-        )
-        if not has_supported_kv_update:
-            return False
-
-        has_unsupported_attention_features = (
-            self.alibi_slopes is not None
-            or bool(self.logits_soft_cap)
-            or self.sinks is not None
-            or self.sliding_window != (-1, -1)
-        )
-        if has_unsupported_attention_features:
-            return False
-
-        has_supported_tensor_layout = output.shape[
-            -1
-        ] == self.head_size and kv_cache.dtype in (torch.float16, torch.float32)
-        if not has_supported_tensor_layout:
-            return False
-
-        query_lens = (
-            attn_metadata.query_start_loc[1:] - attn_metadata.query_start_loc[:-1]
-        )
-        if query_lens.numel() != num_actual_tokens:
-            return False
-        if not torch.all(query_lens[:num_actual_tokens].cpu() == 1):
+        if not self._supports_vulkan_decode(
+            key=key,
+            value=value,
+            kv_cache=kv_cache,
+            attn_metadata=attn_metadata,
+            output=output,
+            num_actual_tokens=num_actual_tokens,
+        ):
             return False
 
         try:
@@ -281,6 +252,41 @@ class VulkanAttentionBackendImpl(CPUAttentionBackendImpl):
             logger.debug("Vulkan attention decode fallback to CPU_ATTN: %s", exc)
 
             return False
+
+    def _supports_vulkan_decode(
+        self,
+        *,
+        key: torch.Tensor | None,
+        value: torch.Tensor | None,
+        kv_cache: torch.Tensor,
+        attn_metadata: CPUAttentionMetadata,
+        output: torch.Tensor,
+        num_actual_tokens: int,
+    ) -> bool:
+        """Return True for the conservative decode-only path we can run."""
+        if self.attn_type != AttentionType.DECODER:
+            return False
+        if attn_metadata.use_sdpa_prefill or not attn_metadata.causal:
+            return False
+        if self.kv_sharing_target_layer_name is not None:
+            return False
+        if key is None or value is None:
+            return False
+        if self.alibi_slopes is not None or bool(self.logits_soft_cap):
+            return False
+        if self.sinks is not None or self.sliding_window != (-1, -1):
+            return False
+        if output.shape[-1] != self.head_size:
+            return False
+        if kv_cache.dtype not in (torch.float16, torch.float32):
+            return False
+
+        query_lens = (
+            attn_metadata.query_start_loc[1:] - attn_metadata.query_start_loc[:-1]
+        ).to(device="cpu")
+        if query_lens.numel() != num_actual_tokens:
+            return False
+        return bool(torch.all(query_lens[:num_actual_tokens] == 1).item())
 
 
 def _try_write_tokens_to_vulkan_cache(
@@ -343,8 +349,12 @@ def _vulkan_cache_has_sequences(
         row = block_table[req_idx]
         for token_pos in range(seq_len):
             logical_block_id = token_pos // spec.block_size
+            if logical_block_id >= row.numel():
+                return False
             token_offset = token_pos % spec.block_size
             physical_block_id = int(row[logical_block_id])
+            if not 0 <= physical_block_id < layout.num_blocks:
+                return False
             slot = physical_block_id * spec.block_size + token_offset
             if slot not in written_slots:
                 return False
