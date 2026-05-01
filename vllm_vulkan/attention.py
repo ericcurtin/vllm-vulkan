@@ -9,6 +9,7 @@ Vulkan paged KV cache. Unsupported cases fall back to CPU_ATTN.
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -28,6 +29,12 @@ if TYPE_CHECKING:
     from vllm_vulkan._rs import GpuTensor, VulkanContext
 
 logger = logging.getLogger(__name__)
+
+# vLLM passes a per-layer KV cache tensor into each Attention.forward call.
+# The Vulkan mirror therefore contains exactly that one layer, represented as
+# layer 0 in our VulkanPagedKVLayout.
+_PER_LAYER_KV_CACHE_INDEX = 0
+_MAX_VERIFIED_SEQUENCE_KEYS = 4096
 
 
 class VulkanAttentionBackend(CPUAttentionBackend):
@@ -55,7 +62,8 @@ class _VulkanKVCacheEntry:
     cache: GpuTensor
     shape: tuple[int, ...]
     dtype: torch.dtype
-    written_slots: set[int]
+    written_slots: bytearray
+    verified_prefix_by_blocks: OrderedDict[tuple[int, ...], int]
 
 
 _VULKAN_KV_CACHES: dict[int, _VulkanKVCacheEntry] = {}
@@ -95,6 +103,7 @@ class VulkanAttentionBackendImpl(CPUAttentionBackendImpl):
             return output
 
         num_actual_tokens = attn_metadata.num_actual_tokens
+        allow_vulkan_decode = True
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             return self._run_sdpa_forward(
                 query[:num_actual_tokens],
@@ -131,6 +140,7 @@ class VulkanAttentionBackendImpl(CPUAttentionBackendImpl):
             )
 
         if attn_metadata.use_sdpa_prefill:
+            allow_vulkan_decode = False
             assert self.sinks is None, "Attention sink is unsupported in SDPA prefill"
             num_decode_tokens = attn_metadata.num_decode_tokens
             self._run_sdpa_forward(
@@ -144,7 +154,7 @@ class VulkanAttentionBackendImpl(CPUAttentionBackendImpl):
             num_actual_tokens = num_decode_tokens
 
         if num_actual_tokens > 0:
-            if not self._try_vulkan_decode(
+            if not allow_vulkan_decode or not self._try_vulkan_decode(
                 query=query,
                 key=key,
                 value=value,
@@ -201,7 +211,7 @@ class VulkanAttentionBackendImpl(CPUAttentionBackendImpl):
             if ctx is None:
                 return False
 
-            layout, gpu_cache = _get_or_create_vulkan_kv_cache(ctx, kv_cache)
+            entry = _get_or_create_vulkan_kv_cache(ctx, kv_cache)
             if kv_cache.dtype == torch.float16:
                 from vllm_vulkan.kv_ops import (  # noqa: PLC0415
                     paged_attn_decode_f16,
@@ -217,7 +227,7 @@ class VulkanAttentionBackendImpl(CPUAttentionBackendImpl):
 
             seq_lens = attn_metadata.seq_lens[:num_actual_tokens].to("cpu")
             block_table = attn_metadata.block_table[:num_actual_tokens].to("cpu")
-            if not _vulkan_cache_has_sequences(layout, kv_cache, block_table, seq_lens):
+            if not _vulkan_cache_has_sequences(entry, block_table, seq_lens):
                 return False
 
             outs = []
@@ -225,9 +235,9 @@ class VulkanAttentionBackendImpl(CPUAttentionBackendImpl):
                 outs.append(
                     decode(
                         ctx,
-                        layout,
-                        gpu_cache,
-                        0,
+                        entry.layout,
+                        entry.cache,
+                        _PER_LAYER_KV_CACHE_INDEX,
                         query[token_idx].detach().to("cpu"),
                         block_table[token_idx],
                         int(seq_lens[token_idx]),
@@ -266,7 +276,7 @@ class VulkanAttentionBackendImpl(CPUAttentionBackendImpl):
         """Return True for the conservative decode-only path we can run."""
         if self.attn_type != AttentionType.DECODER:
             return False
-        if attn_metadata.use_sdpa_prefill or not attn_metadata.causal:
+        if not attn_metadata.causal:
             return False
         if self.kv_sharing_target_layer_name is not None:
             return False
@@ -306,7 +316,7 @@ def _try_write_tokens_to_vulkan_cache(
         if ctx is None:
             return
 
-        layout, gpu_cache = _get_or_create_vulkan_kv_cache(ctx, kv_cache)
+        entry = _get_or_create_vulkan_kv_cache(ctx, kv_cache)
         if kv_cache.dtype == torch.float16:
             from vllm_vulkan.kv_ops import (  # noqa: PLC0415
                 paged_kv_write_f16 as write_kv,
@@ -324,48 +334,86 @@ def _try_write_tokens_to_vulkan_cache(
         )
         write_kv(
             ctx,
-            layout,
-            gpu_cache,
-            0,
+            entry.layout,
+            entry.cache,
+            _PER_LAYER_KV_CACHE_INDEX,
             key[:num_tokens],
             value[:num_tokens],
             slots,
         )
-        _vulkan_cache_written_slots(kv_cache).update(int(slot) for slot in slots)
+        _mark_vulkan_cache_slots_written(entry, slots)
     except Exception as exc:
         logger.debug("Vulkan KV cache mirror skipped: %s", exc)
 
 
 def _vulkan_cache_has_sequences(
-    layout: VulkanPagedKVLayout,
-    kv_cache: torch.Tensor,
+    entry: _VulkanKVCacheEntry,
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
 ) -> bool:
-    written_slots = _vulkan_cache_written_slots(kv_cache)
-    spec = layout.layer_spec(0)
+    layout = entry.layout
+    spec = layout.layer_spec(_PER_LAYER_KV_CACHE_INDEX)
     for req_idx, seq_len_tensor in enumerate(seq_lens):
         seq_len = int(seq_len_tensor)
         row = block_table[req_idx]
-        for token_pos in range(seq_len):
+        needed_blocks = (seq_len + spec.block_size - 1) // spec.block_size
+        active_blocks = _active_block_ids(row, needed_blocks, layout.num_blocks)
+        if active_blocks is None:
+            return False
+
+        start_pos = min(_verified_prefix_len(entry, active_blocks), seq_len)
+        for token_pos in range(start_pos, seq_len):
             logical_block_id = token_pos // spec.block_size
-            if logical_block_id >= row.numel():
-                return False
             token_offset = token_pos % spec.block_size
-            physical_block_id = int(row[logical_block_id])
-            if not 0 <= physical_block_id < layout.num_blocks:
-                return False
+            physical_block_id = active_blocks[logical_block_id]
             slot = physical_block_id * spec.block_size + token_offset
-            if slot not in written_slots:
+            if not entry.written_slots[slot]:
                 return False
+        _remember_verified_prefix(entry, active_blocks, seq_len)
+
     return True
 
 
-def _vulkan_cache_written_slots(kv_cache: torch.Tensor) -> set[int]:
-    entry = _VULKAN_KV_CACHES.get(_kv_cache_storage_key(kv_cache))
-    if entry is None:
-        return set()
-    return entry.written_slots
+def _mark_vulkan_cache_slots_written(
+    entry: _VulkanKVCacheEntry, slots: torch.Tensor
+) -> None:
+    capacity = len(entry.written_slots)
+    for slot_tensor in slots:
+        slot = int(slot_tensor)
+        if 0 <= slot < capacity:
+            entry.written_slots[slot] = 1
+
+
+def _active_block_ids(
+    row: torch.Tensor, needed_blocks: int, num_blocks: int
+) -> tuple[int, ...] | None:
+    if row.numel() < needed_blocks:
+        return None
+
+    block_ids = tuple(int(block_id) for block_id in row[:needed_blocks])
+    if any(block_id < 0 or block_id >= num_blocks for block_id in block_ids):
+        return None
+    return block_ids
+
+
+def _verified_prefix_len(
+    entry: _VulkanKVCacheEntry, active_blocks: tuple[int, ...]
+) -> int:
+    verified = entry.verified_prefix_by_blocks.get(active_blocks)
+    if verified is not None:
+        return verified
+    if len(active_blocks) > 1:
+        return entry.verified_prefix_by_blocks.get(active_blocks[:-1], 0)
+    return 0
+
+
+def _remember_verified_prefix(
+    entry: _VulkanKVCacheEntry, active_blocks: tuple[int, ...], seq_len: int
+) -> None:
+    entry.verified_prefix_by_blocks[active_blocks] = seq_len
+    entry.verified_prefix_by_blocks.move_to_end(active_blocks)
+    while len(entry.verified_prefix_by_blocks) > _MAX_VERIFIED_SEQUENCE_KEYS:
+        entry.verified_prefix_by_blocks.popitem(last=False)
 
 
 def _get_vulkan_context() -> VulkanContext | None:
@@ -386,7 +434,7 @@ def _get_vulkan_context() -> VulkanContext | None:
 def _get_or_create_vulkan_kv_cache(
     ctx: VulkanContext,
     kv_cache: torch.Tensor,
-) -> tuple[VulkanPagedKVLayout, GpuTensor]:
+) -> _VulkanKVCacheEntry:
     key = _kv_cache_storage_key(kv_cache)
     shape = tuple(int(dim) for dim in kv_cache.shape)
     entry = _VULKAN_KV_CACHES.get(key)
@@ -397,7 +445,7 @@ def _get_or_create_vulkan_kv_cache(
         and entry.shape == shape
         and entry.dtype == kv_cache.dtype
     ):
-        return entry.layout, entry.cache
+        return entry
 
     if entry is not None:
         _VULKAN_KV_CACHES.pop(key, None)
@@ -411,7 +459,7 @@ def _get_or_create_vulkan_kv_cache(
     layout = VulkanPagedKVLayout(
         (
             KVCacheLayerSpec(
-                layer_index=0,
+                layer_index=_PER_LAYER_KV_CACHE_INDEX,
                 num_kv_heads=num_kv_heads,
                 head_size=head_size,
                 block_size=block_size,
@@ -423,16 +471,18 @@ def _get_or_create_vulkan_kv_cache(
     gpu_cache = ctx.alloc_activation(layout.total_bytes)
     ctx.update_activation(gpu_cache, bytes(layout.total_bytes))
 
-    _VULKAN_KV_CACHES[key] = _VulkanKVCacheEntry(
+    entry = _VulkanKVCacheEntry(
         storage_key=key,
         layout=layout,
         cache=gpu_cache,
         shape=shape,
         dtype=kv_cache.dtype,
-        written_slots=set(),
+        written_slots=bytearray(layout.capacity_tokens_per_layer),
+        verified_prefix_by_blocks=OrderedDict(),
     )
+    _VULKAN_KV_CACHES[key] = entry
 
-    return layout, gpu_cache
+    return entry
 
 
 def _kv_cache_storage_key(kv_cache: torch.Tensor) -> int:

@@ -35,10 +35,30 @@ def test_debug_enabled(monkeypatch):
     assert envs.VLLM_VULKAN_DEBUG is True
 
 
+def test_disable_attention_default(monkeypatch):
+    monkeypatch.delenv("VLLM_VULKAN_DISABLE_ATTN", raising=False)
+    assert envs.VLLM_VULKAN_DISABLE_ATTN is False
+
+
+def test_disable_attention_enabled(monkeypatch):
+    monkeypatch.setenv("VLLM_VULKAN_DISABLE_ATTN", "1")
+    assert envs.VLLM_VULKAN_DISABLE_ATTN is True
+
+
 def test_device_index_default(monkeypatch):
     monkeypatch.delenv("VLLM_VULKAN_DEVICE_INDEX", raising=False)
     val = envs.VLLM_VULKAN_DEVICE_INDEX
     assert val == 0
+
+
+def test_rust_model_default(monkeypatch):
+    monkeypatch.delenv("VLLM_VULKAN_RUST_MODEL", raising=False)
+    assert envs.VLLM_VULKAN_RUST_MODEL is True
+
+
+def test_rust_model_disabled(monkeypatch):
+    monkeypatch.setenv("VLLM_VULKAN_RUST_MODEL", "0")
+    assert envs.VLLM_VULKAN_RUST_MODEL is False
 
 
 def test_unknown_attr_raises():
@@ -51,3 +71,5 @@ def test_environment_variables_dict_populated():
     assert "VLLM_VULKAN_BLOCK_SIZE" in envs.environment_variables
     assert "VLLM_VULKAN_DEBUG" in envs.environment_variables
     assert "VLLM_VULKAN_DEVICE_INDEX" in envs.environment_variables
+    assert "VLLM_VULKAN_DISABLE_ATTN" in envs.environment_variables
+    assert "VLLM_VULKAN_RUST_MODEL" in envs.environment_variables

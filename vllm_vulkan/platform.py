@@ -241,9 +241,7 @@ class VulkanPlatform(Platform):
                         block_size=cache_config.block_size or config.block_size,
                         dtype=model_config.dtype,
                     )
-                    bytes_per_token = sum(
-                        spec.bytes_per_token for spec in specs
-                    )
+                    bytes_per_token = sum(spec.bytes_per_token for spec in specs)
                     max_tokens_in_kv = int(
                         cache_config.cpu_kvcache_space_bytes / bytes_per_token
                     )
