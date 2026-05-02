@@ -1,0 +1,84 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer QInput {
+    float q[];
+};
+
+layout(binding = 1) readonly buffer BlockTable {
+    uint blocks[];
+};
+
+layout(binding = 2) readonly buffer KVCache {
+    float16_t cache[];
+};
+
+layout(binding = 3) writeonly buffer Output {
+    float output_data[];
+};
+
+layout(push_constant) uniform parameter {
+    uint seq_len;
+    uint num_q_heads;
+    uint num_kv_heads;
+    uint head_size;
+    uint block_size;
+    uint layer_base_elements;
+    uint plane_elements_per_block;
+    uint block_elements;
+    float scale;
+} p;
+
+uint kv_base_for_token(uint token_idx, uint kv_head) {
+    const uint logical_block_id = token_idx / p.block_size;
+    const uint token_offset_in_block =
+        token_idx - logical_block_id * p.block_size;
+    const uint physical_block_id = blocks[logical_block_id];
+    const uint elements_per_token = p.num_kv_heads * p.head_size;
+    return p.layer_base_elements +
+        physical_block_id * p.block_elements +
+        token_offset_in_block * elements_per_token +
+        kv_head * p.head_size;
+}
+
+void main() {
+    const uint global_idx = gl_GlobalInvocationID.x;
+    const uint total_elements = p.num_q_heads * p.head_size;
+    if (global_idx >= total_elements) {
+        return;
+    }
+
+    const uint q_head = global_idx / p.head_size;
+    const uint head_element = global_idx - q_head * p.head_size;
+    const uint gqa_ratio = p.num_q_heads / p.num_kv_heads;
+    const uint kv_head = q_head / gqa_ratio;
+    const uint q_base = q_head * p.head_size;
+
+    // Online softmax keeps the numerically stable max/sum state while scanning
+    // K/V once instead of recomputing every QK dot product in a second pass.
+    float running_max = -3.402823466e+38;
+    float denom = 0.0;
+    float acc = 0.0;
+    for (uint token_idx = 0; token_idx < p.seq_len; token_idx++) {
+        const uint kv_base = kv_base_for_token(token_idx, kv_head);
+        float dot = 0.0;
+        for (uint d = 0; d < p.head_size; d++) {
+            dot += q[q_base + d] * float(cache[kv_base + d]);
+        }
+        const float logit = dot * p.scale;
+        const float new_max = max(running_max, logit);
+        const float old_scale = exp(running_max - new_max);
+        const float weight = exp(logit - new_max);
+        denom = denom * old_scale;
+        acc = acc * old_scale;
+        denom += weight;
+        acc += weight * float(
+            cache[kv_base + p.plane_elements_per_block + head_element]);
+        running_max = new_max;
+    }
+
+    output_data[global_idx] = denom > 0.0 ? acc / denom : 0.0;
+}

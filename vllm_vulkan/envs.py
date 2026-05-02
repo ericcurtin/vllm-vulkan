@@ -17,11 +17,15 @@ import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+_VLLM_VULKAN_RUST_MODEL_DEFAULT = True
+
 if TYPE_CHECKING:
     VLLM_VULKAN_MEMORY_FRACTION: float = 0.9
     VLLM_VULKAN_BLOCK_SIZE: str = "16"
     VLLM_VULKAN_DEBUG: bool = False
     VLLM_VULKAN_DEVICE_INDEX: int = 0
+    VLLM_VULKAN_DISABLE_ATTN: bool = False
+    VLLM_VULKAN_RUST_MODEL: bool = _VLLM_VULKAN_RUST_MODEL_DEFAULT
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # Fraction of device memory to use for KV cache (0, 1].
@@ -34,6 +38,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_VULKAN_DEBUG": lambda: os.getenv("VLLM_VULKAN_DEBUG", "0") == "1",
     # Which Vulkan physical device index to use (default 0).
     "VLLM_VULKAN_DEVICE_INDEX": lambda: int(os.getenv("VLLM_VULKAN_DEVICE_INDEX", "0")),
+    # Disable the experimental Vulkan attention decode path.
+    "VLLM_VULKAN_DISABLE_ATTN": lambda: (
+        os.getenv("VLLM_VULKAN_DISABLE_ATTN", "0") == "1"
+    ),
+    # Use the Rust VulkanModel / Vulkan module hooks during model execution.
+    "VLLM_VULKAN_RUST_MODEL": lambda: (
+        os.getenv(
+            "VLLM_VULKAN_RUST_MODEL",
+            "1" if _VLLM_VULKAN_RUST_MODEL_DEFAULT else "0",
+        )
+        == "1"
+    ),
 }
 
 

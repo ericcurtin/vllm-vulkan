@@ -15,10 +15,15 @@ import os
 import torch
 import torch.nn as nn
 
+from vllm_vulkan import envs
+
 logger = logging.getLogger(__name__)
 
-_USE_RUST_MODEL = os.environ.get("VLLM_VULKAN_RUST_MODEL", "1") == "1"
 _RUST_MODEL_SINGLETON = None  # lazy-initialised
+
+
+def _use_rust_model() -> bool:
+    return envs.VLLM_VULKAN_RUST_MODEL
 
 
 class VulkanWorker:
@@ -111,7 +116,7 @@ def _safe_init_device(self) -> None:
     set_random_seed(self.model_config.seed)
 
     # Model runner: use our Rust-native runner if enabled.
-    if _USE_RUST_MODEL:
+    if _use_rust_model():
         from vllm_vulkan.model_runner import _VulkanCPUModelRunner  # noqa: PLC0415
 
         self.model_runner = _VulkanCPUModelRunner(self.vllm_config, torch.device("cpu"))
@@ -143,7 +148,7 @@ class _VulkanCPUModelRunner:
         """Load PyTorch model, then load Rust VulkanModel and patch forward."""
         self._runner.load_model(**kwargs)
 
-        if not _USE_RUST_MODEL:
+        if not _use_rust_model():
             return
 
         try:

@@ -61,6 +61,14 @@ def __getattr__(name: str):  # noqa: ANN001, ANN201
         from vllm_vulkan.config import VulkanConfig
 
         return VulkanConfig
+    if name == "KVCacheLayerSpec":
+        from vllm_vulkan.kv_layout import KVCacheLayerSpec
+
+        return KVCacheLayerSpec
+    if name == "VulkanPagedKVLayout":
+        from vllm_vulkan.kv_layout import VulkanPagedKVLayout
+
+        return VulkanPagedKVLayout
     if name == "get_config":
         from vllm_vulkan.config import get_config
 
@@ -80,7 +88,9 @@ def __getattr__(name: str):  # noqa: ANN001, ANN201
 
 __all__ = [
     "VulkanConfig",
+    "KVCacheLayerSpec",
     "VulkanPlatform",
+    "VulkanPagedKVLayout",
     "get_config",
     "reset_config",
     "register",

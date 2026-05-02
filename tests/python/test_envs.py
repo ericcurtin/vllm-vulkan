@@ -41,6 +41,11 @@ def test_device_index_default(monkeypatch):
     assert val == 0
 
 
+def test_rust_model_disabled(monkeypatch):
+    monkeypatch.setenv("VLLM_VULKAN_RUST_MODEL", "0")
+    assert envs.VLLM_VULKAN_RUST_MODEL is False
+
+
 def test_unknown_attr_raises():
     with pytest.raises(AttributeError, match="no attribute"):
         _ = envs.VLLM_VULKAN_DOES_NOT_EXIST  # type: ignore[attr-defined]
@@ -51,3 +56,5 @@ def test_environment_variables_dict_populated():
     assert "VLLM_VULKAN_BLOCK_SIZE" in envs.environment_variables
     assert "VLLM_VULKAN_DEBUG" in envs.environment_variables
     assert "VLLM_VULKAN_DEVICE_INDEX" in envs.environment_variables
+    assert "VLLM_VULKAN_DISABLE_ATTN" in envs.environment_variables
+    assert "VLLM_VULKAN_RUST_MODEL" in envs.environment_variables

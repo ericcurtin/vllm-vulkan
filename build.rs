@@ -43,23 +43,14 @@ fn compile_shaders() {
 
     fs::create_dir_all(&out_spirv).expect("failed to create OUT_DIR/spirv");
 
-    // Count already-compiled .spv files in OUT_DIR (incremental rebuild).
-    let compiled: Vec<_> = fs::read_dir(&out_spirv)
-        .map(|rd| {
-            rd.flatten()
-                .filter(|e| {
-                    e.path().extension().and_then(|x| x.to_str()) == Some("spv")
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    if !compiled.is_empty() {
-        println!(
-            "cargo:warning=vllm-vulkan: {} SPIR-V shaders already in OUT_DIR, skipping compilation",
-            compiled.len()
-        );
-        return;
+    // The build script only reruns when shader sources change, so when it does
+    // run, rebuild OUT_DIR's SPIR-V set from source.  Otherwise adding a new
+    // shader can leave stale OUT_DIR contents and break include_bytes! below.
+    for entry in fs::read_dir(&out_spirv).unwrap().flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("spv") {
+            fs::remove_file(path).ok();
+        }
     }
 
     // Run compile_shaders.sh to build the .spv files into OUT_DIR/spirv.
@@ -124,6 +115,7 @@ fn link_macos() {
         if Path::new(lib_dir.as_str()).join("libvulkan.dylib").exists() {
             println!("cargo:rustc-link-search=native={lib_dir}");
             println!("cargo:rustc-link-lib=dylib=vulkan");
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{lib_dir}");
             linked = true;
             break;
         }

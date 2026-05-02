@@ -1,0 +1,55 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer KInput {
+    float16_t data_k[];
+};
+
+layout(binding = 1) readonly buffer VInput {
+    float16_t data_v[];
+};
+
+layout(binding = 2) readonly buffer SlotMapping {
+    uint slots[];
+};
+
+layout(binding = 3) buffer KVCache {
+    float16_t cache[];
+};
+
+layout(push_constant) uniform parameter {
+    uint num_tokens;
+    uint num_kv_heads;
+    uint head_size;
+    uint block_size;
+    uint layer_base_elements;
+    uint plane_elements_per_block;
+    uint block_elements;
+} p;
+
+void main() {
+    const uint global_idx = gl_GlobalInvocationID.x;
+    const uint elements_per_token = p.num_kv_heads * p.head_size;
+    const uint total_elements = p.num_tokens * elements_per_token;
+    if (global_idx >= total_elements) {
+        return;
+    }
+
+    const uint token_idx = global_idx / elements_per_token;
+    const uint token_element = global_idx - token_idx * elements_per_token;
+    const uint slot = slots[token_idx];
+
+    const uint physical_block_id = slot / p.block_size;
+    const uint token_offset_in_block = slot - physical_block_id * p.block_size;
+
+    const uint block_base =
+        p.layer_base_elements + physical_block_id * p.block_elements;
+    const uint dst =
+        block_base + token_offset_in_block * elements_per_token + token_element;
+
+    cache[dst] = data_k[global_idx];
+    cache[dst + p.plane_elements_per_block] = data_v[global_idx];
+}
