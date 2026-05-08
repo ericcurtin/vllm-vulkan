@@ -141,7 +141,12 @@ main() {
   ensure_venv "$venv"
 
   # Install vLLM CPU build (no CUDA dependencies)
-  local vllm_v="0.19.1"
+  local vllm_v
+  if [[ -n "$local_lib" && -f "$local_lib" ]]; then
+    vllm_v=$(cat "$(dirname "${BASH_SOURCE[0]}")/.vllm-version")
+  else
+    vllm_v=$(curl -fsSL "https://raw.githubusercontent.com/$repo_owner/$repo_name/main/.vllm-version")
+  fi
   local url_base="https://github.com/vllm-project/vllm/releases/download"
   local filename="vllm-$vllm_v.tar.gz"
   curl -OL "$url_base/v$vllm_v/$filename"

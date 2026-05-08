@@ -23,8 +23,9 @@ ENV VIRTUAL_ENV=/opt/vllm-vulkan
 RUN uv venv "$VIRTUAL_ENV" --python 3.12 --seed
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
-ARG VLLM_VERSION=0.19.1
-RUN curl -fsSL "https://github.com/vllm-project/vllm/releases/download/v${VLLM_VERSION}/vllm-${VLLM_VERSION}.tar.gz" \
+COPY .vllm-version /tmp/.vllm-version
+RUN VLLM_VERSION=$(cat /tmp/.vllm-version) \
+    && curl -fsSL "https://github.com/vllm-project/vllm/releases/download/v${VLLM_VERSION}/vllm-${VLLM_VERSION}.tar.gz" \
         -o /tmp/vllm.tar.gz \
     && tar xf /tmp/vllm.tar.gz -C /tmp \
     && uv pip install -r "/tmp/vllm-${VLLM_VERSION}/requirements/cpu.txt" \
