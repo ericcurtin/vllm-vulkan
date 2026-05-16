@@ -195,16 +195,16 @@ class VulkanPlatform(Platform):
         # We reserve memory for:
         #   - Model weights in PyTorch (fp16/bf16):  ~model_params * 2 bytes
         #   - Vulkan weight copies (fp32):            ~model_params * 4 bytes
-        #   - OS + Python runtime overhead:           ~4 GB
+        #   - OS + Python runtime overhead:           ~4 GiB
         # KV cache gets the remainder × safety_fraction.
         if cache_config.kv_cache_memory_bytes is None:
             kv_env = os.environ.get("VLLM_CPU_KVCACHE_SPACE")
             if kv_env is not None:
-                kv_gb = float(kv_env)
+                kv_gib = float(kv_env)
             else:
                 import psutil as _psutil  # noqa: PLC0415
 
-                total_ram_gb = _psutil.virtual_memory().total / (1024**3)
+                total_ram_gib = _psutil.virtual_memory().total / (1024**3)
 
                 # Estimate model weight memory:
                 # bf16 weights (already loaded) + float32 Vulkan copies
@@ -213,14 +213,14 @@ class VulkanPlatform(Platform):
                     for p in getattr(vllm_config, "model_config", None) and [] or []
                 )
                 # Rough estimate: 6 bytes/param (2 bf16 + 4 f32)
-                # For E2B ~2B params: 12 GB; for 31B: ~186 GB
+                # For E2B ~2B params: 12 GiB; for 31B: ~186 GiB
                 # Use a conservative 35% of total RAM for KV cache
-                # Reserve memory for: PyTorch weights (~4GB), Vulkan weight
-                # copies (~10GB), OS (~4GB). KV cache gets the rest up to cap.
-                # 115GB total - 4 - 10 - 4 = ~97GB, but use conservative 8GB
-                kv_gb = max(4.0, min(total_ram_gb * 0.07, 8.0))  # cap at 8 GB
-            cache_config.kv_cache_memory_bytes = int(kv_gb * 1024**3)
-            logger.info("Vulkan/CPU KV cache space: %.1f GB", kv_gb)
+                # Reserve memory for: PyTorch weights (~4 GiB), Vulkan weight
+                # copies (~10 GiB), OS (~4 GiB). KV cache gets the rest up to cap.
+                # 115 GiB total - 4 - 10 - 4 = ~97 GiB, but use conservative 8 GiB
+                kv_gib = max(4.0, min(total_ram_gib * 0.07, 8.0))  # cap at 8 GiB
+            cache_config.kv_cache_memory_bytes = int(kv_gib * 1024**3)
+            logger.info("Vulkan/CPU KV cache space: %.1f GiB", kv_gib)
 
         if model_config is not None:
             model_config.disable_cascade_attn = True
@@ -253,10 +253,10 @@ class VulkanPlatform(Platform):
                         if safe_max > 0 and safe_max < model_config.max_model_len:
                             logger.info(
                                 "Vulkan/CPU: capping max_model_len from %d to %d "
-                                "based on %.1f GB KV cache budget.",
+                                "based on %.1f GiB KV cache budget.",
                                 model_config.max_model_len,
                                 safe_max,
-                                cache_config.kv_cache_memory_bytes / 1e9,
+                                cache_config.kv_cache_memory_bytes / 1024**3,
                             )
                             model_config.max_model_len = safe_max
                 except Exception as exc:
