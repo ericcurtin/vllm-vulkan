@@ -2,6 +2,7 @@
 """Tests for VulkanPlatform."""
 
 import platform as py_platform
+from types import SimpleNamespace
 
 import pytest
 
@@ -84,3 +85,36 @@ def test_register_returns_class_path_or_none():
 
     result = vllm_vulkan._register()
     assert result is None or result == "vllm_vulkan.platform.VulkanPlatform"
+
+
+def test_check_and_update_config_sets_kv_cache_memory_bytes(monkeypatch):
+    monkeypatch.setenv("VLLM_CPU_KVCACHE_SPACE", "5")
+    monkeypatch.setenv("VLLM_VULKAN_ALLOW_COMPILE", "1")
+
+    cache_config = SimpleNamespace(
+        block_size=None,
+        kv_cache_memory_bytes=None,
+    )
+    parallel_config = SimpleNamespace(
+        worker_cls="auto",
+        distributed_executor_backend="auto",
+        disable_custom_all_reduce=False,
+    )
+    scheduler_config = SimpleNamespace(async_scheduling=True)
+    compilation_config = SimpleNamespace(mode=None)
+    vllm_config = SimpleNamespace(
+        parallel_config=parallel_config,
+        cache_config=cache_config,
+        model_config=None,
+        scheduler_config=scheduler_config,
+        compilation_config=compilation_config,
+    )
+
+    VulkanPlatform.check_and_update_config(vllm_config)
+
+    assert cache_config.kv_cache_memory_bytes == 5 * 1024**3
+    assert cache_config.block_size == 16
+    assert parallel_config.worker_cls == "vllm_vulkan.worker.VulkanWorker"
+    assert parallel_config.distributed_executor_backend == "uni"
+    assert parallel_config.disable_custom_all_reduce is True
+    assert scheduler_config.async_scheduling is False

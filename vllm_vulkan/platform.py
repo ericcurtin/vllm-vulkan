@@ -191,13 +191,13 @@ class VulkanPlatform(Platform):
         ):
             cache_config.block_size = config.block_size
 
-        # CPU KV cache space (required by CPUWorker).
+        # KV cache memory budget (required by CPUWorker).
         # We reserve memory for:
         #   - Model weights in PyTorch (fp16/bf16):  ~model_params * 2 bytes
         #   - Vulkan weight copies (fp32):            ~model_params * 4 bytes
         #   - OS + Python runtime overhead:           ~4 GB
         # KV cache gets the remainder × safety_fraction.
-        if cache_config.cpu_kvcache_space_bytes is None:
+        if cache_config.kv_cache_memory_bytes is None:
             kv_env = os.environ.get("VLLM_CPU_KVCACHE_SPACE")
             if kv_env is not None:
                 kv_gb = float(kv_env)
@@ -219,7 +219,7 @@ class VulkanPlatform(Platform):
                 # copies (~10GB), OS (~4GB). KV cache gets the rest up to cap.
                 # 115GB total - 4 - 10 - 4 = ~97GB, but use conservative 8GB
                 kv_gb = max(4.0, min(total_ram_gb * 0.07, 8.0))  # cap at 8 GB
-            cache_config.cpu_kvcache_space_bytes = int(kv_gb * 1024**3)
+            cache_config.kv_cache_memory_bytes = int(kv_gb * 1024**3)
             logger.info("Vulkan/CPU KV cache space: %.1f GB", kv_gb)
 
         if model_config is not None:
@@ -230,7 +230,7 @@ class VulkanPlatform(Platform):
             # "220 GiB KV cache needed" error on machines with limited RAM.
             # Users can always pass --max-model-len explicitly to override.
             if (
-                cache_config.cpu_kvcache_space_bytes is not None
+                cache_config.kv_cache_memory_bytes is not None
                 and model_config.max_model_len is not None
             ):
                 # Estimate KV cache bytes per token using the same paged KV
@@ -243,7 +243,7 @@ class VulkanPlatform(Platform):
                     )
                     bytes_per_token = sum(spec.bytes_per_token for spec in specs)
                     max_tokens_in_kv = int(
-                        cache_config.cpu_kvcache_space_bytes / bytes_per_token
+                        cache_config.kv_cache_memory_bytes / bytes_per_token
                     )
                     if max_tokens_in_kv < model_config.max_model_len:
                         # Leave 20% headroom and cap at a multiple of block_size
@@ -256,7 +256,7 @@ class VulkanPlatform(Platform):
                                 "based on %.1f GB KV cache budget.",
                                 model_config.max_model_len,
                                 safe_max,
-                                cache_config.cpu_kvcache_space_bytes / 1e9,
+                                cache_config.kv_cache_memory_bytes / 1e9,
                             )
                             model_config.max_model_len = safe_max
                 except Exception as exc:
