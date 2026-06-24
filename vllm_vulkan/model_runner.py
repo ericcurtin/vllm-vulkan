@@ -392,8 +392,17 @@ def _wrap_linear(module: nn.Module) -> None:
 
         bias = getattr(module, "bias", None)
         try:
-            result = vulkan_ops.linear(x.float(), weight.float(), bias)
-            result = result.to(x.dtype)
+            # The Vulkan matmul kernel tiles 4 rows and returns incorrect
+            # results for M < 4 (e.g. the M=1 decode step), producing garbage
+            # tokens during generation. Pad the row dim up to 4, then slice back.
+            xf = x.float().reshape(-1, x.shape[-1])
+            m = xf.shape[0]
+            if m < 4:
+                xf = torch.cat([xf, xf[-1:].expand(4 - m, -1)], dim=0)
+                result = vulkan_ops.linear(xf, weight.float(), bias)[:m]
+            else:
+                result = vulkan_ops.linear(xf, weight.float(), bias)
+            result = result.reshape(*x.shape[:-1], result.shape[-1]).to(x.dtype)
         except Exception as exc:
             logger.debug("Vulkan linear failed (%s)", exc)
             return orig(x, *args, **kwargs)
