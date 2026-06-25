@@ -345,8 +345,7 @@ class VulkanPlatform(Platform):
 # --- vLLM 0.23 compatibility shims -------------------------------------------
 # 0.23 renamed the platform seed hook (seed_everything -> manual_seed_all); CPU
 # RNG is already seeded in set_random_seed, so a no-op is correct.
-if not hasattr(VulkanPlatform, "manual_seed_all"):
-    VulkanPlatform.manual_seed_all = classmethod(lambda cls, seed: None)
+VulkanPlatform.manual_seed_all = classmethod(lambda cls, seed: None)
 
 # 0.23 profile_run queries num_compute_units; report CPU core count (Vulkan does
 # expose CU via VkPhysicalDeviceShaderCorePropertiesAMD, but _rs does not surface
