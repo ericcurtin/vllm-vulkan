@@ -391,17 +391,37 @@ def _wrap_linear(module: nn.Module) -> None:
             return orig(x, *args, **kwargs)
 
         bias = getattr(module, "bias", None)
+        skip_bias = getattr(module, "skip_bias_add", False)
+        tp_size = getattr(module, "tp_size", 1)
+        # RowParallelLinear sums partial results across tensor-parallel ranks and
+        # applies bias after the reduction, not inside the (sharded) matmul. The
+        # bare matmul below produces only this rank's partial sum, so without the
+        # all-reduce the model emits garbage under tensor parallelism.
+        row_reduce = getattr(module, "reduce_results", False) and tp_size > 1
+        matmul_bias = None if (row_reduce or skip_bias) else bias
         try:
-            result = vulkan_ops.linear(x.float(), weight.float(), bias)
+            result = vulkan_ops.linear(x.float(), weight.float(), matmul_bias)
             result = result.to(x.dtype)
+            if row_reduce:
+                from vllm.distributed import (  # noqa: PLC0415
+                    tensor_model_parallel_all_reduce,
+                )
+
+                result = tensor_model_parallel_all_reduce(result)
+                if bias is not None and not skip_bias:
+                    result = result + bias
+            elif getattr(module, "gather_output", False) and tp_size > 1:
+                from vllm.distributed import (  # noqa: PLC0415
+                    tensor_model_parallel_all_gather,
+                )
+
+                result = tensor_model_parallel_all_gather(result)
         except Exception as exc:
             logger.debug("Vulkan linear failed (%s)", exc)
             return orig(x, *args, **kwargs)
 
         if _returns_tuple:
-            output_bias = (
-                module.bias if getattr(module, "skip_bias_add", False) else None
-            )
+            output_bias = module.bias if skip_bias else None
             return result, output_bias
         return result
 
