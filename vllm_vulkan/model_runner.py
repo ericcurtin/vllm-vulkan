@@ -402,23 +402,29 @@ def _wrap_linear(module: nn.Module) -> None:
         try:
             result = vulkan_ops.linear(x.float(), weight.float(), matmul_bias)
             result = result.to(x.dtype)
-            if row_reduce:
-                from vllm.distributed import (  # noqa: PLC0415
-                    tensor_model_parallel_all_reduce,
-                )
-
-                result = tensor_model_parallel_all_reduce(result)
-                if bias is not None and not skip_bias:
-                    result = result + bias
-            elif getattr(module, "gather_output", False) and tp_size > 1:
-                from vllm.distributed import (  # noqa: PLC0415
-                    tensor_model_parallel_all_gather,
-                )
-
-                result = tensor_model_parallel_all_gather(result)
         except Exception as exc:
             logger.debug("Vulkan linear failed (%s)", exc)
             return orig(x, *args, **kwargs)
+
+        # Collectives run outside the try/except, and only on the success path. A
+        # rank whose matmul failed has already returned orig(), which runs the
+        # same collective, so every rank performs exactly one collective and stays
+        # in lockstep. Catching a collective here and re-running it via orig()
+        # would issue it twice on that rank and deadlock the group.
+        if row_reduce:
+            from vllm.distributed import (  # noqa: PLC0415
+                tensor_model_parallel_all_reduce,
+            )
+
+            result = tensor_model_parallel_all_reduce(result)
+            if bias is not None and not skip_bias:
+                result = result + bias
+        elif getattr(module, "gather_output", False) and tp_size > 1:
+            from vllm.distributed import (  # noqa: PLC0415
+                tensor_model_parallel_all_gather,
+            )
+
+            result = tensor_model_parallel_all_gather(result)
 
         if _returns_tuple:
             output_bias = module.bias if skip_bias else None
