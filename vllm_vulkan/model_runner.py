@@ -397,11 +397,13 @@ def _wrap_linear(module: nn.Module) -> None:
             # tokens during generation. Pad the row dim up to 4, then slice back.
             xf = x.float().reshape(-1, x.shape[-1])
             m = xf.shape[0]
-            if m < 4:
+            if m == 0:
+                result = xf.new_empty(0, weight.shape[0])
+            elif m < 4:
                 xf = torch.cat([xf, xf[-1:].expand(4 - m, -1)], dim=0)
-                result = vulkan_ops.linear(xf, weight.float(), bias)[:m]
+                result = vulkan_ops.linear(xf, weight, bias)[:m]
             else:
-                result = vulkan_ops.linear(xf, weight.float(), bias)
+                result = vulkan_ops.linear(xf, weight, bias)
             result = result.reshape(*x.shape[:-1], result.shape[-1]).to(x.dtype)
         except Exception as exc:
             logger.debug("Vulkan linear failed (%s)", exc)

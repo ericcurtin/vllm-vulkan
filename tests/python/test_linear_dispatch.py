@@ -27,7 +27,7 @@ def _ready_ops():
     return vulkan_ops
 
 
-@pytest.mark.parametrize("m", [1, 2, 3, 4, 8, 17])
+@pytest.mark.parametrize("m", [0, 1, 2, 3, 4, 8, 17])
 @pytest.mark.parametrize("bias", [False, True])
 def test_wrapped_linear_matches_torch_for_small_batch(m, bias):
     _require_device()
