@@ -68,6 +68,10 @@ class VulkanPlatform(Platform):
     device_name: str = "cpu"
     device_type: str = "cpu"
     dispatch_key: str = "CPU"
+    # Vulkan is a GPU backend (compute offloaded to the device) even though
+    # device_type is "cpu"; advertise GPU placement so vLLM's ray distributed
+    # executor will schedule workers (it rejects platforms with no ray_device_key).
+    ray_device_key: str = "GPU"
 
     # ─── Device queries ──────────────────────────────────────────────────────
 
