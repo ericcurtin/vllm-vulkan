@@ -1117,9 +1117,9 @@ impl VulkanModel {
                 let cb = eng.begin_batch().unwrap();
                 let inp_ref = inp_p as *const compute::Buffer;
                 unsafe {
-                    eng.record_to(cb, "mul_mat_vec_f32_f32_f32",
+                    eng.record_to(cb, "mul_mat_vec_f32_f32_f32_r4",
                         &[&*lm_w_ptr, &*inp_ref, &*logit_p],
-                        &pc, (vocab as u32, 1, 1)).unwrap();
+                        &pc, (wg_r4(vocab), 1, 1)).unwrap();
                 }
                 eng.submit_batch(cb).unwrap();
                 read_f32_buf(unsafe { &*logit_p }, vocab)
@@ -1198,7 +1198,7 @@ impl VulkanModel {
         let residual = hidden.to_vec();
         let _t_layer = std::time::Instant::now();
 
-        let shader = "mul_mat_vec_f16_f32_f32";
+        let shader = "mul_mat_vec_f16_f32_f32_r4";
 
         // Init persistent activation buffers on first call.
         let use_gpu = self.engine.is_some()
@@ -1263,9 +1263,9 @@ impl VulkanModel {
             unsafe {
                 eng.record_to(cb, "rms_norm_f32_mul", &[&*raw_p, &*inln_w_gpu, &*inp], &rms_norm_mul_pc(h, eps), (1, 1, 1)).unwrap();
                 eng.record_barrier_to(cb);
-                eng.record_to(cb, shader, &[&*q_w, &*inp, &*q_p], &mv_pc(h, q_dim), (q_dim as u32, t as u32, 1)).unwrap();
-                eng.record_to(cb, shader, &[&*k_w, &*inp, &*k_p], &mv_pc(h, kv_dim), (kv_dim as u32, t as u32, 1)).unwrap();
-                eng.record_to(cb, shader, &[&*v_w, &*inp, &*v_p], &mv_pc(h, kv_dim), (kv_dim as u32, t as u32, 1)).unwrap();
+                eng.record_to(cb, shader, &[&*q_w, &*inp, &*q_p], &mv_pc(h, q_dim), (wg_r4(q_dim), t as u32, 1)).unwrap();
+                eng.record_to(cb, shader, &[&*k_w, &*inp, &*k_p], &mv_pc(h, kv_dim), (wg_r4(kv_dim), t as u32, 1)).unwrap();
+                eng.record_to(cb, shader, &[&*v_w, &*inp, &*v_p], &mv_pc(h, kv_dim), (wg_r4(kv_dim), t as u32, 1)).unwrap();
             }
             eng.submit_batch(cb).unwrap();  // Fence wait 1: input_layernorm + QKV
             if layer_idx == 0 { log::debug!("L{layer_idx} QKV submit: {}µs", _t_layer.elapsed().as_micros()); }
@@ -1347,7 +1347,7 @@ impl VulkanModel {
             let eng  = self.engine.as_mut().unwrap();
             let cb   = eng.begin_batch().unwrap();
             unsafe {
-                eng.record_to(cb, shader, &[&*ow, &*oi, &*oo], &mv_pc(q_dim, h), (h as u32, t as u32, 1)).unwrap();
+                eng.record_to(cb, shader, &[&*ow, &*oi, &*oo], &mv_pc(q_dim, h), (wg_r4(h), t as u32, 1)).unwrap();
             }
             eng.submit_batch(cb).unwrap();
             if layer_idx == 0 { log::debug!("L{layer_idx} o_proj submit: {}µs total since layer start", _t_layer.elapsed().as_micros()); }
@@ -1424,8 +1424,8 @@ impl VulkanModel {
             let cb = eng.begin_batch().unwrap();
             unsafe {
                 // Step 1: gate and up matmuls are independent (same input ffi, different outputs)
-                eng.record_to(cb, shader, &[&*gw, &*ffi, &*gp], &mv_pc(h, ffn_inter), (ffn_inter as u32, t as u32, 1)).unwrap();
-                eng.record_to(cb, shader, &[&*uw, &*ffi, &*up_p], &mv_pc(h, ffn_inter), (ffn_inter as u32, t as u32, 1)).unwrap();
+                eng.record_to(cb, shader, &[&*gw, &*ffi, &*gp], &mv_pc(h, ffn_inter), (wg_r4(ffn_inter), t as u32, 1)).unwrap();
+                eng.record_to(cb, shader, &[&*uw, &*ffi, &*up_p], &mv_pc(h, ffn_inter), (wg_r4(ffn_inter), t as u32, 1)).unwrap();
                 eng.record_barrier_to(cb);
                 // Step 2: gelu(gate) → gelu_p  (gelu_f32: binding0=src, binding1=dst)
                 eng.record_to(cb, "gelu_f32", &[&*gp, &*gelu_p], &gelu_pc, (ew_wg, 1, 1)).unwrap();
@@ -1434,7 +1434,7 @@ impl VulkanModel {
                 eng.record_to(cb, "mul_f32_f32_f32", &[&*gelu_p, &*up_p, &*mid_p], &mul_pc, (mul_wg, 1, 1)).unwrap();
                 eng.record_barrier_to(cb);
                 // Step 4: ff_out = down_proj(mid)
-                eng.record_to(cb, shader, &[&*dw, &*mid_p, &*down_p], &mv_pc(ffn_inter, h), (h as u32, t as u32, 1)).unwrap();
+                eng.record_to(cb, shader, &[&*dw, &*mid_p, &*down_p], &mv_pc(ffn_inter, h), (wg_r4(h), t as u32, 1)).unwrap();
             }
             eng.submit_batch(cb).unwrap();  // ONE fence wait for all FFN ops
             if layer_idx == 0 { log::debug!("L{layer_idx} FFN submit: {}µs total since layer start", _t_layer.elapsed().as_micros()); }
@@ -1504,13 +1504,13 @@ impl VulkanModel {
             let eng = self.engine.as_mut().unwrap();
             let cb = eng.begin_batch().unwrap();
             unsafe {
-                eng.record_to(cb, shader, &[&*pgw, &*inp_p, &*pg_p], &mv_pc(h, ple_dim), (ple_dim as u32, t as u32, 1)).unwrap();
+                eng.record_to(cb, shader, &[&*pgw, &*inp_p, &*pg_p], &mv_pc(h, ple_dim), (wg_r4(ple_dim), t as u32, 1)).unwrap();
                 eng.record_barrier_to(cb);
                 eng.record_to(cb, "gelu_f32", &[&*pg_p, &*gelu_p], &gelu_pc_ple, (gelu_wg_ple, 1, 1)).unwrap();
                 eng.record_barrier_to(cb);
                 eng.record_to(cb, "mul_f32_f32_f32", &[&*gelu_p, &*layer_p, &*mid_p], &mul_pc_ple, (mul_wg_ple, 1, 1)).unwrap();
                 eng.record_barrier_to(cb);
-                eng.record_to(cb, shader, &[&*ppw, &*mid_p, &*pc_p], &mv_pc(ple_dim, h), (h as u32, t as u32, 1)).unwrap();
+                eng.record_to(cb, shader, &[&*ppw, &*mid_p, &*pc_p], &mv_pc(ple_dim, h), (wg_r4(h), t as u32, 1)).unwrap();
             }
             eng.submit_batch(cb).unwrap();  // ONE fence wait for the whole PLE branch
             FBuf::Borrowed(RawSlice { ptr: self.act_ptr_f32(ACT_PLE_C), len: t * h })
@@ -1630,7 +1630,7 @@ impl VulkanModel {
         let cb = eng.begin_batch().unwrap();
         unsafe {
             // o_proj
-            eng.record_to(cb, shader, &[&*ow, &*oi, &*oo], &mv_pc(q_dim, h), (h as u32, t as u32, 1)).unwrap();
+            eng.record_to(cb, shader, &[&*ow, &*oi, &*oo], &mv_pc(q_dim, h), (wg_r4(h), t as u32, 1)).unwrap();
             eng.record_barrier_to(cb);
             // post_attn_norm (weight-multiplying RMSNorm) + residual add
             eng.record_to(cb, "rms_norm_f32_mul", &[&*oo, &*pa_w_gpu, &*pa_normed_p], &rms_norm_mul_pc(h, eps), (1, 1, 1)).unwrap();
@@ -1641,14 +1641,14 @@ impl VulkanModel {
             eng.record_to(cb, "rms_norm_f32_mul", &[&*hidden2_p, &*pf_w_gpu, &*ffi], &rms_norm_mul_pc(h, eps), (1, 1, 1)).unwrap();
             eng.record_barrier_to(cb);
             // FFN: gate + up (independent) -> gelu(gate) -> gelu*up -> down_proj
-            eng.record_to(cb, shader, &[&*gw, &*ffi, &*gp], &mv_pc(h, ffn_inter), (ffn_inter as u32, t as u32, 1)).unwrap();
-            eng.record_to(cb, shader, &[&*uw, &*ffi, &*up_p], &mv_pc(h, ffn_inter), (ffn_inter as u32, t as u32, 1)).unwrap();
+            eng.record_to(cb, shader, &[&*gw, &*ffi, &*gp], &mv_pc(h, ffn_inter), (wg_r4(ffn_inter), t as u32, 1)).unwrap();
+            eng.record_to(cb, shader, &[&*uw, &*ffi, &*up_p], &mv_pc(h, ffn_inter), (wg_r4(ffn_inter), t as u32, 1)).unwrap();
             eng.record_barrier_to(cb);
             eng.record_to(cb, "gelu_f32", &[&*gp, &*gelu_p], &gelu_pc(ffn_inter), (wg512(ffn_inter), 1, 1)).unwrap();
             eng.record_barrier_to(cb);
             eng.record_to(cb, "mul_f32_f32_f32", &[&*gelu_p, &*up_p, &*mid_p], &binary_elementwise_pc(ffn_inter), (wg256(ffn_inter), 1, 1)).unwrap();
             eng.record_barrier_to(cb);
-            eng.record_to(cb, shader, &[&*dw, &*mid_p, &*down_p], &mv_pc(ffn_inter, h), (h as u32, t as u32, 1)).unwrap();
+            eng.record_to(cb, shader, &[&*dw, &*mid_p, &*down_p], &mv_pc(ffn_inter, h), (wg_r4(h), t as u32, 1)).unwrap();
             eng.record_barrier_to(cb);
             // post_ffn_norm + residual add
             eng.record_to(cb, "rms_norm_f32_mul", &[&*down_p, &*postff_w_gpu, &*ff_normed_p], &rms_norm_mul_pc(h, eps), (1, 1, 1)).unwrap();
@@ -1656,13 +1656,13 @@ impl VulkanModel {
             eng.record_to(cb, "add_f32_f32_f32", &[&*hidden2_p, &*ff_normed_p, &*hidden3a_p], &binary_elementwise_pc(h), (wg256(h), 1, 1)).unwrap();
             eng.record_barrier_to(cb);
             // PLE: gate -> gelu -> ×layer_ple -> proj
-            eng.record_to(cb, shader, &[&*pgw, &*hidden3a_p, &*pg_p], &mv_pc(h, ple_dim), (ple_dim as u32, t as u32, 1)).unwrap();
+            eng.record_to(cb, shader, &[&*pgw, &*hidden3a_p, &*pg_p], &mv_pc(h, ple_dim), (wg_r4(ple_dim), t as u32, 1)).unwrap();
             eng.record_barrier_to(cb);
             eng.record_to(cb, "gelu_f32", &[&*pg_p, &*ple_gelu_p], &gelu_pc(ple_dim), (wg512(ple_dim), 1, 1)).unwrap();
             eng.record_barrier_to(cb);
             eng.record_to(cb, "mul_f32_f32_f32", &[&*ple_gelu_p, &*layer_p, &*ple_mid_p], &binary_elementwise_pc(ple_dim), (wg256(ple_dim), 1, 1)).unwrap();
             eng.record_barrier_to(cb);
-            eng.record_to(cb, shader, &[&*ppw, &*ple_mid_p, &*pc_p], &mv_pc(ple_dim, h), (h as u32, t as u32, 1)).unwrap();
+            eng.record_to(cb, shader, &[&*ppw, &*ple_mid_p, &*pc_p], &mv_pc(ple_dim, h), (wg_r4(h), t as u32, 1)).unwrap();
             eng.record_barrier_to(cb);
             // contrib norm + residual add
             eng.record_to(cb, "rms_norm_f32_mul", &[&*pc_p, &*ple_norm_w_gpu, &*contrib_normed_p], &rms_norm_mul_pc(h, eps), (1, 1, 1)).unwrap();
@@ -1774,8 +1774,8 @@ impl VulkanModel {
             let out_p = &out as *const compute::Buffer;
             let cb = eng.begin_batch().unwrap();
             unsafe {
-                eng.record_to(cb, "mul_mat_vec_f16_f32_f32",
-                    &[&*w_ptr, &*inp_p, &*out_p], pc, (n as u32, t as u32, 1)).unwrap();
+                eng.record_to(cb, "mul_mat_vec_f16_f32_f32_r4",
+                    &[&*w_ptr, &*inp_p, &*out_p], pc, (wg_r4(n), t as u32, 1)).unwrap();
             }
             eng.submit_batch(cb).unwrap();
             let result = read_f32_buf(&out, t * n);
@@ -1807,10 +1807,10 @@ impl VulkanModel {
             let out2_p = &out2 as *const compute::Buffer;
             let cb = eng.begin_batch().unwrap();
             unsafe {
-                let sh = "mul_mat_vec_f16_f32_f32";
-                eng.record_to(cb, sh, &[&*w1_ptr, &*inp_p, &*out1_p], pc, (n as u32, t as u32, 1)).unwrap();
+                let sh = "mul_mat_vec_f16_f32_f32_r4";
+                eng.record_to(cb, sh, &[&*w1_ptr, &*inp_p, &*out1_p], pc, (wg_r4(n), t as u32, 1)).unwrap();
                 eng.record_barrier_to(cb);
-                eng.record_to(cb, sh, &[&*w2_ptr, &*inp_p, &*out2_p], pc, (n as u32, t as u32, 1)).unwrap();
+                eng.record_to(cb, sh, &[&*w2_ptr, &*inp_p, &*out2_p], pc, (wg_r4(n), t as u32, 1)).unwrap();
             }
             eng.submit_batch(cb).unwrap();
             let r1 = read_f32_buf(&out1, t * n);
@@ -1970,6 +1970,23 @@ fn wg256(n: usize) -> u32 {
 /// — see `gelu.comp`; matches the FFN's existing `gelu_wg` calculation).
 fn wg512(n: usize) -> u32 {
     n.div_ceil(512) as u32
+}
+
+/// Workgroup count for the `_r4` matvec shader variants
+/// (`mul_mat_vec_{f16,f32}_f32_f32_r4`): each workgroup computes 4 output
+/// rows instead of 1 (`NUM_ROWS=4`, vs. the base variant's implicit
+/// `NUM_ROWS=1`), so a matvec with `n` output rows needs `ceil(n/4)`
+/// workgroups instead of `n`. These `_r4` pipelines were already compiled
+/// by `pipeline.rs`'s `compile_matvec` (for every shader in
+/// `MATVEC_SHADERS`) but never dispatched anywhere in this file — cutting
+/// the workgroup count by ~4x measurably speeds up every matvec dispatch
+/// in the decode hot path (1.1x-1.5x across the shapes Gemma4-E2B
+/// actually uses, see `matvec_r4_tests` below), apparently because
+/// per-workgroup *launch* overhead, not per-element bandwidth, dominates
+/// a wide-but-shallow (single-token) matvec on the Vulkan driver
+/// available for testing.
+fn wg_r4(n: usize) -> u32 {
+    n.div_ceil(4) as u32
 }
 
 /// Convert f32 weights to f16 bytes for GPU upload.
@@ -2250,6 +2267,147 @@ mod matvec_fusion_tests {
         assert!(
             fused_us < old_us,
             "fused post-attention ({fused_us:.1}us) was not faster than the 3-submit path ({old_us:.1}us)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod matvec_r4_tests {
+    //! Validates the `_r4` (`NUM_ROWS=4`) matvec pipeline variants now used
+    //! throughout `forward_layer_gpu_matmuls`/`fused_post_attention`/the LM
+    //! head (see `wg_r4`'s doc comment) against the base (`NUM_ROWS=1`)
+    //! variant they replace: same SPIR-V module, same math, just a
+    //! different `NUM_ROWS` specialization constant and correspondingly
+    //! fewer/bigger workgroups. Requires a real Vulkan device; skips
+    //! cleanly (not a failure) on headless CI runners with no GPU/ICD.
+    use super::*;
+
+    fn fake_random(len: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
+        (0..len)
+            .map(|_| {
+                state ^= state >> 12; state ^= state << 25; state ^= state >> 27;
+                let bits = state.wrapping_mul(0x2545F4914F6CDD1D);
+                ((bits >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    fn l2_rel_err(a: &[f32], b: &[f32]) -> f32 {
+        let mut diff_sq = 0.0f64;
+        let mut ref_sq = 0.0f64;
+        for (&x, &y) in a.iter().zip(b.iter()) {
+            diff_sq += ((x - y) as f64).powi(2);
+            ref_sq += (x as f64).powi(2);
+        }
+        (diff_sq / ref_sq.max(1e-12)).sqrt() as f32
+    }
+
+    fn matvec_pc(k: usize, n: usize) -> Vec<u8> {
+        use std::io::Write;
+        let mut v = Vec::with_capacity(13 * 4);
+        for x in [k as u32, k as u32, k as u32, n as u32,
+                   (k * n) as u32, k as u32, n as u32,
+                   0u32, 0u32, 1u32, 1u32, 1u32, 1u32] {
+            v.write_all(&x.to_le_bytes()).unwrap();
+        }
+        v
+    }
+
+    struct Harness { engine: compute::ComputeEngine }
+
+    fn make_harness() -> Option<Harness> {
+        let dev = match device::ComputeDevice::create(0) {
+            Ok(d) => d,
+            Err(e) => { eprintln!("skip: no Vulkan device available ({e})"); return None; }
+        };
+        let shader_spvs = include_all_shaders();
+        let refs: std::collections::HashMap<&str, &[u8]> = shader_spvs.iter()
+            .map(|(k, v)| (k.as_str(), v.as_slice())).collect();
+        let engine = compute::ComputeEngine::new(
+            dev.instance.clone(), dev.physical_device, dev.device.clone(),
+            dev.compute_queue, dev.compute_queue_family, &refs,
+        ).expect("create ComputeEngine");
+        Some(Harness { engine })
+    }
+
+    fn dispatch(h: &mut Harness, shader: &str, weight: &compute::Buffer, x: &[f32], k: usize, n: usize, wg: u32) -> Vec<f32> {
+        let eng = &mut h.engine;
+        let xb: &[u8] = bytemuck::cast_slice(x);
+        let inp = eng.alloc_host_coherent_storage(xb.len() as u64).unwrap();
+        inp.write(xb).unwrap();
+        let out = eng.alloc_host_coherent_storage((n * 4) as u64).unwrap();
+        let pc = matvec_pc(k, n);
+        let cb = eng.begin_batch().unwrap();
+        eng.record_to(cb, shader, &[weight, &inp, &out], &pc, (wg, 1, 1)).unwrap();
+        eng.submit_batch(cb).unwrap();
+        read_f32_buf(&out, n)
+    }
+
+    fn check_shape(h: &mut Harness, label: &str, k: usize, n: usize) {
+        let weight = fake_random(n * k, 1);
+        let x = fake_random(k, 2);
+        let f16_bytes = f32_to_f16_bytes(&weight);
+        let buf = h.engine.alloc_host_coherent_storage(f16_bytes.len() as u64).unwrap();
+        buf.write(&f16_bytes).unwrap();
+
+        let base = dispatch(h, "mul_mat_vec_f16_f32_f32", &buf, &x, k, n, n as u32);
+        let r4 = dispatch(h, "mul_mat_vec_f16_f32_f32_r4", &buf, &x, k, n, wg_r4(n));
+
+        let err = l2_rel_err(&base, &r4);
+        println!("{label:<22} k={k:>6} n={n:>6}  base-vs-r4 l2_rel_err={err:.6}");
+        assert!(err < 1e-5, "{label}: _r4 output diverged from the base variant: {err}");
+    }
+
+    #[test]
+    fn r4_matches_base_at_gemma4_e2b_shapes() {
+        let Some(mut h) = make_harness() else { return };
+        // Every matvec shape forward_layer_gpu_matmuls/fused_post_attention
+        // actually dispatches (src/model.rs Gemma4Config::e2b()).
+        check_shape(&mut h, "q_proj (sliding)", 1536, 2048);
+        check_shape(&mut h, "q_proj (full-attn)", 1536, 4096);
+        check_shape(&mut h, "o_proj (sliding)", 2048, 1536);
+        check_shape(&mut h, "gate/up_proj", 1536, 6144);
+        check_shape(&mut h, "down_proj (KV-shared)", 12288, 1536);
+        check_shape(&mut h, "ple_gate/proj", 1536, 256);
+    }
+
+    #[test]
+    fn r4_is_faster_than_base_at_gemma4_e2b_shapes() {
+        let Some(mut h) = make_harness() else { return };
+
+        let k = 1536usize;
+        let n = 6144usize; // gate/up_proj width — the widest single-weight
+                            // dispatch outside the KV-shared FFN/LM head.
+        let weight = fake_random(n * k, 3);
+        let x = fake_random(k, 4);
+        let f16_bytes = f32_to_f16_bytes(&weight);
+        let buf = h.engine.alloc_host_coherent_storage(f16_bytes.len() as u64).unwrap();
+        buf.write(&f16_bytes).unwrap();
+
+        for _ in 0..5 {
+            dispatch(&mut h, "mul_mat_vec_f16_f32_f32", &buf, &x, k, n, n as u32);
+            dispatch(&mut h, "mul_mat_vec_f16_f32_f32_r4", &buf, &x, k, n, wg_r4(n));
+        }
+
+        let iters = 100;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters { dispatch(&mut h, "mul_mat_vec_f16_f32_f32", &buf, &x, k, n, n as u32); }
+        let base_elapsed = t0.elapsed();
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters { dispatch(&mut h, "mul_mat_vec_f16_f32_f32_r4", &buf, &x, k, n, wg_r4(n)); }
+        let r4_elapsed = t0.elapsed();
+
+        let base_us = base_elapsed.as_micros() as f64 / iters as f64;
+        let r4_us = r4_elapsed.as_micros() as f64 / iters as f64;
+        println!(
+            "matvec [1,{k}] x [{n},{k}]^T  base(1-row/wg) {base_us:.1}us/call   _r4(4-rows/wg) {r4_us:.1}us/call   speedup {:.2}x",
+            base_us / r4_us
+        );
+        assert!(
+            r4_us < base_us,
+            "_r4 ({r4_us:.1}us) was not faster than the base variant ({base_us:.1}us)"
         );
     }
 }
