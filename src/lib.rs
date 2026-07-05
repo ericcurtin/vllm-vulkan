@@ -1262,31 +1262,20 @@ impl VulkanModel {
             let inv_cap_p = self.act_ptr(ACT_INV_CAP);
             let cap_p = self.act_ptr(ACT_CAP);
 
-            let pc = {
-                use std::io::Write;
-                let mut v = Vec::with_capacity(13 * 4);
-                for x in [h as u32, h as u32, h as u32, vocab as u32,
-                           (h * vocab) as u32, h as u32, vocab as u32,
-                           0u32, 0u32, 1u32, 1u32, 1u32, 1u32] {
-                    v.write_all(&x.to_le_bytes()).unwrap();
-                }
-                v
-            };
-
             let eng = self.engine.as_mut().unwrap();
             let cb = eng.begin_batch().unwrap();
             unsafe {
-                eng.record_to(cb, "rms_norm_f32_mul", &[&*raw_hidden_p, &*norm_w_ptr, &*inp_p], &rms_norm_mul_pc(h, eps), (1, 1, 1)).unwrap();
+                eng.record_to(cb, "rms_norm_f32_mul", &[&*raw_hidden_p, &*norm_w_ptr, &*inp_p], bytemuck::cast_slice(&rms_norm_mul_pc(h, eps)), (1, 1, 1)).unwrap();
                 eng.record_barrier_to(cb);
                 eng.record_to(cb, "mul_mat_vec_f32_f32_f32_r4",
                     &[&*lm_w_ptr, &*inp_p, &*logit_raw_p],
-                    &pc, (wg_r4(vocab), 1, 1)).unwrap();
+                    bytemuck::cast_slice(&mv_pc(h, vocab, 1)), (wg_r4(vocab), 1, 1)).unwrap();
                 eng.record_barrier_to(cb);
-                eng.record_to(cb, "mul_f32_f32_f32", &[&*logit_raw_p, &*inv_cap_p, &*scaled_p], &binary_broadcast_pc(vocab), (wg256(vocab), 1, 1)).unwrap();
+                eng.record_to(cb, "mul_f32_f32_f32", &[&*logit_raw_p, &*inv_cap_p, &*scaled_p], bytemuck::cast_slice(&binary_broadcast_pc(vocab)), (wg256(vocab), 1, 1)).unwrap();
                 eng.record_barrier_to(cb);
-                eng.record_to(cb, "tanh_f32", &[&*scaled_p, &*tanh_p], &unary_head_pc(vocab), (wg512(vocab), 1, 1)).unwrap();
+                eng.record_to(cb, "tanh_f32", &[&*scaled_p, &*tanh_p], bytemuck::cast_slice(&unary_head_pc(vocab)), (wg512(vocab), 1, 1)).unwrap();
                 eng.record_barrier_to(cb);
-                eng.record_to(cb, "mul_f32_f32_f32", &[&*tanh_p, &*cap_p, &*final_p], &binary_broadcast_pc(vocab), (wg256(vocab), 1, 1)).unwrap();
+                eng.record_to(cb, "mul_f32_f32_f32", &[&*tanh_p, &*cap_p, &*final_p], bytemuck::cast_slice(&binary_broadcast_pc(vocab)), (wg256(vocab), 1, 1)).unwrap();
             }
             eng.submit_batch(cb).unwrap();
             read_f32_buf(unsafe { &*final_p }, vocab)
@@ -1329,17 +1318,6 @@ impl VulkanModel {
         let ln = |s: &str| format!("model.layers.{layer_idx}.{s}");
 
         // Helper: pack matvec push constants
-        let mv_pc = |k: usize, n: usize| -> Vec<u8> {
-            use std::io::Write;
-            let mut v = Vec::with_capacity(13 * 4);
-            for x in [k as u32, k as u32, k as u32, n as u32,
-                       (k * n) as u32, k as u32, n as u32,
-                       0u32, 0u32, 1u32, t as u32, t as u32, 1u32] {
-                v.write_all(&x.to_le_bytes()).unwrap();
-            }
-            v
-        };
-
         // Pre-extract all needed weight slices as raw-pointer handles (avoids
         // borrow conflicts with the later `&mut self` GPU calls below without
         // paying for a heap allocation + memcpy on every single decode step).
@@ -1447,9 +1425,9 @@ impl VulkanModel {
                 let eng = self.engine.as_mut().unwrap();
                 let cb = eng.begin_batch().unwrap();
                 unsafe {
-                    eng.record_to(cb, "rms_norm_f32_mul", &[&*raw_p, &*inln_w_gpu, &*inp], &rms_norm_mul_pc(h, eps), (1, 1, 1)).unwrap();
+                    eng.record_to(cb, "rms_norm_f32_mul", &[&*raw_p, &*inln_w_gpu, &*inp], bytemuck::cast_slice(&rms_norm_mul_pc(h, eps)), (1, 1, 1)).unwrap();
                     eng.record_barrier_to(cb);
-                    eng.record_to(cb, shader, &[&*qkv_w, &*inp, &*qkv_p], &mv_pc(h, qkv_dim), (wg_r4(qkv_dim), t as u32, 1)).unwrap();
+                    eng.record_to(cb, shader, &[&*qkv_w, &*inp, &*qkv_p], bytemuck::cast_slice(&mv_pc(h, qkv_dim, t)), (wg_r4(qkv_dim), t as u32, 1)).unwrap();
                 }
                 eng.submit_batch(cb).unwrap();  // Fence wait 1: input_layernorm + fused QKV
                 if layer_idx == 0 { log::debug!("L{layer_idx} QKV submit: {}µs", _t_layer.elapsed().as_micros()); }
@@ -1481,11 +1459,11 @@ impl VulkanModel {
                 let eng = self.engine.as_mut().unwrap();
                 let cb = eng.begin_batch().unwrap();
                 unsafe {
-                    eng.record_to(cb, "rms_norm_f32_mul", &[&*raw_p, &*inln_w_gpu, &*inp], &rms_norm_mul_pc(h, eps), (1, 1, 1)).unwrap();
+                    eng.record_to(cb, "rms_norm_f32_mul", &[&*raw_p, &*inln_w_gpu, &*inp], bytemuck::cast_slice(&rms_norm_mul_pc(h, eps)), (1, 1, 1)).unwrap();
                     eng.record_barrier_to(cb);
-                    eng.record_to(cb, shader, &[&*q_w, &*inp, &*q_p], &mv_pc(h, q_dim), (wg_r4(q_dim), t as u32, 1)).unwrap();
-                    eng.record_to(cb, shader, &[&*k_w, &*inp, &*k_p], &mv_pc(h, kv_dim), (wg_r4(kv_dim), t as u32, 1)).unwrap();
-                    eng.record_to(cb, shader, &[&*v_w, &*inp, &*v_p], &mv_pc(h, kv_dim), (wg_r4(kv_dim), t as u32, 1)).unwrap();
+                    eng.record_to(cb, shader, &[&*q_w, &*inp, &*q_p], bytemuck::cast_slice(&mv_pc(h, q_dim, t)), (wg_r4(q_dim), t as u32, 1)).unwrap();
+                    eng.record_to(cb, shader, &[&*k_w, &*inp, &*k_p], bytemuck::cast_slice(&mv_pc(h, kv_dim, t)), (wg_r4(kv_dim), t as u32, 1)).unwrap();
+                    eng.record_to(cb, shader, &[&*v_w, &*inp, &*v_p], bytemuck::cast_slice(&mv_pc(h, kv_dim, t)), (wg_r4(kv_dim), t as u32, 1)).unwrap();
                 }
                 eng.submit_batch(cb).unwrap();  // Fence wait 1: input_layernorm + QKV
                 if layer_idx == 0 { log::debug!("L{layer_idx} QKV submit: {}µs", _t_layer.elapsed().as_micros()); }
@@ -1569,7 +1547,7 @@ impl VulkanModel {
             let eng  = self.engine.as_mut().unwrap();
             let cb   = eng.begin_batch().unwrap();
             unsafe {
-                eng.record_to(cb, shader, &[&*ow, &*oi, &*oo], &mv_pc(q_dim, h), (wg_r4(h), t as u32, 1)).unwrap();
+                eng.record_to(cb, shader, &[&*ow, &*oi, &*oo], bytemuck::cast_slice(&mv_pc(q_dim, h, t)), (wg_r4(h), t as u32, 1)).unwrap();
             }
             eng.submit_batch(cb).unwrap();
             if layer_idx == 0 { log::debug!("L{layer_idx} o_proj submit: {}µs total since layer start", _t_layer.elapsed().as_micros()); }
@@ -1619,48 +1597,22 @@ impl VulkanModel {
             let gelu_wg = ((ffn_inter + 511) / 512) as u32;
             let mul_wg  = ((ffn_inter + 255) / 256) as u32;
             let ew_wg = gelu_wg; // used below for gelu dispatch
-            let gelu_pc = {
-                use std::io::Write;
-                let mut v = Vec::with_capacity(6 * 4);
-                let kx = ffn_inter as u32;
-                v.write_all(&kx.to_le_bytes()).unwrap();       // KX = num elements
-                v.write_all(&1u32.to_le_bytes()).unwrap();     // KY = 1
-                for _ in 0..4 { v.write_all(&0u32.to_le_bytes()).unwrap(); } // param1-4
-                v
-            };
-            // mul.comp generic_binary_head push constants for elementwise [ffn_inter] × [ffn_inter] → [ffn_inter]
-            // Format: ne(uint), ne00-ne03(4 uint), nb00-nb03(4 uint), [same for src1], [same for dst], misalign(uint), param1(f32), param2(f32), param3(i32)
-            // nb values are in ELEMENTS (ggml convention: nb00=1, nb01=n for a [n] flat tensor)
-            let mul_pc = {
-                use std::io::Write;
-                let n = ffn_inter as u32;
-                let mut v = Vec::with_capacity(29 * 4);
-                // ne, ne00-ne03, nb00-nb03 (src0)
-                for &x in &[n, n,1u32,1,1, 1u32,n,n,n] { v.write_all(&x.to_le_bytes()).unwrap(); }
-                // ne10-ne13, nb10-nb13 (src1)
-                for &x in &[n, 1u32,1,1, 1u32,n,n,n] { v.write_all(&x.to_le_bytes()).unwrap(); }
-                // ne20-ne23, nb20-nb23 (dst)
-                for &x in &[n, 1u32,1,1, 1u32,n,n,n] { v.write_all(&x.to_le_bytes()).unwrap(); }
-                // misalign, param1, param2, param3
-                for &x in &[0u32, 0u32, 0u32, 0u32] { v.write_all(&x.to_le_bytes()).unwrap(); }
-                v
-            };
 
             let eng = self.engine.as_mut().unwrap();
             let cb = eng.begin_batch().unwrap();
             unsafe {
                 // Step 1: gate and up matmuls are independent (same input ffi, different outputs)
-                eng.record_to(cb, shader, &[&*gw, &*ffi, &*gp], &mv_pc(h, ffn_inter), (wg_r4(ffn_inter), t as u32, 1)).unwrap();
-                eng.record_to(cb, shader, &[&*uw, &*ffi, &*up_p], &mv_pc(h, ffn_inter), (wg_r4(ffn_inter), t as u32, 1)).unwrap();
+                eng.record_to(cb, shader, &[&*gw, &*ffi, &*gp], bytemuck::cast_slice(&mv_pc(h, ffn_inter, t)), (wg_r4(ffn_inter), t as u32, 1)).unwrap();
+                eng.record_to(cb, shader, &[&*uw, &*ffi, &*up_p], bytemuck::cast_slice(&mv_pc(h, ffn_inter, t)), (wg_r4(ffn_inter), t as u32, 1)).unwrap();
                 eng.record_barrier_to(cb);
                 // Step 2: gelu(gate) → gelu_p  (gelu_f32: binding0=src, binding1=dst)
-                eng.record_to(cb, "gelu_f32", &[&*gp, &*gelu_p], &gelu_pc, (ew_wg, 1, 1)).unwrap();
+                eng.record_to(cb, "gelu_f32", &[&*gp, &*gelu_p], bytemuck::cast_slice(&unary_head_pc(ffn_inter)), (ew_wg, 1, 1)).unwrap();
                 eng.record_barrier_to(cb);
                 // Step 3: mid = gelu(gate) * up
-                eng.record_to(cb, "mul_f32_f32_f32", &[&*gelu_p, &*up_p, &*mid_p], &mul_pc, (mul_wg, 1, 1)).unwrap();
+                eng.record_to(cb, "mul_f32_f32_f32", &[&*gelu_p, &*up_p, &*mid_p], bytemuck::cast_slice(&binary_elementwise_pc(ffn_inter)), (mul_wg, 1, 1)).unwrap();
                 eng.record_barrier_to(cb);
                 // Step 4: ff_out = down_proj(mid)
-                eng.record_to(cb, shader, &[&*dw, &*mid_p, &*down_p], &mv_pc(ffn_inter, h), (wg_r4(h), t as u32, 1)).unwrap();
+                eng.record_to(cb, shader, &[&*dw, &*mid_p, &*down_p], bytemuck::cast_slice(&mv_pc(ffn_inter, h, t)), (wg_r4(h), t as u32, 1)).unwrap();
             }
             eng.submit_batch(cb).unwrap();  // ONE fence wait for all FFN ops
             if layer_idx == 0 { log::debug!("L{layer_idx} FFN submit: {}µs total since layer start", _t_layer.elapsed().as_micros()); }
@@ -1674,7 +1626,7 @@ impl VulkanModel {
             let up   = model::cpu_matmul(&ff_in, &up_w,   1, h, ffn_inter);
             let gate_act = model::cpu_gelu(&gate);
             let mid: Vec<f32> = gate_act.iter().zip(up.iter()).map(|(&g, &u)| g * u).collect();
-            FBuf::Owned(self.gpu_matmul_or_cpu(&ln("mlp.down_proj.weight"), &mid, t, ffn_inter, h, &mv_pc(ffn_inter, h)))
+            FBuf::Owned(self.gpu_matmul_or_cpu(&ln("mlp.down_proj.weight"), &mid, t, ffn_inter, h, bytemuck::cast_slice(&mv_pc(ffn_inter, h, t))))
         };
 
         // CPU: post_ffn_norm + residual (using pre-extracted weight)
@@ -1708,35 +1660,17 @@ impl VulkanModel {
 
             let gelu_wg_ple = ((ple_dim + 511) / 512) as u32;
             let mul_wg_ple  = ((ple_dim + 255) / 256) as u32;
-            let gelu_pc_ple = {
-                use std::io::Write;
-                let mut v = Vec::with_capacity(6 * 4);
-                v.write_all(&(ple_dim as u32).to_le_bytes()).unwrap();
-                v.write_all(&1u32.to_le_bytes()).unwrap();
-                for _ in 0..4 { v.write_all(&0u32.to_le_bytes()).unwrap(); }
-                v
-            };
-            let mul_pc_ple = {
-                use std::io::Write;
-                let n = ple_dim as u32;
-                let mut v = Vec::with_capacity(29 * 4);
-                for &x in &[n, n,1u32,1,1, 1u32,n,n,n] { v.write_all(&x.to_le_bytes()).unwrap(); }
-                for &x in &[n, 1u32,1,1, 1u32,n,n,n] { v.write_all(&x.to_le_bytes()).unwrap(); }
-                for &x in &[n, 1u32,1,1, 1u32,n,n,n] { v.write_all(&x.to_le_bytes()).unwrap(); }
-                for &x in &[0u32, 0u32, 0u32, 0u32] { v.write_all(&x.to_le_bytes()).unwrap(); }
-                v
-            };
 
             let eng = self.engine.as_mut().unwrap();
             let cb = eng.begin_batch().unwrap();
             unsafe {
-                eng.record_to(cb, shader, &[&*pgw, &*inp_p, &*pg_p], &mv_pc(h, ple_dim), (wg_r4(ple_dim), t as u32, 1)).unwrap();
+                eng.record_to(cb, shader, &[&*pgw, &*inp_p, &*pg_p], bytemuck::cast_slice(&mv_pc(h, ple_dim, t)), (wg_r4(ple_dim), t as u32, 1)).unwrap();
                 eng.record_barrier_to(cb);
-                eng.record_to(cb, "gelu_f32", &[&*pg_p, &*gelu_p], &gelu_pc_ple, (gelu_wg_ple, 1, 1)).unwrap();
+                eng.record_to(cb, "gelu_f32", &[&*pg_p, &*gelu_p], bytemuck::cast_slice(&unary_head_pc(ple_dim)), (gelu_wg_ple, 1, 1)).unwrap();
                 eng.record_barrier_to(cb);
-                eng.record_to(cb, "mul_f32_f32_f32", &[&*gelu_p, &*layer_p, &*mid_p], &mul_pc_ple, (mul_wg_ple, 1, 1)).unwrap();
+                eng.record_to(cb, "mul_f32_f32_f32", &[&*gelu_p, &*layer_p, &*mid_p], bytemuck::cast_slice(&binary_elementwise_pc(ple_dim)), (mul_wg_ple, 1, 1)).unwrap();
                 eng.record_barrier_to(cb);
-                eng.record_to(cb, shader, &[&*ppw, &*mid_p, &*pc_p], &mv_pc(ple_dim, h), (wg_r4(h), t as u32, 1)).unwrap();
+                eng.record_to(cb, shader, &[&*ppw, &*mid_p, &*pc_p], bytemuck::cast_slice(&mv_pc(ple_dim, h, t)), (wg_r4(h), t as u32, 1)).unwrap();
             }
             eng.submit_batch(cb).unwrap();  // ONE fence wait for the whole PLE branch
             FBuf::Borrowed(RawSlice { ptr: self.act_ptr_f32(ACT_PLE_C), len: t * h })
@@ -1790,24 +1724,6 @@ impl VulkanModel {
         t_layer: &std::time::Instant,
     ) -> Vec<f32> {
         let ln = |s: &str| format!("model.layers.{layer_idx}.{s}");
-        let mv_pc = |k: usize, n: usize| -> Vec<u8> {
-            use std::io::Write;
-            let mut v = Vec::with_capacity(13 * 4);
-            for x in [k as u32, k as u32, k as u32, n as u32,
-                       (k * n) as u32, k as u32, n as u32,
-                       0u32, 0u32, 1u32, t as u32, t as u32, 1u32] {
-                v.write_all(&x.to_le_bytes()).unwrap();
-            }
-            v
-        };
-        let gelu_pc = |n: usize| -> Vec<u8> {
-            use std::io::Write;
-            let mut v = Vec::with_capacity(6 * 4);
-            v.write_all(&(n as u32).to_le_bytes()).unwrap();
-            v.write_all(&1u32.to_le_bytes()).unwrap();
-            for _ in 0..4 { v.write_all(&0u32.to_le_bytes()).unwrap(); }
-            v
-        };
 
         // Upload this call's fresh inputs to their persistent buffers. No
         // outstanding borrow on `self` yet at this point, so plain safe
@@ -1856,47 +1772,47 @@ impl VulkanModel {
         let cb = eng.begin_batch().unwrap();
         unsafe {
             // o_proj
-            eng.record_to(cb, shader, &[&*ow, &*oi, &*oo], &mv_pc(q_dim, h), (wg_r4(h), t as u32, 1)).unwrap();
+            eng.record_to(cb, shader, &[&*ow, &*oi, &*oo], bytemuck::cast_slice(&mv_pc(q_dim, h, t)), (wg_r4(h), t as u32, 1)).unwrap();
             eng.record_barrier_to(cb);
             // post_attn_norm (weight-multiplying RMSNorm) + residual add
-            eng.record_to(cb, "rms_norm_f32_mul", &[&*oo, &*pa_w_gpu, &*pa_normed_p], &rms_norm_mul_pc(h, eps), (1, 1, 1)).unwrap();
+            eng.record_to(cb, "rms_norm_f32_mul", &[&*oo, &*pa_w_gpu, &*pa_normed_p], bytemuck::cast_slice(&rms_norm_mul_pc(h, eps)), (1, 1, 1)).unwrap();
             eng.record_barrier_to(cb);
-            eng.record_to(cb, "add_f32_f32_f32", &[&*res_p, &*pa_normed_p, &*hidden2_p], &binary_elementwise_pc(h), (wg256(h), 1, 1)).unwrap();
+            eng.record_to(cb, "add_f32_f32_f32", &[&*res_p, &*pa_normed_p, &*hidden2_p], bytemuck::cast_slice(&binary_elementwise_pc(h)), (wg256(h), 1, 1)).unwrap();
             eng.record_barrier_to(cb);
             // pre_ffn_norm
-            eng.record_to(cb, "rms_norm_f32_mul", &[&*hidden2_p, &*pf_w_gpu, &*ffi], &rms_norm_mul_pc(h, eps), (1, 1, 1)).unwrap();
+            eng.record_to(cb, "rms_norm_f32_mul", &[&*hidden2_p, &*pf_w_gpu, &*ffi], bytemuck::cast_slice(&rms_norm_mul_pc(h, eps)), (1, 1, 1)).unwrap();
             eng.record_barrier_to(cb);
             // FFN: gate + up (independent) -> gelu(gate) -> gelu*up -> down_proj
-            eng.record_to(cb, shader, &[&*gw, &*ffi, &*gp], &mv_pc(h, ffn_inter), (wg_r4(ffn_inter), t as u32, 1)).unwrap();
-            eng.record_to(cb, shader, &[&*uw, &*ffi, &*up_p], &mv_pc(h, ffn_inter), (wg_r4(ffn_inter), t as u32, 1)).unwrap();
+            eng.record_to(cb, shader, &[&*gw, &*ffi, &*gp], bytemuck::cast_slice(&mv_pc(h, ffn_inter, t)), (wg_r4(ffn_inter), t as u32, 1)).unwrap();
+            eng.record_to(cb, shader, &[&*uw, &*ffi, &*up_p], bytemuck::cast_slice(&mv_pc(h, ffn_inter, t)), (wg_r4(ffn_inter), t as u32, 1)).unwrap();
             eng.record_barrier_to(cb);
-            eng.record_to(cb, "gelu_f32", &[&*gp, &*gelu_p], &gelu_pc(ffn_inter), (wg512(ffn_inter), 1, 1)).unwrap();
+            eng.record_to(cb, "gelu_f32", &[&*gp, &*gelu_p], bytemuck::cast_slice(&unary_head_pc(ffn_inter)), (wg512(ffn_inter), 1, 1)).unwrap();
             eng.record_barrier_to(cb);
-            eng.record_to(cb, "mul_f32_f32_f32", &[&*gelu_p, &*up_p, &*mid_p], &binary_elementwise_pc(ffn_inter), (wg256(ffn_inter), 1, 1)).unwrap();
+            eng.record_to(cb, "mul_f32_f32_f32", &[&*gelu_p, &*up_p, &*mid_p], bytemuck::cast_slice(&binary_elementwise_pc(ffn_inter)), (wg256(ffn_inter), 1, 1)).unwrap();
             eng.record_barrier_to(cb);
-            eng.record_to(cb, shader, &[&*dw, &*mid_p, &*down_p], &mv_pc(ffn_inter, h), (wg_r4(h), t as u32, 1)).unwrap();
+            eng.record_to(cb, shader, &[&*dw, &*mid_p, &*down_p], bytemuck::cast_slice(&mv_pc(ffn_inter, h, t)), (wg_r4(h), t as u32, 1)).unwrap();
             eng.record_barrier_to(cb);
             // post_ffn_norm + residual add
-            eng.record_to(cb, "rms_norm_f32_mul", &[&*down_p, &*postff_w_gpu, &*ff_normed_p], &rms_norm_mul_pc(h, eps), (1, 1, 1)).unwrap();
+            eng.record_to(cb, "rms_norm_f32_mul", &[&*down_p, &*postff_w_gpu, &*ff_normed_p], bytemuck::cast_slice(&rms_norm_mul_pc(h, eps)), (1, 1, 1)).unwrap();
             eng.record_barrier_to(cb);
-            eng.record_to(cb, "add_f32_f32_f32", &[&*hidden2_p, &*ff_normed_p, &*hidden3a_p], &binary_elementwise_pc(h), (wg256(h), 1, 1)).unwrap();
+            eng.record_to(cb, "add_f32_f32_f32", &[&*hidden2_p, &*ff_normed_p, &*hidden3a_p], bytemuck::cast_slice(&binary_elementwise_pc(h)), (wg256(h), 1, 1)).unwrap();
             eng.record_barrier_to(cb);
             // PLE: gate -> gelu -> ×layer_ple -> proj
-            eng.record_to(cb, shader, &[&*pgw, &*hidden3a_p, &*pg_p], &mv_pc(h, ple_dim), (wg_r4(ple_dim), t as u32, 1)).unwrap();
+            eng.record_to(cb, shader, &[&*pgw, &*hidden3a_p, &*pg_p], bytemuck::cast_slice(&mv_pc(h, ple_dim, t)), (wg_r4(ple_dim), t as u32, 1)).unwrap();
             eng.record_barrier_to(cb);
-            eng.record_to(cb, "gelu_f32", &[&*pg_p, &*ple_gelu_p], &gelu_pc(ple_dim), (wg512(ple_dim), 1, 1)).unwrap();
+            eng.record_to(cb, "gelu_f32", &[&*pg_p, &*ple_gelu_p], bytemuck::cast_slice(&unary_head_pc(ple_dim)), (wg512(ple_dim), 1, 1)).unwrap();
             eng.record_barrier_to(cb);
-            eng.record_to(cb, "mul_f32_f32_f32", &[&*ple_gelu_p, &*layer_p, &*ple_mid_p], &binary_elementwise_pc(ple_dim), (wg256(ple_dim), 1, 1)).unwrap();
+            eng.record_to(cb, "mul_f32_f32_f32", &[&*ple_gelu_p, &*layer_p, &*ple_mid_p], bytemuck::cast_slice(&binary_elementwise_pc(ple_dim)), (wg256(ple_dim), 1, 1)).unwrap();
             eng.record_barrier_to(cb);
-            eng.record_to(cb, shader, &[&*ppw, &*ple_mid_p, &*pc_p], &mv_pc(ple_dim, h), (wg_r4(h), t as u32, 1)).unwrap();
+            eng.record_to(cb, shader, &[&*ppw, &*ple_mid_p, &*pc_p], bytemuck::cast_slice(&mv_pc(ple_dim, h, t)), (wg_r4(h), t as u32, 1)).unwrap();
             eng.record_barrier_to(cb);
             // contrib norm + residual add
-            eng.record_to(cb, "rms_norm_f32_mul", &[&*pc_p, &*ple_norm_w_gpu, &*contrib_normed_p], &rms_norm_mul_pc(h, eps), (1, 1, 1)).unwrap();
+            eng.record_to(cb, "rms_norm_f32_mul", &[&*pc_p, &*ple_norm_w_gpu, &*contrib_normed_p], bytemuck::cast_slice(&rms_norm_mul_pc(h, eps)), (1, 1, 1)).unwrap();
             eng.record_barrier_to(cb);
-            eng.record_to(cb, "add_f32_f32_f32", &[&*hidden3a_p, &*contrib_normed_p, &*hidden3b_p], &binary_elementwise_pc(h), (wg256(h), 1, 1)).unwrap();
+            eng.record_to(cb, "add_f32_f32_f32", &[&*hidden3a_p, &*contrib_normed_p, &*hidden3b_p], bytemuck::cast_slice(&binary_elementwise_pc(h)), (wg256(h), 1, 1)).unwrap();
             eng.record_barrier_to(cb);
             // Final layer-scalar multiply (broadcast a single scalar weight).
-            eng.record_to(cb, "mul_f32_f32_f32", &[&*hidden3b_p, &*layer_scalar_gpu, &*hidden3_final_p], &binary_broadcast_pc(h), (wg256(h), 1, 1)).unwrap();
+            eng.record_to(cb, "mul_f32_f32_f32", &[&*hidden3b_p, &*layer_scalar_gpu, &*hidden3_final_p], bytemuck::cast_slice(&binary_broadcast_pc(h)), (wg256(h), 1, 1)).unwrap();
         }
         eng.submit_batch(cb).unwrap(); // ONE fence wait for the entire post-attention chain
         if layer_idx == 0 {
@@ -2156,25 +2072,30 @@ fn is_matvec_weight(name: &str) -> bool {
 /// broadcast a single scalar against every output element (the per-layer
 /// scalar multiply) — `src1_idx`'s `fastmod(i00, ne10)` is always 0 when
 /// `ne10 == 1`, so every element reads `data_b[0]`.
-fn binary_head_pc(n: usize, b_len: usize, param1: f32) -> Vec<u8> {
-    use std::io::Write;
+///
+/// Returns a stack-allocated `[u32; 29]` instead of a heap-allocated
+/// `Vec<u8>` — every field here is fully determined by shapes that are
+/// fixed for a layer's whole lifetime (`h`, `q_dim`, `ffn_inter`, ...:
+/// only ~4 distinct combinations exist across all 35 of Gemma4-E2B's
+/// layers), so the previous `Vec::with_capacity` + `write_all` construction
+/// paid for a fresh heap allocation on every single dispatch — several
+/// hundred times per decode step — for a 116-byte value that's cheaper to
+/// build directly on the stack. `f32`/`i32` fields are stored via
+/// `.to_bits()`/`as u32` so the whole array stays one `u32`-typed buffer
+/// that `bytemuck::cast_slice` can reinterpret as `&[u8]` at the call site
+/// without any unsafe code here.
+fn binary_head_pc(n: usize, b_len: usize, param1: f32) -> [u32; 29] {
     let nu = n as u32;
     let bu = b_len as u32;
-    let mut v = Vec::with_capacity(29 * 4);
-    for &x in &[nu, nu, 1u32, 1, 1, 1u32, nu, nu, nu] {
-        v.write_all(&x.to_le_bytes()).unwrap();
-    }
-    for &x in &[bu, 1u32, 1, 1, 1u32, bu, bu, bu] {
-        v.write_all(&x.to_le_bytes()).unwrap();
-    }
-    for &x in &[nu, 1u32, 1, 1, 1u32, nu, nu, nu] {
-        v.write_all(&x.to_le_bytes()).unwrap();
-    }
-    v.write_all(&0u32.to_le_bytes()).unwrap(); // misalign
-    v.write_all(&param1.to_le_bytes()).unwrap(); // param1 (eps for rms_norm; 0.0 otherwise)
-    v.write_all(&0f32.to_le_bytes()).unwrap(); // param2 (unused)
-    v.write_all(&0i32.to_le_bytes()).unwrap(); // param3 (unused)
-    v
+    [
+        nu, nu, 1, 1, 1, 1, nu, nu, nu,
+        bu, 1, 1, 1, 1, bu, bu, bu,
+        nu, 1, 1, 1, 1, nu, nu, nu,
+        0,               // misalign
+        param1.to_bits(), // param1 (eps for rms_norm; 0.0 otherwise)
+        0.0f32.to_bits(), // param2 (unused)
+        0i32 as u32,      // param3 (unused)
+    ]
 }
 
 /// Push constants for `rms_norm_f32_mul` (the weight-multiplying RMSNorm
@@ -2182,35 +2103,46 @@ fn binary_head_pc(n: usize, b_len: usize, param1: f32) -> Vec<u8> {
 /// `rms_norm.comp` reads, and the weight operand's length equals `n` so the
 /// shader's broadcast check (`ncols > ne10`) takes the simple, non-broadcast
 /// path.
-fn rms_norm_mul_pc(n: usize, eps: f32) -> Vec<u8> {
+fn rms_norm_mul_pc(n: usize, eps: f32) -> [u32; 29] {
     binary_head_pc(n, n, eps)
 }
 
 /// Push constants for `add_f32_f32_f32` / `mul_f32_f32_f32` over two
 /// same-shape `[n]`-element rows (residual adds, RMSNorm-weight multiply
 /// is done via `rms_norm_mul_pc` instead — this is for plain elementwise).
-fn binary_elementwise_pc(n: usize) -> Vec<u8> {
+fn binary_elementwise_pc(n: usize) -> [u32; 29] {
     binary_head_pc(n, n, 0.0)
 }
 
 /// Push constants for `mul_f32_f32_f32` broadcasting a single scalar
 /// (`layer_scalar`) against every element of an `[n]`-element row.
-fn binary_broadcast_pc(n: usize) -> Vec<u8> {
+fn binary_broadcast_pc(n: usize) -> [u32; 29] {
     binary_head_pc(n, 1, 0.0)
 }
 
 /// Push constants for the `generic_head.glsl`-based elementwise unary
 /// shaders (`gelu_f32`, `tanh_f32`, ...): `KX, KY, param1-4` (6 x 4 bytes).
 /// `KX` is the element count; the other fields are unused by `tanh_f32`.
-fn unary_head_pc(n: usize) -> Vec<u8> {
-    use std::io::Write;
-    let mut v = Vec::with_capacity(6 * 4);
-    v.write_all(&(n as u32).to_le_bytes()).unwrap();
-    v.write_all(&1u32.to_le_bytes()).unwrap();
-    for _ in 0..4 {
-        v.write_all(&0u32.to_le_bytes()).unwrap();
-    }
-    v
+/// Stack-allocated for the same reason as `binary_head_pc` above.
+fn unary_head_pc(n: usize) -> [u32; 6] {
+    [n as u32, 1, 0, 0, 0, 0]
+}
+
+/// Push constants for the `mul_mat_vec_*_r4` matvec shaders: `ncols,
+/// stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b,
+/// batch_stride_d, fusion_flags, base_work_group_y, ne02, ne12,
+/// broadcast2, broadcast3` (13 x 4 bytes) — every matvec dispatch in
+/// `forward_layer_gpu_matmuls`/`fused_post_attention` builds this from
+/// just `(k, n, t)`. Stack-allocated for the same reason as
+/// `binary_head_pc` above: this was previously two identical closures
+/// (one per function) each heap-allocating a fresh `Vec<u8>` on every
+/// one of ~10 matvec dispatches per layer, per decode step.
+fn mv_pc(k: usize, n: usize, t: usize) -> [u32; 13] {
+    [
+        k as u32, k as u32, k as u32, n as u32,
+        (k * n) as u32, k as u32, n as u32,
+        0, 0, 1, t as u32, t as u32, 1,
+    ]
 }
 
 /// Workgroup count for `add_f32_f32_f32` / `mul_f32_f32_f32` dispatches
@@ -2962,11 +2894,11 @@ mod softcap_tests {
 
         let gpu_softcap = |eng: &mut compute::ComputeEngine| -> Vec<f32> {
             let cb = eng.begin_batch().unwrap();
-            eng.record_to(cb, "mul_f32_f32_f32", &[&logits_buf, &inv_cap_buf, &scaled_buf], &binary_broadcast_pc(vocab), (wg256(vocab), 1, 1)).unwrap();
+            eng.record_to(cb, "mul_f32_f32_f32", &[&logits_buf, &inv_cap_buf, &scaled_buf], bytemuck::cast_slice(&binary_broadcast_pc(vocab)), (wg256(vocab), 1, 1)).unwrap();
             eng.record_barrier_to(cb);
-            eng.record_to(cb, "tanh_f32", &[&scaled_buf, &tanh_buf], &unary_head_pc(vocab), (wg512(vocab), 1, 1)).unwrap();
+            eng.record_to(cb, "tanh_f32", &[&scaled_buf, &tanh_buf], bytemuck::cast_slice(&unary_head_pc(vocab)), (wg512(vocab), 1, 1)).unwrap();
             eng.record_barrier_to(cb);
-            eng.record_to(cb, "mul_f32_f32_f32", &[&tanh_buf, &cap_buf, &final_buf], &binary_broadcast_pc(vocab), (wg256(vocab), 1, 1)).unwrap();
+            eng.record_to(cb, "mul_f32_f32_f32", &[&tanh_buf, &cap_buf, &final_buf], bytemuck::cast_slice(&binary_broadcast_pc(vocab)), (wg256(vocab), 1, 1)).unwrap();
             eng.submit_batch(cb).unwrap();
             read_f32_buf(&final_buf, vocab)
         };
@@ -3219,15 +3151,15 @@ mod final_norm_lm_head_tests {
         let pc: &[u8] = bytemuck::cast_slice(&pc_vals);
 
         let cb = engine.begin_batch().unwrap();
-        engine.record_to(cb, "rms_norm_f32_mul", &[&raw_hidden_buf, &norm_w_buf, &normed_buf], &rms_norm_mul_pc(h, eps), (1, 1, 1)).unwrap();
+        engine.record_to(cb, "rms_norm_f32_mul", &[&raw_hidden_buf, &norm_w_buf, &normed_buf], bytemuck::cast_slice(&rms_norm_mul_pc(h, eps)), (1, 1, 1)).unwrap();
         engine.record_barrier_to(cb);
         engine.record_to(cb, "mul_mat_vec_f32_f32_f32_r4", &[&lm_w_buf, &normed_buf, &raw_logit_buf], pc, (wg_r4(vocab), 1, 1)).unwrap();
         engine.record_barrier_to(cb);
-        engine.record_to(cb, "mul_f32_f32_f32", &[&raw_logit_buf, &inv_cap_buf, &scaled_buf], &binary_broadcast_pc(vocab), (wg256(vocab), 1, 1)).unwrap();
+        engine.record_to(cb, "mul_f32_f32_f32", &[&raw_logit_buf, &inv_cap_buf, &scaled_buf], bytemuck::cast_slice(&binary_broadcast_pc(vocab)), (wg256(vocab), 1, 1)).unwrap();
         engine.record_barrier_to(cb);
-        engine.record_to(cb, "tanh_f32", &[&scaled_buf, &tanh_buf], &unary_head_pc(vocab), (wg512(vocab), 1, 1)).unwrap();
+        engine.record_to(cb, "tanh_f32", &[&scaled_buf, &tanh_buf], bytemuck::cast_slice(&unary_head_pc(vocab)), (wg512(vocab), 1, 1)).unwrap();
         engine.record_barrier_to(cb);
-        engine.record_to(cb, "mul_f32_f32_f32", &[&tanh_buf, &cap_buf, &final_buf], &binary_broadcast_pc(vocab), (wg256(vocab), 1, 1)).unwrap();
+        engine.record_to(cb, "mul_f32_f32_f32", &[&tanh_buf, &cap_buf, &final_buf], bytemuck::cast_slice(&binary_broadcast_pc(vocab)), (wg256(vocab), 1, 1)).unwrap();
         engine.submit_batch(cb).unwrap();
 
         let gpu_result = read_f32_buf(&final_buf, vocab);
