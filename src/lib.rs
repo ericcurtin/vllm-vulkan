@@ -810,7 +810,12 @@ const ACT_HIDDEN3A:        usize = 21; // hidden2 + ff_normed
 const ACT_CONTRIB_NORMED:  usize = 22; // rms_norm_mul(ple_contrib, post_per_layer_input_norm.weight)
 const ACT_HIDDEN3B:        usize = 23; // hidden3a + contrib_normed
 const ACT_HIDDEN3_FINAL:   usize = 24; // hidden3b * layer_scalar — the layer's return value
-const ACT_COUNT:   usize = 25;
+// Holds this call's raw (not yet normalised) `hidden` input, so
+// input_layernorm can run as a GPU dispatch (`rms_norm_f32_mul`) at the
+// start of the QKV submit instead of as a separate CPU `cpu_rms_norm` call
+// beforehand — see the QKV submit in `forward_layer_gpu_matmuls`.
+const ACT_RAW_HIDDEN: usize = 25;
+const ACT_COUNT:   usize = 26;
 
 ///   logits = vk_model.forward(token_id, position)
 #[pyclass]
@@ -1193,15 +1198,12 @@ impl VulkanModel {
         let residual = hidden.to_vec();
         let _t_layer = std::time::Instant::now();
 
-        // CPU: input_layernorm
-        let x = model::cpu_rms_norm(hidden, &inln_w, eps);
-
-        let xb: &[u8] = bytemuck::cast_slice(&x);
         let shader = "mul_mat_vec_f16_f32_f32";
 
         // Init persistent activation buffers on first call.
         let use_gpu = self.engine.is_some()
             && self.gpu_weights.contains_key(&ln("self_attn.q_proj.weight"))
+            && self.gpu_weights.contains_key(&ln("input_layernorm.weight"))
             && self.init_act_bufs();
 
         // Whether every weight the fully-fused post-attention GPU chain
@@ -1234,27 +1236,38 @@ impl VulkanModel {
         //   Submit 2: o_proj + gate + up + down  (after attention, combined)
 
         let (q_vec, k_vec, v_vec) = if use_gpu {
-            // Write input to persistent buffer.
-            unsafe { (*self.act_ptr_mut(ACT_QKV_IN)).write(xb).unwrap(); }
+            // Write the *raw* (not yet normalised) input to a persistent
+            // buffer; input_layernorm now runs on the GPU as the first
+            // dispatch in this same command buffer (see below) instead of
+            // as a separate CPU `cpu_rms_norm` call before it. That removes
+            // one CPU-side allocation + O(h) compute from the hot path
+            // without adding a submit — it's simply the first of the four
+            // dispatches already going into this one vkQueueSubmit.
+            self.act_bufs[ACT_RAW_HIDDEN].write(bytemuck::cast_slice(hidden)).unwrap();
 
+            let raw_p = self.act_ptr(ACT_RAW_HIDDEN);
             let inp = self.act_ptr(ACT_QKV_IN);
             let q_p = self.act_ptr(ACT_Q_OUT);
             let k_p = self.act_ptr(ACT_K_OUT);
             let v_p = self.act_ptr(ACT_V_OUT);
 
+            let inln_w_gpu = &self.gpu_weights[&ln("input_layernorm.weight")] as *const compute::Buffer;
             let q_w = &self.gpu_weights[&ln("self_attn.q_proj.weight")] as *const compute::Buffer;
             let k_w = &self.gpu_weights[&ln("self_attn.k_proj.weight")] as *const compute::Buffer;
             let v_w = &self.gpu_weights[&ln("self_attn.v_proj.weight")] as *const compute::Buffer;
 
-            // SUBMIT 1: Q, K, V in one command buffer (no barriers needed — independent)
+            // SUBMIT 1: input_layernorm, then Q, K, V (Q/K/V independent — no
+            // barrier needed between them, only after the norm they all read).
             let eng = self.engine.as_mut().unwrap();
             let cb = eng.begin_batch().unwrap();
             unsafe {
+                eng.record_to(cb, "rms_norm_f32_mul", &[&*raw_p, &*inln_w_gpu, &*inp], &rms_norm_mul_pc(h, eps), (1, 1, 1)).unwrap();
+                eng.record_barrier_to(cb);
                 eng.record_to(cb, shader, &[&*q_w, &*inp, &*q_p], &mv_pc(h, q_dim), (q_dim as u32, t as u32, 1)).unwrap();
                 eng.record_to(cb, shader, &[&*k_w, &*inp, &*k_p], &mv_pc(h, kv_dim), (kv_dim as u32, t as u32, 1)).unwrap();
                 eng.record_to(cb, shader, &[&*v_w, &*inp, &*v_p], &mv_pc(h, kv_dim), (kv_dim as u32, t as u32, 1)).unwrap();
             }
-            eng.submit_batch(cb).unwrap();  // Fence wait 1: QKV
+            eng.submit_batch(cb).unwrap();  // Fence wait 1: input_layernorm + QKV
             if layer_idx == 0 { log::debug!("L{layer_idx} QKV submit: {}µs", _t_layer.elapsed().as_micros()); }
 
             let q_v = read_f32_buf(unsafe { &*q_p }, t * q_dim);
@@ -1262,6 +1275,7 @@ impl VulkanModel {
             let v_v = read_f32_buf(unsafe { &*v_p }, t * kv_dim);
             (q_v, k_v, v_v)
         } else {
+            let x = model::cpu_rms_norm(hidden, &inln_w, eps);
             let q_w = self.inner.weights.f32_slice(&ln("self_attn.q_proj.weight"));
             let k_w = self.inner.weights.f32_slice(&ln("self_attn.k_proj.weight"));
             let v_w = self.inner.weights.f32_slice(&ln("self_attn.v_proj.weight"));
@@ -1705,6 +1719,7 @@ impl VulkanModel {
             (h * 4) as u64,          // ACT_CONTRIB_NORMED
             (h * 4) as u64,          // ACT_HIDDEN3B
             (h * 4) as u64,          // ACT_HIDDEN3_FINAL
+            (h * 4) as u64,          // ACT_RAW_HIDDEN
         ];
 
         self.act_bufs.clear();
@@ -2167,6 +2182,35 @@ mod matvec_fusion_tests {
         // norm/residual math — any difference should be pure floating-point
         // reassociation noise, not a real numerical divergence.
         assert!(err < 1e-4, "fused post-attention diverged from the 3-submit path: {err}");
+    }
+
+    /// Validates the GPU `rms_norm_f32_mul` dispatch that now computes
+    /// input_layernorm at the start of the QKV submit (see
+    /// `forward_layer_gpu_matmuls`) against `Gemma4Model::forward_layer`,
+    /// the independent pure-CPU reference implementation in src/model.rs
+    /// (which still calls `cpu_rms_norm` for this step). Uses two freshly
+    /// built models with independent KV caches so neither call's
+    /// KV-cache-append affects the other.
+    #[test]
+    fn gpu_input_layernorm_matches_cpu_reference() {
+        let Some(mut gpu_model) = build_test_model(true) else { return };
+        let Some(mut cpu_ref_model) = build_test_model(true) else { return };
+
+        let hidden = fake_random(gpu_model.inner.config.hidden_size, 300);
+        let ple_dim = gpu_model.inner.config.hidden_size_per_layer_input;
+        let layer_ple = fake_random(ple_dim, 301);
+
+        assert!(gpu_model.engine.is_some());
+        let out_gpu = gpu_model.forward_layer_gpu_matmuls(0, &hidden, 0, &layer_ple);
+        let out_cpu_ref = cpu_ref_model.inner.forward_layer(0, &hidden, 0, &layer_ple);
+
+        let err = l2_rel_err(&out_cpu_ref, &out_gpu);
+        println!("GPU input_layernorm+QKV path vs pure-CPU reference: l2_rel_err={err:.6}");
+        // The GPU path quantizes matvec weights to f16 (the pure-CPU
+        // reference keeps everything f32), so some divergence is expected
+        // — this is the same tolerance already established for the
+        // existing GPU-vs-CPU comparisons in this file.
+        assert!(err < 0.01, "GPU input_layernorm diverged from the CPU reference: {err}");
     }
 
     #[test]
