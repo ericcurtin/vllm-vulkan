@@ -230,9 +230,26 @@ impl PipelineCache {
         // NUM_ROWS=2 variant for wider matrices
         let r2 = format!("{name}_r2");
         let _ = self.compile_one_with_spec(&r2, spv, &[(0, 512), (1, 2), (2, 1)]);
-        // NUM_ROWS=4 variant
+        // NUM_ROWS=4 variant, BLOCK_SIZE=32 (not 512): BLOCK_SIZE is tied
+        // directly to the shader's local_size_x (`layout(local_size_x_id =
+        // 0, ...)`), so this is a genuinely independent tuning axis from
+        // NUM_ROWS — measured across all 5 real Gemma4-E2B matvec shapes,
+        // BLOCK_SIZE=32 is 1.05x-1.91x faster than the previous 512, and
+        // consistently the best of {16, 32, 64, 128, 256, 512, 1024}
+        // tried (16 regressed relative to 32 at every shape, consistent
+        // with 32 being this hardware's native SIMD/subgroup width — see
+        // matvec_r4_tests::r4_matches_base_at_gemma4_e2b_shapes /
+        // r4_is_faster_than_base_at_gemma4_e2b_shapes, which validate
+        // this exact configuration).
+        // Unlike _r2 (compiled leniently above since nothing in production
+        // actually dispatches it), _r4 is used for every single matvec
+        // dispatch in the whole model — silently swallowing its
+        // compilation failure here would defer the actual problem to a
+        // much more confusing "shader not found" error the first time
+        // something tries to dispatch it at runtime, instead of failing
+        // fast and clearly at model-load time.
         let r4 = format!("{name}_r4");
-        let _ = self.compile_one_with_spec(&r4, spv, &[(0, 512), (1, 4), (2, 1)]);
+        self.compile_one_with_spec(&r4, spv, &[(0, 32), (1, 4), (2, 1)])?;
         Ok(())
     }
 
