@@ -78,24 +78,38 @@ def main() -> None:
         model.reset_kv_cache()
 
         # ── Prefill: feed prompt tokens one at a time (API is per-token). ──
+        # All but the last prompt token only need to advance the KV cache
+        # (their logits are discarded), so plain forward() is used there;
+        # the last one's logits are what greedy-samples the first generated
+        # token, so it uses forward_and_sample instead — and, since that
+        # forward pass is still prompt processing, it stays inside this
+        # timing block too (the first version of this fix left it outside
+        # both timing blocks entirely, silently omitting a full forward
+        # pass from every reported number: caught in review, see PR #39).
         t0 = time.perf_counter()
-        logits = None
-        for pos, tok in enumerate(prompt_ids):
-            logits = model.forward(tok, pos)
+        for pos, tok in enumerate(prompt_ids[:-1]):
+            model.forward(tok, pos)
+        pos = len(prompt_ids) - 1
+        next_tok = model.forward_and_sample(prompt_ids[-1], pos, 0.0, 1.0, 64, 0.0)
         prefill_s = time.perf_counter() - t0
         all_prefill.append(prefill_s)
 
         # ── Decode: greedy sampling for max_new_tokens steps. ──
-        generated = []
-        pos = len(prompt_ids)
-        next_tok = max(range(len(logits)), key=lambda i: logits[i])
-        generated.append(next_tok)
+        # forward_and_sample (Rust) replaces forward() + a Python
+        # max(range(len(logits)), key=lambda i: logits[i]) argmax: that
+        # inline Python argmax previously ran *inside* this timed decode
+        # loop, and measured ~12.3ms/call at Gemma4-E2B's 262144-token
+        # vocab on its own — a real, measurable source of under-reporting
+        # in this benchmark's own tok/s numbers, on top of being slow for
+        # its own sake. temperature=0.0 below reproduces the exact same
+        # greedy (argmax) behaviour the old inline Python code did.
+        generated = [next_tok]
+        pos += 1
 
         t0 = time.perf_counter()
         for _step in range(args.max_new_tokens - 1):
-            logits = model.forward(next_tok, pos)
+            next_tok = model.forward_and_sample(next_tok, pos, 0.0, 1.0, 64, 0.0)
             pos += 1
-            next_tok = max(range(len(logits)), key=lambda i: logits[i])
             generated.append(next_tok)
         decode_s = time.perf_counter() - t0
         all_decode.append(decode_s)
