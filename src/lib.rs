@@ -1365,7 +1365,13 @@ impl VulkanModel {
         let layer_scalar = w!("layer_scalar")[0];
 
         // ── ATTENTION ──────────────────────────────────────────────────────
-        let residual = hidden.to_vec();
+        // `hidden` is an immutable `&[f32]` for this whole call (the caller
+        // only reassigns its own `hidden` binding *after* this function
+        // returns — see forward_gpu's layer loop) and `residual` below is
+        // only ever read (never mutated), so it can simply alias `hidden`
+        // instead of heap-allocating a full copy of it (1536 floats / 6KB)
+        // on every one of the 35 layers, every decode step.
+        let residual = hidden;
         let _t_layer = std::time::Instant::now();
 
         let shader = "mul_mat_vec_f16_f32_f32_r4";
@@ -1548,7 +1554,7 @@ impl VulkanModel {
 
         if use_fused_post_attn {
             return self.fused_post_attention(
-                layer_idx, shader, &attn_out, &residual, layer_ple,
+                layer_idx, shader, &attn_out, residual, layer_ple,
                 h, q_dim, ffn_inter, ple_dim, eps, t, &_t_layer,
             );
         }
@@ -1577,7 +1583,11 @@ impl VulkanModel {
         let pa_normed = model::cpu_rms_norm(&o_proj, &pa_w, eps);
         let hidden2: Vec<f32> = residual.iter().zip(pa_normed.iter())
             .map(|(&r, &a)| r + a).collect();
-        let residual2 = hidden2.clone();
+        // hidden2 is only read from here on (never mutated), so residual2
+        // can borrow it instead of cloning — this whole branch is the
+        // older 3-submit CPU-fallback path (use_fused_post_attn == false),
+        // kept for the CPU-only build/test configuration.
+        let residual2 = &hidden2;
 
         // CPU: pre_ffn_norm
         let ff_in = model::cpu_rms_norm(&hidden2, &pf_w, eps);
