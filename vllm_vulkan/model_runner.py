@@ -264,7 +264,18 @@ def _wrap_linear(module: nn.Module) -> None:
         row_reduce = getattr(module, "reduce_results", False) and tp_size > 1
         matmul_bias = None if (row_reduce or skip_bias) else bias
         try:
-            result = vulkan_ops.linear(x.float(), weight.float(), matmul_bias)
+            # weight is passed through as-is (NOT weight.float()) so its
+            # tensor identity - and hence vulkan_ops's persistent GPU
+            # weight cache, keyed on id(weight.untyped_storage()) - stays
+            # stable across every call. weight.float() would allocate a
+            # brand-new tensor (and storage) whenever weight isn't already
+            # float32 (true for any bf16/fp16-loaded model, the common
+            # case), silently defeating the cache and forcing a full
+            # weight-matrix re-upload to the GPU on every single forward
+            # call instead of once. vulkan_ops.linear()/_vulkan_matvec()
+            # do their own float32 conversion internally, lazily, only on
+            # a cache miss (see _get_or_upload_weight).
+            result = vulkan_ops.linear(x.float(), weight, matmul_bias)
             result = result.to(x.dtype)
         except Exception as exc:
             logger.debug("Vulkan linear failed (%s)", exc)
