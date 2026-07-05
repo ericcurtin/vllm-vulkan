@@ -214,36 +214,44 @@ class VulkanAttentionBackendImpl(CPUAttentionBackendImpl):
             entry = _get_or_create_vulkan_kv_cache(ctx, kv_cache)
             if kv_cache.dtype == torch.float16:
                 from vllm_vulkan.kv_ops import (  # noqa: PLC0415
-                    paged_attn_decode_f16,
+                    paged_attn_decode_batch_f16,
                 )
 
-                decode = paged_attn_decode_f16
+                decode_batch = paged_attn_decode_batch_f16
             else:
                 from vllm_vulkan.kv_ops import (  # noqa: PLC0415
-                    paged_attn_decode_f32,
+                    paged_attn_decode_batch_f32,
                 )
 
-                decode = paged_attn_decode_f32
+                decode_batch = paged_attn_decode_batch_f32
 
             seq_lens = attn_metadata.seq_lens[:num_actual_tokens].to("cpu")
             block_table = attn_metadata.block_table[:num_actual_tokens].to("cpu")
             if not _vulkan_cache_has_sequences(entry, block_table, seq_lens):
                 return False
 
-            outs = []
-            for token_idx in range(num_actual_tokens):
-                outs.append(
-                    decode(
-                        ctx,
-                        entry.layout,
-                        entry.cache,
-                        _PER_LAYER_KV_CACHE_INDEX,
-                        query[token_idx].detach().to("cpu"),
-                        block_table[token_idx],
-                        int(seq_lens[token_idx]),
-                        self.scale,
-                    )
-                )
+            # One vkQueueSubmit for the whole batch instead of one per
+            # token: kv_ops.py's module-level design already batches every
+            # other op this way ("batch all ops ... into one vkQueueSubmit"
+            # to avoid "~150µs driver overhead each") - this loop used to
+            # be the one place still issuing a separate submit+fence-wait
+            # per token, once per attention layer per decode step.
+            #
+            # unbind(0)/tolist() do the detach+device-transfer+split (or
+            # int conversion) once, in a single C-level call each, instead
+            # of num_actual_tokens separate Python-level slice/.item() calls
+            # - avoiding exactly the kind of per-token Python overhead this
+            # PR otherwise removes from the GPU-submission side.
+            outs = decode_batch(
+                ctx,
+                entry.layout,
+                entry.cache,
+                _PER_LAYER_KV_CACHE_INDEX,
+                list(query[:num_actual_tokens].detach().to("cpu").unbind(0)),
+                list(block_table.unbind(0)),
+                seq_lens.tolist(),
+                self.scale,
+            )
 
             output[:num_actual_tokens].copy_(
                 torch.stack(outs).to(dtype=output.dtype, device=output.device)
