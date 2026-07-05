@@ -14,10 +14,8 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    import torch
+import torch
 
 logger = logging.getLogger(__name__)
 
@@ -74,32 +72,53 @@ def _pure_python_compute_slot_mapping(
 
     Context Parallelism (TOTAL_CP_WORLD_SIZE > 1) is not supported on CPU,
     consistent with the original C++ implementation.
+
+    Vectorized across every request in one pass instead of a Python loop
+    over range(num_reqs): the original version called `.item()` twice per
+    request (forcing a CPU/tensor sync each time) purely to slice
+    `positions`/`slot_mapping` and index into `block_table` one request row
+    at a time - work that `torch.repeat_interleave` (to build a per-token
+    "which request do I belong to" index from `query_start_loc` without a
+    loop) plus a single fancy-indexed gather from `block_table` does in one
+    shot for the whole batch. This runs once per forward pass (prefill and
+    decode) whenever `vllm._C` isn't available, so the per-request Python/
+    tensor-sync overhead scaled with concurrent batch size on every call.
     """
     assert TOTAL_CP_WORLD_SIZE == 1, "Context Parallelism is not supported on CPU."
 
     num_reqs = query_start_loc.shape[0] - 1
+    if num_reqs <= 0 or num_tokens <= 0:
+        return
 
-    for req_idx in range(num_reqs):
-        start = int(query_start_loc[req_idx].item())
-        end = int(query_start_loc[req_idx + 1].item())
-        if start >= end:
-            continue
+    positions = positions[:num_tokens]
 
-        # positions for this request's tokens: shape [token_num]
-        pos_slice = positions[start:end]  # int64
+    # Per-token request index, built without a Python loop: repeat request
+    # index r exactly (query_start_loc[r+1] - query_start_loc[r]) times -
+    # requests with zero tokens this step (start == end) are naturally
+    # skipped, matching the original `if start >= end: continue`.
+    #
+    # query_start_loc is frequently a CPU tensor (often pinned memory) even
+    # when positions/block_table live on the active accelerator device, so
+    # req_ids_per_token (used to index block_table alongside block_indices,
+    # which is derived from positions) must be built on positions.device,
+    # not query_start_loc.device - indexing with tensors on mismatched
+    # devices raises a RuntimeError.
+    req_lens = (
+        (query_start_loc[1:] - query_start_loc[:-1])
+        .clamp(min=0)
+        .to(device=positions.device, dtype=torch.int64)
+    )
+    req_ids_per_token = torch.repeat_interleave(
+        torch.arange(num_reqs, dtype=torch.int64, device=positions.device),
+        req_lens,
+    )
 
-        # block indices within the block_table row: shape [token_num]
-        block_indices = (pos_slice // block_size).long()
+    block_indices = (positions // block_size).long()
+    block_ids = block_table[req_ids_per_token, block_indices].long()
+    offsets = (positions % block_size).long()
+    slots = block_ids * block_size + offsets
 
-        # physical block IDs from the block table: shape [token_num]
-        row = block_table[req_idx]  # shape [max_num_blocks_per_req], int32
-        block_ids = row[block_indices].long()  # int64 for arithmetic
-
-        # slot = block_id * block_size + position % block_size
-        offsets = (pos_slice % block_size).long()
-        slots = block_ids * block_size + offsets
-
-        slot_mapping[start:end] = slots
+    slot_mapping[:num_tokens] = slots
 
 
 class _FuncWrapper:
