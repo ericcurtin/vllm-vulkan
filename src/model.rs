@@ -270,6 +270,19 @@ pub fn cpu_gelu(x: &[f32]) -> Vec<f32> {
 
 /// RoPE: apply rotary positional embedding to q and k.
 /// pos: token position, x: [num_heads, head_dim], rotary_dim = dims to rotate
+///
+/// The per-index rotation angle (and hence its `sin`/`cos`) depends only on
+/// `pos`, `i`, `rotary_dim`, and `theta` — the same values for every head,
+/// and the same for Q and K (both are called with the same `rotary_dim`/
+/// `theta` here). The previous implementation recomputed `theta.powf(..)`
+/// and `angle.sin_cos()` (both transcendental, i.e. genuinely expensive —
+/// unlike a plain multiply/add) inside the per-head loop, so a single
+/// decode step paid for `rotary_dim/2` of each per *head* (8 query heads +
+/// up to 1 key head for Gemma4-E2B) instead of just once. Precomputing the
+/// `(sin, cos)` table once and reusing it across every head removes that
+/// redundant work entirely — same math, computed once instead of up to 9
+/// times, with no change in the result (every head applies the exact same
+/// precomputed rotation it would otherwise have recomputed itself).
 pub fn cpu_rope(
     q: &mut [f32], k: &mut [f32],
     pos: usize,
@@ -279,12 +292,16 @@ pub fn cpu_rope(
     rotary_dim: usize,
     theta: f32,
 ) {
-    let rotate_head = |x: &mut [f32], pos: usize, head_dim: usize, rotary_dim: usize, theta: f32| {
-        let half = rotary_dim / 2;
-        for i in 0..half {
-            let freq = 1.0 / theta.powf(i as f32 * 2.0 / rotary_dim as f32);
-            let angle = pos as f32 * freq;
-            let (s, c) = angle.sin_cos();
+    let half = rotary_dim / 2;
+    let mut sin_cos: Vec<(f32, f32)> = Vec::with_capacity(half);
+    for i in 0..half {
+        let freq = 1.0 / theta.powf(i as f32 * 2.0 / rotary_dim as f32);
+        let angle = pos as f32 * freq;
+        sin_cos.push(angle.sin_cos());
+    }
+
+    let rotate_head = |x: &mut [f32], sin_cos: &[(f32, f32)]| {
+        for (i, &(s, c)) in sin_cos.iter().enumerate() {
             let x0 = x[i];
             let x1 = x[i + half];
             x[i]        = x0 * c - x1 * s;
@@ -295,11 +312,11 @@ pub fn cpu_rope(
 
     for h in 0..num_q_heads {
         let slice = &mut q[h * head_dim..(h + 1) * head_dim];
-        rotate_head(slice, pos, head_dim, rotary_dim, theta);
+        rotate_head(slice, &sin_cos);
     }
     for h in 0..num_kv_heads {
         let slice = &mut k[h * head_dim..(h + 1) * head_dim];
-        rotate_head(slice, pos, head_dim, rotary_dim, theta);
+        rotate_head(slice, &sin_cos);
     }
 }
 
