@@ -174,34 +174,67 @@ impl KvCache {
 
 // ─── CPU op primitives (used before full GPU pipeline is wired) ───────────────
 
-/// RMS normalisation in f32: out = x / rms(x) * weight
-pub fn cpu_rms_norm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
+/// RMS normalisation in place: `x[i] = x[i] / rms(x) * weight[i]`.
+///
+/// Several call sites (per-head Q-norm/K-norm/V-norm in the decode hot path)
+/// used to call the allocating `cpu_rms_norm` and immediately
+/// `copy_from_slice` the result back over the same slice they read from —
+/// paying for a heap allocation *and* a redundant copy just to mutate a
+/// buffer in place. This does the same math directly over `x`, with no
+/// allocation.
+pub fn cpu_rms_norm_inplace(x: &mut [f32], weight: &[f32], eps: f32) {
     let n = weight.len();
+    assert!(n > 0, "cpu_rms_norm_inplace: weight must be non-empty");
+    assert_eq!(
+        x.len() % n,
+        0,
+        "cpu_rms_norm_inplace: x.len() ({}) must be a multiple of weight.len() ({n})",
+        x.len(),
+    );
     let chunks = x.len() / n;
-    let mut out = vec![0.0f32; x.len()];
     for c in 0..chunks {
-        let row = &x[c * n..(c + 1) * n];
+        let row = &mut x[c * n..(c + 1) * n];
         let rms = (row.iter().map(|&v| v * v).sum::<f32>() / n as f32 + eps).sqrt();
         let scale = 1.0 / rms;
-        for i in 0..n {
-            out[c * n + i] = row[i] * scale * weight[i];
+        for (v, &w) in row.iter_mut().zip(weight.iter()) {
+            *v = *v * scale * w;
         }
     }
+}
+
+/// RMS normalisation without weight, in place (has_weight=False, e.g.
+/// v_norm). See `cpu_rms_norm_inplace` doc comment for why this exists
+/// alongside the allocating `cpu_rms_norm_no_weight`.
+pub fn cpu_rms_norm_no_weight_inplace(x: &mut [f32], n: usize, eps: f32) {
+    assert!(n > 0, "cpu_rms_norm_no_weight_inplace: n must be greater than zero");
+    assert_eq!(
+        x.len() % n,
+        0,
+        "cpu_rms_norm_no_weight_inplace: x.len() ({}) must be a multiple of n ({n})",
+        x.len(),
+    );
+    let chunks = x.len() / n;
+    for c in 0..chunks {
+        let row = &mut x[c * n..(c + 1) * n];
+        let rms = (row.iter().map(|&v| v * v).sum::<f32>() / n as f32 + eps).sqrt();
+        let scale = 1.0 / rms;
+        for v in row.iter_mut() {
+            *v *= scale;
+        }
+    }
+}
+
+/// RMS normalisation in f32: out = x / rms(x) * weight
+pub fn cpu_rms_norm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
+    let mut out = x.to_vec();
+    cpu_rms_norm_inplace(&mut out, weight, eps);
     out
 }
 
 /// RMS normalisation without weight (has_weight=False, e.g. v_norm).
 pub fn cpu_rms_norm_no_weight(x: &[f32], n: usize, eps: f32) -> Vec<f32> {
-    let chunks = x.len() / n;
-    let mut out = vec![0.0f32; x.len()];
-    for c in 0..chunks {
-        let row = &x[c * n..(c + 1) * n];
-        let rms = (row.iter().map(|&v| v * v).sum::<f32>() / n as f32 + eps).sqrt();
-        let scale = 1.0 / rms;
-        for i in 0..n {
-            out[c * n + i] = row[i] * scale;
-        }
-    }
+    let mut out = x.to_vec();
+    cpu_rms_norm_no_weight_inplace(&mut out, n, eps);
     out
 }
 
@@ -437,40 +470,35 @@ impl Gemma4Model {
         // 3. Q-norm and K-norm
         let q_norm_w = self.weights.f32_slice(&ln("self_attn.q_norm.weight")).to_vec();
         let k_norm_w = self.weights.f32_slice(&ln("self_attn.k_norm.weight")).to_vec();
-        // Apply q_norm per head
-        let mut q_heads = q.clone();
+        // Apply q_norm per head, in place (no clone, no allocate-then-copy-back).
         for h_idx in 0..num_q_heads {
-            let slice = &mut q_heads[h_idx * head_dim..(h_idx + 1) * head_dim];
-            let normed = cpu_rms_norm(slice, &q_norm_w, eps);
-            slice.copy_from_slice(&normed);
+            let slice = &mut q[h_idx * head_dim..(h_idx + 1) * head_dim];
+            cpu_rms_norm_inplace(slice, &q_norm_w, eps);
         }
-        q = q_heads;
 
         let mut k_final: Vec<f32>;
         let mut v_final: Vec<f32>;
 
         if !is_kv_shared {
-            let mut k_heads = k_raw.clone();
+            let mut k_heads = k_raw;
             for h_idx in 0..num_kv_heads {
                 let slice = &mut k_heads[h_idx * head_dim..(h_idx + 1) * head_dim];
-                let normed = cpu_rms_norm(slice, &k_norm_w, eps);
-                slice.copy_from_slice(&normed);
+                cpu_rms_norm_inplace(slice, &k_norm_w, eps);
             }
 
             // V-norm (no weight)
-            let mut v_heads = v_raw.clone();
+            let mut v_heads = v_raw;
             for h_idx in 0..num_kv_heads {
                 let slice = &mut v_heads[h_idx * head_dim..(h_idx + 1) * head_dim];
-                let normed = cpu_rms_norm_no_weight(slice, head_dim, eps);
-                slice.copy_from_slice(&normed);
+                cpu_rms_norm_no_weight_inplace(slice, head_dim, eps);
             }
             k_final = k_heads;
             v_final = v_heads;
         } else {
             // KV-shared: k and v come from the target layer's cache.
             // We still need dummy values for RoPE (q only matters).
-            k_final = k_raw.clone();
-            v_final = v_raw.clone();
+            k_final = k_raw;
+            v_final = v_raw;
         }
 
         // 4. RoPE

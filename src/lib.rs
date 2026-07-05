@@ -1236,23 +1236,21 @@ impl VulkanModel {
         let mut k_final = k_vec;
         let mut v_final = v_vec;
 
-        // CPU: Q-norm, K-norm, V-norm (using pre-extracted weights)
+        // CPU: Q-norm, K-norm, V-norm (using pre-extracted weights), in place —
+        // no per-head allocation + copy-back (see cpu_rms_norm_inplace doc).
         for hi in 0..num_q {
             let s = &mut q[hi * head_dim..(hi + 1) * head_dim];
-            let n = model::cpu_rms_norm(s, &q_norm_w, eps);
-            s.copy_from_slice(&n);
+            model::cpu_rms_norm_inplace(s, &q_norm_w, eps);
         }
         if !is_kv_shared {
             let k_norm = k_norm_w.as_ref().unwrap();
             for hi in 0..num_kv {
                 let s = &mut k_final[hi * head_dim..(hi + 1) * head_dim];
-                let n = model::cpu_rms_norm(s, k_norm, eps);
-                s.copy_from_slice(&n);
+                model::cpu_rms_norm_inplace(s, k_norm, eps);
             }
             for hi in 0..num_kv {
                 let s = &mut v_final[hi * head_dim..(hi + 1) * head_dim];
-                let n = model::cpu_rms_norm_no_weight(s, head_dim, eps);
-                s.copy_from_slice(&n);
+                model::cpu_rms_norm_no_weight_inplace(s, head_dim, eps);
             }
         }
 
