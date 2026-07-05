@@ -320,19 +320,24 @@ pub fn cpu_sdpa(
     let gqa_ratio = num_q_heads / num_kv_heads;
     let mut out = vec![0.0f32; num_q_heads * head_dim];
 
+    // Which KV positions any query head can attend to only depends on
+    // seq_len/sliding_window — it's the same for every head in this call, so
+    // the `scores`/`exp_scores` scratch buffers can be allocated once here
+    // and reused across all `num_q_heads` iterations below (every index is
+    // unconditionally overwritten before being read in each iteration, so
+    // reuse is safe) instead of once per head.
+    let kv_start = if let Some(window) = sliding_window {
+        seq_len.saturating_sub(window)
+    } else {
+        0
+    };
+    let valid_len = seq_len - kv_start;
+    let mut scores = vec![0.0f32; valid_len];
+    let mut exp_scores = vec![0.0f32; valid_len];
+
     for qh in 0..num_q_heads {
         let kvh = qh / gqa_ratio;
         let q_row = &q[qh * head_dim..(qh + 1) * head_dim];
-
-        // Determine which KV positions this query can attend to.
-        let kv_start = if let Some(window) = sliding_window {
-            seq_len.saturating_sub(window)
-        } else {
-            0
-        };
-
-        let valid_len = seq_len - kv_start;
-        let mut scores = vec![f32::NEG_INFINITY; valid_len];
 
         for (si, kv_pos) in (kv_start..seq_len).enumerate() {
             let k_row = &k[(kv_pos * num_kv_heads + kvh) * head_dim
@@ -343,7 +348,9 @@ pub fn cpu_sdpa(
 
         // Softmax
         let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let mut exp_scores: Vec<f32> = scores.iter().map(|&s| (s - max_score).exp()).collect();
+        for (e, &s) in exp_scores.iter_mut().zip(scores.iter()) {
+            *e = (s - max_score).exp();
+        }
         let sum: f32 = exp_scores.iter().sum();
         exp_scores.iter_mut().for_each(|s| *s /= sum);
 
