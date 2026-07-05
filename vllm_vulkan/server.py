@@ -20,6 +20,7 @@ import logging
 import os
 import time
 import uuid
+from pathlib import Path
 
 from transformers import AutoTokenizer
 
@@ -268,6 +269,22 @@ def main():
     # Load the model.
     logger.info("Loading tokenizer for %s...", args.model)
     tokenizer = AutoTokenizer.from_pretrained(args.model)
+
+    if getattr(tokenizer, "chat_template", None) is None:
+        # Base models (e.g. google/gemma-4-E2B) ship without a chat template.
+        # Fall back to the packaged instruction-tuned template so that
+        # /v1/chat/completions still works.
+        template_path = Path(__file__).parent / "template_gemma4.jinja"
+        if not template_path.exists():
+            raise FileNotFoundError(
+                f"Tokenizer has no chat template, and the fallback template "
+                f"was not found at {template_path}. Chat completions will fail."
+            )
+        logger.info(
+            "Tokenizer has no chat template; using packaged fallback from %s",
+            template_path,
+        )
+        tokenizer.chat_template = template_path.read_text(encoding="utf-8")
 
     logger.info("Finding safetensors file...")
     st_path = find_safetensors(args.model)

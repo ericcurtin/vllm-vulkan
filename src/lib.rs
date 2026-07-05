@@ -1078,7 +1078,7 @@ impl VulkanModel {
                 let cb = eng.begin_batch().unwrap();
                 let inp_ref = inp_p as *const compute::Buffer;
                 unsafe {
-                    eng.record_to(cb, "mul_mat_vec_f32_f32_f32_subgroup",
+                    eng.record_to(cb, "mul_mat_vec_f32_f32_f32",
                         &[&*lm_w_ptr, &*inp_ref, &*logit_p],
                         &pc, (vocab as u32, 1, 1)).unwrap();
                 }
@@ -1153,7 +1153,7 @@ impl VulkanModel {
         let x = model::cpu_rms_norm(hidden, &inln_w, eps);
 
         let xb = f32_slice_to_bytes(&x);
-        let shader = "mul_mat_vec_f16_f32_f32_subgroup";
+        let shader = "mul_mat_vec_f16_f32_f32";
 
         // Init persistent activation buffers on first call.
         let use_gpu = self.engine.is_some()
@@ -1491,7 +1491,7 @@ impl VulkanModel {
             let out_p = &out as *const compute::Buffer;
             let cb = eng.begin_batch().unwrap();
             unsafe {
-                eng.record_to(cb, "mul_mat_vec_f16_f32_f32_subgroup",
+                eng.record_to(cb, "mul_mat_vec_f16_f32_f32",
                     &[&*w_ptr, &*inp_p, &*out_p], pc, (n as u32, t as u32, 1)).unwrap();
             }
             eng.submit_batch(cb).unwrap();
@@ -1524,7 +1524,7 @@ impl VulkanModel {
             let out2_p = &out2 as *const compute::Buffer;
             let cb = eng.begin_batch().unwrap();
             unsafe {
-                let sh = "mul_mat_vec_f16_f32_f32_subgroup";
+                let sh = "mul_mat_vec_f16_f32_f32";
                 eng.record_to(cb, sh, &[&*w1_ptr, &*inp_p, &*out1_p], pc, (n as u32, t as u32, 1)).unwrap();
                 eng.record_barrier_to(cb);
                 eng.record_to(cb, sh, &[&*w2_ptr, &*inp_p, &*out2_p], pc, (n as u32, t as u32, 1)).unwrap();
