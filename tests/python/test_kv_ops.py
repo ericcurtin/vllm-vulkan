@@ -13,6 +13,8 @@ _rs = pytest.importorskip("vllm_vulkan._rs", exc_type=ImportError)
 
 from vllm_vulkan.kv_layout import KVCacheLayerSpec, VulkanPagedKVLayout  # noqa: E402
 from vllm_vulkan.kv_ops import (  # noqa: E402
+    paged_attn_decode_batch_f16,
+    paged_attn_decode_batch_f32,
     paged_attn_decode_f16,
     paged_attn_decode_f32,
     paged_kv_write_f16,
@@ -264,3 +266,162 @@ def test_paged_attn_decode_validates_block_table():
 
     with pytest.raises(ValueError, match="outside"):
         paged_attn_decode_f32(ctx, layout, cache, 0, q, [layout.num_blocks], seq_len=1)
+
+
+@pytest.mark.parametrize(
+    (
+        "torch_dtype",
+        "dtype_size",
+        "write_fn",
+        "decode_fn",
+        "decode_batch_fn",
+        "write_shader",
+        "decode_shaders",
+        "seed",
+        "rtol",
+        "atol",
+    ),
+    [
+        (
+            torch.float32,
+            4,
+            paged_kv_write_f32,
+            paged_attn_decode_f32,
+            paged_attn_decode_batch_f32,
+            "paged_kv_write_f32",
+            ("paged_attn_decode_f32", "paged_attn_decode_f32_coop"),
+            0,
+            1e-4,
+            1e-4,
+        ),
+        (
+            torch.float16,
+            2,
+            paged_kv_write_f16,
+            paged_attn_decode_f16,
+            paged_attn_decode_batch_f16,
+            "paged_kv_write_f16",
+            ("paged_attn_decode_f16", "paged_attn_decode_f16_coop"),
+            1,
+            5e-3,
+            5e-3,
+        ),
+    ],
+)
+def test_paged_attn_decode_batch_matches_per_token_calls_and_torch_reference(
+    torch_dtype: torch.dtype,
+    dtype_size: int,
+    write_fn: Callable,
+    decode_fn: Callable,
+    decode_batch_fn: Callable,
+    write_shader: str,
+    decode_shaders: tuple[str, ...],
+    seed: int,
+    rtol: float,
+    atol: float,
+):
+    """paged_attn_decode_batch_{f16,f32} - one vkQueueSubmit for the whole
+    batch instead of one per token (see attention.py's _try_vulkan_decode)
+    - must produce exactly the same results as calling the single-token
+    paged_attn_decode_{f16,f32} once per (query, block_table, seq_len)
+    triple, for a batch of *independent* sequences (different K/V data,
+    different block tables, different sequence lengths) sharing one cache.
+    """
+    ctx = _require_vulkan_context()
+    _require_shader(ctx, write_shader)
+    _require_shader(ctx, *decode_shaders)
+
+    spec, layout = _make_layout(dtype_size)
+    cache = ctx.alloc_activation(layout.total_bytes)
+    ctx.update_activation(cache, bytes(layout.total_bytes))
+
+    torch.manual_seed(seed)
+
+    # Two independent "requests" in the batch: different seq_lens, block
+    # tables, and K/V/Q data, writing into disjoint block ranges of the
+    # same shared cache - exactly like multiple concurrent decode requests.
+    seq_lens = [6, 3]
+    block_tables = [
+        torch.tensor([2, 0], dtype=torch.int64),
+        torch.tensor([1], dtype=torch.int64),
+    ]
+    scale = spec.head_size**-0.5
+
+    ks, vs, qs = [], [], []
+    for seq_len, block_table in zip(seq_lens, block_tables, strict=True):
+        k = torch.randn(seq_len, spec.num_kv_heads, spec.head_size, dtype=torch_dtype)
+        v = torch.randn_like(k)
+        q = torch.randn(4, spec.head_size, dtype=torch.float32)
+        slot_mapping = _slot_mapping_from_block_table(
+            block_table, seq_len, spec.block_size
+        )
+        write_fn(ctx, layout, cache, 0, k, v, slot_mapping)
+        ks.append(k)
+        vs.append(v)
+        qs.append(q)
+
+    # Reference: per-token single calls (the old behaviour).
+    per_token_outs = [
+        decode_fn(ctx, layout, cache, 0, qs[i], block_tables[i], seq_lens[i], scale)
+        for i in range(len(seq_lens))
+    ]
+
+    # Under test: one batched call.
+    batch_outs = decode_batch_fn(
+        ctx, layout, cache, 0, qs, block_tables, seq_lens, scale
+    )
+
+    assert len(batch_outs) == len(per_token_outs)
+    for i, (batch_out, per_token_out) in enumerate(
+        zip(batch_outs, per_token_outs, strict=True)
+    ):
+        torch.testing.assert_close(
+            batch_out,
+            per_token_out,
+            rtol=rtol,
+            atol=atol,
+            msg=f"batch output {i} diverged from the per-token call",
+        )
+
+    # Also cross-check the batch outputs directly against the pure-PyTorch
+    # attention reference (not just "agrees with the other Vulkan path"),
+    # for the same end-to-end correctness guarantee the per-token test above
+    # already has.
+    for i in range(len(seq_lens)):
+        expected = _attention_reference(qs[i], ks[i], vs[i], scale)
+        torch.testing.assert_close(batch_outs[i], expected, rtol=rtol, atol=atol)
+
+
+def test_paged_attn_decode_batch_validates_mismatched_list_lengths():
+    ctx = _require_vulkan_context()
+    _require_shader(ctx, "paged_attn_decode_f32", "paged_attn_decode_f32_coop")
+
+    spec, layout = _make_layout(dtype_size=4)
+    cache = ctx.alloc_activation(layout.total_bytes)
+    q = torch.zeros((1, spec.head_size), dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="same length"):
+        paged_attn_decode_batch_f32(
+            ctx,
+            layout,
+            cache,
+            0,
+            queries=[q, q],
+            block_tables=[[0]],
+            seq_lens=[1, 1],
+        )
+
+
+def test_paged_attn_decode_batch_empty_returns_empty_list():
+    ctx = _require_vulkan_context()
+    _require_shader(ctx, "paged_attn_decode_f32", "paged_attn_decode_f32_coop")
+
+    spec, layout = _make_layout(dtype_size=4)
+    cache = ctx.alloc_activation(layout.total_bytes)
+
+    assert (
+        paged_attn_decode_batch_f32(
+            ctx, layout, cache, 0, queries=[], block_tables=[], seq_lens=[]
+        )
+        == []
+    )

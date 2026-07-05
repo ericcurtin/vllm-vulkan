@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
-from vllm_vulkan.kv_layout import VulkanPagedKVLayout
+from vllm_vulkan.kv_layout import KVCacheLayerSpec, VulkanPagedKVLayout
 
 if TYPE_CHECKING:
     from vllm_vulkan._rs import GpuTensor, VulkanContext
@@ -209,23 +209,118 @@ def paged_attn_decode_f32(
     )
 
 
-def _paged_attn_decode(
+def paged_attn_decode_batch_f16(
     ctx: VulkanContext,
     layout: VulkanPagedKVLayout,
     cache: GpuTensor,
     layer_index: int,
-    q: torch.Tensor,
-    block_table: torch.Tensor | list[int] | tuple[int, ...],
-    seq_len: int,
-    scale: float | None,
+    queries: list[torch.Tensor],
+    block_tables: list[torch.Tensor | list[int] | tuple[int, ...]],
+    seq_lens: list[int],
+    scale: float | None = None,
+) -> list[torch.Tensor]:
+    """Batched form of paged_attn_decode_f16: decode every (query,
+    block_table, seq_len) triple in the batch as a single vkQueueSubmit
+    instead of one submit per token. See _paged_attn_decode_batch.
+    """
+    return _paged_attn_decode_batch(
+        ctx=ctx,
+        layout=layout,
+        cache=cache,
+        layer_index=layer_index,
+        queries=queries,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        scale=scale,
+        shader_name=_PAGED_ATTN_DECODE_F16_SHADER,
+        coop_shader_name=_PAGED_ATTN_DECODE_F16_COOP_SHADER,
+        dtype_size=2,
+    )
+
+
+def paged_attn_decode_batch_f32(
+    ctx: VulkanContext,
+    layout: VulkanPagedKVLayout,
+    cache: GpuTensor,
+    layer_index: int,
+    queries: list[torch.Tensor],
+    block_tables: list[torch.Tensor | list[int] | tuple[int, ...]],
+    seq_lens: list[int],
+    scale: float | None = None,
+) -> list[torch.Tensor]:
+    """Batched form of paged_attn_decode_f32: decode every (query,
+    block_table, seq_len) triple in the batch as a single vkQueueSubmit
+    instead of one submit per token. See _paged_attn_decode_batch.
+    """
+    return _paged_attn_decode_batch(
+        ctx=ctx,
+        layout=layout,
+        cache=cache,
+        layer_index=layer_index,
+        queries=queries,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        scale=scale,
+        shader_name=_PAGED_ATTN_DECODE_SHADER,
+        coop_shader_name=_PAGED_ATTN_DECODE_COOP_SHADER,
+        dtype_size=4,
+    )
+
+
+def _resolve_paged_attn_decode_dispatch(
+    ctx: VulkanContext,
+    layout: VulkanPagedKVLayout,
+    cache: GpuTensor,
+    layer_index: int,
     shader_name: str,
     coop_shader_name: str,
     dtype_size: int,
-) -> torch.Tensor:
+) -> tuple[str, KVCacheLayerSpec]:
+    """Resolve everything about a decode dispatch that's constant across
+    every token in a batch - which shader variant to use, and the shared
+    cache buffer/layout dtype validation - exactly once.
+
+    _select_decode_shader queries the Vulkan context for available shaders
+    (an FFI call into Rust), and _validate_cache_buffer/_validate_layout_dtype
+    don't depend on any per-token value (q, block_table, seq_len) at all;
+    doing all three once per batch instead of once per token is what makes
+    _paged_attn_decode_batch's single execute_batch call actually cheap
+    per-token, not just "one submit instead of N" with the same per-token
+    Python/FFI overhead still paid beforehand.
+    """
     spec = layout.layer_spec(layer_index)
     dispatch_shader_name = _select_decode_shader(ctx, shader_name, coop_shader_name)
     _validate_cache_buffer(cache, layout)
     _validate_layout_dtype(spec.dtype_size, dtype_size, shader_name)
+    return dispatch_shader_name, spec
+
+
+def _build_paged_attn_decode_op(
+    layout: VulkanPagedKVLayout,
+    cache: GpuTensor,
+    layer_index: int,
+    spec: KVCacheLayerSpec,
+    dispatch_shader_name: str,
+    coop_shader_name: str,
+    q: torch.Tensor,
+    block_table: torch.Tensor | list[int] | tuple[int, ...],
+    seq_len: int,
+    scale: float | None,
+) -> tuple[tuple[str, list, list[int], bytes, tuple[int, int, int], bool], int, int]:
+    """Validate per-token inputs and build one execute_batch op-tuple for a
+    single (query, block_table, seq_len) decode step, without submitting
+    it. Everything shared across a whole batch (shader selection, cache/
+    dtype validation) must already be resolved by
+    _resolve_paged_attn_decode_dispatch and passed in via
+    dispatch_shader_name/spec - this function only does work that
+    genuinely varies per token.
+
+    Returns (op_tuple, num_q_heads, head_size) so callers can either submit
+    it alone (_paged_attn_decode, one token) or collect several from
+    different tokens/sequences and submit them all as a single
+    ctx.execute_batch call (_paged_attn_decode_batch) - one vkQueueSubmit
+    and one fence wait for the whole batch instead of one per token.
+    """
     if seq_len <= 0:
         raise ValueError("seq_len must be > 0")
     if seq_len > layout.capacity_tokens_per_layer:
@@ -274,24 +369,121 @@ def _paged_attn_decode(
         )
     output_nbytes = total_elements * _F32_NBYTES
 
-    results = ctx.execute_batch(
+    op = (
+        dispatch_shader_name,
         [
-            (
-                dispatch_shader_name,
-                [
-                    _tensor_to_bytes(q_f32),
-                    blocks.tobytes(),
-                    cache,
-                ],
-                [output_nbytes],
-                pc,
-                workgroups,
-                False,
-            )
-        ]
+            _tensor_to_bytes(q_f32),
+            blocks.tobytes(),
+            cache,
+        ],
+        [output_nbytes],
+        pc,
+        workgroups,
+        False,
     )
+    return op, num_q_heads, spec.head_size
+
+
+def _paged_attn_decode(
+    ctx: VulkanContext,
+    layout: VulkanPagedKVLayout,
+    cache: GpuTensor,
+    layer_index: int,
+    q: torch.Tensor,
+    block_table: torch.Tensor | list[int] | tuple[int, ...],
+    seq_len: int,
+    scale: float | None,
+    shader_name: str,
+    coop_shader_name: str,
+    dtype_size: int,
+) -> torch.Tensor:
+    dispatch_shader_name, spec = _resolve_paged_attn_decode_dispatch(
+        ctx=ctx,
+        layout=layout,
+        cache=cache,
+        layer_index=layer_index,
+        shader_name=shader_name,
+        coop_shader_name=coop_shader_name,
+        dtype_size=dtype_size,
+    )
+    op, num_q_heads, head_size = _build_paged_attn_decode_op(
+        layout=layout,
+        cache=cache,
+        layer_index=layer_index,
+        spec=spec,
+        dispatch_shader_name=dispatch_shader_name,
+        coop_shader_name=coop_shader_name,
+        q=q,
+        block_table=block_table,
+        seq_len=seq_len,
+        scale=scale,
+    )
+    results = ctx.execute_batch([op])
     output = np.frombuffer(results[0][0], dtype=np.float32).copy()
-    return torch.from_numpy(output.reshape(num_q_heads, spec.head_size))
+    return torch.from_numpy(output.reshape(num_q_heads, head_size))
+
+
+def _paged_attn_decode_batch(
+    ctx: VulkanContext,
+    layout: VulkanPagedKVLayout,
+    cache: GpuTensor,
+    layer_index: int,
+    queries: list[torch.Tensor],
+    block_tables: list[torch.Tensor | list[int] | tuple[int, ...]],
+    seq_lens: list[int],
+    scale: float | None,
+    shader_name: str,
+    coop_shader_name: str,
+    dtype_size: int,
+) -> list[torch.Tensor]:
+    """Decode a whole batch of (query, block_table, seq_len) triples - one
+    per token/sequence - as a SINGLE ctx.execute_batch call: one
+    vkQueueSubmit and one fence wait for the entire batch, instead of one
+    per token (see attention.py's _try_vulkan_decode, which used to call
+    the single-token _paged_attn_decode in a Python loop).
+    """
+    if not (len(queries) == len(block_tables) == len(seq_lens)):
+        raise ValueError(
+            "queries, block_tables, and seq_lens must have the same length "
+            f"(got {len(queries)}, {len(block_tables)}, {len(seq_lens)})"
+        )
+    if not queries:
+        return []
+
+    dispatch_shader_name, spec = _resolve_paged_attn_decode_dispatch(
+        ctx=ctx,
+        layout=layout,
+        cache=cache,
+        layer_index=layer_index,
+        shader_name=shader_name,
+        coop_shader_name=coop_shader_name,
+        dtype_size=dtype_size,
+    )
+
+    ops = []
+    shapes = []
+    for q, block_table, seq_len in zip(queries, block_tables, seq_lens, strict=True):
+        op, num_q_heads, head_size = _build_paged_attn_decode_op(
+            layout=layout,
+            cache=cache,
+            layer_index=layer_index,
+            spec=spec,
+            dispatch_shader_name=dispatch_shader_name,
+            coop_shader_name=coop_shader_name,
+            q=q,
+            block_table=block_table,
+            seq_len=seq_len,
+            scale=scale,
+        )
+        ops.append(op)
+        shapes.append((num_q_heads, head_size))
+
+    results = ctx.execute_batch(ops)
+    outputs = []
+    for (num_q_heads, head_size), result in zip(shapes, results, strict=True):
+        output = np.frombuffer(result[0], dtype=np.float32).copy()
+        outputs.append(torch.from_numpy(output.reshape(num_q_heads, head_size)))
+    return outputs
 
 
 def _require_shader(ctx: VulkanContext, shader_name: str) -> None:
