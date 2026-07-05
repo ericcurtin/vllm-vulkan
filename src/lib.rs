@@ -788,7 +788,10 @@ const ACT_DOWN:    usize = 10;
 const ACT_GELU:    usize = 11; // gelu(gate) output           [ffn_inter]
 const ACT_PLE_G:   usize = 12; // PLE gate output             [ple_dim]
 const ACT_PLE_C:   usize = 13; // PLE contribution output     [H]
-const ACT_COUNT:   usize = 14;
+const ACT_PLE_LAYER: usize = 14; // PLE per-layer embed input [ple_dim]
+const ACT_PLE_GELU:  usize = 15; // gelu(PLE gate) output     [ple_dim]
+const ACT_PLE_MID:   usize = 16; // gelu(gate) * layer_ple    [ple_dim]
+const ACT_COUNT:   usize = 17;
 
 ///   logits = vk_model.forward(token_id, position)
 #[pyclass]
@@ -993,6 +996,7 @@ impl VulkanModel {
 impl VulkanModel {
     /// GPU-accelerated forward pass: matmuls on GPU, norms + attention on CPU.
     fn forward_gpu(&mut self, token_id: u32, position: usize) -> Vec<f32> {
+        let _t_total = std::time::Instant::now();
         let cfg = self.inner.config.clone();
         let h = cfg.hidden_size;
         let eps = cfg.rms_norm_eps;
@@ -1020,10 +1024,21 @@ impl VulkanModel {
         let ple_inputs: Vec<f32> = ple_proj_normed.iter().zip(ple_embeds_flat.iter())
             .map(|(&p, &e)| (p + e) * cfg.per_layer_input_scale).collect();
 
+        if log::log_enabled!(log::Level::Debug) {
+            log::debug!("PROFILE embed+ple: {}us", _t_total.elapsed().as_micros());
+        }
+
         // ── 35 Decoder Layers ────────────────────────────────────────────────
         for layer_idx in 0..cfg.num_hidden_layers {
+            let _t_layer_all = (layer_idx == 0).then(std::time::Instant::now);
             let layer_ple = &ple_inputs[layer_idx * ple_dim..(layer_idx + 1) * ple_dim];
             hidden = self.forward_layer_gpu_matmuls(layer_idx, &hidden, position, layer_ple);
+            if let Some(t) = _t_layer_all {
+                log::debug!("L0 total (incl. PLE): {}us", t.elapsed().as_micros());
+            }
+        }
+        if log::log_enabled!(log::Level::Debug) {
+            log::debug!("PROFILE after layers: {}us", _t_total.elapsed().as_micros());
         }
 
         // ── Final norm + LM head (GPU) ────────────────────────────────────────
@@ -1091,6 +1106,7 @@ impl VulkanModel {
         };
 
         logits.iter_mut().for_each(|l| *l = (*l / cap).tanh() * cap);
+        log::debug!("PROFILE total forward: {}us", _t_total.elapsed().as_micros());
         logits
     }
 
@@ -1130,9 +1146,18 @@ impl VulkanModel {
             v
         };
 
-        // Pre-extract all needed weight slices (avoids borrow conflicts later).
+        // Pre-extract all needed weight slices as raw-pointer handles (avoids
+        // borrow conflicts with the later `&mut self` GPU calls below without
+        // paying for a heap allocation + memcpy on every single decode step).
+        // SAFETY: `self.inner.weights` is never mutated for the lifetime of
+        // `self`, so the underlying `Vec<f32>` backing storage never moves or
+        // is freed while `self` is alive — these pointers stay valid for as
+        // long as the `RawSlice` values derived from them are in scope here.
         macro_rules! w {
-            ($name:expr) => { self.inner.weights.f32_slice(&ln($name)).to_vec() };
+            ($name:expr) => {{
+                let s = self.inner.weights.f32_slice(&ln($name));
+                RawSlice { ptr: s.as_ptr(), len: s.len() }
+            }};
         }
 
         let inln_w   = w!("input_layernorm.weight");
@@ -1372,42 +1397,70 @@ impl VulkanModel {
         let mut hidden3: Vec<f32> = residual2.iter().zip(ff_normed.iter())
             .map(|(&r, &f)| r + f).collect();
 
-        // PLE: gate_ple matmul [H→ple_dim] on GPU (persistent buf), then CPU gelu+elementwise,
-        //      then proj [ple_dim→H] on GPU (persistent buf)
-        let gate_ple = if use_gpu && self.gpu_weights.contains_key(&ln("per_layer_input_gate.weight")) {
+        // PLE (per-layer embedding) contribution: gate_proj → gelu → ×layer_ple → proj,
+        // all four steps fused into ONE command buffer / vkQueueSubmit (mirrors the
+        // FFN fusion above). Previously this was 2 separate submits with a CPU
+        // gelu + elementwise-multiply round trip in between; fusing it into a
+        // single GPU submit removes one fence-wait per layer from the decode step.
+        let contrib = if use_gpu
+            && self.gpu_weights.contains_key(&ln("per_layer_input_gate.weight"))
+            && self.gpu_weights.contains_key(&ln("per_layer_projection.weight"))
+        {
             let h3b = f32_slice_to_bytes(&hidden3);
             unsafe { (*self.act_ptr_mut(ACT_FFIN)).write(&h3b).unwrap(); }  // reuse ACT_FFIN as PLE input
-            let inp_p = self.act_ptr(ACT_FFIN);
-            let pg_p  = self.act_ptr(ACT_PLE_G);
-            let pgw   = &self.gpu_weights[&ln("per_layer_input_gate.weight")] as *const compute::Buffer;
+            let lpb = f32_slice_to_bytes(layer_ple);
+            unsafe { (*self.act_ptr_mut(ACT_PLE_LAYER)).write(&lpb).unwrap(); }
+
+            let inp_p   = self.act_ptr(ACT_FFIN);
+            let pg_p    = self.act_ptr(ACT_PLE_G);
+            let gelu_p  = self.act_ptr(ACT_PLE_GELU);
+            let layer_p = self.act_ptr(ACT_PLE_LAYER);
+            let mid_p   = self.act_ptr(ACT_PLE_MID);
+            let pc_p    = self.act_ptr(ACT_PLE_C);
+
+            let pgw = &self.gpu_weights[&ln("per_layer_input_gate.weight")] as *const compute::Buffer;
+            let ppw = &self.gpu_weights[&ln("per_layer_projection.weight")] as *const compute::Buffer;
+
+            let gelu_wg_ple = ((ple_dim + 511) / 512) as u32;
+            let mul_wg_ple  = ((ple_dim + 255) / 256) as u32;
+            let gelu_pc_ple = {
+                use std::io::Write;
+                let mut v = Vec::with_capacity(6 * 4);
+                v.write_all(&(ple_dim as u32).to_le_bytes()).unwrap();
+                v.write_all(&1u32.to_le_bytes()).unwrap();
+                for _ in 0..4 { v.write_all(&0u32.to_le_bytes()).unwrap(); }
+                v
+            };
+            let mul_pc_ple = {
+                use std::io::Write;
+                let n = ple_dim as u32;
+                let mut v = Vec::with_capacity(29 * 4);
+                for &x in &[n, n,1u32,1,1, 1u32,n,n,n] { v.write_all(&x.to_le_bytes()).unwrap(); }
+                for &x in &[n, 1u32,1,1, 1u32,n,n,n] { v.write_all(&x.to_le_bytes()).unwrap(); }
+                for &x in &[n, 1u32,1,1, 1u32,n,n,n] { v.write_all(&x.to_le_bytes()).unwrap(); }
+                for &x in &[0u32, 0u32, 0u32, 0u32] { v.write_all(&x.to_le_bytes()).unwrap(); }
+                v
+            };
+
             let eng = self.engine.as_mut().unwrap();
             let cb = eng.begin_batch().unwrap();
             unsafe {
                 eng.record_to(cb, shader, &[&*pgw, &*inp_p, &*pg_p], &mv_pc(h, ple_dim), (ple_dim as u32, t as u32, 1)).unwrap();
+                eng.record_barrier_to(cb);
+                eng.record_to(cb, "gelu_f32", &[&*pg_p, &*gelu_p], &gelu_pc_ple, (gelu_wg_ple, 1, 1)).unwrap();
+                eng.record_barrier_to(cb);
+                eng.record_to(cb, "mul_f32_f32_f32", &[&*gelu_p, &*layer_p, &*mid_p], &mul_pc_ple, (mul_wg_ple, 1, 1)).unwrap();
+                eng.record_barrier_to(cb);
+                eng.record_to(cb, shader, &[&*ppw, &*mid_p, &*pc_p], &mv_pc(ple_dim, h), (h as u32, t as u32, 1)).unwrap();
             }
-            eng.submit_batch(cb).unwrap();
-            read_f32_buf(unsafe { &*pg_p }, t * ple_dim)
-        } else {
-            let pgw = self.inner.weights.f32_slice(&ln("per_layer_input_gate.weight"));
-            model::cpu_matmul(&hidden3, pgw, 1, h, ple_dim)
-        };
-        let gate_ple_act = model::cpu_gelu(&gate_ple);
-        let gated: Vec<f32> = gate_ple_act.iter().zip(layer_ple.iter())
-            .map(|(&g, &p)| g * p).collect();
-        let contrib = if use_gpu && self.gpu_weights.contains_key(&ln("per_layer_projection.weight")) {
-            let gb = f32_slice_to_bytes(&gated);
-            unsafe { (*self.act_ptr_mut(ACT_PLE_G)).write(&gb).unwrap(); }  // reuse ACT_PLE_G as gated input
-            let gat_p = self.act_ptr(ACT_PLE_G);
-            let pc_p  = self.act_ptr(ACT_PLE_C);
-            let ppw   = &self.gpu_weights[&ln("per_layer_projection.weight")] as *const compute::Buffer;
-            let eng = self.engine.as_mut().unwrap();
-            let cb = eng.begin_batch().unwrap();
-            unsafe {
-                eng.record_to(cb, shader, &[&*ppw, &*gat_p, &*pc_p], &mv_pc(ple_dim, h), (h as u32, t as u32, 1)).unwrap();
-            }
-            eng.submit_batch(cb).unwrap();
+            eng.submit_batch(cb).unwrap();  // ONE fence wait for the whole PLE branch
             read_f32_buf(unsafe { &*pc_p }, t * h)
         } else {
+            let pgw = self.inner.weights.f32_slice(&ln("per_layer_input_gate.weight"));
+            let gate_ple = model::cpu_matmul(&hidden3, pgw, 1, h, ple_dim);
+            let gate_ple_act = model::cpu_gelu(&gate_ple);
+            let gated: Vec<f32> = gate_ple_act.iter().zip(layer_ple.iter())
+                .map(|(&g, &p)| g * p).collect();
             let ppw = self.inner.weights.f32_slice(&ln("per_layer_projection.weight"));
             model::cpu_matmul(&gated, ppw, 1, ple_dim, h)
         };
@@ -1447,6 +1500,9 @@ impl VulkanModel {
             (ffn_inter * 4) as u64,  // ACT_GELU
             (ple_dim * 4) as u64,    // ACT_PLE_G
             (h * 4) as u64,          // ACT_PLE_C
+            (ple_dim * 4) as u64,    // ACT_PLE_LAYER
+            (ple_dim * 4) as u64,    // ACT_PLE_GELU
+            (ple_dim * 4) as u64,    // ACT_PLE_MID
         ];
 
         self.act_bufs.clear();
@@ -1552,6 +1608,33 @@ impl VulkanModel {
 
 
 // ─── Helper functions for VulkanModel ────────────────────────────────────────
+
+/// A non-owning handle to an `[f32]` slice, identified by raw pointer + len.
+///
+/// Used to reference small per-layer weight tensors (norm weights, scalars)
+/// across a sequence of `&mut self` calls (GPU dispatch, buffer writes) that
+/// the borrow checker cannot otherwise reconcile with a live `&self.inner`
+/// borrow, without resorting to a heap allocation + memcpy on every decode
+/// step. `Deref<Target = [f32]>` gives it the same call-site ergonomics as
+/// `Vec<f32>` (e.g. `&inln_w`, `inln_w[0]`) via deref coercion.
+#[derive(Clone, Copy)]
+struct RawSlice {
+    ptr: *const f32,
+    len: usize,
+}
+
+// SAFETY: RawSlice is only ever constructed from a `&[f32]` borrowed out of
+// `VulkanModel::inner.weights`, which is immutable and pinned for the whole
+// lifetime of the model. Values are used only on the thread that created
+// them (Vulkan buffer handles are already !Send in this crate).
+impl std::ops::Deref for RawSlice {
+    type Target = [f32];
+    fn deref(&self) -> &[f32] {
+        // SAFETY: see struct docs — the backing Vec<f32> outlives every
+        // RawSlice derived from it and is never mutated in between.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
 
 /// Returns true if this weight tensor should be uploaded to GPU as f16.
 /// Norm weights, scalars, and embeddings stay as f32 for precision.
