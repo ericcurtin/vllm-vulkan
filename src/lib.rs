@@ -815,7 +815,19 @@ const ACT_HIDDEN3_FINAL:   usize = 24; // hidden3b * layer_scalar — the layer'
 // start of the QKV submit instead of as a separate CPU `cpu_rms_norm` call
 // beforehand — see the QKV submit in `forward_layer_gpu_matmuls`.
 const ACT_RAW_HIDDEN: usize = 25;
-const ACT_COUNT:   usize = 26;
+// Combined Q+K+V matvec output: `self_attn.qkv_proj.weight` (the
+// concatenated Q/K/V weight rows built in `new()`) is dispatched as ONE
+// matvec producing `[q_dim + 2*kv_dim]` outputs instead of three separate
+// matvecs each paying their own workgroup-launch overhead — Q, K, V read
+// the same input and have no dependency on each other, so this is a pure
+// dispatch-count reduction, not a semantic change. ACT_Q_OUT/ACT_K_OUT/
+// ACT_V_OUT above are unused by the fused QKV path (kept allocated, but
+// harmlessly so — a few KB) since the CPU-fallback-adjacent code they
+// once served no longer references them; removing them would mean
+// renumbering every constant below, which isn't worth the risk for a
+// few KB of idle memory.
+const ACT_QKV_OUT: usize = 26;
+const ACT_COUNT:   usize = 27;
 
 ///   logits = vk_model.forward(token_id, position)
 #[pyclass]
@@ -902,7 +914,48 @@ impl VulkanModel {
                                 gpu_w.insert(name.clone(), buf);
                             }
                         }
-                        log::info!("Uploaded {:.1}GB of weights to GPU (projection weights as f16)",
+
+                        // Build a concatenated Q+K+V weight per layer
+                        // ("self_attn.qkv_proj.weight") so the decode hot
+                        // path can dispatch one matvec producing
+                        // [q_dim + 2*kv_dim] outputs instead of three
+                        // separate ones. Q, K, V read the same input
+                        // vector and have no data dependency on each
+                        // other, so this is a pure dispatch-count
+                        // reduction — concatenating the weight rows is
+                        // the only change needed, since row-major [N, H]
+                        // weight tensors are already contiguous, so
+                        // stacking Q's rows, then K's, then V's produces
+                        // exactly the [q_dim+2*kv_dim, H] matrix a single
+                        // matvec needs.
+                        for layer_idx in 0..cfg.num_hidden_layers {
+                            let ln = |s: &str| format!("model.layers.{layer_idx}.{s}");
+                            let (Some(q), Some(k), Some(v)) = (
+                                raw_weights.get(&ln("self_attn.q_proj.weight")),
+                                raw_weights.get(&ln("self_attn.k_proj.weight")),
+                                raw_weights.get(&ln("self_attn.v_proj.weight")),
+                            ) else { continue };
+                            // Encode each of Q/K/V's f32 rows directly into
+                            // its slice of one f16 byte buffer — avoids
+                            // materialising a combined f32 Vec (~30MB per
+                            // full-attention layer, over 1GB across all 35
+                            // layers) purely as a stepping stone to the f16
+                            // bytes actually uploaded.
+                            let mut bytes = vec![0u8; (q.len() + k.len() + v.len()) * 2];
+                            let (q_bytes, rest) = bytes.split_at_mut(q.len() * 2);
+                            let (k_bytes, v_bytes) = rest.split_at_mut(k.len() * 2);
+                            append_f16_bytes(q_bytes, q);
+                            append_f16_bytes(k_bytes, k);
+                            append_f16_bytes(v_bytes, v);
+                            if let Ok(buf) = engine.alloc_host_coherent_storage(bytes.len() as u64) {
+                                if buf.write(&bytes).is_ok() {
+                                    total_bytes += bytes.len() as u64;
+                                    gpu_w.insert(ln("self_attn.qkv_proj.weight"), buf);
+                                }
+                            }
+                        }
+
+                        log::info!("Uploaded {:.1}GB of weights to GPU (projection weights as f16, fused QKV)",
                                    total_bytes as f64 / 1e9);
                         (Some(engine), gpu_w)
                     }
@@ -1206,6 +1259,14 @@ impl VulkanModel {
             && self.gpu_weights.contains_key(&ln("input_layernorm.weight"))
             && self.init_act_bufs();
 
+        // Whether the concatenated Q+K+V weight built in `new()` is
+        // resident on the GPU, letting the QKV submit dispatch one matvec
+        // instead of three (see ACT_QKV_OUT's doc comment). Falls back to
+        // the three-separate-dispatch path below if not (e.g. a partial
+        // upload failure) rather than failing outright.
+        let use_fused_qkv = use_gpu
+            && self.gpu_weights.contains_key(&ln("self_attn.qkv_proj.weight"));
+
         // Whether every weight the fully-fused post-attention GPU chain
         // needs (see `fused_post_attention` below) is resident on the GPU.
         // Requires strictly more weights than `use_gpu` above (that only
@@ -1247,32 +1308,70 @@ impl VulkanModel {
 
             let raw_p = self.act_ptr(ACT_RAW_HIDDEN);
             let inp = self.act_ptr(ACT_QKV_IN);
-            let q_p = self.act_ptr(ACT_Q_OUT);
-            let k_p = self.act_ptr(ACT_K_OUT);
-            let v_p = self.act_ptr(ACT_V_OUT);
-
             let inln_w_gpu = &self.gpu_weights[&ln("input_layernorm.weight")] as *const compute::Buffer;
-            let q_w = &self.gpu_weights[&ln("self_attn.q_proj.weight")] as *const compute::Buffer;
-            let k_w = &self.gpu_weights[&ln("self_attn.k_proj.weight")] as *const compute::Buffer;
-            let v_w = &self.gpu_weights[&ln("self_attn.v_proj.weight")] as *const compute::Buffer;
 
             // SUBMIT 1: input_layernorm, then Q, K, V (Q/K/V independent — no
             // barrier needed between them, only after the norm they all read).
-            let eng = self.engine.as_mut().unwrap();
-            let cb = eng.begin_batch().unwrap();
-            unsafe {
-                eng.record_to(cb, "rms_norm_f32_mul", &[&*raw_p, &*inln_w_gpu, &*inp], &rms_norm_mul_pc(h, eps), (1, 1, 1)).unwrap();
-                eng.record_barrier_to(cb);
-                eng.record_to(cb, shader, &[&*q_w, &*inp, &*q_p], &mv_pc(h, q_dim), (wg_r4(q_dim), t as u32, 1)).unwrap();
-                eng.record_to(cb, shader, &[&*k_w, &*inp, &*k_p], &mv_pc(h, kv_dim), (wg_r4(kv_dim), t as u32, 1)).unwrap();
-                eng.record_to(cb, shader, &[&*v_w, &*inp, &*v_p], &mv_pc(h, kv_dim), (wg_r4(kv_dim), t as u32, 1)).unwrap();
-            }
-            eng.submit_batch(cb).unwrap();  // Fence wait 1: input_layernorm + QKV
-            if layer_idx == 0 { log::debug!("L{layer_idx} QKV submit: {}µs", _t_layer.elapsed().as_micros()); }
+            //
+            // When the fused Q+K+V weight is available, Q/K/V collapse into
+            // ONE matvec dispatch producing [q_dim+2*kv_dim] outputs (see
+            // ACT_QKV_OUT's doc comment) instead of three separate ones.
+            let (q_v, k_v, v_v) = if use_fused_qkv {
+                let qkv_p = self.act_ptr(ACT_QKV_OUT);
+                let qkv_w = &self.gpu_weights[&ln("self_attn.qkv_proj.weight")] as *const compute::Buffer;
+                let qkv_dim = q_dim + 2 * kv_dim;
 
-            let q_v = read_f32_buf(unsafe { &*q_p }, t * q_dim);
-            let k_v = read_f32_buf(unsafe { &*k_p }, t * kv_dim);
-            let v_v = read_f32_buf(unsafe { &*v_p }, t * kv_dim);
+                let eng = self.engine.as_mut().unwrap();
+                let cb = eng.begin_batch().unwrap();
+                unsafe {
+                    eng.record_to(cb, "rms_norm_f32_mul", &[&*raw_p, &*inln_w_gpu, &*inp], &rms_norm_mul_pc(h, eps), (1, 1, 1)).unwrap();
+                    eng.record_barrier_to(cb);
+                    eng.record_to(cb, shader, &[&*qkv_w, &*inp, &*qkv_p], &mv_pc(h, qkv_dim), (wg_r4(qkv_dim), t as u32, 1)).unwrap();
+                }
+                eng.submit_batch(cb).unwrap();  // Fence wait 1: input_layernorm + fused QKV
+                if layer_idx == 0 { log::debug!("L{layer_idx} QKV submit: {}µs", _t_layer.elapsed().as_micros()); }
+
+                // The offset slicing below (`combined[..q_dim]`, etc.)
+                // assumes a single token's worth of output laid out as
+                // [Q | K | V] with no interleaving across tokens — true
+                // for t==1 (the only value forward_layer_gpu_matmuls is
+                // ever called with today: this is the single-token decode
+                // path), but silently wrong for t>1, where the fused
+                // matvec's output layout would need to be re-derived from
+                // mv_pc's batch striding instead of assumed. Fail loudly
+                // rather than risk a silent correctness bug if that ever
+                // changes.
+                assert_eq!(t, 1, "fused QKV output splitting assumes a single-token batch (t=1)");
+                let combined = read_f32_buf(unsafe { &*qkv_p }, t * qkv_dim);
+                let q_v = combined[..q_dim].to_vec();
+                let k_v = combined[q_dim..q_dim + kv_dim].to_vec();
+                let v_v = combined[q_dim + kv_dim..].to_vec();
+                (q_v, k_v, v_v)
+            } else {
+                let q_p = self.act_ptr(ACT_Q_OUT);
+                let k_p = self.act_ptr(ACT_K_OUT);
+                let v_p = self.act_ptr(ACT_V_OUT);
+                let q_w = &self.gpu_weights[&ln("self_attn.q_proj.weight")] as *const compute::Buffer;
+                let k_w = &self.gpu_weights[&ln("self_attn.k_proj.weight")] as *const compute::Buffer;
+                let v_w = &self.gpu_weights[&ln("self_attn.v_proj.weight")] as *const compute::Buffer;
+
+                let eng = self.engine.as_mut().unwrap();
+                let cb = eng.begin_batch().unwrap();
+                unsafe {
+                    eng.record_to(cb, "rms_norm_f32_mul", &[&*raw_p, &*inln_w_gpu, &*inp], &rms_norm_mul_pc(h, eps), (1, 1, 1)).unwrap();
+                    eng.record_barrier_to(cb);
+                    eng.record_to(cb, shader, &[&*q_w, &*inp, &*q_p], &mv_pc(h, q_dim), (wg_r4(q_dim), t as u32, 1)).unwrap();
+                    eng.record_to(cb, shader, &[&*k_w, &*inp, &*k_p], &mv_pc(h, kv_dim), (wg_r4(kv_dim), t as u32, 1)).unwrap();
+                    eng.record_to(cb, shader, &[&*v_w, &*inp, &*v_p], &mv_pc(h, kv_dim), (wg_r4(kv_dim), t as u32, 1)).unwrap();
+                }
+                eng.submit_batch(cb).unwrap();  // Fence wait 1: input_layernorm + QKV
+                if layer_idx == 0 { log::debug!("L{layer_idx} QKV submit: {}µs", _t_layer.elapsed().as_micros()); }
+
+                let q_v = read_f32_buf(unsafe { &*q_p }, t * q_dim);
+                let k_v = read_f32_buf(unsafe { &*k_p }, t * kv_dim);
+                let v_v = read_f32_buf(unsafe { &*v_p }, t * kv_dim);
+                (q_v, k_v, v_v)
+            };
             (q_v, k_v, v_v)
         } else {
             let x = model::cpu_rms_norm(hidden, &inln_w, eps);
@@ -1720,6 +1819,7 @@ impl VulkanModel {
             (h * 4) as u64,          // ACT_HIDDEN3B
             (h * 4) as u64,          // ACT_HIDDEN3_FINAL
             (h * 4) as u64,          // ACT_RAW_HIDDEN
+            ((q_dim + 2 * kv_dim) * 4) as u64, // ACT_QKV_OUT
         ];
 
         self.act_bufs.clear();
@@ -1993,11 +2093,23 @@ fn wg_r4(n: usize) -> u32 {
 /// f16 halves memory bandwidth which is the main bottleneck for matvec ops.
 fn f32_to_f16_bytes(data: &[f32]) -> Vec<u8> {
     let mut bytes = vec![0u8; data.len() * 2];
+    append_f16_bytes(&mut bytes[..], data);
+    bytes
+}
+
+/// Encodes `data` as little-endian f16 bytes directly into `dst` (which
+/// must be exactly `data.len() * 2` bytes), with no intermediate
+/// allocation. Used to build the concatenated Q+K+V weight buffer in
+/// `new()` without first materialising a combined `Vec<f32>` — for
+/// full-attention layers that's ~30MB of f32 Q+K+V weight per layer (over
+/// 1GB across all 35 layers) that would otherwise be allocated and freed
+/// purely as a stepping stone to the f16 bytes actually uploaded.
+fn append_f16_bytes(dst: &mut [u8], data: &[f32]) {
+    debug_assert_eq!(dst.len(), data.len() * 2);
     for (i, &v) in data.iter().enumerate() {
         let h = half::f16::from_f32(v);
-        bytes[i * 2..i * 2 + 2].copy_from_slice(&h.to_le_bytes());
+        dst[i * 2..i * 2 + 2].copy_from_slice(&h.to_le_bytes());
     }
-    bytes
 }
 
 /// Quantize f32 weights to Q8_0 format for GPU upload.
@@ -2050,6 +2162,31 @@ fn _rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__vulkan_available__", device::is_vulkan_available())?;
 
     Ok(())
+}
+
+/// Serializes every GPU-timing test in this file's `#[cfg(test)]` modules.
+///
+/// `cargo test` runs tests concurrently (one thread per test by default);
+/// each GPU perf test here creates its own `ComputeDevice`/`ComputeEngine`
+/// and submits work to the same physical GPU queue, so two such tests
+/// running at once contend for the GPU and can make an otherwise
+/// consistently-faster dispatch measure as slower purely from scheduling
+/// noise (observed directly: `matvec_r4_tests`'s r4-vs-base comparison,
+/// already merged and normally reliable, spuriously failed once under full
+/// suite parallelism while investigating this — re-running it alone showed
+/// the expected win every time). Every GPU perf/correctness test acquires
+/// this lock for its full duration so at most one such test ever touches
+/// the GPU at a time, regardless of `cargo test`'s thread count.
+#[cfg(test)]
+static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquires `GPU_TEST_LOCK`, tolerating poisoning: the lock only ever
+/// guards "don't run two GPU-timing tests at once", not any shared data,
+/// so a prior test panicking while holding it (e.g. a failed assertion)
+/// doesn't mean the next test needs to fail too.
+#[cfg(test)]
+fn gpu_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 #[cfg(test)]
@@ -2161,6 +2298,24 @@ mod matvec_fusion_tests {
             cpu_tensors.insert(name.clone(), model::SimpleTensor { data, shape: vec![] });
         }
 
+        // Mirror new()'s concatenated-QKV upload so tests actually exercise
+        // the fused QKV dispatch path (forward_layer_gpu_matmuls's
+        // use_fused_qkv), not just fall back to the three-separate-dispatch
+        // path because "self_attn.qkv_proj.weight" is missing.
+        {
+            let q = &cpu_tensors[&ln("self_attn.q_proj.weight")].data;
+            let k = &cpu_tensors[&ln("self_attn.k_proj.weight")].data;
+            let v = &cpu_tensors[&ln("self_attn.v_proj.weight")].data;
+            let mut combined = Vec::with_capacity(q.len() + k.len() + v.len());
+            combined.extend_from_slice(q);
+            combined.extend_from_slice(k);
+            combined.extend_from_slice(v);
+            let bytes = f32_to_f16_bytes(&combined);
+            let buf = engine.alloc_host_coherent_storage(bytes.len() as u64).unwrap();
+            buf.write(&bytes).unwrap();
+            gpu_weights.insert(ln("self_attn.qkv_proj.weight"), buf);
+        }
+
         let kv_caches: Vec<model::KvCache> = (0..cfg.num_hidden_layers).map(|i| {
             let hd = cfg.layer_head_dim(i);
             model::KvCache::new(64, cfg.num_key_value_heads, hd)
@@ -2182,6 +2337,7 @@ mod matvec_fusion_tests {
 
     #[test]
     fn fused_post_attention_matches_three_submit_path() {
+        let _guard = gpu_test_guard();
         let Some(mut fused_model) = build_test_model(true) else { return };
         let Some(mut old_model) = build_test_model(false) else { return };
 
@@ -2210,6 +2366,7 @@ mod matvec_fusion_tests {
     /// KV-cache-append affects the other.
     #[test]
     fn gpu_input_layernorm_matches_cpu_reference() {
+        let _guard = gpu_test_guard();
         let Some(mut gpu_model) = build_test_model(true) else { return };
         let Some(mut cpu_ref_model) = build_test_model(true) else { return };
 
@@ -2232,6 +2389,7 @@ mod matvec_fusion_tests {
 
     #[test]
     fn fused_post_attention_is_faster_than_three_submit_path() {
+        let _guard = gpu_test_guard();
         let Some(mut fused_model) = build_test_model(true) else { return };
         let Some(mut old_model) = build_test_model(false) else { return };
 
@@ -2361,6 +2519,7 @@ mod matvec_r4_tests {
 
     #[test]
     fn r4_matches_base_at_gemma4_e2b_shapes() {
+        let _guard = gpu_test_guard();
         let Some(mut h) = make_harness() else { return };
         // Every matvec shape forward_layer_gpu_matmuls/fused_post_attention
         // actually dispatches (src/model.rs Gemma4Config::e2b()).
@@ -2374,6 +2533,7 @@ mod matvec_r4_tests {
 
     #[test]
     fn r4_is_faster_than_base_at_gemma4_e2b_shapes() {
+        let _guard = gpu_test_guard();
         let Some(mut h) = make_harness() else { return };
 
         let k = 1536usize;
@@ -2408,6 +2568,174 @@ mod matvec_r4_tests {
         assert!(
             r4_us < base_us,
             "_r4 ({r4_us:.1}us) was not faster than the base variant ({base_us:.1}us)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod qkv_fusion_tests {
+    //! Validates the concatenated Q+K+V weight (`self_attn.qkv_proj.weight`,
+    //! built in `new()`) and its single-matvec dispatch (`use_fused_qkv` in
+    //! `forward_layer_gpu_matmuls`) against three separate Q/K/V matvec
+    //! dispatches against the same underlying weights. Requires a real
+    //! Vulkan device; skips cleanly (not a failure) on headless CI runners
+    //! with no GPU/ICD.
+    use super::*;
+
+    fn fake_random(len: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
+        (0..len).map(|_| {
+            state ^= state >> 12; state ^= state << 25; state ^= state >> 27;
+            let bits = state.wrapping_mul(0x2545F4914F6CDD1D);
+            ((bits >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        }).collect()
+    }
+
+    fn matvec_pc(k: usize, n: usize) -> Vec<u8> {
+        use std::io::Write;
+        let mut v = Vec::with_capacity(13 * 4);
+        for x in [k as u32, k as u32, k as u32, n as u32,
+                   (k * n) as u32, k as u32, n as u32,
+                   0u32, 0u32, 1u32, 1u32, 1u32, 1u32] {
+            v.write_all(&x.to_le_bytes()).unwrap();
+        }
+        v
+    }
+
+    struct Harness { engine: compute::ComputeEngine }
+
+    fn make_harness() -> Option<Harness> {
+        let dev = match device::ComputeDevice::create(0) {
+            Ok(d) => d,
+            Err(e) => { eprintln!("skip: no Vulkan device available ({e})"); return None; }
+        };
+        let shader_spvs = include_all_shaders();
+        let refs: std::collections::HashMap<&str, &[u8]> = shader_spvs.iter()
+            .map(|(k, v)| (k.as_str(), v.as_slice())).collect();
+        let engine = compute::ComputeEngine::new(
+            dev.instance.clone(), dev.physical_device, dev.device.clone(),
+            dev.compute_queue, dev.compute_queue_family, &refs,
+        ).expect("create ComputeEngine");
+        Some(Harness { engine })
+    }
+
+    /// Uploads f16-quantized weight/input once, then supports dispatching
+    /// against them repeatedly (mirrors production: weights are uploaded
+    /// once at model-load time, dispatched every decode step afterwards).
+    struct Fixture {
+        q_buf: compute::Buffer,
+        k_buf: compute::Buffer,
+        v_buf: compute::Buffer,
+        qkv_buf: compute::Buffer,
+        inp: compute::Buffer,
+        q_dim: usize,
+        kv_dim: usize,
+        k: usize,
+    }
+
+    fn build_fixture(h: &mut Harness, k: usize, q_dim: usize, kv_dim: usize) -> Fixture {
+        let qw = fake_random(q_dim * k, 1);
+        let kw = fake_random(kv_dim * k, 2);
+        let vw = fake_random(kv_dim * k, 3);
+        let x = fake_random(k, 4);
+
+        let upload = |eng: &mut compute::ComputeEngine, data: &[f32]| {
+            let bytes = f32_to_f16_bytes(data);
+            let buf = eng.alloc_host_coherent_storage(bytes.len() as u64).unwrap();
+            buf.write(&bytes).unwrap();
+            buf
+        };
+        let q_buf = upload(&mut h.engine, &qw);
+        let k_buf = upload(&mut h.engine, &kw);
+        let v_buf = upload(&mut h.engine, &vw);
+
+        // Exactly what new()'s weight-upload loop does: concatenate the
+        // raw f32 rows, then quantize the concatenation as one f16 buffer.
+        let mut combined = Vec::with_capacity(qw.len() + kw.len() + vw.len());
+        combined.extend_from_slice(&qw);
+        combined.extend_from_slice(&kw);
+        combined.extend_from_slice(&vw);
+        let qkv_buf = upload(&mut h.engine, &combined);
+
+        let xb: &[u8] = bytemuck::cast_slice(&x);
+        let inp = h.engine.alloc_host_coherent_storage(xb.len() as u64).unwrap();
+        inp.write(xb).unwrap();
+
+        Fixture { q_buf, k_buf, v_buf, qkv_buf, inp, q_dim, kv_dim, k }
+    }
+
+    fn dispatch_separate(h: &mut Harness, f: &Fixture) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let q_out = h.engine.alloc_host_coherent_storage((f.q_dim * 4) as u64).unwrap();
+        let k_out = h.engine.alloc_host_coherent_storage((f.kv_dim * 4) as u64).unwrap();
+        let v_out = h.engine.alloc_host_coherent_storage((f.kv_dim * 4) as u64).unwrap();
+        let cb = h.engine.begin_batch().unwrap();
+        h.engine.record_to(cb, "mul_mat_vec_f16_f32_f32_r4", &[&f.q_buf, &f.inp, &q_out], &matvec_pc(f.k, f.q_dim), (wg_r4(f.q_dim), 1, 1)).unwrap();
+        h.engine.record_to(cb, "mul_mat_vec_f16_f32_f32_r4", &[&f.k_buf, &f.inp, &k_out], &matvec_pc(f.k, f.kv_dim), (wg_r4(f.kv_dim), 1, 1)).unwrap();
+        h.engine.record_to(cb, "mul_mat_vec_f16_f32_f32_r4", &[&f.v_buf, &f.inp, &v_out], &matvec_pc(f.k, f.kv_dim), (wg_r4(f.kv_dim), 1, 1)).unwrap();
+        h.engine.submit_batch(cb).unwrap();
+        (read_f32_buf(&q_out, f.q_dim), read_f32_buf(&k_out, f.kv_dim), read_f32_buf(&v_out, f.kv_dim))
+    }
+
+    fn dispatch_fused(h: &mut Harness, f: &Fixture) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let n = f.q_dim + 2 * f.kv_dim;
+        let out = h.engine.alloc_host_coherent_storage((n * 4) as u64).unwrap();
+        let cb = h.engine.begin_batch().unwrap();
+        h.engine.record_to(cb, "mul_mat_vec_f16_f32_f32_r4", &[&f.qkv_buf, &f.inp, &out], &matvec_pc(f.k, n), (wg_r4(n), 1, 1)).unwrap();
+        h.engine.submit_batch(cb).unwrap();
+        let combined = read_f32_buf(&out, n);
+        (
+            combined[..f.q_dim].to_vec(),
+            combined[f.q_dim..f.q_dim + f.kv_dim].to_vec(),
+            combined[f.q_dim + f.kv_dim..].to_vec(),
+        )
+    }
+
+    #[test]
+    fn fused_qkv_matches_separate_dispatch() {
+        let _guard = gpu_test_guard();
+        let Some(mut h) = make_harness() else { return };
+        // Both Gemma4-E2B QKV shapes (sliding-window and full-attention layers).
+        for (label, q_dim, kv_dim) in [("sliding", 2048, 256), ("full-attn", 4096, 512)] {
+            let f = build_fixture(&mut h, 1536, q_dim, kv_dim);
+            let (q_sep, k_sep, v_sep) = dispatch_separate(&mut h, &f);
+            let (q_fused, k_fused, v_fused) = dispatch_fused(&mut h, &f);
+            for (i, (&a, &b)) in q_sep.iter().zip(q_fused.iter()).enumerate() {
+                assert!((a - b).abs() < 1e-6, "{label}: Q mismatch at {i}: {a} vs {b}");
+            }
+            for (i, (&a, &b)) in k_sep.iter().zip(k_fused.iter()).enumerate() {
+                assert!((a - b).abs() < 1e-6, "{label}: K mismatch at {i}: {a} vs {b}");
+            }
+            for (i, (&a, &b)) in v_sep.iter().zip(v_fused.iter()).enumerate() {
+                assert!((a - b).abs() < 1e-6, "{label}: V mismatch at {i}: {a} vs {b}");
+            }
+            println!("{label:<10} fused QKV matches 3 separate dispatches exactly (q_dim={q_dim} kv_dim={kv_dim})");
+        }
+    }
+
+    #[test]
+    fn fused_qkv_is_faster_than_separate_dispatch() {
+        let _guard = gpu_test_guard();
+        let Some(mut h) = make_harness() else { return };
+        let f = build_fixture(&mut h, 1536, 2048, 256); // sliding-window shape
+
+        for _ in 0..5 { dispatch_separate(&mut h, &f); dispatch_fused(&mut h, &f); }
+
+        let iters = 1000;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters { dispatch_separate(&mut h, &f); }
+        let sep_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters { dispatch_fused(&mut h, &f); }
+        let fused_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+        println!(
+            "QKV: 3 separate _r4 dispatches {sep_us:.1}us/call   1 fused _r4 dispatch {fused_us:.1}us/call   speedup {:.2}x",
+            sep_us / fused_us
+        );
+        assert!(
+            fused_us < sep_us,
+            "fused QKV ({fused_us:.1}us) was not faster than 3 separate dispatches ({sep_us:.1}us)"
         );
     }
 }
