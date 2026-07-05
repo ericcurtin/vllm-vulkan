@@ -827,7 +827,24 @@ const ACT_RAW_HIDDEN: usize = 25;
 // renumbering every constant below, which isn't worth the risk for a
 // few KB of idle memory.
 const ACT_QKV_OUT: usize = 26;
-const ACT_COUNT:   usize = 27;
+// Final logit softcap (`(logits/cap).tanh()*cap`, applied over the whole
+// vocab — 262144 elements for Gemma4-E2B) used to run as a single-threaded
+// CPU loop after the LM head's GPU matvec, ~1.1ms every decode step
+// regardless of GPU availability. Extending the LM head's existing
+// vkQueueSubmit with a broadcast-mul(1/cap) -> tanh -> broadcast-mul(cap)
+// chain (using the same broadcast-scalar trick as the per-layer
+// `layer_scalar` multiply) measured ~2.1-2.2x faster in isolation — see
+// `softcap_tests` below. ACT_INV_CAP/ACT_CAP hold the two scalar
+// constants (written once, in `init_act_bufs`, since `final_logit_softcapping`
+// never changes after model load); the other three are [vocab]-sized
+// intermediate/final buffers for the mul/tanh/mul chain.
+const ACT_LOGIT_RAW:    usize = 27;
+const ACT_LOGIT_SCALED: usize = 28;
+const ACT_LOGIT_TANH:   usize = 29;
+const ACT_LOGIT_FINAL:  usize = 30;
+const ACT_INV_CAP:      usize = 31;
+const ACT_CAP:          usize = 32;
+const ACT_COUNT:   usize = 33;
 
 ///   logits = vk_model.forward(token_id, position)
 #[pyclass]
@@ -1123,66 +1140,74 @@ impl VulkanModel {
         let normed = model::cpu_rms_norm(&hidden, norm_w, eps);
 
         // LM head: [1, H] @ [vocab, H]^T — the biggest matmul, must be on GPU.
+        // The final logit softcap ((logits/cap).tanh()*cap) — previously a
+        // single-threaded CPU loop over the entire vocab, ~1.1ms every
+        // decode step regardless of GPU availability — now runs as part of
+        // this same submit too: broadcast-mul(1/cap) -> tanh -> broadcast-
+        // mul(cap), using the persistent ACT_LOGIT_*/ACT_*_CAP buffers (see
+        // ACT_LOGIT_RAW's doc comment). Measured ~2.1-2.2x faster than the
+        // CPU loop in isolation (softcap_tests below).
         let vocab = cfg.vocab_size;
-        let cap = cfg.final_logit_softcapping;
-        let mut logits = if let (Some(eng), Some(lm_w_ptr)) = (
-            self.engine.as_mut(),
-            self.gpu_weights.get("model.embed_tokens.weight")
-                .map(|b| b as *const compute::Buffer)
-        ) {
+        // Requires init_act_bufs() to have actually succeeded — not just
+        // self.engine.is_some() — before touching any ACT_* slot below.
+        // forward_layer_gpu_matmuls's own use_gpu already calls
+        // init_act_bufs() too (it's idempotent: returns true immediately
+        // once act_bufs_ready is set), so in the common case this is a
+        // cheap re-check; but if every layer's use_gpu happened to be
+        // false (e.g. missing per-layer weights) while embed_tokens.weight
+        // is still present, act_bufs could otherwise still be empty here,
+        // and every act_ptr*() call below would index out of bounds.
+        let use_gpu_lm_head = self.engine.is_some()
+            && self.gpu_weights.contains_key("model.embed_tokens.weight")
+            && self.init_act_bufs();
+        let logits = if use_gpu_lm_head {
+            let lm_w_ptr = &self.gpu_weights["model.embed_tokens.weight"] as *const compute::Buffer;
             let normed_bytes: &[u8] = bytemuck::cast_slice(&normed);
-            let logit_size = (vocab * 4) as u64;
+            let inp_p = self.act_ptr_mut(ACT_QKV_IN); // reuse - we're done with layer ops
+            unsafe { (*inp_p).write(normed_bytes).unwrap(); }
 
-            // Use persistent buffers for LM head too
-            let inp_p  = self.act_ptr_mut(ACT_QKV_IN);  // reuse - we're done with layer ops
-            let out_p_key = logit_size + 99;  // unique key for logit output
-            // Allocate logit output buffer lazily
-            let logit_p: *const compute::Buffer = {
-                if !self.act_bufs.iter().any(|b| b.size == logit_size) {
-                    if let Ok(buf) = self.engine.as_mut().unwrap().alloc_host_coherent_storage(logit_size) {
-                        self.act_bufs.push(buf);
-                    }
+            let inp_ref = inp_p as *const compute::Buffer;
+            let raw_p = self.act_ptr(ACT_LOGIT_RAW);
+            let scaled_p = self.act_ptr(ACT_LOGIT_SCALED);
+            let tanh_p = self.act_ptr(ACT_LOGIT_TANH);
+            let final_p = self.act_ptr(ACT_LOGIT_FINAL);
+            let inv_cap_p = self.act_ptr(ACT_INV_CAP);
+            let cap_p = self.act_ptr(ACT_CAP);
+
+            let pc = {
+                use std::io::Write;
+                let mut v = Vec::with_capacity(13 * 4);
+                for x in [h as u32, h as u32, h as u32, vocab as u32,
+                           (h * vocab) as u32, h as u32, vocab as u32,
+                           0u32, 0u32, 1u32, 1u32, 1u32, 1u32] {
+                    v.write_all(&x.to_le_bytes()).unwrap();
                 }
-                // Find the logit buffer
-                self.act_bufs.iter().find(|b| b.size == logit_size)
-                    .map(|b| b as *const compute::Buffer)
-                    .unwrap_or(std::ptr::null())
+                v
             };
 
-            if logit_p.is_null() {
-                // Fallback to CPU
-                let lm_w = self.inner.weights.f32_slice("model.embed_tokens.weight");
-                model::cpu_matmul(&normed, lm_w, 1, h, vocab)
-            } else {
-                unsafe { (*inp_p).write(normed_bytes).unwrap(); }
-
-                let eng = self.engine.as_mut().unwrap();
-                let pc = {
-                    use std::io::Write;
-                    let mut v = Vec::with_capacity(13 * 4);
-                    for x in [h as u32, h as u32, h as u32, vocab as u32,
-                               (h * vocab) as u32, h as u32, vocab as u32,
-                               0u32, 0u32, 1u32, 1u32, 1u32, 1u32] {
-                        v.write_all(&x.to_le_bytes()).unwrap();
-                    }
-                    v
-                };
-                let cb = eng.begin_batch().unwrap();
-                let inp_ref = inp_p as *const compute::Buffer;
-                unsafe {
-                    eng.record_to(cb, "mul_mat_vec_f32_f32_f32_r4",
-                        &[&*lm_w_ptr, &*inp_ref, &*logit_p],
-                        &pc, (wg_r4(vocab), 1, 1)).unwrap();
-                }
-                eng.submit_batch(cb).unwrap();
-                read_f32_buf(unsafe { &*logit_p }, vocab)
+            let eng = self.engine.as_mut().unwrap();
+            let cb = eng.begin_batch().unwrap();
+            unsafe {
+                eng.record_to(cb, "mul_mat_vec_f32_f32_f32_r4",
+                    &[&*lm_w_ptr, &*inp_ref, &*raw_p],
+                    &pc, (wg_r4(vocab), 1, 1)).unwrap();
+                eng.record_barrier_to(cb);
+                eng.record_to(cb, "mul_f32_f32_f32", &[&*raw_p, &*inv_cap_p, &*scaled_p], &binary_broadcast_pc(vocab), (wg256(vocab), 1, 1)).unwrap();
+                eng.record_barrier_to(cb);
+                eng.record_to(cb, "tanh_f32", &[&*scaled_p, &*tanh_p], &unary_head_pc(vocab), (wg512(vocab), 1, 1)).unwrap();
+                eng.record_barrier_to(cb);
+                eng.record_to(cb, "mul_f32_f32_f32", &[&*tanh_p, &*cap_p, &*final_p], &binary_broadcast_pc(vocab), (wg256(vocab), 1, 1)).unwrap();
             }
+            eng.submit_batch(cb).unwrap();
+            read_f32_buf(unsafe { &*final_p }, vocab)
         } else {
+            let cap = cfg.final_logit_softcapping;
             let lm_w = self.inner.weights.f32_slice("model.embed_tokens.weight");
-            model::cpu_matmul(&normed, lm_w, 1, h, vocab)
+            let mut raw = model::cpu_matmul(&normed, lm_w, 1, h, vocab);
+            raw.iter_mut().for_each(|l| *l = (*l / cap).tanh() * cap);
+            raw
         };
 
-        logits.iter_mut().for_each(|l| *l = (*l / cap).tanh() * cap);
         log::debug!("PROFILE total forward: {}us", _t_total.elapsed().as_micros());
         logits
     }
@@ -1792,6 +1817,8 @@ impl VulkanModel {
         let ffn_inter = cfg.intermediate_size * 2; // largest (double-wide KV-shared layers)
 
         let ple_dim = cfg.hidden_size_per_layer_input; // 256
+        let vocab = cfg.vocab_size;
+        let cap = cfg.final_logit_softcapping;
         let sizes: [u64; ACT_COUNT] = [
             (h * 4) as u64,          // ACT_QKV_IN
             (q_dim * 4) as u64,      // ACT_Q_OUT
@@ -1820,6 +1847,12 @@ impl VulkanModel {
             (h * 4) as u64,          // ACT_HIDDEN3_FINAL
             (h * 4) as u64,          // ACT_RAW_HIDDEN
             ((q_dim + 2 * kv_dim) * 4) as u64, // ACT_QKV_OUT
+            (vocab * 4) as u64,      // ACT_LOGIT_RAW
+            (vocab * 4) as u64,      // ACT_LOGIT_SCALED
+            (vocab * 4) as u64,      // ACT_LOGIT_TANH
+            (vocab * 4) as u64,      // ACT_LOGIT_FINAL
+            4,                       // ACT_INV_CAP
+            4,                       // ACT_CAP
         ];
 
         self.act_bufs.clear();
@@ -1833,6 +1866,11 @@ impl VulkanModel {
                 }
             }
         }
+        // final_logit_softcapping never changes after model load, so its
+        // scalar broadcast operands only need writing once here rather
+        // than on every decode step.
+        self.act_bufs[ACT_INV_CAP].write(bytemuck::cast_slice(&[1.0f32 / cap])).unwrap();
+        self.act_bufs[ACT_CAP].write(bytemuck::cast_slice(&[cap])).unwrap();
         self.act_bufs_ready = true;
         log::info!("Allocated {} persistent activation buffers ({:.1} KB)",
             ACT_COUNT,
@@ -2057,6 +2095,20 @@ fn binary_elementwise_pc(n: usize) -> Vec<u8> {
 /// (`layer_scalar`) against every element of an `[n]`-element row.
 fn binary_broadcast_pc(n: usize) -> Vec<u8> {
     binary_head_pc(n, 1, 0.0)
+}
+
+/// Push constants for the `generic_head.glsl`-based elementwise unary
+/// shaders (`gelu_f32`, `tanh_f32`, ...): `KX, KY, param1-4` (6 x 4 bytes).
+/// `KX` is the element count; the other fields are unused by `tanh_f32`.
+fn unary_head_pc(n: usize) -> Vec<u8> {
+    use std::io::Write;
+    let mut v = Vec::with_capacity(6 * 4);
+    v.write_all(&(n as u32).to_le_bytes()).unwrap();
+    v.write_all(&1u32.to_le_bytes()).unwrap();
+    for _ in 0..4 {
+        v.write_all(&0u32.to_le_bytes()).unwrap();
+    }
+    v
 }
 
 /// Workgroup count for `add_f32_f32_f32` / `mul_f32_f32_f32` dispatches
@@ -2746,6 +2798,93 @@ mod qkv_fusion_tests {
         assert!(
             fused_us < sep_us,
             "fused QKV ({fused_us:.1}us) was not faster than 3 separate dispatches ({sep_us:.1}us)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod softcap_tests {
+    //! Validates the GPU-based final logit softcap (`forward_gpu`'s
+    //! broadcast-mul(1/cap) -> tanh -> broadcast-mul(cap) chain, appended
+    //! to the LM head's existing matvec submit) against the single-
+    //! threaded CPU loop it replaces (`(x/cap).tanh()*cap` over the whole
+    //! vocab — 262144 elements for Gemma4-E2B, ~1.1ms/call in isolation).
+    //! Requires a real Vulkan device; skips cleanly (not a failure) on
+    //! headless CI runners with no GPU/ICD.
+    use super::*;
+
+    #[test]
+    fn gpu_softcap_vs_cpu_softcap() {
+        let _guard = gpu_test_guard();
+        let dev = match device::ComputeDevice::create(0) {
+            Ok(d) => d,
+            Err(e) => { eprintln!("skip: {e}"); return; }
+        };
+        let shader_spvs = include_all_shaders();
+        let refs: std::collections::HashMap<&str, &[u8]> = shader_spvs.iter()
+            .map(|(k, v)| (k.as_str(), v.as_slice())).collect();
+        let mut engine = compute::ComputeEngine::new(
+            dev.instance.clone(), dev.physical_device, dev.device.clone(),
+            dev.compute_queue, dev.compute_queue_family, &refs,
+        ).unwrap();
+
+        let vocab = 262144usize;
+        let cap = 30.0f32;
+        let logits_init: Vec<f32> = (0..vocab).map(|i| (i as f32 * 0.0001).sin() * 40.0).collect();
+
+        // CPU reference (today's implementation).
+        let cpu_softcap = |logits: &[f32]| -> Vec<f32> {
+            logits.iter().map(|&l| (l / cap).tanh() * cap).collect()
+        };
+        let cpu_result = cpu_softcap(&logits_init);
+
+        // GPU: broadcast-mul(1/cap) -> tanh -> broadcast-mul(cap), all in one submit.
+        let logits_buf = engine.alloc_host_coherent_storage((vocab * 4) as u64).unwrap();
+        logits_buf.write(bytemuck::cast_slice(&logits_init)).unwrap();
+        let scaled_buf = engine.alloc_host_coherent_storage((vocab * 4) as u64).unwrap();
+        let tanh_buf = engine.alloc_host_coherent_storage((vocab * 4) as u64).unwrap();
+        let final_buf = engine.alloc_host_coherent_storage((vocab * 4) as u64).unwrap();
+        let inv_cap_buf = engine.alloc_host_coherent_storage(4).unwrap();
+        inv_cap_buf.write(bytemuck::cast_slice(&[1.0f32 / cap])).unwrap();
+        let cap_buf = engine.alloc_host_coherent_storage(4).unwrap();
+        cap_buf.write(bytemuck::cast_slice(&[cap])).unwrap();
+
+        let gpu_softcap = |eng: &mut compute::ComputeEngine| -> Vec<f32> {
+            let cb = eng.begin_batch().unwrap();
+            eng.record_to(cb, "mul_f32_f32_f32", &[&logits_buf, &inv_cap_buf, &scaled_buf], &binary_broadcast_pc(vocab), (wg256(vocab), 1, 1)).unwrap();
+            eng.record_barrier_to(cb);
+            eng.record_to(cb, "tanh_f32", &[&scaled_buf, &tanh_buf], &unary_head_pc(vocab), (wg512(vocab), 1, 1)).unwrap();
+            eng.record_barrier_to(cb);
+            eng.record_to(cb, "mul_f32_f32_f32", &[&tanh_buf, &cap_buf, &final_buf], &binary_broadcast_pc(vocab), (wg256(vocab), 1, 1)).unwrap();
+            eng.submit_batch(cb).unwrap();
+            read_f32_buf(&final_buf, vocab)
+        };
+
+        let gpu_result = gpu_softcap(&mut engine);
+        let mut max_err = 0.0f32;
+        for (&a, &b) in cpu_result.iter().zip(gpu_result.iter()) {
+            max_err = max_err.max((a - b).abs());
+        }
+        println!("GPU vs CPU softcap max abs err: {max_err:.6}");
+        assert!(max_err < 1e-4, "GPU softcap diverged from CPU reference: {max_err}");
+
+        // Timing.
+        for _ in 0..3 {
+            cpu_softcap(&logits_init);
+            gpu_softcap(&mut engine);
+        }
+        let iters = 20;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters { std::hint::black_box(cpu_softcap(&logits_init)); }
+        let cpu_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters { std::hint::black_box(gpu_softcap(&mut engine)); }
+        let gpu_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+        println!(
+            "softcap over {vocab} elements: CPU {cpu_us:.1}us/call   GPU (3 dispatches, 1 submit) {gpu_us:.1}us/call   speedup {:.2}x",
+            cpu_us / gpu_us
         );
     }
 }
