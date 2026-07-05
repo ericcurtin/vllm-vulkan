@@ -1292,10 +1292,10 @@ impl VulkanModel {
             }
             eng.submit_batch(cb).unwrap();
             if layer_idx == 0 { log::debug!("L{layer_idx} o_proj submit: {}µs total since layer start", _t_layer.elapsed().as_micros()); }
-            read_f32_buf(unsafe { &*oo }, t * h)
+            FBuf::Borrowed(RawSlice { ptr: self.act_ptr_f32(ACT_O_OUT), len: t * h })
         } else {
             let ow = self.inner.weights.f32_slice(&ln("self_attn.o_proj.weight"));
-            model::cpu_matmul(&attn_out, ow, 1, q_dim, h)
+            FBuf::Owned(model::cpu_matmul(&attn_out, ow, 1, q_dim, h))
         };
 
         // CPU: post_attn_norm + residual (using pre-extracted weight)
@@ -1380,7 +1380,7 @@ impl VulkanModel {
             eng.submit_batch(cb).unwrap();  // ONE fence wait for all FFN ops
             if layer_idx == 0 { log::debug!("L{layer_idx} FFN submit: {}µs total since layer start", _t_layer.elapsed().as_micros()); }
 
-            read_f32_buf(unsafe { &*down_p }, t * h)
+            FBuf::Borrowed(RawSlice { ptr: self.act_ptr_f32(ACT_DOWN), len: t * h })
         } else {
             // CPU fallback
             let gate_w = self.inner.weights.f32_slice(&ln("mlp.gate_proj.weight")).to_vec();
@@ -1389,7 +1389,7 @@ impl VulkanModel {
             let up   = model::cpu_matmul(&ff_in, &up_w,   1, h, ffn_inter);
             let gate_act = model::cpu_gelu(&gate);
             let mid: Vec<f32> = gate_act.iter().zip(up.iter()).map(|(&g, &u)| g * u).collect();
-            self.gpu_matmul_or_cpu(&ln("mlp.down_proj.weight"), &mid, t, ffn_inter, h, &mv_pc(ffn_inter, h))
+            FBuf::Owned(self.gpu_matmul_or_cpu(&ln("mlp.down_proj.weight"), &mid, t, ffn_inter, h, &mv_pc(ffn_inter, h)))
         };
 
         // CPU: post_ffn_norm + residual (using pre-extracted weight)
@@ -1454,7 +1454,7 @@ impl VulkanModel {
                 eng.record_to(cb, shader, &[&*ppw, &*mid_p, &*pc_p], &mv_pc(ple_dim, h), (h as u32, t as u32, 1)).unwrap();
             }
             eng.submit_batch(cb).unwrap();  // ONE fence wait for the whole PLE branch
-            read_f32_buf(unsafe { &*pc_p }, t * h)
+            FBuf::Borrowed(RawSlice { ptr: self.act_ptr_f32(ACT_PLE_C), len: t * h })
         } else {
             let pgw = self.inner.weights.f32_slice(&ln("per_layer_input_gate.weight"));
             let gate_ple = model::cpu_matmul(&hidden3, pgw, 1, h, ple_dim);
@@ -1462,7 +1462,7 @@ impl VulkanModel {
             let gated: Vec<f32> = gate_ple_act.iter().zip(layer_ple.iter())
                 .map(|(&g, &p)| g * p).collect();
             let ppw = self.inner.weights.f32_slice(&ln("per_layer_projection.weight"));
-            model::cpu_matmul(&gated, ppw, 1, ple_dim, h)
+            FBuf::Owned(model::cpu_matmul(&gated, ppw, 1, ple_dim, h))
         };
         let contrib_normed = model::cpu_rms_norm(&contrib, &ple_norm_w, eps);
         hidden3.iter_mut().zip(contrib_normed.iter()).for_each(|(hv, &c)| *hv += c);
@@ -1531,6 +1531,16 @@ impl VulkanModel {
 
     fn act_ptr_mut(&mut self, slot: usize) -> *mut compute::Buffer {
         &mut self.act_bufs[slot] as *mut compute::Buffer
+    }
+
+    /// Raw pointer to a persistent activation buffer's mapped memory, viewed
+    /// as `f32`. Used with `RawSlice`/`FBuf` to read a GPU dispatch's output
+    /// directly out of the mapped buffer without the `Vec<f32>` allocation +
+    /// copy that `read_f32_buf` does, for call sites that only need to *read*
+    /// the result (see `FBuf` doc comment). Detached from `self`'s borrow —
+    /// same rationale as `act_ptr`/`act_ptr_mut` above.
+    fn act_ptr_f32(&self, slot: usize) -> *const f32 {
+        self.act_bufs[slot].mapped_ptr.unwrap() as *const f32
     }
 
     fn gpu_matmul_or_cpu(&mut self, weight_name: &str, x: &[f32],
@@ -1633,6 +1643,33 @@ impl std::ops::Deref for RawSlice {
         // SAFETY: see struct docs — the backing Vec<f32> outlives every
         // RawSlice derived from it and is never mutated in between.
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+/// Either a borrowed activation-buffer view (`RawSlice`, GPU dispatch path)
+/// or an owned `Vec<f32>` (CPU-fallback path), unified behind one type so
+/// call sites like `forward_layer_gpu_matmuls`'s `let x = if use_gpu {...}
+/// else {...};` — which must produce the same type from both branches — can
+/// read a GPU dispatch's output directly out of its persistent, mapped
+/// buffer with no allocation, instead of both branches always paying for a
+/// `read_f32_buf` heap allocation + copy just to satisfy the CPU fallback's
+/// `Vec<f32>` return type. Only usable where the result is read, never
+/// mutated in place, after construction (RoPE/RMSNorm's in-place update
+/// paths still go through owned `Vec<f32>`, since those aren't valid
+/// `RawSlice` targets — mutating a `Buffer` still in flight for other reads
+/// would be unsound).
+enum FBuf {
+    Borrowed(RawSlice),
+    Owned(Vec<f32>),
+}
+
+impl std::ops::Deref for FBuf {
+    type Target = [f32];
+    fn deref(&self) -> &[f32] {
+        match self {
+            FBuf::Borrowed(s) => s,
+            FBuf::Owned(v) => v,
+        }
     }
 }
 
