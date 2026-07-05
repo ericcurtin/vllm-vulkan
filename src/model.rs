@@ -432,6 +432,122 @@ pub fn cpu_sdpa(
     out
 }
 
+// ─── Sampling ──────────────────────────────────────────────────────────────
+
+/// Temperature/top-p/top-k sampling over a full vocab of logits, mirroring
+/// (and replacing) `vllm_vulkan/server.py`'s pure-Python `temperature_sample`
+/// — the sampling step used once per decode step by the standalone Rust
+/// `VulkanModel` serving path (`vllm_vulkan.server`, documented as giving
+/// "~3 tok/s on GB10").
+///
+/// That Python implementation does a full `sorted()` over all
+/// `vocab_size` (262144 for Gemma4-E2B) logits just to select the top
+/// `top_k` (a full O(n log n) sort in the CPython interpreter, plus several
+/// more full-vocab list comprehensions for temperature scaling and
+/// softmax), on every single decode step — on top of `VulkanModel.forward`
+/// already having to convert its `Vec<f32>` return value into 262144
+/// individual Python `float` objects for `sorted()`/the list comprehensions
+/// to iterate over in the first place. Both of those costs disappear
+/// entirely if the whole computation (starting from the logits Rust
+/// already has, ending at a single sampled token id) never leaves Rust —
+/// see `VulkanModel::forward_and_sample` (src/lib.rs), which calls this
+/// directly on `forward_gpu`'s/`forward`'s own output.
+///
+/// `uniform_random` is a caller-supplied uniform `[0, 1)` draw (e.g.
+/// Python's `random.random()`) rather than something this function
+/// generates itself, so this crate doesn't need to add a `rand`
+/// dependency or make any choice about RNG algorithm/quality — sampling
+/// quality is exactly as good as whatever uniform source the caller
+/// already trusted before this change.
+///
+/// `top_k <= 0` means "no top-k filtering" (use the full vocab), matching
+/// the Python implementation's `else` branch — mathematically equivalent
+/// to `top_k >= vocab_size` here, since softmax probabilities already sum
+/// to 1, so renormalizing the full set by its own sum is a no-op up to
+/// floating-point rounding.
+///
+/// `temperature < 0.01` means greedy (argmax) sampling, matching
+/// `vllm_vulkan/server.py`'s `generate()` — which never called
+/// `temperature_sample` at all below that threshold, calling
+/// `greedy_sample` directly instead, both to avoid dividing by
+/// a near-zero temperature and because sampling is deterministic there
+/// anyway. `temperature_sample` itself only special-cased exactly `0.0`,
+/// which was unreachable in practice since `generate()` was always the
+/// caller — this function uses the threshold that actually mattered
+/// end-to-end.
+pub fn sample_with_temperature(
+    logits: &[f32],
+    temperature: f32,
+    top_p: f32,
+    top_k: i64,
+    uniform_random: f32,
+) -> usize {
+    if temperature < 0.01 {
+        return argmax(logits);
+    }
+
+    let n = logits.len();
+    let inv_temp = 1.0 / temperature;
+
+    // Softmax over the temperature-scaled logits.
+    let max_scaled = logits.iter().fold(f32::NEG_INFINITY, |m, &l| m.max(l * inv_temp));
+    let mut probs: Vec<f32> = logits.iter().map(|&l| (l * inv_temp - max_scaled).exp()).collect();
+    let sum: f32 = probs.iter().sum();
+    probs.iter_mut().for_each(|p| *p /= sum);
+
+    // Sort every (index, prob) pair descending by prob — this single sort
+    // serves both the top-k selection (the Python version's separate
+    // `sorted()` call for that) and the top-p step (which iterates the
+    // already-top-k-sorted list in order), since `probs` sorted descending
+    // is a superset of both intermediate orderings the Python version
+    // computes with two separate sorts.
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal));
+
+    let k = if top_k <= 0 { n } else { (top_k as usize).min(n) };
+    let top_k_order = &order[..k];
+    let top_k_sum: f32 = top_k_order.iter().map(|&i| probs[i]).sum();
+
+    // Top-p (nucleus): walk the (already-sorted) top-k prefix accumulating
+    // renormalized probability mass until it reaches top_p.
+    let mut cumsum = 0.0f32;
+    let mut nucleus_end = top_k_order.len();
+    for (pos, &idx) in top_k_order.iter().enumerate() {
+        cumsum += probs[idx] / top_k_sum;
+        if cumsum >= top_p {
+            nucleus_end = pos + 1;
+            break;
+        }
+    }
+    let nucleus = &top_k_order[..nucleus_end];
+    let nucleus_sum: f32 = nucleus.iter().map(|&i| probs[i]).sum();
+
+    // Sample via the caller-supplied uniform draw against the nucleus's
+    // renormalized cumulative distribution.
+    let mut cumsum = 0.0f32;
+    for &idx in nucleus {
+        cumsum += probs[idx] / nucleus_sum;
+        if uniform_random <= cumsum {
+            return idx;
+        }
+    }
+    *nucleus.last().unwrap()
+}
+
+/// Index of the largest element (ties broken by first occurrence, matching
+/// Python's `max(range(len(logits)), key=...)`).
+pub fn argmax(logits: &[f32]) -> usize {
+    let mut best_idx = 0;
+    let mut best_val = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > best_val {
+            best_val = v;
+            best_idx = i;
+        }
+    }
+    best_idx
+}
+
 // ─── Gemma4 forward pass (pure CPU, correct, used to verify) ─────────────────
 
 /// Complete Gemma4-E2B forward pass for a single token (decode step).
@@ -850,6 +966,174 @@ mod cpu_dot4_tests {
         for (i, (&a, &b)) in out_naive.iter().zip(out_dot4.iter()).enumerate() {
             let diff = (a - b).abs();
             assert!(diff < 1e-3, "index {i}: naive={a} dot4={b} diff={diff}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod sampling_tests {
+    //! Validates `sample_with_temperature`/`argmax` (the Rust replacement
+    //! for `vllm_vulkan/server.py`'s pure-Python `temperature_sample`/
+    //! `greedy_sample` — see `sample_with_temperature`'s doc comment for
+    //! why that matters) against a direct, unoptimized port of the exact
+    //! Python algorithm (including its two separate sorts, rather than
+    //! `sample_with_temperature`'s single combined one), plus some
+    //! deterministic edge cases. Pure CPU — no Vulkan device needed.
+    use super::*;
+
+    fn fake_random(len: usize, seed: u64) -> Vec<f32> {
+        (0..len).map(|i| {
+            let x = (i as u64).wrapping_mul(2654435761).wrapping_add(seed);
+            ((x % 20000) as f32 / 10000.0) - 1.0
+        }).collect()
+    }
+
+    /// Line-for-line port of `vllm_vulkan/server.py`'s `temperature_sample`,
+    /// deliberately kept as literal a translation as possible (including
+    /// its separate top-k sort and its second, redundant top-p sort, and
+    /// its own `temperature <= 0.0` greedy threshold specifically — as
+    /// opposed to `sample_with_temperature`'s `< 0.01`, which instead
+    /// matches `generate()`'s *dispatch* threshold, the one that actually
+    /// mattered end-to-end; see `sample_with_temperature`'s doc comment)
+    /// so that comparing it against `sample_with_temperature` (which
+    /// combines both sorts into one) is a meaningful independent check
+    /// rather than comparing an implementation against a copy of itself.
+    /// Test cases below only exercise `temperature >= 0.01` so this
+    /// deliberate threshold difference never affects the comparison.
+    fn python_port_temperature_sample(
+        logits: &[f32], temperature: f32, top_p: f32, top_k: i64, uniform_random: f32,
+    ) -> usize {
+        if temperature <= 0.0 {
+            return argmax(logits);
+        }
+        let n = logits.len();
+        let scaled: Vec<f32> = logits.iter().map(|&v| v / temperature).collect();
+        let max_l = scaled.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exp_l: Vec<f32> = scaled.iter().map(|&x| (x - max_l).exp()).collect();
+        let total: f32 = exp_l.iter().sum();
+        let probs: Vec<f32> = exp_l.iter().map(|&x| x / total).collect();
+
+        let (top_k_indices, top_k_probs): (Vec<usize>, Vec<f32>) = if top_k > 0 {
+            let k = (top_k as usize).min(probs.len());
+            let mut idx: Vec<usize> = (0..n).collect();
+            idx.sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+            idx.truncate(k);
+            let total_k: f32 = idx.iter().map(|&i| probs[i]).sum();
+            let p: Vec<f32> = idx.iter().map(|&i| probs[i] / total_k).collect();
+            (idx, p)
+        } else {
+            ((0..n).collect(), probs.clone())
+        };
+
+        // Second sort (redundant when the top-k branch above ran, since
+        // top_k_probs is already descending — but included here anyway
+        // for a faithful port, and load-bearing when top_k<=0).
+        let mut sorted_pos: Vec<usize> = (0..top_k_probs.len()).collect();
+        sorted_pos.sort_unstable_by(|&a, &b| top_k_probs[b].partial_cmp(&top_k_probs[a]).unwrap());
+
+        let mut cumsum = 0.0f32;
+        let mut nucleus = Vec::new();
+        for &pos in &sorted_pos {
+            cumsum += top_k_probs[pos];
+            nucleus.push(pos);
+            if cumsum >= top_p {
+                break;
+            }
+        }
+        let total_n: f32 = nucleus.iter().map(|&pos| top_k_probs[pos]).sum();
+        let nucleus_probs: Vec<f32> = nucleus.iter().map(|&pos| top_k_probs[pos] / total_n).collect();
+
+        let mut cumsum = 0.0f32;
+        for (&pos, &p) in nucleus.iter().zip(nucleus_probs.iter()) {
+            cumsum += p;
+            if uniform_random <= cumsum {
+                return top_k_indices[pos];
+            }
+        }
+        top_k_indices[*nucleus.last().unwrap()]
+    }
+
+    #[test]
+    fn argmax_finds_the_max() {
+        let logits = vec![0.1, 5.0, -3.0, 5.0, 2.0];
+        // Ties broken by first occurrence, matching Python's max(range(...), key=...).
+        assert_eq!(argmax(&logits), 1);
+    }
+
+    #[test]
+    fn temperature_zero_is_greedy_regardless_of_other_params() {
+        let logits = fake_random(1000, 1);
+        let expected = argmax(&logits);
+        for &(top_p, top_k, r) in &[(1.0, 64i64, 0.0f32), (0.5, 1, 0.999), (1.0, 0, 0.5)] {
+            let got = sample_with_temperature(&logits, 0.0, top_p, top_k, r);
+            assert_eq!(got, expected);
+        }
+    }
+
+    #[test]
+    fn small_nonzero_temperature_is_also_greedy() {
+        // Matches vllm_vulkan/server.py's generate(), which routed anything
+        // below 0.01 to greedy_sample directly rather than calling
+        // temperature_sample at all (see sample_with_temperature's doc
+        // comment) — a plain `temperature <= 0.0` check alone would divide
+        // by a near-zero temperature here and very likely NOT return the
+        // argmax, since even tiny logit differences get blown up into an
+        // essentially one-hot distribution that's numerically fragile
+        // rather than exactly greedy.
+        let logits = fake_random(1000, 4);
+        let expected = argmax(&logits);
+        for &temperature in &[0.0f32, 0.001, 0.005, 0.0099] {
+            let got = sample_with_temperature(&logits, temperature, 1.0, 64, 0.5);
+            assert_eq!(got, expected, "temperature={temperature} should be treated as greedy");
+        }
+        // Sanity: 0.01 itself and above should NOT be forced greedy (this
+        // just confirms the threshold is where we think it is, not that
+        // the non-greedy result differs from argmax for this specific
+        // input, which would be a flaky assumption).
+        let non_greedy = sample_with_temperature(&logits, 0.01, 1.0, 64, 0.5);
+        let reference = python_port_temperature_sample(&logits, 0.01, 1.0, 64, 0.5);
+        assert_eq!(non_greedy, reference);
+    }
+
+    #[test]
+    fn top_k_one_always_returns_argmax() {
+        let logits = fake_random(2000, 2);
+        let expected = argmax(&logits);
+        for &r in &[0.0f32, 0.3, 0.7, 0.999999] {
+            let got = sample_with_temperature(&logits, 1.0, 1.0, 1, r);
+            assert_eq!(got, expected, "top_k=1 should always pick the single candidate (uniform_random={r})");
+        }
+    }
+
+    #[test]
+    fn uniform_random_zero_selects_highest_probability_candidate() {
+        let logits = fake_random(5000, 3);
+        let expected = argmax(&logits);
+        let got = sample_with_temperature(&logits, 1.0, 1.0, 64, 0.0);
+        assert_eq!(got, expected, "uniform_random=0.0 should always land on the first (highest-prob) nucleus member");
+    }
+
+    #[test]
+    fn matches_python_port_across_random_inputs() {
+        let vocab = 4096usize; // smaller than the real 262144 so many random trials stay fast
+        for trial in 0..20u64 {
+            let logits = fake_random(vocab, 100 + trial);
+            for &(temperature, top_p, top_k) in &[
+                (1.0f32, 1.0f32, 64i64),
+                (0.7, 0.9, 40),
+                (1.5, 1.0, 0), // top_k<=0: no filtering
+                (0.5, 0.5, 10),
+            ] {
+                for &r in &[0.0f32, 0.1, 0.5, 0.9, 0.999999] {
+                    let fast = sample_with_temperature(&logits, temperature, top_p, top_k, r);
+                    let reference = python_port_temperature_sample(&logits, temperature, top_p, top_k, r);
+                    assert_eq!(
+                        fast, reference,
+                        "trial={trial} temperature={temperature} top_p={top_p} top_k={top_k} r={r}: \
+                         sample_with_temperature={fast} python_port={reference}"
+                    );
+                }
+            }
         }
     }
 }

@@ -18,6 +18,7 @@ import argparse
 import glob
 import logging
 import os
+import random
 import time
 import uuid
 from pathlib import Path
@@ -54,16 +55,33 @@ def find_safetensors(model_name_or_path: str) -> str:
 
 
 def greedy_sample(logits: list[float]) -> int:
-    """Return the token with the highest logit."""
+    """Return the token with the highest logit.
+
+    Superseded by ``model.forward_and_sample`` (Rust, ``src/lib.rs`` /
+    ``src/model.rs``) in ``generate()`` below — kept here for any external
+    callers that already depend on this exact pure-Python signature.
+    """
     return max(range(len(logits)), key=lambda i: logits[i])
 
 
 def temperature_sample(
     logits: list[float], temperature: float = 1.0, top_p: float = 1.0, top_k: int = 64
 ) -> int:
-    """Sample from logits with temperature, top-p, and top-k filtering."""
+    """Sample from logits with temperature, top-p, and top-k filtering.
+
+    Superseded by ``model.forward_and_sample`` (Rust, ``src/lib.rs`` /
+    ``src/model.rs``) in ``generate()`` below: this pure-Python
+    implementation does a full ``sorted()`` over the entire vocab (plus
+    several more full-vocab list comprehensions) on every call, which
+    measured ~82ms/call at Gemma4-E2B's 262144-token vocab — vs. ~8.6ms/call
+    even through ``vllm_vulkan._rs.sample_logits`` (which still pays a
+    Python-list round trip that ``forward_and_sample`` skips entirely, by
+    never converting the logit vector out of Rust in the first place). Kept
+    here for any external callers that already depend on this exact
+    pure-Python signature, and as a readable reference for the algorithm
+    `model::sample_with_temperature` (Rust) implements.
+    """
     import math
-    import random
 
     if temperature == 0.0:
         return greedy_sample(logits)
@@ -138,15 +156,26 @@ def generate(
     # Reset and prefill KV cache.
     model.reset_kv_cache()
 
-    # Prefill: run forward for each prompt token.
-    for pos, token_id in enumerate(input_ids):
-        logits = model.forward(token_id, pos)
+    # Prefill: run forward for each prompt token except the last (whose
+    # logits are the ones actually sampled from below) — advances the KV
+    # cache only, discarding logits nothing will read.
+    for pos, token_id in enumerate(input_ids[:-1]):
+        model.forward(token_id, pos)
 
-    # Get next token from last prefill step.
-    if temperature == 0.0 or (temperature < 0.01):
-        next_token = greedy_sample(logits)
-    else:
-        next_token = temperature_sample(logits, temperature, top_p, top_k)
+    # Get next token from the last prefill step. forward_and_sample (Rust)
+    # replaces forward() + greedy_sample()/temperature_sample(): sampling
+    # happens without ever converting the 262144-element logit vector into
+    # a Python object, and without CPython's interpreter overhead for the
+    # temperature/top-p/top-k algorithm itself (measured ~82ms/call for the
+    # old pure-Python temperature_sample vs. ~8.6ms/call even through the
+    # standalone vllm_vulkan._rs.sample_logits, which still pays a
+    # Python-list round trip that forward_and_sample skips entirely — see
+    # temperature_sample's docstring above and model::sample_with_temperature's
+    # doc comment in the Rust source).
+    last_pos = len(input_ids) - 1
+    next_token = model.forward_and_sample(
+        input_ids[-1], last_pos, temperature, top_p, top_k, random.random()
+    )
 
     # Decode: generate new tokens.
     generated_ids: list[int] = []
@@ -159,13 +188,10 @@ def generate(
         if next_token in stop_tokens:
             break
 
-        logits = model.forward(next_token, pos)
+        next_token = model.forward_and_sample(
+            next_token, pos, temperature, top_p, top_k, random.random()
+        )
         pos += 1
-
-        if temperature == 0.0 or (temperature < 0.01):
-            next_token = greedy_sample(logits)
-        else:
-            next_token = temperature_sample(logits, temperature, top_p, top_k)
 
     # Remove trailing EOS/end-of-turn tokens.
     while generated_ids and generated_ids[-1] in stop_tokens:

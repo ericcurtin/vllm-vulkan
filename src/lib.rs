@@ -83,6 +83,33 @@ fn get_memory_info(device_idx: usize) -> PyResult<(u64, u64)> {
     device::memory_info(device_idx).map_err(PyRuntimeError::new_err)
 }
 
+/// Temperature/top-p/top-k sample a token id from a full vocab of logits.
+///
+/// Exposed standalone (not just via `VulkanModel.forward_and_sample`) so
+/// existing call sites that already have a logits list/array in hand (or
+/// tests) can use the fast Rust sampler directly instead of Python's
+/// `sorted()`-based `temperature_sample` — see `model::sample_with_temperature`
+/// for why that matters. `uniform_random` should be a fresh uniform `[0, 1)`
+/// draw per call (e.g. Python's `random.random()`); `top_k <= 0` means no
+/// top-k filtering (use the full vocab); `temperature < 0.01` means greedy
+/// (argmax) sampling, ignoring `top_p`/`top_k`/`uniform_random` (see
+/// `model::sample_with_temperature`'s doc comment for why 0.01 specifically).
+#[pyfunction]
+#[pyo3(signature = (logits, temperature=1.0, top_p=1.0, top_k=64, uniform_random=0.0))]
+fn sample_logits(logits: Vec<f32>, temperature: f32, top_p: f32, top_k: i64, uniform_random: f32) -> PyResult<usize> {
+    // Unlike VulkanModel.forward_and_sample (whose logits always come from
+    // this crate's own forward_gpu/forward, which never return an empty
+    // vector), this function accepts an arbitrary caller-supplied `logits`
+    // directly from Python — an empty list would otherwise reach
+    // model::sample_with_temperature's final `nucleus.last().unwrap()` and
+    // panic (aborting the whole Python process, not raising a catchable
+    // exception) rather than failing gracefully.
+    if logits.is_empty() {
+        return Err(PyRuntimeError::new_err("sample_logits: logits must not be empty"));
+    }
+    Ok(model::sample_with_temperature(&logits, temperature, top_p, top_k, uniform_random))
+}
+
 // ─── GpuTensor — persistent device-local buffer ──────────────────────────────
 
 /// A tensor resident on the Vulkan device.
@@ -1025,6 +1052,39 @@ impl VulkanModel {
         } else {
             Ok(self.inner.forward(token_id, position))
         }
+    }
+
+    /// Run one decode step and sample the next token id, without ever
+    /// converting the (`vocab_size`-element, 262144 for Gemma4-E2B) logit
+    /// vector into a Python object.
+    ///
+    /// `vllm_vulkan/server.py` (the standalone Rust-`VulkanModel`-backed
+    /// serving path this crate documents as giving "~3 tok/s on GB10")
+    /// previously called `forward()` and passed its `Vec<f32>` return
+    /// value — converted by PyO3 into 262144 individual Python `float`
+    /// objects — into a pure-Python `temperature_sample()` that then did a
+    /// full `sorted()` over all of them (plus several more full-vocab list
+    /// comprehensions) just to pick one token. Doing the whole thing here
+    /// instead means the logits never leave Rust at all: no per-element
+    /// Python object conversion, and a single compiled `sort_unstable_by`
+    /// instead of CPython's interpreted `sorted()` — see
+    /// `model::sample_with_temperature`'s doc comment for the full
+    /// rationale and `sample_logits` for a standalone-callable version of
+    /// just the sampling step.
+    ///
+    /// `uniform_random` should be a fresh uniform `[0, 1)` draw per call
+    /// (e.g. Python's `random.random()`) — see `sample_logits`.
+    #[pyo3(signature = (token_id, position, temperature=1.0, top_p=1.0, top_k=64, uniform_random=0.0))]
+    fn forward_and_sample(
+        &mut self, token_id: u32, position: usize,
+        temperature: f32, top_p: f32, top_k: i64, uniform_random: f32,
+    ) -> PyResult<usize> {
+        let logits = if self.engine.is_some() {
+            self.forward_gpu(token_id, position)
+        } else {
+            self.inner.forward(token_id, position)
+        };
+        Ok(model::sample_with_temperature(&logits, temperature, top_p, top_k, uniform_random))
     }
 
     /// Reset the KV cache (start a new sequence).
@@ -2247,6 +2307,7 @@ fn _rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_device_info, m)?)?;
     m.add_function(wrap_pyfunction!(synchronize, m)?)?;
     m.add_function(wrap_pyfunction!(get_memory_info, m)?)?;
+    m.add_function(wrap_pyfunction!(sample_logits, m)?)?;
 
     m.add_class::<VulkanDevice>()?;
     m.add_class::<VulkanContext>()?;
