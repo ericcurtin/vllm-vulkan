@@ -259,17 +259,21 @@ def _vulkan_matvec(
     weight: torch.Tensor,  # [N, K] any dtype
 ) -> torch.Tensor:
     """Dispatch mul_mat_vec_f32_f32_f32_subgroup for decode (T<4)."""
-    # Cache key on original weight (before .float())
+    # Cache key on original weight (before .float()) - and the .float()
+    # conversion itself only happens lazily, in the `w_gpu is None`
+    # fallback branch below, since on the (overwhelmingly common) cache-hit
+    # path the GPU-resident buffer already holds the converted weight and
+    # recomputing weight.float() here would just be a wasted full
+    # weight-matrix copy, every single call, for a value nothing else uses.
     w_gpu = _get_or_upload_weight(ctx, weight)
-    weight_f32 = weight.float()
 
     T, K = x.shape  # noqa: N806
-    N = weight_f32.shape[0]  # noqa: N806
+    N = weight.shape[0]  # noqa: N806
     pc = _matvec_pc(T, K, N)
     x_bytes = _to_bytes(x)
     out_size = T * N * 4
 
-    w_binding = w_gpu if w_gpu is not None else _to_bytes(weight_f32)
+    w_binding = w_gpu if w_gpu is not None else _to_bytes(weight.float())
 
     results = ctx.execute_batch(
         [
