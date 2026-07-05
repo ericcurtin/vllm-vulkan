@@ -1342,10 +1342,10 @@ impl VulkanModel {
                 // rather than risk a silent correctness bug if that ever
                 // changes.
                 assert_eq!(t, 1, "fused QKV output splitting assumes a single-token batch (t=1)");
-                let combined = read_f32_buf(unsafe { &*qkv_p }, t * qkv_dim);
-                let q_v = combined[..q_dim].to_vec();
-                let k_v = combined[q_dim..q_dim + kv_dim].to_vec();
-                let v_v = combined[q_dim + kv_dim..].to_vec();
+                let qkv_buf_ref = unsafe { &*qkv_p };
+                let q_v = read_f32_buf_at(qkv_buf_ref, 0, q_dim);
+                let k_v = read_f32_buf_at(qkv_buf_ref, q_dim, kv_dim);
+                let v_v = read_f32_buf_at(qkv_buf_ref, q_dim + kv_dim, kv_dim);
                 (q_v, k_v, v_v)
             } else {
                 let q_p = self.act_ptr(ACT_Q_OUT);
@@ -2141,6 +2141,17 @@ fn read_f32_buf(buf: &compute::Buffer, count: usize) -> Vec<f32> {
     unsafe { std::slice::from_raw_parts(ptr, count).to_vec() }
 }
 
+/// Like `read_f32_buf`, but starting `offset` `f32` elements into the
+/// buffer instead of at the start — lets a single dispatch's output
+/// (e.g. the fused QKV matvec's `[Q | K | V]` layout) be split into
+/// several owned `Vec<f32>`s with one allocation each, instead of reading
+/// the whole thing into one `Vec<f32>` and then `.to_vec()`-ing each
+/// sub-slice out of *that* (an extra, avoidable full-size copy).
+fn read_f32_buf_at(buf: &compute::Buffer, offset: usize, count: usize) -> Vec<f32> {
+    let ptr = buf.mapped_ptr.unwrap() as *const f32;
+    unsafe { std::slice::from_raw_parts(ptr.add(offset), count).to_vec() }
+}
+
 /// Python-visible module `vllm_vulkan._rs`.
 #[pymodule]
 fn _rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -2682,11 +2693,10 @@ mod qkv_fusion_tests {
         let cb = h.engine.begin_batch().unwrap();
         h.engine.record_to(cb, "mul_mat_vec_f16_f32_f32_r4", &[&f.qkv_buf, &f.inp, &out], &matvec_pc(f.k, n), (wg_r4(n), 1, 1)).unwrap();
         h.engine.submit_batch(cb).unwrap();
-        let combined = read_f32_buf(&out, n);
         (
-            combined[..f.q_dim].to_vec(),
-            combined[f.q_dim..f.q_dim + f.kv_dim].to_vec(),
-            combined[f.q_dim + f.kv_dim..].to_vec(),
+            read_f32_buf_at(&out, 0, f.q_dim),
+            read_f32_buf_at(&out, f.q_dim, f.kv_dim),
+            read_f32_buf_at(&out, f.q_dim + f.kv_dim, f.kv_dim),
         )
     }
 
