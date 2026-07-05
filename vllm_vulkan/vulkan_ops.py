@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import struct
 import weakref
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import torch
@@ -68,35 +68,64 @@ def is_ready() -> bool:
     return _ctx is not None
 
 
-# ─── Weight cache (persistent GPU buffers) ───────────────────────────────────
+# ─── Weight cache (persistent GPU buffers + CPU float32 shadow copies) ───────
 
 
 class _WeightCache:
-    """Weak-ref keyed cache: storage object id → GpuTensor."""
+    """Weak-ref keyed cache: storage object id → arbitrary cached value.
+
+    Used both for persistent GPU-resident weight buffers (_weight_cache)
+    and for CPU-side float32 shadow copies of bf16/fp16 weights
+    (_cpu_float32_cache) - same assumption either way: the same nn.Module's
+    persistent .weight Parameter object (same storage) is passed in on
+    every forward call, so a conversion that only depends on the weight
+    itself only needs to be redone once, not on every single call.
+
+    put() registers a cleanup callback on the storage's weakref (rather
+    than just storing (weakref, value) and relying on a future get() call
+    to notice the weakref is dead and evict it) - without that callback,
+    a weight whose storage is garbage collected but whose id() key is
+    never looked up again (e.g. the model is replaced/reloaded, or the
+    module is discarded) would leave its entry - and the large cached
+    value it holds (a GPU-resident buffer or a full float32 CPU copy of
+    the weight matrix) - in self._data forever, since a plain dict never
+    removes entries on its own. The callback closes over a *weak*
+    reference to self (not self directly) so the cache instance itself
+    isn't kept alive by its own cleanup callbacks.
+
+    The weakref object returned by weakref.ref(storage, _cleanup) is
+    stored as part of the cached entry (not discarded) - a weakref's
+    callback only fires while the weakref object itself is still alive;
+    if nothing keeps a reference to it, CPython is free to collect the
+    weakref object itself before `storage` is ever collected, silently
+    disabling the callback (verified empirically while writing this).
+    """
 
     def __init__(self) -> None:
-        self._data: dict[int, tuple] = {}  # key → (weakref, GpuTensor)
+        self._data: dict[int, tuple] = {}  # key → (weakref, cached value)
 
     def get(self, w: torch.Tensor) -> object | None:
+        entry = self._data.get(id(w.untyped_storage()))
+        return entry[1] if entry is not None else None
+
+    def put(self, w: torch.Tensor, value: object) -> None:
         storage = w.untyped_storage()
         key = id(storage)
-        entry = self._data.get(key)
-        if entry is not None:
-            ref, gpu = entry
-            if ref() is not None:
-                return gpu
-            del self._data[key]
-        return None
+        self_ref = weakref.ref(self)
 
-    def put(self, w: torch.Tensor, gpu: object) -> None:
-        storage = w.untyped_storage()
-        self._data[id(storage)] = (weakref.ref(storage), gpu)
+        def _cleanup(_storage_ref: object) -> None:
+            cache = self_ref()
+            if cache is not None:
+                cache._data.pop(key, None)
+
+        self._data[key] = (weakref.ref(storage, _cleanup), value)
 
     def __len__(self) -> int:
         return len(self._data)
 
 
 _weight_cache = _WeightCache()
+_cpu_float32_cache = _WeightCache()
 
 
 def _get_or_upload_weight(ctx: VulkanContext, weight: torch.Tensor) -> object | None:
@@ -112,6 +141,29 @@ def _get_or_upload_weight(ctx: VulkanContext, weight: torch.Tensor) -> object | 
     except Exception as exc:
         logger.debug("Failed to upload weight: %s", exc)
         return None
+
+
+def _get_or_convert_to_float32_cpu(weight: torch.Tensor) -> torch.Tensor:
+    """Return a CPU float32 copy of weight, converting once on first use.
+
+    Used by linear()'s CPU (prefill) fallback path, which - unlike the GPU
+    matvec decode path's _get_or_upload_weight - has no cache at all before
+    this: weight.float() allocated a brand-new float32 copy of the entire
+    weight matrix on every single prefill call, for every wrapped Linear
+    module, even though the weight (and hence its correct float32 copy)
+    never changes between calls. Measured on this hardware, for a
+    realistic Gemma4-E2B FFN weight shape (k=1536, n=6144, bf16): the
+    conversion alone costs ~1.26ms out of ~8.8ms for the whole prefill
+    linear() call (~14%) - real, repeated, entirely avoidable work.
+    """
+    if weight.dtype == torch.float32:
+        return weight
+    cached = _cpu_float32_cache.get(weight)
+    if cached is not None:
+        return cast("torch.Tensor", cached)
+    w_f32 = weight.float()
+    _cpu_float32_cache.put(weight, w_f32)
+    return w_f32
 
 
 # ─── Tensor ↔ bytes helpers ──────────────────────────────────────────────────
@@ -245,7 +297,9 @@ def linear(
     ):
         result = _vulkan_matvec(ctx, x_2d, weight)
     else:
-        result = torch.nn.functional.linear(x_2d, weight.float())
+        result = torch.nn.functional.linear(
+            x_2d, _get_or_convert_to_float32_cpu(weight)
+        )
 
     if bias is not None:
         result = result + bias.float()
