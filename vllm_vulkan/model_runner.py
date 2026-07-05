@@ -13,8 +13,8 @@ loaded PyTorch model:
      debugging numerical differences.
 
 Note: the standalone Rust ``VulkanModel`` (a from-scratch, fully-fused
-Gemma4 forward pass, see ``vllm_vulkan._rs.VulkanModel`` / ``src/model_gpu.rs``
-/ ``src/lib.rs``) is a separate, complete GPU decode engine — it is not
+Gemma4 forward pass, see ``vllm_vulkan._rs.VulkanModel`` / ``src/lib.rs``)
+is a separate, complete GPU decode engine — it is not
 wired into vLLM's scheduler/paged-KV-cache here (that would require bypassing
 vLLM's attention backend entirely). It is exercised directly via
 ``scripts/bench_vulkan_model.py``. An earlier version of this module loaded
@@ -145,7 +145,7 @@ def _apply_module_hooks(model: nn.Module) -> None:
     """Apply Vulkan dispatch hooks to RMSNorm and Linear modules.
 
     Note: there is a separate, complete Rust decode engine
-    (``vllm_vulkan._rs.VulkanModel``, see ``src/model_gpu.rs``) that fuses an
+    (``vllm_vulkan._rs.VulkanModel``, see ``src/lib.rs``) that fuses an
     entire Gemma4 forward pass into a handful of GPU submits per token. It is
     not used here — wiring it in would mean bypassing vLLM's own paged
     KV-cache/attention backend for this model, which this hook-based
