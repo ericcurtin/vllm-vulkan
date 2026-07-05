@@ -1103,14 +1103,34 @@ impl VulkanModel {
                                             (token_id as usize + 1) * h]
             .iter().map(|&v| v * cfg.embed_scale).collect();
 
-        // ── PLE preprocessing (CPU) ──────────────────────────────────────────
+        // ── PLE preprocessing ─────────────────────────────────────────────────
         let ple_embed_w = self.inner.weights.f32_slice("model.embed_tokens_per_layer.weight");
         let ple_embeds_flat: Vec<f32> = ple_embed_w[token_id as usize * total_ple..
                                                        (token_id as usize + 1) * total_ple]
             .iter().map(|&v| v * cfg.ple_scale).collect();
 
-        let proj_w = self.inner.weights.f32_slice("model.per_layer_model_projection.weight");
-        let ple_proj = model::cpu_matmul(&hidden, proj_w, 1, h, total_ple);
+        // [1, H] x [total_ple, H]^T (H=1536, total_ple=8960 for Gemma4-E2B) —
+        // unlike every per-layer projection (q/k/v/o_proj/gate/up/down),
+        // this one previously always ran on the CPU via cpu_matmul
+        // (matrixmultiply::sgemm), regardless of GPU availability. Measured
+        // in isolation that's ~6.9ms/call — confirmed as real FLOPs, not a
+        // GEMM-packing-overhead artifact, since a naive dot-product loop is
+        // even slower — while the same mul_mat_vec_f16_f32_f32_r4 GPU
+        // dispatch already used everywhere else in this file takes ~1.0-1.1ms
+        // for this shape, a ~6.3-6.6x win (see ple_proj_tests below).
+        // Stack-allocated + bytemuck-cast rather than a heap Vec<u8> built
+        // via std::io::Write::write_all — same little-endian byte layout on
+        // every platform this crate targets (x86_64/aarch64), no allocation
+        // on this once-per-decode-step hot path.
+        let pc_vals: [u32; 13] = [
+            h as u32, h as u32, h as u32, total_ple as u32,
+            (h * total_ple) as u32, h as u32, total_ple as u32,
+            0u32, 0u32, 1u32, 1u32, 1u32, 1u32,
+        ];
+        let pc: &[u8] = bytemuck::cast_slice(&pc_vals);
+        let ple_proj = self.gpu_matmul_or_cpu(
+            "model.per_layer_model_projection.weight", &hidden, 1, h, total_ple, pc,
+        );
         let ple_proj: Vec<f32> = ple_proj.iter()
             .map(|&v| v * cfg.per_layer_projection_scale).collect();
         let pn_w = self.inner.weights.f32_slice("model.per_layer_projection_norm.weight");
@@ -2296,7 +2316,9 @@ mod matvec_fusion_tests {
     /// how the test forces `use_fused_post_attn` to be false, to compare
     /// the new fused path against the older three-submit path through the
     /// exact same production entry point.
-    fn build_test_model(with_layer_scalar_on_gpu: bool) -> Option<VulkanModel> {
+    // pub(crate): reused by ple_proj_tests below, which needs a real
+    // VulkanModel to exercise gpu_matmul_or_cpu directly.
+    pub(crate) fn build_test_model(with_layer_scalar_on_gpu: bool) -> Option<VulkanModel> {
         let dev = match device::ComputeDevice::create(0) {
             Ok(d) => d,
             Err(e) => { eprintln!("skip: no Vulkan device available ({e})"); return None; }
@@ -2338,6 +2360,12 @@ mod matvec_fusion_tests {
             (ln("per_layer_projection.weight"), 15, h * ple_dim),
             (ln("post_per_layer_input_norm.weight"), 16, h),
             (ln("layer_scalar"), 17, 1),
+            // Global (not per-layer) PLE projection weight, used by
+            // ple_proj_tests below to exercise gpu_matmul_or_cpu directly —
+            // shape matches forward_gpu's total_ple = num_hidden_layers *
+            // hidden_size_per_layer_input (35 * 256 = 8960 for e2b()).
+            ("model.per_layer_model_projection.weight".to_string(), 18,
+                cfg.num_hidden_layers * cfg.hidden_size_per_layer_input * h),
         ];
 
         let mut cpu_tensors = Map::new();
@@ -2885,6 +2913,121 @@ mod softcap_tests {
         println!(
             "softcap over {vocab} elements: CPU {cpu_us:.1}us/call   GPU (3 dispatches, 1 submit) {gpu_us:.1}us/call   speedup {:.2}x",
             cpu_us / gpu_us
+        );
+    }
+}
+
+#[cfg(test)]
+mod ple_proj_tests {
+    //! Validates `gpu_matmul_or_cpu` — the method `forward_gpu`'s PLE
+    //! (per-layer embedding) preprocessing now uses for its
+    //! "per_layer_model_projection" matmul ([1,H] x [total_ple,H]^T,
+    //! H=1536, total_ple=8960 for Gemma4-E2B) — against the
+    //! `model::cpu_matmul` (matrixmultiply::sgemm) path it replaces there.
+    //! Unlike every per-layer projection (q/k/v/o_proj/gate/up/down), this
+    //! one previously always ran on the CPU regardless of GPU
+    //! availability; measured in isolation that CPU matmul takes ~6.9ms
+    //! (confirmed against a naive dot-product loop too, which is *slower*
+    //! — this isn't a GEMM-packing-overhead artifact, just real FLOPs).
+    //! Requires a real Vulkan device; skips cleanly (not a failure) on
+    //! headless CI runners with no GPU/ICD.
+    use super::*;
+    use super::matvec_fusion_tests::build_test_model;
+
+    fn fake_random(len: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
+        (0..len).map(|_| {
+            state ^= state >> 12; state ^= state << 25; state ^= state >> 27;
+            let bits = state.wrapping_mul(0x2545F4914F6CDD1D);
+            ((bits >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        }).collect()
+    }
+
+    /// Whole-vector L2 relative error — see other test modules' identical
+    /// helper (e.g. `matvec_fusion_tests::l2_rel_err`) for why this is used
+    /// instead of a per-element relative error.
+    fn l2_rel_err(a: &[f32], b: &[f32]) -> f32 {
+        let mut diff_sq = 0.0f64;
+        let mut ref_sq = 0.0f64;
+        for (&x, &y) in a.iter().zip(b.iter()) {
+            diff_sq += ((x - y) as f64).powi(2);
+            ref_sq += (x as f64).powi(2);
+        }
+        (diff_sq / ref_sq.max(1e-12)).sqrt() as f32
+    }
+
+    #[test]
+    fn gpu_matmul_or_cpu_matches_cpu_matmul_for_ple_proj() {
+        let _guard = gpu_test_guard();
+        let Some(mut model) = build_test_model(true) else { return };
+
+        let cfg = &model.inner.config;
+        let h = cfg.hidden_size;
+        let total_ple = cfg.num_hidden_layers * cfg.hidden_size_per_layer_input;
+        let hidden = fake_random(h, 100);
+
+        let cpu_result = model::cpu_matmul(
+            &hidden,
+            model.inner.weights.f32_slice("model.per_layer_model_projection.weight"),
+            1, h, total_ple,
+        );
+
+        assert!(model.gpu_weights.contains_key("model.per_layer_model_projection.weight"));
+        let pc_vals: [u32; 13] = [
+            h as u32, h as u32, h as u32, total_ple as u32,
+            (h * total_ple) as u32, h as u32, total_ple as u32,
+            0u32, 0u32, 1u32, 1u32, 1u32, 1u32,
+        ];
+        let pc: &[u8] = bytemuck::cast_slice(&pc_vals);
+        let gpu_result = model.gpu_matmul_or_cpu(
+            "model.per_layer_model_projection.weight", &hidden, 1, h, total_ple, pc,
+        );
+
+        let err = l2_rel_err(&cpu_result, &gpu_result);
+        println!("gpu_matmul_or_cpu (PLE-proj shape) vs cpu_matmul: l2_rel_err={err:.6}");
+        assert!(err < 0.01, "gpu_matmul_or_cpu diverged from cpu_matmul reference: {err}");
+    }
+
+    #[test]
+    fn gpu_matmul_or_cpu_is_faster_than_cpu_matmul_for_ple_proj() {
+        let _guard = gpu_test_guard();
+        let Some(mut model) = build_test_model(true) else { return };
+
+        let cfg = model.inner.config.clone();
+        let h = cfg.hidden_size;
+        let total_ple = cfg.num_hidden_layers * cfg.hidden_size_per_layer_input;
+        let hidden = fake_random(h, 200);
+        let weight = model.inner.weights.f32_slice("model.per_layer_model_projection.weight").to_vec();
+        let pc_vals: [u32; 13] = [
+            h as u32, h as u32, h as u32, total_ple as u32,
+            (h * total_ple) as u32, h as u32, total_ple as u32,
+            0u32, 0u32, 1u32, 1u32, 1u32, 1u32,
+        ];
+        let pc: &[u8] = bytemuck::cast_slice(&pc_vals);
+
+        for _ in 0..3 {
+            model::cpu_matmul(&hidden, &weight, 1, h, total_ple);
+            model.gpu_matmul_or_cpu("model.per_layer_model_projection.weight", &hidden, 1, h, total_ple, pc);
+        }
+
+        let iters = 30;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters { std::hint::black_box(model::cpu_matmul(&hidden, &weight, 1, h, total_ple)); }
+        let cpu_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            std::hint::black_box(model.gpu_matmul_or_cpu("model.per_layer_model_projection.weight", &hidden, 1, h, total_ple, pc));
+        }
+        let gpu_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+        println!(
+            "PLE-proj matmul [1,{h}] x [{total_ple},{h}]^T via gpu_matmul_or_cpu: CPU(sgemm) {cpu_us:.1}us/call   GPU {gpu_us:.1}us/call   speedup {:.2}x",
+            cpu_us / gpu_us
+        );
+        assert!(
+            gpu_us < cpu_us,
+            "gpu_matmul_or_cpu ({gpu_us:.1}us) was not faster than cpu_matmul ({cpu_us:.1}us)"
         );
     }
 }
