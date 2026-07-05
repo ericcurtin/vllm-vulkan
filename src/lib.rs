@@ -1053,7 +1053,7 @@ impl VulkanModel {
             self.gpu_weights.get("model.embed_tokens.weight")
                 .map(|b| b as *const compute::Buffer)
         ) {
-            let normed_bytes = f32_slice_to_bytes(&normed);
+            let normed_bytes: &[u8] = bytemuck::cast_slice(&normed);
             let logit_size = (vocab * 4) as u64;
 
             // Use persistent buffers for LM head too
@@ -1077,7 +1077,7 @@ impl VulkanModel {
                 let lm_w = self.inner.weights.f32_slice("model.embed_tokens.weight");
                 model::cpu_matmul(&normed, lm_w, 1, h, vocab)
             } else {
-                unsafe { (*inp_p).write(&normed_bytes).unwrap(); }
+                unsafe { (*inp_p).write(normed_bytes).unwrap(); }
 
                 let eng = self.engine.as_mut().unwrap();
                 let pc = {
@@ -1177,7 +1177,7 @@ impl VulkanModel {
         // CPU: input_layernorm
         let x = model::cpu_rms_norm(hidden, &inln_w, eps);
 
-        let xb = f32_slice_to_bytes(&x);
+        let xb: &[u8] = bytemuck::cast_slice(&x);
         let shader = "mul_mat_vec_f16_f32_f32";
 
         // Init persistent activation buffers on first call.
@@ -1195,7 +1195,7 @@ impl VulkanModel {
 
         let (q_vec, k_vec, v_vec) = if use_gpu {
             // Write input to persistent buffer.
-            unsafe { (*self.act_ptr_mut(ACT_QKV_IN)).write(&xb).unwrap(); }
+            unsafe { (*self.act_ptr_mut(ACT_QKV_IN)).write(xb).unwrap(); }
 
             let inp = self.act_ptr(ACT_QKV_IN);
             let q_p = self.act_ptr(ACT_Q_OUT);
@@ -1280,8 +1280,8 @@ impl VulkanModel {
 
         // GPU: o_proj — use persistent buffers (no alloc/free overhead)
         let o_proj = if use_gpu && self.gpu_weights.contains_key(&ln("self_attn.o_proj.weight")) {
-            let attnb = f32_slice_to_bytes(&attn_out);
-            unsafe { (*self.act_ptr_mut(ACT_O_IN)).write(&attnb).unwrap(); }
+            let attnb: &[u8] = bytemuck::cast_slice(&attn_out);
+            unsafe { (*self.act_ptr_mut(ACT_O_IN)).write(attnb).unwrap(); }
             let oi   = self.act_ptr(ACT_O_IN);
             let oo   = self.act_ptr(ACT_O_OUT);
             let ow   = &self.gpu_weights[&ln("self_attn.o_proj.weight")] as *const compute::Buffer;
@@ -1315,8 +1315,8 @@ impl VulkanModel {
             && self.gpu_weights.contains_key(&ln("mlp.gate_proj.weight"))
             && self.gpu_weights.contains_key(&ln("mlp.down_proj.weight"))
         {
-            let ffb = f32_slice_to_bytes(&ff_in);
-            unsafe { (*self.act_ptr_mut(ACT_FFIN)).write(&ffb).unwrap(); }
+            let ffb: &[u8] = bytemuck::cast_slice(&ff_in);
+            unsafe { (*self.act_ptr_mut(ACT_FFIN)).write(ffb).unwrap(); }
 
             let ffi    = self.act_ptr(ACT_FFIN);
             let gp     = self.act_ptr(ACT_GATE);   // gate_proj output (src for gelu)
@@ -1406,10 +1406,10 @@ impl VulkanModel {
             && self.gpu_weights.contains_key(&ln("per_layer_input_gate.weight"))
             && self.gpu_weights.contains_key(&ln("per_layer_projection.weight"))
         {
-            let h3b = f32_slice_to_bytes(&hidden3);
-            unsafe { (*self.act_ptr_mut(ACT_FFIN)).write(&h3b).unwrap(); }  // reuse ACT_FFIN as PLE input
-            let lpb = f32_slice_to_bytes(layer_ple);
-            unsafe { (*self.act_ptr_mut(ACT_PLE_LAYER)).write(&lpb).unwrap(); }
+            let h3b: &[u8] = bytemuck::cast_slice(&hidden3);
+            unsafe { (*self.act_ptr_mut(ACT_FFIN)).write(h3b).unwrap(); }  // reuse ACT_FFIN as PLE input
+            let lpb: &[u8] = bytemuck::cast_slice(layer_ple);
+            unsafe { (*self.act_ptr_mut(ACT_PLE_LAYER)).write(lpb).unwrap(); }
 
             let inp_p   = self.act_ptr(ACT_FFIN);
             let pg_p    = self.act_ptr(ACT_PLE_G);
@@ -1539,9 +1539,9 @@ impl VulkanModel {
             self.engine.as_mut(),
             self.gpu_weights.get(weight_name).map(|b| b as *const compute::Buffer)
         ) {
-            let xb = f32_slice_to_bytes(x);
+            let xb: &[u8] = bytemuck::cast_slice(x);
             let inp = eng.alloc_host_coherent_storage((x.len() * 4) as u64).unwrap();
-            inp.write(&xb).unwrap();
+            inp.write(xb).unwrap();
             let out = eng.alloc_host_coherent_storage((t * n * 4) as u64).unwrap();
             let inp_p = &inp as *const compute::Buffer;
             let out_p = &out as *const compute::Buffer;
@@ -1570,9 +1570,9 @@ impl VulkanModel {
         ) {
             let w1_ptr = &self.gpu_weights[w1_name] as *const compute::Buffer;
             let w2_ptr = &self.gpu_weights[w2_name] as *const compute::Buffer;
-            let xb = f32_slice_to_bytes(x);
+            let xb: &[u8] = bytemuck::cast_slice(x);
             let inp = eng.alloc_host_coherent_storage((x.len() * 4) as u64).unwrap();
-            inp.write(&xb).unwrap();
+            inp.write(xb).unwrap();
             let out1 = eng.alloc_host_coherent_storage((t * n * 4) as u64).unwrap();
             let out2 = eng.alloc_host_coherent_storage((t * n * 4) as u64).unwrap();
             let inp_p  = &inp  as *const compute::Buffer;
@@ -1644,14 +1644,6 @@ fn is_matvec_weight(name: &str) -> bool {
         || name.ends_with("_gate.weight")   // e.g. per_layer_input_gate.weight
         || name.ends_with("_projection.weight")  // e.g. per_layer_projection.weight
         // embed_tokens.weight stays f32 (LM head precision), layernorm/scalar stay f32
-}
-
-fn f32_slice_to_bytes(data: &[f32]) -> Vec<u8> {
-    let mut bytes = vec![0u8; data.len() * 4];
-    for (i, &v) in data.iter().enumerate() {
-        bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
-    }
-    bytes
 }
 
 /// Convert f32 weights to f16 bytes for GPU upload.
