@@ -258,6 +258,17 @@ pub struct ComputeEngine {
     pipeline_cache: PipelineCache,
 
     command_pool: vk::CommandPool,
+    /// Single persistent command buffer, reused for every dispatch/batch via
+    /// reset + begin instead of allocating (and freeing) a fresh command
+    /// buffer from the pool on every call. vkAllocateCommandBuffers /
+    /// vkFreeCommandBuffers involve driver bookkeeping on every call — on a
+    /// translation layer such as KosmicKrisp (Vulkan-on-Metal) that cost is
+    /// paid per decode-step dispatch, so reusing one command buffer removes
+    /// it from the hot path entirely. Only one command buffer is ever in
+    /// flight at a time (dispatches are fully synchronous, see
+    /// `end_and_submit`), so a single persistent buffer is always safe to
+    /// reset here.
+    cmd_buf: vk::CommandBuffer,
     fence: vk::Fence,
 
     descriptor_pools: Vec<vk::DescriptorPool>,
@@ -289,6 +300,13 @@ impl ComputeEngine {
         let command_pool = unsafe { device.create_command_pool(&cmd_pool_ci, None) }
             .map_err(|e| format!("create_command_pool: {e}"))?;
 
+        let cmd_buf_alloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let cmd_buf = unsafe { device.allocate_command_buffers(&cmd_buf_alloc) }
+            .map_err(|e| format!("allocate_command_buffers: {e}"))?[0];
+
         let fence_ci = vk::FenceCreateInfo::default();
         let fence = unsafe { device.create_fence(&fence_ci, None) }
             .map_err(|e| format!("create_fence: {e}"))?;
@@ -301,6 +319,7 @@ impl ComputeEngine {
             compute_queue_family,
             pipeline_cache,
             command_pool,
+            cmd_buf,
             fence,
             descriptor_pools: Vec::new(),
             descriptor_sets: Vec::new(),
@@ -424,20 +443,22 @@ impl ComputeEngine {
         Ok(())
     }
 
+    /// Reset and begin the single persistent command buffer for a new
+    /// recording. Avoids a vkAllocateCommandBuffers call on every dispatch —
+    /// see the `cmd_buf` field doc comment for why this matters here.
     fn begin_one_shot(&self) -> Result<vk::CommandBuffer, String> {
-        let alloc = vk::CommandBufferAllocateInfo::default()
-            .command_pool(self.command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let cbs = unsafe { self.device.allocate_command_buffers(&alloc) }
-            .map_err(|e| format!("allocate_command_buffers: {e}"))?;
+        unsafe {
+            self.device
+                .reset_command_buffer(self.cmd_buf, vk::CommandBufferResetFlags::empty())
+        }
+        .map_err(|e| format!("reset_command_buffer: {e}"))?;
 
         let begin = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        unsafe { self.device.begin_command_buffer(cbs[0], &begin) }
+        unsafe { self.device.begin_command_buffer(self.cmd_buf, &begin) }
             .map_err(|e| format!("begin_command_buffer: {e}"))?;
 
-        Ok(cbs[0])
+        Ok(self.cmd_buf)
     }
 
     fn end_and_submit(&self, cb: vk::CommandBuffer) -> Result<(), String> {
@@ -460,10 +481,8 @@ impl ComputeEngine {
         unsafe { self.device.reset_fences(&[self.fence]) }
             .map_err(|e| format!("reset_fences: {e}"))?;
 
-        unsafe {
-            self.device
-                .free_command_buffers(self.command_pool, &[cb]);
-        }
+        // Command buffer is NOT freed — it's a persistent handle owned by
+        // `self.cmd_buf`, reset and reused on the next `begin_one_shot`.
 
         Ok(())
     }
@@ -591,6 +610,7 @@ impl Drop for ComputeEngine {
                 self.device.destroy_descriptor_pool(pool, None);
             }
             self.device.destroy_fence(self.fence, None);
+            // destroy_command_pool implicitly frees self.cmd_buf too.
             self.device.destroy_command_pool(self.command_pool, None);
             // pipeline_cache and device are dropped after this.
         }
