@@ -518,18 +518,47 @@ impl ComputeEngine {
 
         let ds = self.next_descriptor_set()?;
 
-        let buffer_infos: Vec<vk::DescriptorBufferInfo> = buffers
-            .iter()
-            .map(|b| vk::DescriptorBufferInfo::default()
-                .buffer(b.buffer).offset(0).range(vk::WHOLE_SIZE))
-            .collect();
-        let writes: Vec<vk::WriteDescriptorSet> = buffer_infos.iter().enumerate()
-            .map(|(i, info)| vk::WriteDescriptorSet::default()
+        // `buffers.len()` is always <= MAX_BINDINGS (the descriptor set
+        // layout has exactly that many bindings — see pipeline.rs), so
+        // both of these can be fixed-size stack arrays instead of heap-
+        // allocated `Vec`s that this function rebuilt from scratch on
+        // every single dispatch (several hundred times per decode step in
+        // the decode hot path). `buffer_infos` must outlive the
+        // `update_descriptor_sets` call below since each `writes[i]`
+        // stores a raw pointer into it (via `.buffer_info(...)`) — same
+        // requirement the original `Vec`-based version had, just now
+        // satisfied by a stack array that isn't moved instead of a heap
+        // allocation that wasn't either.
+        let n = buffers.len();
+        // A real (not debug-only) check: `debug_assert!` is compiled out in
+        // release builds, which would leave the out-of-bounds
+        // `buffer_infos[i]`/`writes[i]` array writes below as the only
+        // thing standing between an over-large `buffers` slice and a
+        // panic — Rust's array indexing always bounds-checks (so this
+        // could never become silent memory corruption), but it's a worse,
+        // less diagnosable failure mode than returning the `Err` this
+        // function's signature already supports for its other error
+        // paths (e.g. "Shader not found" above).
+        if n > MAX_BINDINGS as usize {
+            return Err(format!(
+                "record_to: {n} buffers exceeds MAX_BINDINGS ({MAX_BINDINGS})"
+            ));
+        }
+
+        let mut buffer_infos = [vk::DescriptorBufferInfo::default(); MAX_BINDINGS as usize];
+        for (i, b) in buffers.iter().enumerate() {
+            buffer_infos[i] = vk::DescriptorBufferInfo::default()
+                .buffer(b.buffer).offset(0).range(vk::WHOLE_SIZE);
+        }
+
+        let mut writes = [vk::WriteDescriptorSet::default(); MAX_BINDINGS as usize];
+        for i in 0..n {
+            writes[i] = vk::WriteDescriptorSet::default()
                 .dst_set(ds).dst_binding(i as u32)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(std::slice::from_ref(info)))
-            .collect();
-        unsafe { self.device.update_descriptor_sets(&writes, &[]) };
+                .buffer_info(std::slice::from_ref(&buffer_infos[i]));
+        }
+        unsafe { self.device.update_descriptor_sets(&writes[..n], &[]) };
 
         unsafe {
             if !push_constants.is_empty() {
