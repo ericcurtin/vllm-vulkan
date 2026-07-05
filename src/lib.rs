@@ -2679,6 +2679,74 @@ mod matvec_r4_tests {
 }
 
 #[cfg(test)]
+mod record_to_tests {
+    //! Validates `ComputeEngine::record_to`'s stack-allocated descriptor-
+    //! write buffers (see its doc comment) — specifically the
+    //! `buffers.len() > MAX_BINDINGS` guard, which returns a real `Err`
+    //! (not a panic) since `debug_assert!` would be compiled out in
+    //! release builds, and a naive fixed-size-array write beyond that
+    //! bound would otherwise be the only thing standing between an
+    //! over-large `buffers` slice and a crash.
+    use super::*;
+    use crate::pipeline::MAX_BINDINGS;
+
+    fn make_engine() -> Option<compute::ComputeEngine> {
+        let dev = match device::ComputeDevice::create(0) {
+            Ok(d) => d,
+            Err(e) => { eprintln!("skip: no Vulkan device available ({e})"); return None; }
+        };
+        let shader_spvs = include_all_shaders();
+        let refs: std::collections::HashMap<&str, &[u8]> = shader_spvs.iter()
+            .map(|(k, v)| (k.as_str(), v.as_slice())).collect();
+        Some(compute::ComputeEngine::new(
+            dev.instance.clone(), dev.physical_device, dev.device.clone(),
+            dev.compute_queue, dev.compute_queue_family, &refs,
+        ).expect("create ComputeEngine"))
+    }
+
+    #[test]
+    fn record_to_rejects_more_buffers_than_max_bindings() {
+        let _guard = gpu_test_guard();
+        let Some(mut engine) = make_engine() else { return };
+
+        // One more binding than the descriptor set layout supports.
+        let too_many = MAX_BINDINGS as usize + 1;
+        let bufs: Vec<compute::Buffer> = (0..too_many)
+            .map(|_| engine.alloc_host_coherent_storage(4).unwrap())
+            .collect();
+        let buf_refs: Vec<&compute::Buffer> = bufs.iter().collect();
+
+        let cb = engine.begin_batch().unwrap();
+        let result = engine.record_to(cb, "gelu_f32", &buf_refs, &[0u8; 24], (1, 1, 1));
+
+        assert!(
+            result.is_err(),
+            "record_to should reject {too_many} buffers (> MAX_BINDINGS={MAX_BINDINGS}) with an Err, not panic or silently succeed"
+        );
+    }
+
+    #[test]
+    fn record_to_accepts_exactly_max_bindings() {
+        let _guard = gpu_test_guard();
+        let Some(mut engine) = make_engine() else { return };
+
+        let exactly_max = MAX_BINDINGS as usize;
+        let bufs: Vec<compute::Buffer> = (0..exactly_max)
+            .map(|_| engine.alloc_host_coherent_storage(4).unwrap())
+            .collect();
+        let buf_refs: Vec<&compute::Buffer> = bufs.iter().collect();
+
+        let cb = engine.begin_batch().unwrap();
+        let result = engine.record_to(cb, "gelu_f32", &buf_refs, &[0u8; 24], (1, 1, 1));
+
+        assert!(
+            result.is_ok(),
+            "record_to should accept exactly MAX_BINDINGS ({MAX_BINDINGS}) buffers: {result:?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod qkv_fusion_tests {
     //! Validates the concatenated Q+K+V weight (`self_attn.qkv_proj.weight`,
     //! built in `new()`) and its single-matvec dispatch (`use_fused_qkv` in
