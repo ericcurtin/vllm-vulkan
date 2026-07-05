@@ -53,12 +53,15 @@ def vulkan_ctx():
     if vulkan_ops._ctx is None:
         pytest.skip("Vulkan device is a software renderer; GPU dispatch disabled")
     prev_cache = vulkan_ops._weight_cache
+    prev_cpu_cache = vulkan_ops._cpu_float32_cache
     vulkan_ops._weight_cache = vulkan_ops._WeightCache()
+    vulkan_ops._cpu_float32_cache = vulkan_ops._WeightCache()
     try:
         yield ctx
     finally:
         vulkan_ops._ctx = prev_ctx
         vulkan_ops._weight_cache = prev_cache
+        vulkan_ops._cpu_float32_cache = prev_cpu_cache
 
 
 @pytest.fixture
@@ -157,4 +160,91 @@ def test_wrap_linear_reuses_weight_cache_across_repeated_forward_calls(
         "repeated forward() calls (as happen once per decode step in real "
         "usage) must hit the weight cache, not re-upload the weight matrix "
         "on every single call"
+    )
+
+
+@pytest.fixture
+def cpu_float32_conversion_counter(monkeypatch):
+    """Count real CPU float32 conversions (_cpu_float32_cache.put calls)
+    deterministically, same rationale as upload_counter above."""
+    counts = {"n": 0}
+    orig_put = vulkan_ops._WeightCache.put
+
+    def counting_put(self, w, value):
+        if self is vulkan_ops._cpu_float32_cache:
+            counts["n"] += 1
+        return orig_put(self, w, value)
+
+    monkeypatch.setattr(vulkan_ops._WeightCache, "put", counting_put)
+    return counts
+
+
+def test_linear_prefill_path_reuses_cpu_float32_cache_across_calls(
+    vulkan_ctx, cpu_float32_conversion_counter
+):
+    """linear()'s CPU (prefill, T >= _MATVEC_THRESHOLD) fallback path used
+    to call weight.float() unconditionally on every call, with no caching
+    at all - unlike the GPU decode path's _get_or_upload_weight. Repeated
+    prefill calls with the same persistent bf16 weight object (as a real
+    nn.Module.weight Parameter would be, across every prefill request)
+    must convert to float32 once, not on every single call.
+    """
+    out_features, in_features = 16, 8
+    weight = torch.randn(out_features, in_features, dtype=torch.bfloat16)
+    x = torch.randn(8, in_features, dtype=torch.float32)  # T=8 >= _MATVEC_THRESHOLD
+
+    out1 = vulkan_ops.linear(x, weight, None)
+    assert cpu_float32_conversion_counter["n"] == 1, "first call should convert once"
+
+    for _ in range(5):
+        out_n = vulkan_ops.linear(x, weight, None)
+        torch.testing.assert_close(out_n, out1)
+    assert cpu_float32_conversion_counter["n"] == 1, (
+        "repeated prefill calls with the same weight object must reuse the "
+        "cached float32 conversion, not redo it on every call"
+    )
+
+
+def test_linear_prefill_path_float32_weight_bypasses_cache(
+    vulkan_ctx, cpu_float32_conversion_counter
+):
+    """A weight that's already float32 needs no conversion or caching at
+    all - _get_or_convert_to_float32_cpu should return it unchanged and
+    never touch _cpu_float32_cache."""
+    out_features, in_features = 16, 8
+    weight = torch.randn(out_features, in_features, dtype=torch.float32)
+    x = torch.randn(8, in_features, dtype=torch.float32)
+
+    vulkan_ops.linear(x, weight, None)
+    vulkan_ops.linear(x, weight, None)
+    assert cpu_float32_conversion_counter["n"] == 0
+    assert len(vulkan_ops._cpu_float32_cache) == 0
+
+
+def test_weight_cache_entry_is_freed_when_weight_storage_is_garbage_collected():
+    """Regression test for a real memory leak: _WeightCache.put() used to
+    store (weakref.ref(storage), value) with no cleanup callback, so a
+    weight whose storage was garbage collected - but whose id() key was
+    never looked up again - left its entry (and the large cached value it
+    holds: a GPU-resident buffer or a full float32 CPU copy of the weight
+    matrix) in the cache's dict forever, since a plain dict never removes
+    entries on its own. This doesn't need a real Vulkan device - it's pure
+    Python/GC behaviour on _WeightCache directly.
+    """
+    import gc
+
+    cache = vulkan_ops._WeightCache()
+
+    def put_a_short_lived_weight():
+        weight = torch.randn(4, 4, dtype=torch.float32)
+        cache.put(weight, object())
+        assert len(cache) == 1
+        # weight (and its storage) goes out of scope when this function
+        # returns, with nothing else referencing it.
+
+    put_a_short_lived_weight()
+    gc.collect()
+    assert len(cache) == 0, (
+        "cache entry for a garbage-collected weight must be removed "
+        "automatically, not leak forever"
     )
