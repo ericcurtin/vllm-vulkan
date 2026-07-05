@@ -676,6 +676,10 @@ fn include_all_shaders() -> std::collections::HashMap<String, Vec<u8>> {
     spv!("soft_max_large3_f32_f16");
 
     // ── Binary elementwise ──────────────────────────────────────────────
+    // Plain f32×f32→f32 add, used to fuse residual adds into
+    // forward_layer_gpu_matmuls's post-attention GPU chain (see
+    // fused_post_attention) instead of round-tripping through the CPU.
+    spv!("add_f32_f32_f32");
     spv!("add_f32_f32_f16");
     spv!("add_f32_f16_f32");
     spv!("mul_f32_f32_f16");
@@ -791,7 +795,22 @@ const ACT_PLE_C:   usize = 13; // PLE contribution output     [H]
 const ACT_PLE_LAYER: usize = 14; // PLE per-layer embed input [ple_dim]
 const ACT_PLE_GELU:  usize = 15; // gelu(PLE gate) output     [ple_dim]
 const ACT_PLE_MID:   usize = 16; // gelu(gate) * layer_ple    [ple_dim]
-const ACT_COUNT:   usize = 17;
+// Slots below back the fully-fused post-attention GPU chain (see
+// `forward_layer_gpu_matmuls`'s `fused_post_attention` path): norms and
+// residual adds that used to round-trip through the CPU between the
+// o_proj / FFN / PLE submits are computed on the GPU instead, so the whole
+// o_proj → ... → layer-scalar chain executes as ONE vkQueueSubmit instead
+// of three. All slots below are `[H]`-sized (hidden_size), matching
+// ACT_QKV_IN/ACT_O_OUT/ACT_FFIN above.
+const ACT_RESIDUAL:        usize = 17; // hidden (this layer's input), for the post-attn residual add
+const ACT_PA_NORMED:       usize = 18; // rms_norm_mul(o_proj_out, post_attention_layernorm.weight)
+const ACT_HIDDEN2:         usize = 19; // residual + pa_normed
+const ACT_FF_NORMED:       usize = 20; // rms_norm_mul(down_proj_out, post_feedforward_layernorm.weight)
+const ACT_HIDDEN3A:        usize = 21; // hidden2 + ff_normed
+const ACT_CONTRIB_NORMED:  usize = 22; // rms_norm_mul(ple_contrib, post_per_layer_input_norm.weight)
+const ACT_HIDDEN3B:        usize = 23; // hidden3a + contrib_normed
+const ACT_HIDDEN3_FINAL:   usize = 24; // hidden3b * layer_scalar — the layer's return value
+const ACT_COUNT:   usize = 25;
 
 ///   logits = vk_model.forward(token_id, position)
 #[pyclass]
@@ -1185,6 +1204,27 @@ impl VulkanModel {
             && self.gpu_weights.contains_key(&ln("self_attn.q_proj.weight"))
             && self.init_act_bufs();
 
+        // Whether every weight the fully-fused post-attention GPU chain
+        // needs (see `fused_post_attention` below) is resident on the GPU.
+        // Requires strictly more weights than `use_gpu` above (that only
+        // checks q_proj), since the fused path folds o_proj, the whole FFN,
+        // the whole PLE branch, and every norm/residual in between into one
+        // vkQueueSubmit — if any single piece is CPU-only (e.g. a partial
+        // upload failure), we fall back to the old per-branch GPU/CPU
+        // dispatch below rather than trying to partially fuse.
+        let use_fused_post_attn = use_gpu
+            && self.gpu_weights.contains_key(&ln("self_attn.o_proj.weight"))
+            && self.gpu_weights.contains_key(&ln("post_attention_layernorm.weight"))
+            && self.gpu_weights.contains_key(&ln("pre_feedforward_layernorm.weight"))
+            && self.gpu_weights.contains_key(&ln("mlp.gate_proj.weight"))
+            && self.gpu_weights.contains_key(&ln("mlp.up_proj.weight"))
+            && self.gpu_weights.contains_key(&ln("mlp.down_proj.weight"))
+            && self.gpu_weights.contains_key(&ln("post_feedforward_layernorm.weight"))
+            && self.gpu_weights.contains_key(&ln("per_layer_input_gate.weight"))
+            && self.gpu_weights.contains_key(&ln("per_layer_projection.weight"))
+            && self.gpu_weights.contains_key(&ln("post_per_layer_input_norm.weight"))
+            && self.gpu_weights.contains_key(&ln("layer_scalar"));
+
         // ── GPU BATCH: ALL 7 MATMULS IN ONE vkQueueSubmit ───────────────────
         // We batch QKV + o_proj + gate + up + down into a single command buffer.
         // The fence wait happens ONCE per layer instead of 4 times.
@@ -1275,6 +1315,13 @@ impl VulkanModel {
             &q, cache.k_up_to_now(), cache.v_up_to_now(),
             num_q, num_kv, head_dim, cache.seq_len, 1.0, window,
         );
+
+        if use_fused_post_attn {
+            return self.fused_post_attention(
+                layer_idx, shader, &attn_out, &residual, layer_ple,
+                h, q_dim, ffn_inter, ple_dim, eps, t, &_t_layer,
+            );
+        }
 
         // GPU: o_proj — use persistent buffers (no alloc/free overhead)
         let o_proj = if use_gpu && self.gpu_weights.contains_key(&ln("self_attn.o_proj.weight")) {
@@ -1471,6 +1518,155 @@ impl VulkanModel {
         hidden3
     }
 
+    /// The whole post-attention half of a decoder layer — o_proj plus its
+    /// norm and residual, the FFN (gate/up/gelu/mul/down) plus its norm
+    /// and residual, the PLE branch (gate/gelu/mul/proj) plus its norm
+    /// and residual, and the final layer-scalar multiply — as ONE command
+    /// buffer / vkQueueSubmit, instead of the three separate submits
+    /// (o_proj, FFN, PLE) the `use_gpu`-but-not-`use_fused_post_attn` path
+    /// below still uses, with a CPU round trip for every norm/residual add
+    /// in between.
+    ///
+    /// Every fence wait measured on real Vulkan hardware in this repo's CI
+    /// costs far more than the handful of extra elementwise dispatches
+    /// this adds inside a single submit (barriers between dispatches in
+    /// the *same* command buffer are cheap; a `vkQueueSubmit` + fence wait
+    /// is not) — see the perf test in `matvec_fusion_tests` below for a
+    /// same-hardware, same-shapes A/B measurement of exactly this trade-off.
+    #[allow(clippy::too_many_arguments)]
+    fn fused_post_attention(
+        &mut self,
+        layer_idx: usize,
+        shader: &str,
+        attn_out: &[f32],
+        residual: &[f32],
+        layer_ple: &[f32],
+        h: usize,
+        q_dim: usize,
+        ffn_inter: usize,
+        ple_dim: usize,
+        eps: f32,
+        t: usize,
+        t_layer: &std::time::Instant,
+    ) -> Vec<f32> {
+        let ln = |s: &str| format!("model.layers.{layer_idx}.{s}");
+        let mv_pc = |k: usize, n: usize| -> Vec<u8> {
+            use std::io::Write;
+            let mut v = Vec::with_capacity(13 * 4);
+            for x in [k as u32, k as u32, k as u32, n as u32,
+                       (k * n) as u32, k as u32, n as u32,
+                       0u32, 0u32, 1u32, t as u32, t as u32, 1u32] {
+                v.write_all(&x.to_le_bytes()).unwrap();
+            }
+            v
+        };
+        let gelu_pc = |n: usize| -> Vec<u8> {
+            use std::io::Write;
+            let mut v = Vec::with_capacity(6 * 4);
+            v.write_all(&(n as u32).to_le_bytes()).unwrap();
+            v.write_all(&1u32.to_le_bytes()).unwrap();
+            for _ in 0..4 { v.write_all(&0u32.to_le_bytes()).unwrap(); }
+            v
+        };
+
+        // Upload this call's fresh inputs to their persistent buffers. No
+        // outstanding borrow on `self` yet at this point, so plain safe
+        // indexing works — no need for the raw-pointer/unsafe pattern the
+        // rest of this function uses to work around holding `self.engine`
+        // mutably borrowed at the same time as `self.act_bufs`/`self.gpu_weights`.
+        self.act_bufs[ACT_O_IN].write(bytemuck::cast_slice(attn_out)).unwrap();
+        self.act_bufs[ACT_RESIDUAL].write(bytemuck::cast_slice(residual)).unwrap();
+        self.act_bufs[ACT_PLE_LAYER].write(bytemuck::cast_slice(layer_ple)).unwrap();
+
+        let oi               = self.act_ptr(ACT_O_IN);
+        let oo               = self.act_ptr(ACT_O_OUT);
+        let res_p            = self.act_ptr(ACT_RESIDUAL);
+        let pa_normed_p      = self.act_ptr(ACT_PA_NORMED);
+        let hidden2_p        = self.act_ptr(ACT_HIDDEN2);
+        let ffi              = self.act_ptr(ACT_FFIN); // reused as ff_in, like the non-fused path
+        let gp               = self.act_ptr(ACT_GATE);
+        let gelu_p           = self.act_ptr(ACT_GELU);
+        let up_p             = self.act_ptr(ACT_UP);
+        let mid_p            = self.act_ptr(ACT_MID);
+        let down_p           = self.act_ptr(ACT_DOWN);
+        let ff_normed_p      = self.act_ptr(ACT_FF_NORMED);
+        let hidden3a_p       = self.act_ptr(ACT_HIDDEN3A);
+        let pg_p             = self.act_ptr(ACT_PLE_G);
+        let ple_gelu_p       = self.act_ptr(ACT_PLE_GELU);
+        let layer_p          = self.act_ptr(ACT_PLE_LAYER);
+        let ple_mid_p        = self.act_ptr(ACT_PLE_MID);
+        let pc_p             = self.act_ptr(ACT_PLE_C);
+        let contrib_normed_p = self.act_ptr(ACT_CONTRIB_NORMED);
+        let hidden3b_p       = self.act_ptr(ACT_HIDDEN3B);
+        let hidden3_final_p  = self.act_ptr(ACT_HIDDEN3_FINAL);
+
+        let ow             = &self.gpu_weights[&ln("self_attn.o_proj.weight")] as *const compute::Buffer;
+        let pa_w_gpu       = &self.gpu_weights[&ln("post_attention_layernorm.weight")] as *const compute::Buffer;
+        let pf_w_gpu       = &self.gpu_weights[&ln("pre_feedforward_layernorm.weight")] as *const compute::Buffer;
+        let gw             = &self.gpu_weights[&ln("mlp.gate_proj.weight")] as *const compute::Buffer;
+        let uw             = &self.gpu_weights[&ln("mlp.up_proj.weight")] as *const compute::Buffer;
+        let dw             = &self.gpu_weights[&ln("mlp.down_proj.weight")] as *const compute::Buffer;
+        let postff_w_gpu   = &self.gpu_weights[&ln("post_feedforward_layernorm.weight")] as *const compute::Buffer;
+        let pgw            = &self.gpu_weights[&ln("per_layer_input_gate.weight")] as *const compute::Buffer;
+        let ppw            = &self.gpu_weights[&ln("per_layer_projection.weight")] as *const compute::Buffer;
+        let ple_norm_w_gpu = &self.gpu_weights[&ln("post_per_layer_input_norm.weight")] as *const compute::Buffer;
+        let layer_scalar_gpu = &self.gpu_weights[&ln("layer_scalar")] as *const compute::Buffer;
+
+        let eng = self.engine.as_mut().unwrap();
+        let cb = eng.begin_batch().unwrap();
+        unsafe {
+            // o_proj
+            eng.record_to(cb, shader, &[&*ow, &*oi, &*oo], &mv_pc(q_dim, h), (h as u32, t as u32, 1)).unwrap();
+            eng.record_barrier_to(cb);
+            // post_attn_norm (weight-multiplying RMSNorm) + residual add
+            eng.record_to(cb, "rms_norm_f32_mul", &[&*oo, &*pa_w_gpu, &*pa_normed_p], &rms_norm_mul_pc(h, eps), (1, 1, 1)).unwrap();
+            eng.record_barrier_to(cb);
+            eng.record_to(cb, "add_f32_f32_f32", &[&*res_p, &*pa_normed_p, &*hidden2_p], &binary_elementwise_pc(h), (wg256(h), 1, 1)).unwrap();
+            eng.record_barrier_to(cb);
+            // pre_ffn_norm
+            eng.record_to(cb, "rms_norm_f32_mul", &[&*hidden2_p, &*pf_w_gpu, &*ffi], &rms_norm_mul_pc(h, eps), (1, 1, 1)).unwrap();
+            eng.record_barrier_to(cb);
+            // FFN: gate + up (independent) -> gelu(gate) -> gelu*up -> down_proj
+            eng.record_to(cb, shader, &[&*gw, &*ffi, &*gp], &mv_pc(h, ffn_inter), (ffn_inter as u32, t as u32, 1)).unwrap();
+            eng.record_to(cb, shader, &[&*uw, &*ffi, &*up_p], &mv_pc(h, ffn_inter), (ffn_inter as u32, t as u32, 1)).unwrap();
+            eng.record_barrier_to(cb);
+            eng.record_to(cb, "gelu_f32", &[&*gp, &*gelu_p], &gelu_pc(ffn_inter), (wg512(ffn_inter), 1, 1)).unwrap();
+            eng.record_barrier_to(cb);
+            eng.record_to(cb, "mul_f32_f32_f32", &[&*gelu_p, &*up_p, &*mid_p], &binary_elementwise_pc(ffn_inter), (wg256(ffn_inter), 1, 1)).unwrap();
+            eng.record_barrier_to(cb);
+            eng.record_to(cb, shader, &[&*dw, &*mid_p, &*down_p], &mv_pc(ffn_inter, h), (h as u32, t as u32, 1)).unwrap();
+            eng.record_barrier_to(cb);
+            // post_ffn_norm + residual add
+            eng.record_to(cb, "rms_norm_f32_mul", &[&*down_p, &*postff_w_gpu, &*ff_normed_p], &rms_norm_mul_pc(h, eps), (1, 1, 1)).unwrap();
+            eng.record_barrier_to(cb);
+            eng.record_to(cb, "add_f32_f32_f32", &[&*hidden2_p, &*ff_normed_p, &*hidden3a_p], &binary_elementwise_pc(h), (wg256(h), 1, 1)).unwrap();
+            eng.record_barrier_to(cb);
+            // PLE: gate -> gelu -> ×layer_ple -> proj
+            eng.record_to(cb, shader, &[&*pgw, &*hidden3a_p, &*pg_p], &mv_pc(h, ple_dim), (ple_dim as u32, t as u32, 1)).unwrap();
+            eng.record_barrier_to(cb);
+            eng.record_to(cb, "gelu_f32", &[&*pg_p, &*ple_gelu_p], &gelu_pc(ple_dim), (wg512(ple_dim), 1, 1)).unwrap();
+            eng.record_barrier_to(cb);
+            eng.record_to(cb, "mul_f32_f32_f32", &[&*ple_gelu_p, &*layer_p, &*ple_mid_p], &binary_elementwise_pc(ple_dim), (wg256(ple_dim), 1, 1)).unwrap();
+            eng.record_barrier_to(cb);
+            eng.record_to(cb, shader, &[&*ppw, &*ple_mid_p, &*pc_p], &mv_pc(ple_dim, h), (h as u32, t as u32, 1)).unwrap();
+            eng.record_barrier_to(cb);
+            // contrib norm + residual add
+            eng.record_to(cb, "rms_norm_f32_mul", &[&*pc_p, &*ple_norm_w_gpu, &*contrib_normed_p], &rms_norm_mul_pc(h, eps), (1, 1, 1)).unwrap();
+            eng.record_barrier_to(cb);
+            eng.record_to(cb, "add_f32_f32_f32", &[&*hidden3a_p, &*contrib_normed_p, &*hidden3b_p], &binary_elementwise_pc(h), (wg256(h), 1, 1)).unwrap();
+            eng.record_barrier_to(cb);
+            // Final layer-scalar multiply (broadcast a single scalar weight).
+            eng.record_to(cb, "mul_f32_f32_f32", &[&*hidden3b_p, &*layer_scalar_gpu, &*hidden3_final_p], &binary_broadcast_pc(h), (wg256(h), 1, 1)).unwrap();
+        }
+        eng.submit_batch(cb).unwrap(); // ONE fence wait for the entire post-attention chain
+        if layer_idx == 0 {
+            log::debug!("L{layer_idx} fused post-attn submit: {}µs total since layer start", t_layer.elapsed().as_micros());
+        }
+        // `eng`'s mutable borrow of `self.engine` ended at `submit_batch`
+        // above, so the result can be read back with plain safe indexing.
+        read_f32_buf(&self.act_bufs[ACT_HIDDEN3_FINAL], h)
+    }
+
     /// GPU matmul (single) with CPU fallback.
     /// Initialise persistent activation buffers sized for one decode step.
     fn init_act_bufs(&mut self) -> bool {
@@ -1501,6 +1697,14 @@ impl VulkanModel {
             (ple_dim * 4) as u64,    // ACT_PLE_LAYER
             (ple_dim * 4) as u64,    // ACT_PLE_GELU
             (ple_dim * 4) as u64,    // ACT_PLE_MID
+            (h * 4) as u64,          // ACT_RESIDUAL
+            (h * 4) as u64,          // ACT_PA_NORMED
+            (h * 4) as u64,          // ACT_HIDDEN2
+            (h * 4) as u64,          // ACT_FF_NORMED
+            (h * 4) as u64,          // ACT_HIDDEN3A
+            (h * 4) as u64,          // ACT_CONTRIB_NORMED
+            (h * 4) as u64,          // ACT_HIDDEN3B
+            (h * 4) as u64,          // ACT_HIDDEN3_FINAL
         ];
 
         self.act_bufs.clear();
@@ -1681,6 +1885,78 @@ fn is_matvec_weight(name: &str) -> bool {
         // embed_tokens.weight stays f32 (LM head precision), layernorm/scalar stay f32
 }
 
+/// Shared "generic_binary_head" push-constant layout used by
+/// `mul_mat_vec.comp`'s sibling elementwise/norm shaders (`add.comp`,
+/// `mul.comp`, `rms_norm.comp`): `ne, ne00-03, nb00-03, ne10-13, nb10-13,
+/// ne20-23, nb20-23, misalign, param1, param2, param3` (29 x 4 bytes — see
+/// `shaders/generic_binary_head.glsl`). Every tensor `forward_layer_gpu_matmuls`
+/// dispatches these against is a flat `[n]` row vector (batch/channel dims
+/// are all 1, single token per decode step), so only the element counts
+/// (`ne00`, `ne10`, `ne20`) and `param1` actually matter here; every other
+/// field is filled with the same "contiguous 1-D tensor" convention this
+/// file's `mv_pc`/`gelu_pc` closures already use elsewhere.
+///
+/// `b_len` is the second operand's element count: pass `n` for a plain
+/// elementwise op (residual add, RMSNorm weight multiply) or `1` to
+/// broadcast a single scalar against every output element (the per-layer
+/// scalar multiply) — `src1_idx`'s `fastmod(i00, ne10)` is always 0 when
+/// `ne10 == 1`, so every element reads `data_b[0]`.
+fn binary_head_pc(n: usize, b_len: usize, param1: f32) -> Vec<u8> {
+    use std::io::Write;
+    let nu = n as u32;
+    let bu = b_len as u32;
+    let mut v = Vec::with_capacity(29 * 4);
+    for &x in &[nu, nu, 1u32, 1, 1, 1u32, nu, nu, nu] {
+        v.write_all(&x.to_le_bytes()).unwrap();
+    }
+    for &x in &[bu, 1u32, 1, 1, 1u32, bu, bu, bu] {
+        v.write_all(&x.to_le_bytes()).unwrap();
+    }
+    for &x in &[nu, 1u32, 1, 1, 1u32, nu, nu, nu] {
+        v.write_all(&x.to_le_bytes()).unwrap();
+    }
+    v.write_all(&0u32.to_le_bytes()).unwrap(); // misalign
+    v.write_all(&param1.to_le_bytes()).unwrap(); // param1 (eps for rms_norm; 0.0 otherwise)
+    v.write_all(&0f32.to_le_bytes()).unwrap(); // param2 (unused)
+    v.write_all(&0i32.to_le_bytes()).unwrap(); // param3 (unused)
+    v
+}
+
+/// Push constants for `rms_norm_f32_mul` (the weight-multiplying RMSNorm
+/// variant) over a single `[n]`-element row: `param1` becomes the epsilon
+/// `rms_norm.comp` reads, and the weight operand's length equals `n` so the
+/// shader's broadcast check (`ncols > ne10`) takes the simple, non-broadcast
+/// path.
+fn rms_norm_mul_pc(n: usize, eps: f32) -> Vec<u8> {
+    binary_head_pc(n, n, eps)
+}
+
+/// Push constants for `add_f32_f32_f32` / `mul_f32_f32_f32` over two
+/// same-shape `[n]`-element rows (residual adds, RMSNorm-weight multiply
+/// is done via `rms_norm_mul_pc` instead — this is for plain elementwise).
+fn binary_elementwise_pc(n: usize) -> Vec<u8> {
+    binary_head_pc(n, n, 0.0)
+}
+
+/// Push constants for `mul_f32_f32_f32` broadcasting a single scalar
+/// (`layer_scalar`) against every element of an `[n]`-element row.
+fn binary_broadcast_pc(n: usize) -> Vec<u8> {
+    binary_head_pc(n, 1, 0.0)
+}
+
+/// Workgroup count for `add_f32_f32_f32` / `mul_f32_f32_f32` dispatches
+/// (256 threads/workgroup, up to 2 elements/thread — see `mul.comp`;
+/// matches the FFN's existing `mul_wg` calculation).
+fn wg256(n: usize) -> u32 {
+    n.div_ceil(256) as u32
+}
+
+/// Workgroup count for `gelu_f32` (512 threads/workgroup, 1 element/thread
+/// — see `gelu.comp`; matches the FFN's existing `gelu_wg` calculation).
+fn wg512(n: usize) -> u32 {
+    n.div_ceil(512) as u32
+}
+
 /// Convert f32 weights to f16 bytes for GPU upload.
 /// f16 halves memory bandwidth which is the main bottleneck for matvec ops.
 fn f32_to_f16_bytes(data: &[f32]) -> Vec<u8> {
@@ -1742,4 +2018,194 @@ fn _rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__vulkan_available__", device::is_vulkan_available())?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod matvec_fusion_tests {
+    //! Validates `fused_post_attention` (the single-vkQueueSubmit
+    //! o_proj→FFN→PLE→scalar chain in `forward_layer_gpu_matmuls`) against
+    //! the exact same math run through individual CPU primitives, and
+    //! against the older three-separate-submits GPU path it replaces —
+    //! both reached through the real `forward_layer_gpu_matmuls` entry
+    //! point, not a reimplementation. Requires a real Vulkan device; skips
+    //! cleanly on headless CI runners with no GPU/ICD.
+    use super::*;
+    use std::collections::HashMap as Map;
+
+    /// Deterministic pseudo-random f32s in [-1, 1) (xorshift64*), so the
+    /// test needs no `rand` dependency and no downloaded model checkpoint.
+    fn fake_random(len: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
+        (0..len)
+            .map(|_| {
+                state ^= state >> 12; state ^= state << 25; state ^= state >> 27;
+                let bits = state.wrapping_mul(0x2545F4914F6CDD1D);
+                ((bits >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    fn l2_rel_err(a: &[f32], b: &[f32]) -> f32 {
+        let mut diff_sq = 0.0f64;
+        let mut ref_sq = 0.0f64;
+        for (&x, &y) in a.iter().zip(b.iter()) {
+            diff_sq += ((x - y) as f64).powi(2);
+            ref_sq += (x as f64).powi(2);
+        }
+        (diff_sq / ref_sq.max(1e-12)).sqrt() as f32
+    }
+
+    /// Builds a `VulkanModel` with real Gemma4-E2B layer-0 dimensions, but
+    /// small random weights (not a downloaded checkpoint — the full e2b()
+    /// vocab/embedding tables alone are multiple GiB, which this harness
+    /// has no need for: it only exercises `forward_layer_gpu_matmuls`,
+    /// never the embedding or LM head). `layer_scalar` is uploaded to the
+    /// GPU only when `with_layer_scalar_on_gpu` is true — omitting it is
+    /// how the test forces `use_fused_post_attn` to be false, to compare
+    /// the new fused path against the older three-submit path through the
+    /// exact same production entry point.
+    fn build_test_model(with_layer_scalar_on_gpu: bool) -> Option<VulkanModel> {
+        let dev = match device::ComputeDevice::create(0) {
+            Ok(d) => d,
+            Err(e) => { eprintln!("skip: no Vulkan device available ({e})"); return None; }
+        };
+        let shader_spvs = include_all_shaders();
+        let refs: Map<&str, &[u8]> = shader_spvs.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect();
+        let mut engine = compute::ComputeEngine::new(
+            dev.instance.clone(), dev.physical_device, dev.device.clone(),
+            dev.compute_queue, dev.compute_queue_family, &refs,
+        ).expect("create ComputeEngine");
+
+        let cfg = model::Gemma4Config::e2b();
+        let h = cfg.hidden_size;
+        let layer_idx = 0usize; // sliding-window, non-KV-shared layer
+        let head_dim = cfg.layer_head_dim(layer_idx);
+        let q_dim = cfg.num_attention_heads * head_dim;
+        let kv_dim = cfg.num_key_value_heads * head_dim;
+        let ffn_inter = cfg.layer_intermediate_size(layer_idx);
+        let ple_dim = cfg.hidden_size_per_layer_input;
+        let ln = |s: &str| format!("model.layers.{layer_idx}.{s}");
+
+        // (name, seed, len) for every tensor forward_layer_gpu_matmuls needs
+        // for layer 0. Shapes match Gemma4Config::e2b() exactly.
+        let tensors: Vec<(String, u64, usize)> = vec![
+            (ln("input_layernorm.weight"), 1, h),
+            (ln("self_attn.q_proj.weight"), 2, q_dim * h),
+            (ln("self_attn.k_proj.weight"), 3, kv_dim * h),
+            (ln("self_attn.v_proj.weight"), 4, kv_dim * h),
+            (ln("self_attn.q_norm.weight"), 5, head_dim),
+            (ln("self_attn.k_norm.weight"), 6, head_dim),
+            (ln("self_attn.o_proj.weight"), 7, h * q_dim),
+            (ln("post_attention_layernorm.weight"), 8, h),
+            (ln("pre_feedforward_layernorm.weight"), 9, h),
+            (ln("mlp.gate_proj.weight"), 10, ffn_inter * h),
+            (ln("mlp.up_proj.weight"), 11, ffn_inter * h),
+            (ln("mlp.down_proj.weight"), 12, h * ffn_inter),
+            (ln("post_feedforward_layernorm.weight"), 13, h),
+            (ln("per_layer_input_gate.weight"), 14, ple_dim * h),
+            (ln("per_layer_projection.weight"), 15, h * ple_dim),
+            (ln("post_per_layer_input_norm.weight"), 16, h),
+            (ln("layer_scalar"), 17, 1),
+        ];
+
+        let mut cpu_tensors = Map::new();
+        let mut gpu_weights = Map::new();
+        for (name, seed, len) in &tensors {
+            let data = fake_random(*len, *seed);
+            let is_matvec = is_matvec_weight(name);
+            if name.ends_with("layer_scalar") && !with_layer_scalar_on_gpu {
+                // Deliberately omit: forces use_fused_post_attn == false.
+            } else if is_matvec {
+                let bytes = f32_to_f16_bytes(&data);
+                let buf = engine.alloc_host_coherent_storage(bytes.len() as u64).unwrap();
+                buf.write(&bytes).unwrap();
+                gpu_weights.insert(name.clone(), buf);
+            } else {
+                let bytes: &[u8] = bytemuck::cast_slice(&data);
+                let buf = engine.alloc_host_coherent_storage(bytes.len() as u64).unwrap();
+                buf.write(bytes).unwrap();
+                gpu_weights.insert(name.clone(), buf);
+            }
+            cpu_tensors.insert(name.clone(), model::SimpleTensor { data, shape: vec![] });
+        }
+
+        let kv_caches: Vec<model::KvCache> = (0..cfg.num_hidden_layers).map(|i| {
+            let hd = cfg.layer_head_dim(i);
+            model::KvCache::new(64, cfg.num_key_value_heads, hd)
+        }).collect();
+
+        Some(VulkanModel {
+            inner: model::Gemma4Model {
+                config: cfg,
+                weights: model::Gemma4Weights { tensors: cpu_tensors },
+                kv_caches,
+            },
+            max_seq_len: 64,
+            engine: Some(engine),
+            gpu_weights,
+            act_bufs: Vec::new(),
+            act_bufs_ready: false,
+        })
+    }
+
+    #[test]
+    fn fused_post_attention_matches_three_submit_path() {
+        let Some(mut fused_model) = build_test_model(true) else { return };
+        let Some(mut old_model) = build_test_model(false) else { return };
+
+        let hidden = fake_random(fused_model.inner.config.hidden_size, 100);
+        let ple_dim = fused_model.inner.config.hidden_size_per_layer_input;
+        let layer_ple = fake_random(ple_dim, 101);
+
+        assert!(fused_model.engine.is_some());
+        let out_fused = fused_model.forward_layer_gpu_matmuls(0, &hidden, 0, &layer_ple);
+        let out_old = old_model.forward_layer_gpu_matmuls(0, &hidden, 0, &layer_ple);
+
+        let err = l2_rel_err(&out_old, &out_fused);
+        println!("fused vs 3-submit path: l2_rel_err={err:.6}");
+        // Both paths run the identical f16-quantized matvec weights and f32
+        // norm/residual math — any difference should be pure floating-point
+        // reassociation noise, not a real numerical divergence.
+        assert!(err < 1e-4, "fused post-attention diverged from the 3-submit path: {err}");
+    }
+
+    #[test]
+    fn fused_post_attention_is_faster_than_three_submit_path() {
+        let Some(mut fused_model) = build_test_model(true) else { return };
+        let Some(mut old_model) = build_test_model(false) else { return };
+
+        let hidden = fake_random(fused_model.inner.config.hidden_size, 200);
+        let ple_dim = fused_model.inner.config.hidden_size_per_layer_input;
+        let layer_ple = fake_random(ple_dim, 201);
+
+        // Warm up (pipeline creation, first-dispatch driver overhead).
+        for _ in 0..5 {
+            fused_model.forward_layer_gpu_matmuls(0, &hidden, 0, &layer_ple);
+            old_model.forward_layer_gpu_matmuls(0, &hidden, 0, &layer_ple);
+        }
+
+        let iters = 50;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            fused_model.forward_layer_gpu_matmuls(0, &hidden, 0, &layer_ple);
+        }
+        let fused_elapsed = t0.elapsed();
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            old_model.forward_layer_gpu_matmuls(0, &hidden, 0, &layer_ple);
+        }
+        let old_elapsed = t0.elapsed();
+
+        let fused_us = fused_elapsed.as_micros() as f64 / iters as f64;
+        let old_us = old_elapsed.as_micros() as f64 / iters as f64;
+        println!(
+            "forward_layer_gpu_matmuls: 3-submit {old_us:.1}us/call   fused-1-submit {fused_us:.1}us/call   speedup {:.2}x",
+            old_us / fused_us
+        );
+        assert!(
+            fused_us < old_us,
+            "fused post-attention ({fused_us:.1}us) was not faster than the 3-submit path ({old_us:.1}us)"
+        );
+    }
 }

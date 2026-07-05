@@ -176,6 +176,7 @@ compile "gelu_inplace_f32" "gelu.comp" ${U_F32} INPLACE=1
 # ── Elementwise binary ─────────────────────────────────────────────────────────
 echo ""
 echo "=== Elementwise binary ==="
+compile "add_f32_f32_f32" "add.comp"  DATA_A_F32=1 A_TYPE=float DATA_B_F32=1 B_TYPE=float D_TYPE=float FLOAT_TYPE=float RMS_NORM_ROPE_FUSION=0
 compile "add_f32_f32_f16" "add.comp"  DATA_A_F32=1 A_TYPE=float DATA_B_F32=1 B_TYPE=float D_TYPE=float16_t FLOAT_TYPE=float RMS_NORM_ROPE_FUSION=0
 compile "add_f32_f16_f32" "add.comp"  DATA_A_F32=1 A_TYPE=float DATA_B_F16=1 B_TYPE=float16_t D_TYPE=float FLOAT_TYPE=float RMS_NORM_ROPE_FUSION=0
 compile "add_rms_f32_f32_f32" "multi_add.comp" ${BIN_F32}
