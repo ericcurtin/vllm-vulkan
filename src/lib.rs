@@ -1156,17 +1156,24 @@ impl VulkanModel {
         }
 
         // ── Final norm + LM head (GPU) ────────────────────────────────────────
-        let norm_w = self.inner.weights.f32_slice("model.norm.weight");
-        let normed = model::cpu_rms_norm(&hidden, norm_w, eps);
-
         // LM head: [1, H] @ [vocab, H]^T — the biggest matmul, must be on GPU.
-        // The final logit softcap ((logits/cap).tanh()*cap) — previously a
+        // The final `model.norm` RMSNorm over the last hidden state ([H] =
+        // 1536 elements for Gemma4-E2B) previously ran as a CPU
+        // `cpu_rms_norm` call before this dispatch chain even started, then
+        // its output got copied into a GPU buffer for the LM head matvec
+        // anyway. `model.norm.weight` is already uploaded to `gpu_weights`
+        // (every raw safetensors tensor is — see `new()`), exactly like
+        // `input_layernorm.weight` is for the QKV submit, so this now runs
+        // as the first dispatch of the same submit as the LM head matvec
+        // and softcap chain instead, reusing ACT_RAW_HIDDEN (see its doc
+        // comment above) the same way the QKV submit does. The final
+        // logit softcap ((logits/cap).tanh()*cap) — previously a
         // single-threaded CPU loop over the entire vocab, ~1.1ms every
-        // decode step regardless of GPU availability — now runs as part of
-        // this same submit too: broadcast-mul(1/cap) -> tanh -> broadcast-
-        // mul(cap), using the persistent ACT_LOGIT_*/ACT_*_CAP buffers (see
-        // ACT_LOGIT_RAW's doc comment). Measured ~2.1-2.2x faster than the
-        // CPU loop in isolation (softcap_tests below).
+        // decode step regardless of GPU availability — already runs as
+        // part of this same submit too: broadcast-mul(1/cap) -> tanh ->
+        // broadcast-mul(cap), using the persistent ACT_LOGIT_*/ACT_*_CAP
+        // buffers (see ACT_LOGIT_RAW's doc comment). Measured ~2.1-2.2x
+        // faster than the CPU loop in isolation (softcap_tests below).
         let vocab = cfg.vocab_size;
         // Requires init_act_bufs() to have actually succeeded — not just
         // self.engine.is_some() — before touching any ACT_* slot below.
@@ -1179,15 +1186,16 @@ impl VulkanModel {
         // and every act_ptr*() call below would index out of bounds.
         let use_gpu_lm_head = self.engine.is_some()
             && self.gpu_weights.contains_key("model.embed_tokens.weight")
+            && self.gpu_weights.contains_key("model.norm.weight")
             && self.init_act_bufs();
         let logits = if use_gpu_lm_head {
             let lm_w_ptr = &self.gpu_weights["model.embed_tokens.weight"] as *const compute::Buffer;
-            let normed_bytes: &[u8] = bytemuck::cast_slice(&normed);
-            let inp_p = self.act_ptr_mut(ACT_QKV_IN); // reuse - we're done with layer ops
-            unsafe { (*inp_p).write(normed_bytes).unwrap(); }
+            let norm_w_ptr = &self.gpu_weights["model.norm.weight"] as *const compute::Buffer;
+            self.act_bufs[ACT_RAW_HIDDEN].write(bytemuck::cast_slice(&hidden)).unwrap();
 
-            let inp_ref = inp_p as *const compute::Buffer;
-            let raw_p = self.act_ptr(ACT_LOGIT_RAW);
+            let raw_hidden_p = self.act_ptr(ACT_RAW_HIDDEN);
+            let inp_p = self.act_ptr(ACT_QKV_IN); // reuse - we're done with layer ops
+            let logit_raw_p = self.act_ptr(ACT_LOGIT_RAW);
             let scaled_p = self.act_ptr(ACT_LOGIT_SCALED);
             let tanh_p = self.act_ptr(ACT_LOGIT_TANH);
             let final_p = self.act_ptr(ACT_LOGIT_FINAL);
@@ -1208,11 +1216,13 @@ impl VulkanModel {
             let eng = self.engine.as_mut().unwrap();
             let cb = eng.begin_batch().unwrap();
             unsafe {
+                eng.record_to(cb, "rms_norm_f32_mul", &[&*raw_hidden_p, &*norm_w_ptr, &*inp_p], &rms_norm_mul_pc(h, eps), (1, 1, 1)).unwrap();
+                eng.record_barrier_to(cb);
                 eng.record_to(cb, "mul_mat_vec_f32_f32_f32_r4",
-                    &[&*lm_w_ptr, &*inp_ref, &*raw_p],
+                    &[&*lm_w_ptr, &*inp_p, &*logit_raw_p],
                     &pc, (wg_r4(vocab), 1, 1)).unwrap();
                 eng.record_barrier_to(cb);
-                eng.record_to(cb, "mul_f32_f32_f32", &[&*raw_p, &*inv_cap_p, &*scaled_p], &binary_broadcast_pc(vocab), (wg256(vocab), 1, 1)).unwrap();
+                eng.record_to(cb, "mul_f32_f32_f32", &[&*logit_raw_p, &*inv_cap_p, &*scaled_p], &binary_broadcast_pc(vocab), (wg256(vocab), 1, 1)).unwrap();
                 eng.record_barrier_to(cb);
                 eng.record_to(cb, "tanh_f32", &[&*scaled_p, &*tanh_p], &unary_head_pc(vocab), (wg512(vocab), 1, 1)).unwrap();
                 eng.record_barrier_to(cb);
@@ -1221,6 +1231,8 @@ impl VulkanModel {
             eng.submit_batch(cb).unwrap();
             read_f32_buf(unsafe { &*final_p }, vocab)
         } else {
+            let norm_w = self.inner.weights.f32_slice("model.norm.weight");
+            let normed = model::cpu_rms_norm(&hidden, norm_w, eps);
             let cap = cfg.final_logit_softcapping;
             let lm_w = self.inner.weights.f32_slice("model.embed_tokens.weight");
             let mut raw = model::cpu_matmul(&normed, lm_w, 1, h, vocab);
@@ -3029,5 +3041,128 @@ mod ple_proj_tests {
             gpu_us < cpu_us,
             "gpu_matmul_or_cpu ({gpu_us:.1}us) was not faster than cpu_matmul ({cpu_us:.1}us)"
         );
+    }
+}
+
+#[cfg(test)]
+mod final_norm_lm_head_tests {
+    //! Validates `forward_gpu`'s final `model.norm` RMSNorm — now dispatched
+    //! as `rms_norm_f32_mul` at the start of the LM head's existing
+    //! matvec+softcap submit instead of as a separate CPU `cpu_rms_norm`
+    //! call beforehand — against the CPU reference chain it replaces
+    //! (`cpu_rms_norm` -> `cpu_matmul` -> softcap). Same GPU-fused-norm
+    //! pattern `gpu_input_layernorm_matches_cpu_reference` above already
+    //! validates for the QKV submit's `input_layernorm`, applied to the
+    //! other end of the decoder stack.
+    //!
+    //! Uses a reduced vocab size (4096, vs. Gemma4-E2B's real 262144) so
+    //! the test allocates a `[4096, 1536]` f32 weight (~25MB) instead of a
+    //! `[262144, 1536]` one (~1.6GB) — `model.embed_tokens.weight` stays
+    //! f32 (LM head precision, see `is_matvec_weight`'s doc comment), so
+    //! unlike PLE-proj's f16 weight this isn't a case where a smaller test
+    //! risks missing a size-dependent bug in the matvec kernel itself:
+    //! `mul_mat_vec_f32_f32_f32_r4` (and its f16-weight sibling) is already
+    //! validated bit-for-bit against the base (non-r4) kernel at multiple
+    //! shapes by `matvec_r4_tests` above. What's new and actually under
+    //! test here is the *ordering* — that `rms_norm_f32_mul`'s output
+    //! correctly feeds the matvec dispatch that follows it in the same
+    //! command buffer — which a reduced N exercises identically to the
+    //! real one (both are well above the r4 kernel's 4-rows-per-workgroup
+    //! tiling granularity).
+    //!
+    //! Requires a real Vulkan device; skips cleanly (not a failure) on
+    //! headless CI runners with no GPU/ICD.
+    use super::*;
+
+    fn fake_random(len: usize, seed: u64) -> Vec<f32> {
+        (0..len).map(|i| {
+            let x = (i as u64).wrapping_mul(2654435761).wrapping_add(seed);
+            ((x % 20000) as f32 / 10000.0) - 1.0
+        }).collect()
+    }
+
+    fn l2_rel_err(a: &[f32], b: &[f32]) -> f32 {
+        let num: f32 = a.iter().zip(b.iter()).map(|(&x, &y)| (x - y).powi(2)).sum::<f32>().sqrt();
+        let den: f32 = a.iter().map(|&x| x.powi(2)).sum::<f32>().sqrt();
+        if den > 0.0 { num / den } else { num }
+    }
+
+    /// CPU reference: `cpu_rms_norm` -> `cpu_matmul` -> softcap — exactly
+    /// what forward_gpu's `else` (no-GPU) branch still does.
+    fn cpu_reference(hidden: &[f32], norm_w: &[f32], lm_w: &[f32], h: usize, vocab: usize, eps: f32, cap: f32) -> Vec<f32> {
+        let normed = model::cpu_rms_norm(hidden, norm_w, eps);
+        let mut raw = model::cpu_matmul(&normed, lm_w, 1, h, vocab);
+        raw.iter_mut().for_each(|l| *l = (*l / cap).tanh() * cap);
+        raw
+    }
+
+    #[test]
+    fn gpu_fused_final_norm_matches_cpu_reference() {
+        let _guard = gpu_test_guard();
+        let dev = match device::ComputeDevice::create(0) {
+            Ok(d) => d,
+            Err(e) => { eprintln!("skip: {e}"); return; }
+        };
+        let shader_spvs = include_all_shaders();
+        let refs: std::collections::HashMap<&str, &[u8]> = shader_spvs.iter()
+            .map(|(k, v)| (k.as_str(), v.as_slice())).collect();
+        let mut engine = compute::ComputeEngine::new(
+            dev.instance.clone(), dev.physical_device, dev.device.clone(),
+            dev.compute_queue, dev.compute_queue_family, &refs,
+        ).unwrap();
+
+        let h = 1536usize;
+        let vocab = 4096usize; // see module doc comment for why this is reduced
+        let eps = 1e-6f32;
+        let cap = 30.0f32;
+
+        let hidden = fake_random(h, 400);
+        let norm_w = fake_random(h, 401);
+        let lm_w = fake_random(vocab * h, 402);
+
+        let cpu_result = cpu_reference(&hidden, &norm_w, &lm_w, h, vocab, eps, cap);
+
+        // GPU: rms_norm_f32_mul -> mul_mat_vec_f32_f32_f32_r4 -> softcap
+        // chain, exactly forward_gpu's use_gpu_lm_head path, in one submit.
+        let raw_hidden_buf = engine.alloc_host_coherent_storage((h * 4) as u64).unwrap();
+        raw_hidden_buf.write(bytemuck::cast_slice(&hidden)).unwrap();
+        let norm_w_buf = engine.alloc_host_coherent_storage((h * 4) as u64).unwrap();
+        norm_w_buf.write(bytemuck::cast_slice(&norm_w)).unwrap();
+        let lm_w_buf = engine.alloc_host_coherent_storage((vocab * h * 4) as u64).unwrap();
+        lm_w_buf.write(bytemuck::cast_slice(&lm_w)).unwrap();
+        let normed_buf = engine.alloc_host_coherent_storage((h * 4) as u64).unwrap();
+        let raw_logit_buf = engine.alloc_host_coherent_storage((vocab * 4) as u64).unwrap();
+        let scaled_buf = engine.alloc_host_coherent_storage((vocab * 4) as u64).unwrap();
+        let tanh_buf = engine.alloc_host_coherent_storage((vocab * 4) as u64).unwrap();
+        let final_buf = engine.alloc_host_coherent_storage((vocab * 4) as u64).unwrap();
+        let inv_cap_buf = engine.alloc_host_coherent_storage(4).unwrap();
+        inv_cap_buf.write(bytemuck::cast_slice(&[1.0f32 / cap])).unwrap();
+        let cap_buf = engine.alloc_host_coherent_storage(4).unwrap();
+        cap_buf.write(bytemuck::cast_slice(&[cap])).unwrap();
+
+        let pc_vals: [u32; 13] = [
+            h as u32, h as u32, h as u32, vocab as u32,
+            (h * vocab) as u32, h as u32, vocab as u32,
+            0u32, 0u32, 1u32, 1u32, 1u32, 1u32,
+        ];
+        let pc: &[u8] = bytemuck::cast_slice(&pc_vals);
+
+        let cb = engine.begin_batch().unwrap();
+        engine.record_to(cb, "rms_norm_f32_mul", &[&raw_hidden_buf, &norm_w_buf, &normed_buf], &rms_norm_mul_pc(h, eps), (1, 1, 1)).unwrap();
+        engine.record_barrier_to(cb);
+        engine.record_to(cb, "mul_mat_vec_f32_f32_f32_r4", &[&lm_w_buf, &normed_buf, &raw_logit_buf], pc, (wg_r4(vocab), 1, 1)).unwrap();
+        engine.record_barrier_to(cb);
+        engine.record_to(cb, "mul_f32_f32_f32", &[&raw_logit_buf, &inv_cap_buf, &scaled_buf], &binary_broadcast_pc(vocab), (wg256(vocab), 1, 1)).unwrap();
+        engine.record_barrier_to(cb);
+        engine.record_to(cb, "tanh_f32", &[&scaled_buf, &tanh_buf], &unary_head_pc(vocab), (wg512(vocab), 1, 1)).unwrap();
+        engine.record_barrier_to(cb);
+        engine.record_to(cb, "mul_f32_f32_f32", &[&tanh_buf, &cap_buf, &final_buf], &binary_broadcast_pc(vocab), (wg256(vocab), 1, 1)).unwrap();
+        engine.submit_batch(cb).unwrap();
+
+        let gpu_result = read_f32_buf(&final_buf, vocab);
+
+        let err = l2_rel_err(&cpu_result, &gpu_result);
+        println!("GPU fused final-norm+LM-head+softcap vs CPU reference: l2_rel_err={err:.6}");
+        assert!(err < 1e-4, "GPU fused final norm diverged from CPU reference: {err}");
     }
 }
