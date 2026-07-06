@@ -1273,7 +1273,7 @@ impl VulkanModel {
                 eng.record_barrier_to(cb);
                 eng.record_to(cb, "mul_f32_f32_f32", &[&*logit_raw_p, &*inv_cap_p, &*scaled_p], bytemuck::cast_slice(&binary_broadcast_pc(vocab)), (wg256(vocab), 1, 1)).unwrap();
                 eng.record_barrier_to(cb);
-                eng.record_to(cb, "tanh_f32", &[&*scaled_p, &*tanh_p], bytemuck::cast_slice(&unary_head_pc(vocab)), (wg512(vocab), 1, 1)).unwrap();
+                eng.record_to(cb, "tanh_f32", &[&*scaled_p, &*tanh_p], bytemuck::cast_slice(&unary_head_pc(vocab)), (wg128(vocab), 1, 1)).unwrap();
                 eng.record_barrier_to(cb);
                 eng.record_to(cb, "mul_f32_f32_f32", &[&*tanh_p, &*cap_p, &*final_p], bytemuck::cast_slice(&binary_broadcast_pc(vocab)), (wg256(vocab), 1, 1)).unwrap();
             }
@@ -2152,17 +2152,11 @@ fn wg256(n: usize) -> u32 {
     n.div_ceil(256) as u32
 }
 
-/// Workgroup count for `tanh_f32` (512 threads/workgroup, 1 element/thread
-/// — see `tanh.comp`). NOT used for `gelu_f32` (see `wg128` below): the two
-/// shaders have independently-tuned `local_size_x` values, so they need
-/// separate workgroup-count helpers even though both are 1-element/thread
-/// unary shaders.
-fn wg512(n: usize) -> u32 {
-    n.div_ceil(512) as u32
-}
-
-/// Workgroup count for `gelu_f32` (128 threads/workgroup, 1 element/thread
-/// — see `gelu.comp`, tuned to 128 rather than the more common 512).
+/// Workgroup count for `gelu_f32` and `tanh_f32` (both 128 threads/workgroup,
+/// 1 element/thread — see `gelu.comp` / `tanh.comp`; both independently
+/// measured to be faster at `local_size_x=128` than the more common 512
+/// at their respective real dispatch sizes: `ple_dim`/`ffn_inter` for
+/// gelu, `vocab` for tanh).
 fn wg128(n: usize) -> u32 {
     n.div_ceil(128) as u32
 }
@@ -3026,7 +3020,7 @@ mod softcap_tests {
             let cb = eng.begin_batch().unwrap();
             eng.record_to(cb, "mul_f32_f32_f32", &[&logits_buf, &inv_cap_buf, &scaled_buf], bytemuck::cast_slice(&binary_broadcast_pc(vocab)), (wg256(vocab), 1, 1)).unwrap();
             eng.record_barrier_to(cb);
-            eng.record_to(cb, "tanh_f32", &[&scaled_buf, &tanh_buf], bytemuck::cast_slice(&unary_head_pc(vocab)), (wg512(vocab), 1, 1)).unwrap();
+            eng.record_to(cb, "tanh_f32", &[&scaled_buf, &tanh_buf], bytemuck::cast_slice(&unary_head_pc(vocab)), (wg128(vocab), 1, 1)).unwrap();
             eng.record_barrier_to(cb);
             eng.record_to(cb, "mul_f32_f32_f32", &[&tanh_buf, &cap_buf, &final_buf], bytemuck::cast_slice(&binary_broadcast_pc(vocab)), (wg256(vocab), 1, 1)).unwrap();
             eng.submit_batch(cb).unwrap();
@@ -3287,7 +3281,7 @@ mod final_norm_lm_head_tests {
         engine.record_barrier_to(cb);
         engine.record_to(cb, "mul_f32_f32_f32", &[&raw_logit_buf, &inv_cap_buf, &scaled_buf], bytemuck::cast_slice(&binary_broadcast_pc(vocab)), (wg256(vocab), 1, 1)).unwrap();
         engine.record_barrier_to(cb);
-        engine.record_to(cb, "tanh_f32", &[&scaled_buf, &tanh_buf], bytemuck::cast_slice(&unary_head_pc(vocab)), (wg512(vocab), 1, 1)).unwrap();
+        engine.record_to(cb, "tanh_f32", &[&scaled_buf, &tanh_buf], bytemuck::cast_slice(&unary_head_pc(vocab)), (wg128(vocab), 1, 1)).unwrap();
         engine.record_barrier_to(cb);
         engine.record_to(cb, "mul_f32_f32_f32", &[&tanh_buf, &cap_buf, &final_buf], bytemuck::cast_slice(&binary_broadcast_pc(vocab)), (wg256(vocab), 1, 1)).unwrap();
         engine.submit_batch(cb).unwrap();
