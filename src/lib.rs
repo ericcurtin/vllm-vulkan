@@ -2823,6 +2823,82 @@ mod binary_elementwise_tests {
 }
 
 #[cfg(test)]
+mod pipeline_cache_startup_tests {
+    //! `compile_matvec` used to also compile a NUM_ROWS=2 (`_r2`) variant
+    //! for all 17 MATVEC_SHADERS entries, never actually dispatched
+    //! anywhere in this codebase (confirmed via `grep -rn '_r2' src/
+    //! vllm_vulkan/ tests/` finding zero dispatch call sites — every
+    //! real matvec dispatch uses either the unsuffixed base variant, the
+    //! `_subgroup` unsuffixed variant, or `_r4`). Measured directly
+    //! (`PipelineCache::new()`, i.e. model-load, timed before/after
+    //! removing it): ~1865-1885ms with `_r2` vs ~1461-1467ms without,
+    //! consistently reproducible across repeated runs — a ~400ms
+    //! (~22%) model-load startup-time win from removing this dead
+    //! pipeline. This test is a deterministic (non-flaky) structural
+    //! regression guard confirming `_r2` variants are no longer compiled
+    //! at all, rather than a wall-clock assertion (which would be
+    //! sensitive to the specific CI runner's absolute performance).
+    use super::*;
+
+    fn make_engine() -> Option<compute::ComputeEngine> {
+        let dev = match device::ComputeDevice::create(0) {
+            Ok(d) => d,
+            Err(e) => { eprintln!("skip: no Vulkan device available ({e})"); return None; }
+        };
+        let shader_spvs = include_all_shaders();
+        let refs: std::collections::HashMap<&str, &[u8]> = shader_spvs.iter()
+            .map(|(k, v)| (k.as_str(), v.as_slice())).collect();
+        Some(compute::ComputeEngine::new(
+            dev.instance.clone(), dev.physical_device, dev.device.clone(),
+            dev.compute_queue, dev.compute_queue_family, &refs,
+        ).expect("create ComputeEngine"))
+    }
+
+    #[test]
+    fn r2_matvec_variant_is_no_longer_compiled() {
+        let _guard = gpu_test_guard();
+        let Some(mut engine) = make_engine() else { return };
+
+        // Trivial zero-filled data: this test only checks whether
+        // `record_to` finds a compiled pipeline for each shader name
+        // (Ok) or not (Err "not found") — the actual numerical result is
+        // irrelevant here, unlike the correctness tests elsewhere.
+        let k = 64usize;
+        let n = 4usize;
+        let weight_f16 = f32_to_f16_bytes(&vec![0.0f32; n * k]);
+        let x = vec![0.0f32; k];
+        let wbuf = engine.alloc_host_coherent_storage(weight_f16.len() as u64).unwrap();
+        wbuf.write(&weight_f16).unwrap();
+        let xbuf = engine.alloc_host_coherent_storage((k * 4) as u64).unwrap();
+        xbuf.write(bytemuck::cast_slice(&x)).unwrap();
+        let out = engine.alloc_host_coherent_storage((n * 4) as u64).unwrap();
+        let pc = mv_pc(k, n, 1);
+
+        // The base and _r4 variants must still be present and dispatchable...
+        let cb = engine.begin_batch().unwrap();
+        let res_base = engine.record_to(
+            cb, "mul_mat_vec_f16_f32_f32", &[&wbuf, &xbuf, &out], bytemuck::cast_slice(&pc), (n as u32, 1, 1),
+        );
+        assert!(res_base.is_ok(), "base matvec variant should still be compiled: {res_base:?}");
+
+        let res_r4 = engine.record_to(
+            cb, "mul_mat_vec_f16_f32_f32_r4", &[&wbuf, &xbuf, &out], bytemuck::cast_slice(&pc), (wg_r4(n), 1, 1),
+        );
+        assert!(res_r4.is_ok(), "_r4 matvec variant should still be compiled: {res_r4:?}");
+
+        // ...but the dead _r2 variant must be gone.
+        let res_r2 = engine.record_to(
+            cb, "mul_mat_vec_f16_f32_f32_r2", &[&wbuf, &xbuf, &out], bytemuck::cast_slice(&pc), (n.div_ceil(2) as u32, 1, 1),
+        );
+        assert!(
+            res_r2.is_err(),
+            "expected '_r2' matvec variant to no longer be compiled (dead code, never \
+             dispatched anywhere), but record_to succeeded: {res_r2:?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod record_to_tests {
     //! Validates `ComputeEngine::record_to`'s stack-allocated descriptor-
     //! write buffers (see its doc comment) — specifically the
