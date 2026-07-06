@@ -1,6 +1,25 @@
 #version 450
 
-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+// BLOCK_SIZE (local_size_x / dot_sums reduction width) is compile-time
+// configurable: this shader is compiled twice, as BLOCK_SIZE=256 (the
+// default, optimal when head_size==256 — Gemma4-E2B's sliding-window
+// layers) and BLOCK_SIZE=512 ("_512" name suffix, optimal when
+// head_size==512 — Gemma4-E2B's full-attention layers). Measured
+// directly (marginal per-dispatch cost): BLOCK_SIZE=256 is ~9-14%
+// faster than 512 at head_size=256, while BLOCK_SIZE=512 is ~5-9%
+// faster than 256 at head_size=512 — matching BLOCK_SIZE to head_size
+// avoids wasted/idle threads in the cooperative dot-product reduction
+// (each thread handles `head_size / BLOCK_SIZE` elements via the
+// `for (d=tid; d<head_size; d+=BLOCK_SIZE)` loop below; when
+// BLOCK_SIZE > head_size, threads with `tid >= head_size` do zero
+// useful work in that loop but still pay the full barrier/reduction
+// cost). See kv_ops.py's `_select_decode_shader` for the head_size-
+// based selection between the two compiled variants.
+#ifndef BLOCK_SIZE
+#define BLOCK_SIZE 256
+#endif
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 
 layout(binding = 0) readonly buffer QInput {
     float q[];
@@ -30,7 +49,7 @@ layout(push_constant) uniform parameter {
     float scale;
 } p;
 
-shared float dot_sums[256];
+shared float dot_sums[BLOCK_SIZE];
 
 uint kv_base_for_token(uint token_idx, uint kv_head) {
     const uint logical_block_id = token_idx / p.block_size;

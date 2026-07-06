@@ -783,8 +783,10 @@ fn include_all_shaders() -> std::collections::HashMap<String, Vec<u8>> {
     spv!("paged_kv_write_f32");
     spv!("paged_attn_decode_f16");
     spv!("paged_attn_decode_f16_coop");
+    spv!("paged_attn_decode_f16_coop_512");
     spv!("paged_attn_decode_f32");
     spv!("paged_attn_decode_f32_coop");
+    spv!("paged_attn_decode_f32_coop_512");
 
     map
 }
@@ -3054,8 +3056,8 @@ mod pipeline_cache_startup_tests {
             "rms_norm_f32", "rms_norm_f32_mul",
             "mul_mat_vec_f32_f32_f32", "mul_mat_vec_f16_f32_f32", "mul_mat_vec_f32_f32_f32_subgroup",
             "paged_kv_write_f16", "paged_kv_write_f32",
-            "paged_attn_decode_f16", "paged_attn_decode_f16_coop",
-            "paged_attn_decode_f32", "paged_attn_decode_f32_coop",
+            "paged_attn_decode_f16", "paged_attn_decode_f16_coop", "paged_attn_decode_f16_coop_512",
+            "paged_attn_decode_f32", "paged_attn_decode_f32_coop", "paged_attn_decode_f32_coop_512",
         ] {
             let res = engine.record_to(cb, name, &[&dummy], &pc, (1, 1, 1));
             assert!(res.is_ok(), "shader '{name}' should still be compiled: {res:?}");

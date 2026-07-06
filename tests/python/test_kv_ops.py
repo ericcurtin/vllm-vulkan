@@ -13,6 +13,7 @@ _rs = pytest.importorskip("vllm_vulkan._rs", exc_type=ImportError)
 
 from vllm_vulkan.kv_layout import KVCacheLayerSpec, VulkanPagedKVLayout  # noqa: E402
 from vllm_vulkan.kv_ops import (  # noqa: E402
+    _select_decode_shader,
     paged_attn_decode_batch_f16,
     paged_attn_decode_batch_f32,
     paged_attn_decode_f16,
@@ -425,3 +426,126 @@ def test_paged_attn_decode_batch_empty_returns_empty_list():
         )
         == []
     )
+
+
+@pytest.mark.parametrize(
+    (
+        "torch_dtype",
+        "dtype_size",
+        "write_fn",
+        "decode_fn",
+        "write_shader",
+        "decode_shaders",
+        "seed",
+        "rtol",
+        "atol",
+    ),
+    [
+        (
+            torch.float32,
+            4,
+            paged_kv_write_f32,
+            paged_attn_decode_f32,
+            "paged_kv_write_f32",
+            ("paged_attn_decode_f32", "paged_attn_decode_f32_coop_512"),
+            2,
+            1e-4,
+            1e-4,
+        ),
+        (
+            torch.float16,
+            2,
+            paged_kv_write_f16,
+            paged_attn_decode_f16,
+            "paged_kv_write_f16",
+            ("paged_attn_decode_f16", "paged_attn_decode_f16_coop_512"),
+            3,
+            5e-3,
+            5e-3,
+        ),
+    ],
+)
+def test_paged_attn_decode_matches_torch_reference_at_head_size_512(
+    torch_dtype: torch.dtype,
+    dtype_size: int,
+    write_fn: Callable,
+    decode_fn: Callable,
+    write_shader: str,
+    decode_shaders: tuple[str, ...],
+    seed: int,
+    rtol: float,
+    atol: float,
+):
+    """Exercises the BLOCK_SIZE=512 `_coop_512` shader variant specifically
+    (head_size=512 matches Gemma4-E2B's full-attention layers, and
+    _select_decode_shader prefers the 512-wide variant at this size — see
+    test_select_decode_shader_prefers_block_size_matching_head_size below)
+    against the same pure-PyTorch attention reference used at the smaller
+    default head_size=8 shape above, to confirm the 512-wide cooperative
+    reduction is numerically correct, not just "faster in isolation".
+    """
+    ctx = _require_vulkan_context()
+    _require_shader(ctx, write_shader)
+    _require_shader(ctx, *decode_shaders)
+
+    spec = KVCacheLayerSpec(
+        layer_index=0,
+        num_kv_heads=1,
+        head_size=512,
+        block_size=16,
+        dtype_size=dtype_size,
+    )
+    layout = VulkanPagedKVLayout((spec,), num_blocks=8)
+    cache = ctx.alloc_activation(layout.total_bytes)
+    ctx.update_activation(cache, bytes(layout.total_bytes))
+
+    seq_len = 40
+    block_table = torch.tensor([3, 5, 0], dtype=torch.int64)
+    slot_mapping = _slot_mapping_from_block_table(block_table, seq_len, spec.block_size)
+
+    torch.manual_seed(seed)
+    k = torch.randn(seq_len, spec.num_kv_heads, spec.head_size, dtype=torch_dtype)
+    v = torch.randn_like(k)
+    q = torch.randn(8, spec.head_size, dtype=torch.float32)  # 8 q_heads, GQA ratio 8
+    scale = spec.head_size**-0.5
+
+    write_fn(ctx, layout, cache, 0, k, v, slot_mapping)
+    out = decode_fn(ctx, layout, cache, 0, q, block_table, seq_len, scale)
+
+    expected = _attention_reference(q, k, v, scale)
+    torch.testing.assert_close(out, expected, rtol=rtol, atol=atol)
+
+
+def test_select_decode_shader_prefers_block_size_matching_head_size():
+    """_select_decode_shader should prefer the `_coop_512` variant when
+    head_size>=512 (Gemma4-E2B's full-attention layers) and the plain
+    `_coop` (BLOCK_SIZE=256) variant otherwise (e.g. head_size=256, its
+    sliding-window layers) — matching BLOCK_SIZE to head_size avoids
+    wasted/idle threads in the cooperative dot-product reduction (see
+    paged_attn_decode_f32_coop.comp's BLOCK_SIZE comment for the measured
+    rationale). Both are real, always-available shaders in this codebase
+    (not a hypothetical), so this also implicitly confirms both compiled
+    successfully.
+    """
+    ctx = _require_vulkan_context()
+    _require_shader(ctx, "paged_attn_decode_f32_coop", "paged_attn_decode_f32_coop_512")
+
+    name_256, wg_256 = _select_decode_shader(
+        ctx,
+        "paged_attn_decode_f32",
+        "paged_attn_decode_f32_coop",
+        "paged_attn_decode_f32_coop_512",
+        head_size=256,
+    )
+    assert name_256 == "paged_attn_decode_f32_coop"
+    assert wg_256 == 256
+
+    name_512, wg_512 = _select_decode_shader(
+        ctx,
+        "paged_attn_decode_f32",
+        "paged_attn_decode_f32_coop",
+        "paged_attn_decode_f32_coop_512",
+        head_size=512,
+    )
+    assert name_512 == "paged_attn_decode_f32_coop_512"
+    assert wg_512 == 512
