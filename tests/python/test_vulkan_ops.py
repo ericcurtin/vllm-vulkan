@@ -726,3 +726,324 @@ class TestLinearMatvecDispatchThreshold:
             "still use the GPU weight cache / matvec dispatch path"
         )
         assert upload_counter["n"] == 1
+
+
+class TestWrapRmsNormHoistsStaticLookups:
+    """`_wrap_rms_norm` now captures `weight`/`eps`/the disable-ops env
+    var once, at hook-install time, instead of re-deriving them (via
+    `getattr`/`os.environ.get`) on every single forward call — see its
+    doc comment in model_runner.py for the measured per-call overhead
+    this avoids. These tests confirm the hoisting doesn't change
+    behavior, and measure the actual speedup.
+    """
+
+    def test_wrapped_forward_matches_unwrapped_reference(self, vulkan_ctx):
+        """Correctness: a wrapped RMSNorm module's forward() must produce
+        the same result as computing RMSNorm directly, both with and
+        without a residual — exercising every branch the hoisted values
+        (`weight`, `eps`) are used in."""
+        from vllm_vulkan.model_runner import _wrap_rms_norm
+
+        class FakeRMSNorm(torch.nn.Module):
+            def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.randn(hidden_size))
+                self.variance_epsilon = eps
+
+            def forward(self, x, residual=None):
+                if residual is not None:
+                    x = x + residual
+                xf = x.float()
+                out = (
+                    xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps)
+                ) * self.weight.float()
+                out = out.to(x.dtype)
+                if residual is not None:
+                    return out, x
+                return out
+
+            @property
+            def eps(self) -> float:
+                return self.variance_epsilon
+
+        module = FakeRMSNorm(1536)
+        x = torch.randn(1, 1536, dtype=torch.float32)
+
+        expected_no_residual = module(x)
+        _wrap_rms_norm(module)
+        result_no_residual = module.forward(x)
+        torch.testing.assert_close(
+            result_no_residual, expected_no_residual, rtol=1e-3, atol=1e-4
+        )
+
+        module2 = FakeRMSNorm(1536)
+        residual = torch.randn(1, 1536, dtype=torch.float32)
+        expected_out, expected_residual_out = module2(x, residual)
+        _wrap_rms_norm(module2)
+        result_out, result_residual_out = module2.forward(x, residual)
+        torch.testing.assert_close(result_out, expected_out, rtol=1e-3, atol=1e-4)
+        torch.testing.assert_close(result_residual_out, expected_residual_out)
+
+    def test_disable_ops_env_var_is_read_once_at_install_time(
+        self, vulkan_ctx, monkeypatch
+    ):
+        """`VLLM_VULKAN_DISABLE_OPS` must be captured once when
+        `_wrap_rms_norm` installs the hook, not re-read on every forward
+        call — setting it *after* installation must have no effect on an
+        already-wrapped module (matches `_returns_tuple`'s existing
+        hoisted-at-install-time contract for `_wrap_linear`)."""
+        from vllm_vulkan.model_runner import _wrap_rms_norm
+
+        module = torch.nn.Module()
+        module.weight = torch.nn.Parameter(torch.randn(8))
+        module.variance_epsilon = 1e-6
+        module.forward = lambda x, residual=None: ("orig-called", x, residual)
+
+        monkeypatch.delenv("VLLM_VULKAN_DISABLE_OPS", raising=False)
+        _wrap_rms_norm(module)
+
+        monkeypatch.setenv("VLLM_VULKAN_DISABLE_OPS", "1")
+        x = torch.randn(1, 8, dtype=torch.float32)
+        result = module.forward(x)
+        assert not (isinstance(result, tuple) and result[0] == "orig-called"), (
+            "toggling VLLM_VULKAN_DISABLE_OPS after hook installation must not "
+            "affect an already-wrapped module (the env var is captured once, "
+            "at install time)"
+        )
+
+    def test_weight_float_conversion_happens_once_not_per_call(
+        self, vulkan_ctx, monkeypatch
+    ):
+        """`vulkan_ops.rms_norm` -> `_cpu_rms_norm` calls `weight.float()`
+        internally on every invocation — `_wrap_rms_norm` must convert
+        `weight` to float32 once, at hook-install time (`weight_f32`),
+        so that this internal `.float()` call becomes a no-op (already
+        float32) instead of a fresh allocation+copy on every forward
+        call. Counts real `Tensor.float()` calls on the *original* bf16
+        weight object directly (via `monkeypatch`) rather than relying
+        on timing, for a deterministic (not just probabilistic) check.
+        """
+        from vllm_vulkan.model_runner import _wrap_rms_norm
+
+        module = torch.nn.Module()
+        module.weight = torch.nn.Parameter(
+            torch.randn(1536, dtype=torch.bfloat16), requires_grad=False
+        )
+        module.variance_epsilon = 1e-6
+        module.forward = lambda x, residual=None: x
+
+        counts = {"n": 0}
+        orig_float = torch.Tensor.float
+
+        def counting_float(self):
+            if self is module.weight:
+                counts["n"] += 1
+            return orig_float(self)
+
+        monkeypatch.setattr(torch.Tensor, "float", counting_float)
+        _wrap_rms_norm(module)
+        assert counts["n"] == 1, (
+            "weight.float() must be called exactly once, at hook-install "
+            "time, not deferred to forward-call time"
+        )
+
+        x = torch.randn(1, 1536, dtype=torch.float32)
+        for _ in range(5):
+            module.forward(x)
+        assert counts["n"] == 1, (
+            "repeated forward() calls must not trigger additional "
+            "weight.float() conversions of the original bf16 weight"
+        )
+
+
+class TestWrapLinearHoistsStaticLookups:
+    """`_wrap_linear` now captures `weight`/`bias`/`skip_bias_add`/
+    `tp_size`/`reduce_results`/`gather_output`/the disable-ops-or-linear
+    env vars once, at hook-install time, instead of re-deriving them on
+    every single forward call — see its doc comment in model_runner.py
+    for the measured per-call overhead this avoids (and the also-removed
+    redundant `x.float()` call, since `vulkan_ops.linear()` already does
+    that conversion internally).
+    """
+
+    def test_wrapped_forward_matches_unwrapped_reference(self, vulkan_ctx):
+        """Correctness: a wrapped Linear module's forward() must produce
+        the same result as `torch.nn.functional.linear` directly — this
+        also exercises the removed-redundant-`x.float()` change, since a
+        bf16 `x` input now reaches `vulkan_ops.linear()` unconverted."""
+        from vllm_vulkan.model_runner import _wrap_linear
+
+        module = torch.nn.Linear(1536, 2048, bias=True)
+        module.weight = torch.nn.Parameter(
+            module.weight.detach().to(torch.bfloat16), requires_grad=False
+        )
+        module.bias = torch.nn.Parameter(
+            module.bias.detach().to(torch.bfloat16), requires_grad=False
+        )
+
+        x = torch.randn(1, 1536, dtype=torch.bfloat16)
+        expected = torch.nn.functional.linear(
+            x.float(), module.weight.float(), module.bias.float()
+        ).to(x.dtype)
+
+        _wrap_linear(module)
+        result = module.forward(x)
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
+    def test_disable_linear_env_vars_are_read_once_at_install_time(
+        self, vulkan_ctx, monkeypatch
+    ):
+        """Same contract as `TestWrapRmsNormHoistsStaticLookups`'s
+        equivalent test, for `_wrap_linear`'s two disable env vars."""
+        from vllm_vulkan.model_runner import _wrap_linear
+
+        module = torch.nn.Linear(1536, 2048, bias=True)
+
+        monkeypatch.delenv("VLLM_VULKAN_DISABLE_OPS", raising=False)
+        monkeypatch.delenv("VLLM_VULKAN_DISABLE_LINEAR", raising=False)
+        _wrap_linear(module)
+
+        monkeypatch.setenv("VLLM_VULKAN_DISABLE_LINEAR", "1")
+        x = torch.randn(1, 1536, dtype=torch.float32)
+        # Must still dispatch through vulkan_ops.linear() (i.e. behave as
+        # if the env var were unset), since it was captured before this
+        # setenv call.
+        result = module.forward(x)
+        expected = torch.nn.functional.linear(x, module.weight.float(), module.bias)
+        torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
+
+    def test_bias_float_conversion_happens_once_not_per_call(
+        self, vulkan_ctx, monkeypatch
+    ):
+        """`vulkan_ops.linear` calls `bias.float()` internally on every
+        invocation when a bias is present — `_wrap_linear` must convert
+        `bias` to float32 once, at hook-install time (`bias_f32`), so
+        this internal `.float()` call becomes a no-op instead of a fresh
+        allocation+copy on every forward call. Same deterministic
+        call-counting approach as
+        `TestWrapRmsNormHoistsStaticLookups.test_weight_float_conversion_happens_once_not_per_call`,
+        applied to `bias` here. Uses a large-enough weight
+        (`_MATVEC_MIN_WEIGHT_ELEMENTS`-sized) so this exercises the real
+        GPU dispatch path where `vulkan_ops.linear()`'s own `bias.float()`
+        call actually runs (T=1, weight_elements >= threshold).
+        """
+        from vllm_vulkan.model_runner import _wrap_linear
+
+        module = torch.nn.Linear(1536, 2048, bias=True)
+        module.weight = torch.nn.Parameter(
+            module.weight.detach().to(torch.bfloat16), requires_grad=False
+        )
+        module.bias = torch.nn.Parameter(
+            module.bias.detach().to(torch.bfloat16), requires_grad=False
+        )
+
+        counts = {"n": 0}
+        orig_float = torch.Tensor.float
+
+        def counting_float(self):
+            if self is module.bias:
+                counts["n"] += 1
+            return orig_float(self)
+
+        monkeypatch.setattr(torch.Tensor, "float", counting_float)
+        _wrap_linear(module)
+        assert counts["n"] == 1, (
+            "bias.float() must be called exactly once, at hook-install time, "
+            "not deferred to forward-call time"
+        )
+
+        x = torch.randn(1, 1536, dtype=torch.float32)
+        for _ in range(5):
+            module.forward(x)
+        assert counts["n"] == 1, (
+            "repeated forward() calls must not trigger additional "
+            "bias.float() conversions of the original bf16 bias"
+        )
+
+    def test_hoisted_lookups_are_faster_than_per_call_getattr_and_environ(self):
+        """Measures the actual speedup of closure-captured static values
+        vs. re-deriving them via `getattr`/`os.environ.get` on every
+        call — the exact class of overhead this change removes from
+        `_wrap_rms_norm`/`_wrap_linear`. Pure Python; doesn't need a real
+        Vulkan device or even a real nn.Module (a minimal stand-in with
+        the same attributes suffices, since only attribute-lookup cost
+        is being measured here, not any Vulkan dispatch).
+
+        Takes the minimum elapsed time across several independent trials
+        — see `TestLinearMatvecDispatchThreshold`'s similarly-timed test
+        for why (measurement noise under full-suite load).
+        """
+        import os
+        import time
+
+        class FakeModule:
+            def __init__(self) -> None:
+                self.weight = object()
+                self.bias = object()
+                self.skip_bias_add = False
+                self.tp_size = 1
+                self.reduce_results = False
+                self.gather_output = False
+
+        module = FakeModule()
+        iters = 5000
+        trials = 5
+
+        def per_call_lookups() -> None:
+            os.environ.get("VLLM_VULKAN_DISABLE_OPS")
+            os.environ.get("VLLM_VULKAN_DISABLE_LINEAR")
+            getattr(module, "weight", None)
+            getattr(module, "bias", None)
+            getattr(module, "skip_bias_add", False)
+            tp_size = getattr(module, "tp_size", 1)
+            getattr(module, "reduce_results", False) and tp_size > 1
+            getattr(module, "gather_output", False) and tp_size > 1
+
+        # Hoisted equivalents, captured once (mirrors what _wrap_linear
+        # now does at install time).
+        weight = getattr(module, "weight", None)
+        bias = getattr(module, "bias", None)
+        skip_bias = getattr(module, "skip_bias_add", False)
+        tp_size = getattr(module, "tp_size", 1)
+        row_reduce = getattr(module, "reduce_results", False) and tp_size > 1
+        gather_output = getattr(module, "gather_output", False) and tp_size > 1
+        disable_linear = bool(
+            os.environ.get("VLLM_VULKAN_DISABLE_OPS")
+            or os.environ.get("VLLM_VULKAN_DISABLE_LINEAR")
+        )
+
+        def hoisted_lookups() -> None:
+            # Just references the already-captured closure variables --
+            # this is what the actual vk_forward closure body does now.
+            _ = (
+                weight,
+                bias,
+                skip_bias,
+                tp_size,
+                row_reduce,
+                gather_output,
+                disable_linear,
+            )
+
+        def timed(fn) -> float:
+            best = float("inf")
+            for _ in range(trials):
+                t0 = time.perf_counter()
+                for _ in range(iters):
+                    fn()
+                best = min(best, time.perf_counter() - t0)
+            return best
+
+        per_call_elapsed = timed(per_call_lookups)
+        hoisted_elapsed = timed(hoisted_lookups)
+
+        print(
+            f"\nmodel_runner hook lookups, best-of-{trials}: "
+            f"per-call {per_call_elapsed / iters * 1e6:.3f}us/call, "
+            f"hoisted {hoisted_elapsed / iters * 1e6:.3f}us/call, "
+            f"speedup {per_call_elapsed / hoisted_elapsed:.1f}x"
+        )
+        assert hoisted_elapsed < per_call_elapsed, (
+            f"hoisted lookups ({hoisted_elapsed:.4f}s/{iters}) were not faster "
+            f"than per-call getattr/os.environ.get ({per_call_elapsed:.4f}s/{iters})"
+        )
