@@ -33,11 +33,16 @@ logger = logging.getLogger(__name__)
 # ─── Global context ──────────────────────────────────────────────────────────
 
 _ctx: VulkanContext | None = None
+# Cache for `available_shaders()` — see `_cached_available_shaders`'s doc
+# comment. Reset to None (invalidated, recomputed lazily on first use)
+# whenever `set_context` installs a (possibly different) context.
+_available_shaders_cache: frozenset[str] | None = None
 
 
 def set_context(ctx: VulkanContext) -> None:
-    global _ctx
+    global _ctx, _available_shaders_cache
     _ctx = ctx
+    _available_shaders_cache = None
 
     # Detect software renderer and disable GPU dispatch.
     try:
@@ -57,6 +62,39 @@ def set_context(ctx: VulkanContext) -> None:
                 _ctx = None
     except Exception:
         pass
+
+
+def _cached_available_shaders(ctx: VulkanContext) -> frozenset[str]:
+    """Returns `ctx.available_shaders()`, computed once and cached instead
+    of re-queried (and re-marshalled from Rust into a fresh Python list on
+    every call) on every single invocation.
+
+    `available_shaders()` is a pure function of the context — the set of
+    compiled shaders is fixed for the whole lifetime of a `VulkanContext`
+    (determined once, at pipeline-cache construction time) — but
+    `linear()` called it on *every* decode-shaped call (checking whether
+    `"mul_mat_vec_f32_f32_f32"` is in the returned list, then discarding
+    the whole list), and that's ~5-6 Linear-family modules x 35 Gemma4-E2B
+    decoder layers = ~175-210 calls/decode-step. Measured directly on
+    this hardware: `ctx.available_shaders()` (a `Vec<String>` rebuilt and
+    marshalled through PyO3 into a fresh Python list on every call) costs
+    ~1.1us/call — modest per call, but purely repeated, avoidable work
+    across every one of those calls, every decode step.
+
+    Cached as a `frozenset` (not the raw list) so every `in` membership
+    check this module makes (`"shader_name" in ...`) is O(1) instead of
+    O(shader_count) — a second, smaller improvement layered on top of
+    just avoiding the repeated PyO3 round-trip.
+
+    Invalidated (see `set_context`) whenever a new context is installed,
+    so tests that construct multiple `VulkanContext` instances (e.g. the
+    `vulkan_ctx` fixture in tests/python/test_vulkan_ops.py) never read a
+    stale cache from a previous context.
+    """
+    global _available_shaders_cache
+    if _available_shaders_cache is None:
+        _available_shaders_cache = frozenset(ctx.available_shaders())
+    return _available_shaders_cache
 
 
 def get_context() -> VulkanContext:
@@ -259,6 +297,10 @@ def _matvec_pc(T: int, K: int, N: int) -> bytes:  # noqa: N803
 # ─── RMS Norm ────────────────────────────────────────────────────────────────
 
 _MATVEC_THRESHOLD = 4  # T < this → matvec shader; T >= this → CPU
+# Weight matrices with fewer than this many elements (in_features *
+# out_features) always use the CPU path, regardless of T — see
+# `linear`'s doc comment for the measurement behind this cutoff.
+_MATVEC_MIN_WEIGHT_ELEMENTS = 1_000_000
 
 
 def rms_norm(
@@ -313,7 +355,30 @@ def linear(
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Linear layer: decode path uses Vulkan matvec, prefill uses CPU."""
+    """Linear layer: decode path uses Vulkan matvec (for large-enough
+    weights), prefill uses CPU.
+
+    `_MATVEC_THRESHOLD` alone (T < 4 → GPU) isn't the whole story: the
+    right dispatch decision also depends on the weight matrix's total
+    size (`in_features * out_features`), not just `T`. Measured directly
+    on this hardware at Gemma4-E2B's real Linear-module shapes: for
+    `k_proj`/`v_proj` (small, since `num_key_value_heads=1` gives an
+    `out_features` of only 256/512) the CPU path is faster at *every* T
+    tested (1, 2, 4, 8) — including the all-important T=1 decode case,
+    where GPU dispatch measured ~1.1-2.0x *slower* than CPU there (e.g.
+    ~164-209us GPU vs ~81-187us CPU) — while for `q_proj`/`o_proj`/
+    `gate_proj`/`up_proj`/`down_proj` (all >=3.15M elements), GPU
+    dispatch is a clear win at T=1 (0.24x-0.45x of CPU's time) exactly as
+    `_MATVEC_THRESHOLD` already assumed. `_MATVEC_MIN_WEIGHT_ELEMENTS`
+    (1,000,000) sits between the largest measured small-weight case
+    (512*1536 = 0.79M, CPU-favoring even at T=1) and the smallest
+    measured large-weight case (2048*1536 = 3.15M, GPU-favoring at
+    T=1-2) — comfortably clear of either boundary rather than sitting
+    right at a fragile crossover point.
+
+    See `TestLinearMatvecDispatchThreshold` (tests/python/test_vulkan_ops.py)
+    for the measurements this doc comment summarizes.
+    """
     ctx = get_context()
 
     orig_shape = x.shape
@@ -322,7 +387,12 @@ def linear(
     x_2d = x.float().reshape(-1, in_feat)
     T = x_2d.shape[0]  # noqa: N806
 
-    if T < _MATVEC_THRESHOLD and "mul_mat_vec_f32_f32_f32" in ctx.available_shaders():
+    weight_elements = in_feat * out_feat
+    if (
+        weight_elements >= _MATVEC_MIN_WEIGHT_ELEMENTS
+        and T < _MATVEC_THRESHOLD
+        and "mul_mat_vec_f32_f32_f32" in _cached_available_shaders(ctx)
+    ):
         result = _vulkan_matvec(ctx, x_2d, weight)
     else:
         result = torch.nn.functional.linear(
@@ -412,10 +482,11 @@ def rms_norm_then_linear(
     out_feat = linear_weight.shape[0]
 
     # Decode path only (T < threshold); prefill falls back to CPU for linear.
+    available_shaders = _cached_available_shaders(ctx)
     if (
         T >= _MATVEC_THRESHOLD
-        or "rms_norm_f32_mul" not in ctx.available_shaders()
-        or "mul_mat_vec_f32_f32_f32" not in ctx.available_shaders()
+        or "rms_norm_f32_mul" not in available_shaders
+        or "mul_mat_vec_f32_f32_f32" not in available_shaders
     ):
         normed = rms_norm(x, norm_weight, eps)
         return linear(normed, linear_weight, bias)

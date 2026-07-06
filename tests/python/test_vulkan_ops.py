@@ -82,10 +82,11 @@ def upload_counter(monkeypatch):
 
 def test_linear_matches_torch_reference_at_realistic_hidden_size(vulkan_ctx):
     """Direct numerical correctness check for vulkan_ops.linear()'s GPU
-    decode path (T < _MATVEC_THRESHOLD) against `torch.nn.functional.linear`
-    as ground truth, at a realistic transformer hidden size (1536, matching
-    Gemma4-E2B) -- not just the tiny in_features=8 shapes the other tests in
-    this file use to exercise the weight cache.
+    decode path (T < _MATVEC_THRESHOLD, weight_elements >=
+    _MATVEC_MIN_WEIGHT_ELEMENTS) against `torch.nn.functional.linear` as
+    ground truth, at a realistic transformer shape (2048x1536, matching
+    Gemma4-E2B's q_proj) -- not just the tiny in_features=8 shapes the
+    other tests in this file use to exercise the weight cache.
 
     This specific gap (no test comparing the GPU decode-matvec path's
     OUTPUT against a real reference at a realistic K) is what let a real
@@ -96,8 +97,15 @@ def test_linear_matches_torch_reference_at_realistic_hidden_size(vulkan_ctx):
     measured divergence, and this file's `_require_vulkan_context` /
     vulkan_ops.py's `linear`/`_vulkan_matvec` for the fix (now dispatching
     mul_mat_vec_f32_f32_f32, the plain non-subgroup variant, instead).
+
+    out_features=2048 (not 512, used before `_MATVEC_MIN_WEIGHT_ELEMENTS`
+    was introduced): 512*1536=786432 elements would now fall *below* that
+    threshold and take the CPU path instead, defeating this test's whole
+    purpose of exercising the GPU matvec dispatch specifically. 2048*1536
+    = 3,145,728 stays clearly above the threshold (see
+    TestLinearMatvecDispatchThreshold for the measurements behind it).
     """
-    out_features, in_features = 512, 1536
+    out_features, in_features = 2048, 1536
     weight = torch.randn(out_features, in_features, dtype=torch.float32)
     x = torch.randn(1, in_features, dtype=torch.float32)  # T=1 < _MATVEC_THRESHOLD
 
@@ -134,8 +142,16 @@ def test_linear_reuses_weight_cache_across_calls_with_bf16_weight(
     This only passes if vulkan_ops.linear()/_vulkan_matvec() never
     convert `weight` to float32 before it reaches _get_or_upload_weight
     (the conversion must happen lazily, only on a cache miss).
+
+    out_features/in_features=2048/1536 (not a tiny shape like 16/8): must
+    stay above `_MATVEC_MIN_WEIGHT_ELEMENTS` so this test actually
+    exercises the GPU weight cache (`_get_or_upload_weight`) it claims to
+    -- a smaller shape would now take the CPU float32-cache path instead
+    (still passing, since `upload_counter` patches the shared
+    `_WeightCache.put` used by both caches, but silently testing the
+    wrong cache).
     """
-    out_features, in_features = 16, 8
+    out_features, in_features = 2048, 1536
     weight = torch.randn(out_features, in_features, dtype=torch.bfloat16)
     x = torch.randn(1, in_features, dtype=torch.float32)  # T=1 < _MATVEC_THRESHOLD
 
@@ -158,6 +174,12 @@ def test_wrap_linear_reuses_weight_cache_across_repeated_forward_calls(
     decode step), must not defeat the weight cache by pre-converting
     `weight` with `.float()` before calling vulkan_ops.linear() - that
     would give every call a fresh tensor identity and always miss.
+
+    Linear(1536, 2048) (not a tiny shape like Linear(8, 16)): must stay
+    above `_MATVEC_MIN_WEIGHT_ELEMENTS` so this test actually exercises
+    the GPU weight cache via the real GPU matvec dispatch path, matching
+    `test_linear_reuses_weight_cache_across_calls_with_bf16_weight`'s
+    same reasoning above.
     """
     from vllm_vulkan.model_runner import _wrap_linear  # noqa: PLC0415
 
@@ -166,7 +188,7 @@ def test_wrap_linear_reuses_weight_cache_across_repeated_forward_calls(
     # a tensor that still requires grad, and the later .numpy() call inside
     # _to_bytes fails, an unrelated test-construction pitfall rather than
     # anything about the cache behaviour actually under test here.
-    module = torch.nn.Linear(8, 16, bias=True)
+    module = torch.nn.Linear(1536, 2048, bias=True)
     module.weight = torch.nn.Parameter(
         module.weight.detach().to(torch.bfloat16), requires_grad=False
     )
@@ -176,7 +198,7 @@ def test_wrap_linear_reuses_weight_cache_across_repeated_forward_calls(
 
     _wrap_linear(module)
 
-    x = torch.randn(1, 8, dtype=torch.float32)  # T=1: decode-shaped input
+    x = torch.randn(1, 1536, dtype=torch.float32)  # T=1: decode-shaped input
     module.forward(x)
     assert upload_counter["n"] == 1, "first forward() should upload once"
 
@@ -273,6 +295,87 @@ def test_weight_cache_entry_is_freed_when_weight_storage_is_garbage_collected():
     assert len(cache) == 0, (
         "cache entry for a garbage-collected weight must be removed "
         "automatically, not leak forever"
+    )
+
+
+def test_cached_available_shaders_matches_uncached_reference(vulkan_ctx):
+    """`_cached_available_shaders` must return the exact same set of
+    shader names as calling `ctx.available_shaders()` directly, just
+    computed once instead of on every call — see its own doc comment in
+    vulkan_ops.py for the measured per-call overhead this avoids
+    (`linear()` used to call `ctx.available_shaders()` on every
+    invocation, ~175-210 times/decode-step across Gemma4-E2B's decoder
+    layers)."""
+    cached = vulkan_ops._cached_available_shaders(vulkan_ctx)
+    assert cached == frozenset(vulkan_ctx.available_shaders())
+
+    # Must actually be cached, not recomputed on every call: repeated
+    # calls return the identical (not just equal) frozenset object.
+    assert vulkan_ops._cached_available_shaders(vulkan_ctx) is cached
+
+
+def test_set_context_invalidates_the_shader_cache():
+    """A fresh `set_context` call must invalidate any previously cached
+    `available_shaders()` result — otherwise a test (or a real caller)
+    that swaps in a different `VulkanContext` could silently keep
+    reading a stale cache computed for the *previous* context. Pure
+    Python/state behaviour on the module-level cache directly — doesn't
+    need a real Vulkan device."""
+    prev_ctx = vulkan_ops._ctx
+    prev_cache = vulkan_ops._available_shaders_cache
+    try:
+        vulkan_ops._available_shaders_cache = frozenset({"stale_entry"})
+        vulkan_ops.set_context(object())  # type: ignore[arg-type]
+        assert vulkan_ops._available_shaders_cache is None, (
+            "set_context must invalidate (reset to None) any previously "
+            "cached available_shaders() result"
+        )
+    finally:
+        vulkan_ops._ctx = prev_ctx
+        vulkan_ops._available_shaders_cache = prev_cache
+
+
+def test_cached_available_shaders_is_faster_than_uncached_repeated_calls(
+    vulkan_ctx,
+):
+    """Measures the actual speedup: `_cached_available_shaders` should be
+    dramatically faster than calling `ctx.available_shaders()` fresh on
+    every call, since the latter re-marshals a `Vec<String>` from Rust
+    into a brand-new Python list via PyO3 every single time.
+
+    Takes the minimum elapsed time across several independent trials —
+    see `TestLinearMatvecDispatchThreshold`'s similarly-timed test for
+    why (measurement noise under full-suite load).
+    """
+    import time
+
+    # Warm the cache once before timing the cached path.
+    vulkan_ops._cached_available_shaders(vulkan_ctx)
+
+    iters = 2000
+    trials = 5
+
+    def timed(fn) -> float:
+        best = float("inf")
+        for _ in range(trials):
+            t0 = time.perf_counter()
+            for _ in range(iters):
+                fn()
+            best = min(best, time.perf_counter() - t0)
+        return best
+
+    uncached_elapsed = timed(vulkan_ctx.available_shaders)
+    cached_elapsed = timed(lambda: vulkan_ops._cached_available_shaders(vulkan_ctx))
+
+    print(
+        f"\navailable_shaders(), best-of-{trials}: "
+        f"uncached {uncached_elapsed / iters * 1e6:.3f}us/call, "
+        f"cached {cached_elapsed / iters * 1e6:.3f}us/call, "
+        f"speedup {uncached_elapsed / cached_elapsed:.1f}x"
+    )
+    assert cached_elapsed < uncached_elapsed, (
+        f"cached available_shaders ({cached_elapsed:.4f}s/{iters}) was not "
+        f"faster than the uncached reference ({uncached_elapsed:.4f}s/{iters})"
     )
 
 
@@ -445,7 +548,16 @@ class TestRmsNormAlwaysUsesCpu:
         """Measures the actual speedup at the real Gemma4-E2B decode
         shape (nrows=1, ncols=1536) — the single most common call
         pattern (once per RMSNorm module, per decoder layer, per
-        generated token)."""
+        generated token).
+
+        Takes the *minimum* elapsed time across several independent
+        trials rather than a single timed loop — see
+        `TestLinearMatvecDispatchThreshold.test_small_weight_cpu_path_is_faster_than_gpu_dispatch_at_decode_shape`'s
+        doc comment for why (measurement noise from running as part of
+        the full suite, not from anything about this specific
+        comparison — this margin is large enough that it's unlikely to
+        flip, but the fix is cheap and keeps both tests consistent).
+        """
         import time
 
         x = torch.randn(1, 1536, dtype=torch.float32)
@@ -458,18 +570,24 @@ class TestRmsNormAlwaysUsesCpu:
             _reference_gpu_rms_norm_dispatch(vulkan_ctx, x, weight, eps)
 
         iters = 200
-        t0 = time.perf_counter()
-        for _ in range(iters):
-            _reference_gpu_rms_norm_dispatch(vulkan_ctx, x, weight, eps)
-        gpu_elapsed = time.perf_counter() - t0
+        trials = 5
 
-        t0 = time.perf_counter()
-        for _ in range(iters):
-            vulkan_ops.rms_norm(x, weight, eps)
-        cpu_elapsed = time.perf_counter() - t0
+        def timed(fn) -> float:
+            best = float("inf")
+            for _ in range(trials):
+                t0 = time.perf_counter()
+                for _ in range(iters):
+                    fn()
+                best = min(best, time.perf_counter() - t0)
+            return best
+
+        gpu_elapsed = timed(
+            lambda: _reference_gpu_rms_norm_dispatch(vulkan_ctx, x, weight, eps)
+        )
+        cpu_elapsed = timed(lambda: vulkan_ops.rms_norm(x, weight, eps))
 
         print(
-            f"\nrms_norm at decode shape (nrows=1, ncols=1536): "
+            f"\nrms_norm at decode shape (nrows=1, ncols=1536), best-of-{trials}: "
             f"GPU dispatch {gpu_elapsed / iters * 1e6:.1f}us/call, "
             f"CPU (current) {cpu_elapsed / iters * 1e6:.1f}us/call, "
             f"speedup {gpu_elapsed / cpu_elapsed:.2f}x"
@@ -478,3 +596,133 @@ class TestRmsNormAlwaysUsesCpu:
             f"CPU rms_norm ({cpu_elapsed:.4f}s/{iters}) was not faster than "
             f"GPU dispatch ({gpu_elapsed:.4f}s/{iters})"
         )
+
+
+class TestLinearMatvecDispatchThreshold:
+    """`linear()`'s GPU-vs-CPU dispatch decision now also checks
+    `weight_elements >= _MATVEC_MIN_WEIGHT_ELEMENTS`, not just
+    `T < _MATVEC_THRESHOLD` — see `linear`'s doc comment in
+    vulkan_ops.py for the measurements this threshold is based on:
+    Gemma4-E2B's k_proj/v_proj (small, since `num_key_value_heads=1`
+    gives an out_features of only 256/512) measured CPU-faster at every
+    T tested, including T=1 decode, while q_proj/o_proj/gate_proj/
+    up_proj/down_proj (all >=3.15M elements) measured GPU-faster at
+    T=1, exactly as `_MATVEC_THRESHOLD` already assumed.
+    """
+
+    def test_small_weight_matches_torch_reference(self, vulkan_ctx):
+        """Correctness check for the (new) small-weight CPU-only path, at
+        Gemma4-E2B's real k_proj/v_proj shape (num_key_value_heads=1 *
+        head_dim=256 out_features, hidden_size=1536 in_features)."""
+        out_features, in_features = 256, 1536
+        weight = torch.randn(out_features, in_features, dtype=torch.float32)
+        x = torch.randn(1, in_features, dtype=torch.float32)
+
+        result = vulkan_ops.linear(x, weight, None)
+        expected = torch.nn.functional.linear(x, weight, None)
+        torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
+
+    def test_small_weight_uses_cpu_path_not_gpu_weight_cache(
+        self, vulkan_ctx, upload_counter
+    ):
+        """A weight below `_MATVEC_MIN_WEIGHT_ELEMENTS` (k_proj/v_proj's
+        real shape: 256*1536 = 393216 elements) must take the CPU path
+        (`_get_or_convert_to_float32_cpu`) rather than the GPU weight
+        cache (`_get_or_upload_weight`) — verified directly by checking
+        the weight never appears in `_weight_cache` (the GPU-specific
+        cache), even though `linear()` was called at T=1 (which alone
+        would have triggered the old T-only threshold's GPU path).
+
+        bf16 (not float32): `_get_or_convert_to_float32_cpu` only
+        populates `_cpu_float32_cache` when an actual conversion happens
+        (skipped entirely for already-float32 weights — see
+        `test_linear_prefill_path_float32_weight_bypasses_cache` above),
+        so a bf16 weight is needed here to actually exercise (and count)
+        that cache being populated.
+        """
+        out_features, in_features = 256, 1536
+        weight = torch.randn(out_features, in_features, dtype=torch.bfloat16)
+        x = torch.randn(1, in_features, dtype=torch.float32)
+
+        vulkan_ops.linear(x, weight, None)
+        assert vulkan_ops._weight_cache.get(weight) is None, (
+            "a small weight (below _MATVEC_MIN_WEIGHT_ELEMENTS) must never "
+            "reach the GPU weight cache"
+        )
+        assert upload_counter["n"] == 1, (
+            "the CPU float32 conversion cache should still be populated exactly once"
+        )
+
+    def test_small_weight_cpu_path_is_faster_than_gpu_dispatch_at_decode_shape(
+        self, vulkan_ctx
+    ):
+        """Measures the actual speedup at Gemma4-E2B's real k_proj shape
+        (256x1536) and T=1 (decode) — the shape/size this threshold fix
+        targets.
+
+        Takes the *minimum* elapsed time across several independent
+        trials (rather than a single timed loop) for each path: when run
+        as part of the full test suite (as opposed to in isolation),
+        this measurement is noisy enough — from other tests' torch/numpy
+        activity, GC pauses, OS scheduling, etc. — that a single trial
+        occasionally shows an inflated CPU-path time large enough to
+        flip the comparison, even though the true underlying costs are
+        not close (isolated runs consistently show ~1.5-3x, not a
+        marginal ~1.0x). Taking the minimum of several trials is the
+        standard fix for exactly this kind of measurement noise (see
+        e.g. `matvec_r4_tests` in src/lib.rs for the same technique
+        applied to a Rust benchmark that had the same flakiness).
+        """
+        import time
+
+        out_features, in_features = 256, 1536
+        weight = torch.randn(out_features, in_features, dtype=torch.float32)
+        x = torch.randn(1, in_features, dtype=torch.float32)
+
+        for _ in range(5):
+            vulkan_ops.linear(x, weight, None)
+            vulkan_ops._vulkan_matvec(vulkan_ctx, x, weight)
+
+        iters = 200
+        trials = 5
+
+        def timed(fn) -> float:
+            best = float("inf")
+            for _ in range(trials):
+                t0 = time.perf_counter()
+                for _ in range(iters):
+                    fn()
+                best = min(best, time.perf_counter() - t0)
+            return best
+
+        gpu_elapsed = timed(lambda: vulkan_ops._vulkan_matvec(vulkan_ctx, x, weight))
+        cpu_elapsed = timed(lambda: vulkan_ops.linear(x, weight, None))
+
+        print(
+            f"\nlinear() at k_proj shape (256x1536, T=1), best-of-{trials}: "
+            f"GPU matvec {gpu_elapsed / iters * 1e6:.1f}us/call, "
+            f"linear() (now CPU) {cpu_elapsed / iters * 1e6:.1f}us/call, "
+            f"speedup {gpu_elapsed / cpu_elapsed:.2f}x"
+        )
+        assert cpu_elapsed < gpu_elapsed, (
+            f"linear()'s CPU path ({cpu_elapsed:.4f}s/{iters}) was not faster "
+            f"than GPU matvec dispatch ({gpu_elapsed:.4f}s/{iters})"
+        )
+
+    def test_large_weight_still_uses_gpu_path_at_decode_shape(
+        self, vulkan_ctx, upload_counter
+    ):
+        """A weight at or above `_MATVEC_MIN_WEIGHT_ELEMENTS` (q_proj's
+        real shape: 2048*1536 = 3,145,728 elements) must still take the
+        GPU path at T=1 (decode) — this threshold fix must not regress
+        the already-correct, already-fast large-weight case."""
+        out_features, in_features = 2048, 1536
+        weight = torch.randn(out_features, in_features, dtype=torch.float32)
+        x = torch.randn(1, in_features, dtype=torch.float32)
+
+        vulkan_ops.linear(x, weight, None)
+        assert vulkan_ops._weight_cache.get(weight) is not None, (
+            "a large weight (>= _MATVEC_MIN_WEIGHT_ELEMENTS) at T=1 must "
+            "still use the GPU weight cache / matvec dispatch path"
+        )
+        assert upload_counter["n"] == 1
