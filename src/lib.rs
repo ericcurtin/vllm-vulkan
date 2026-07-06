@@ -679,61 +679,49 @@ fn include_all_shaders() -> std::collections::HashMap<String, Vec<u8>> {
         };
     }
 
-    // ── Elementwise unary (f32 only — new llama.cpp has no f16 variants) ─
-    spv!("silu_f32");
+    // ── Elementwise unary ────────────────────────────────────────────────
+    // Only gelu_f32/tanh_f32 are actually dispatched anywhere in this
+    // codebase (Rust or Python) — see gelu_tests/softcap_tests. The
+    // remaining unary variants that used to be registered here
+    // (silu_f32, gelu_quick_f32, relu_f32, exp_f32, sigmoid_f32, abs_f32,
+    // neg_f32, ceil_f32, gelu_inplace_f32) were never dispatched anywhere
+    // — confirmed via `grep -rn '"<name>"' src/ vllm_vulkan/ tests/`
+    // finding matches only in scripts/compile_shaders.sh (which compiles
+    // the .comp source into a .spv file regardless of whether Rust ever
+    // loads it) or doc-comment examples, never a real `record_to`/
+    // `execute_*` call site. See the doc comment on
+    // `pipeline_cache_startup_tests` for the measured model-load-time
+    // impact of removing this and the other dead registrations below.
     spv!("gelu_f32");
-    spv!("gelu_quick_f32");
-    spv!("relu_f32");
     spv!("tanh_f32");
-    spv!("exp_f32");
-    spv!("sigmoid_f32");
-    spv!("abs_f32");
-    spv!("neg_f32");
-    spv!("ceil_f32");
 
-    // ── Normalization ───────────────────────────────────────────────────
-    // rms_norm: fused with optional RoPE (ADD_RMS=0 means plain rms_norm)
-    spv!("rms_norm_mul_rope_f32_f32");
-    spv!("rms_norm_mul_rope_f32_f16");
-
-    // ── Softmax ─────────────────────────────────────────────────────────
-    spv!("soft_max_f32_f16");
-    spv!("soft_max_large1_f32_f16");
-    spv!("soft_max_large2_f32_f16");
-    spv!("soft_max_large3_f32_f16");
+    // ── Normalization / softmax / RoPE ───────────────────────────────────
+    // RoPE and attention (including softmax) run on the CPU in this
+    // codebase (model::cpu_rope / model::cpu_sdpa), not via GPU shaders,
+    // so rms_norm_mul_rope_*, soft_max_*, and rope_* were all dead
+    // registrations — same confirmation method as above.
 
     // ── Binary elementwise ──────────────────────────────────────────────
-    // Plain f32×f32→f32 add, used to fuse residual adds into
-    // forward_layer_gpu_matmuls's post-attention GPU chain (see
-    // fused_post_attention) instead of round-tripping through the CPU.
+    // Only the f32×f32→f32 variants are dispatched (used to fuse
+    // residual adds/elementwise-muls into forward_layer_gpu_matmuls's
+    // post-attention GPU chain — see fused_post_attention). The f16-
+    // output variants (add_f32_f32_f16, add_f32_f16_f32, mul_f32_f32_f16,
+    // div_f32_f32_f16, sub_f32_f32_f16) and the ADD_RMS-fused variants
+    // (add_rms_f32_f32_f32/f16, compiled from multi_add.comp — separate
+    // from add.comp's own dead-code ADD_RMS branch, see mul.comp's/
+    // add.comp's doc comments) were all dead registrations.
     spv!("add_f32_f32_f32");
-    spv!("add_f32_f32_f16");
-    spv!("add_f32_f16_f32");
-    spv!("mul_f32_f32_f16");
-    spv!("div_f32_f32_f16");
-    spv!("sub_f32_f32_f16");
-    spv!("add_rms_f32_f32_f32");
-    spv!("add_rms_f32_f32_f16");
 
     // ── GLU activations ─────────────────────────────────────────────────
-    spv!("swiglu_f32");
-    spv!("geglu_f32");
-
-    // ── RoPE ────────────────────────────────────────────────────────────
-    spv!("rope_norm_f32_f16");
-    spv!("rope_norm_f16");
-    spv!("rope_neox_f32_f16");
-    spv!("rope_neox_f16");
-    spv!("rope_multi_f32_f16");
-    spv!("rope_multi_f16");
+    // swiglu_f32/geglu_f32 were dead: this model's FFN activation is
+    // done as two separate dispatches (gelu_f32 then mul_f32_f32_f32),
+    // not a single fused GLU shader — see forward_layer_gpu_matmuls.
 
     // ── Copy / reshape ──────────────────────────────────────────────────
-    spv!("get_rows_f32_f32");
-    spv!("get_rows_f16");
-    spv!("fill_f16");
-    spv!("concat_f16");
-    spv!("contig_cpy_f32_f16");
-    spv!("contig_cpy_f16_f32");
+    // get_rows_f32_f32/f16 (embedding gather), fill_f16, concat_f16, and
+    // contig_cpy_f32_f16/f16_f32 were all dead: embedding lookup is done
+    // via a direct CPU slice index (see forward_gpu's "Embedding"
+    // section), not a GPU gather shader.
 
     // ── Matmul (decode: matrix-vector) ──────────────────────────────────
     // f32/f16 weights → f32 output
@@ -778,13 +766,13 @@ fn include_all_shaders() -> std::collections::HashMap<String, Vec<u8>> {
     spv!("flash_attn_f32_f16_f16_f16acc");
 
     // ── Misc utils ──────────────────────────────────────────────────────
-    spv!("quantize_q8_1_x4");
+    // quantize_q8_1_x4 was dead: it's a companion to the (now-removed,
+    // see #53) quantized-weight matvec shaders, with no other use.
 
     // ── Manually compiled extras (needed for GPU inference) ──────────────
     // These were compiled directly with glslangValidator (not via vulkan-shaders-gen).
     spv!("rms_norm_f32");
     spv!("mul_f32_f32_f32");   // elementwise multiply f32×f32→f32
-    spv!("gelu_inplace_f32");  // GELU activation f32→f32
     // Note: rms_norm_f32_mul is created from rms_norm_f32 SPIR-V at pipeline creation
     // time by setting the do_multiply=true specialization constant (constant_id=1).
     // It is registered in the pipeline cache as "rms_norm_f32_mul" automatically.
@@ -3008,6 +2996,70 @@ mod pipeline_cache_startup_tests {
         assert!(res_f32_subgroup.is_ok(), "mul_mat_vec_f32_f32_f32_subgroup should still be compiled: {res_f32_subgroup:?}");
         let res_f16 = engine.record_to(cb, "mul_mat_vec_f16_f32_f32", &[&wbuf, &xbuf, &out], bytemuck::cast_slice(&pc), (n as u32, 1, 1));
         assert!(res_f16.is_ok(), "mul_mat_vec_f16_f32_f32 should still be compiled: {res_f16:?}");
+    }
+
+    #[test]
+    fn unreferenced_shader_families_are_no_longer_compiled() {
+        let _guard = gpu_test_guard();
+        let Some(mut engine) = make_engine() else { return };
+
+        // Trivial dummy buffers/push-constants — see
+        // r2_matvec_variant_is_no_longer_compiled above for why numerical
+        // correctness (and matching each shader's "real" binding count)
+        // is irrelevant to this test: record_to's first and only
+        // observable-here check is pipeline existence, before any actual
+        // GPU submission.
+        let dummy = engine.alloc_host_coherent_storage(1024).unwrap();
+        let pc = [0u8; 32];
+        let cb = engine.begin_batch().unwrap();
+
+        // All 37 shader names below used to be registered (compiled via
+        // `spv!()` in include_all_shaders) but were never actually
+        // dispatched anywhere in this codebase (Rust or Python) —
+        // confirmed via `grep -rn '"<name>"' src/ vllm_vulkan/ tests/`
+        // finding matches only in scripts/compile_shaders.sh (which
+        // compiles every .comp source into a .spv file regardless of
+        // whether Rust ever loads it) or doc-comment examples, never a
+        // real `record_to`/`execute_*` call site. Removing them dropped
+        // `PipelineCache::new()`'s (i.e. model-load) wall time from
+        // ~707ms to ~462-464ms, consistently reproducible across
+        // repeated runs — on top of #52/#53/#54's earlier matvec-focused
+        // cleanup (which took it from ~1865ms to ~707ms), a combined
+        // ~75% model-load startup-time reduction this session.
+        for name in [
+            "silu_f32", "gelu_quick_f32", "relu_f32", "exp_f32", "sigmoid_f32",
+            "abs_f32", "neg_f32", "ceil_f32", "gelu_inplace_f32",
+            "rms_norm_mul_rope_f32_f32", "rms_norm_mul_rope_f32_f16",
+            "soft_max_f32_f16", "soft_max_large1_f32_f16", "soft_max_large2_f32_f16", "soft_max_large3_f32_f16",
+            "add_f32_f32_f16", "add_f32_f16_f32", "mul_f32_f32_f16", "div_f32_f32_f16", "sub_f32_f32_f16",
+            "add_rms_f32_f32_f32", "add_rms_f32_f32_f16",
+            "swiglu_f32", "geglu_f32",
+            "rope_norm_f32_f16", "rope_norm_f16", "rope_neox_f32_f16", "rope_neox_f16",
+            "rope_multi_f32_f16", "rope_multi_f16",
+            "get_rows_f32_f32", "get_rows_f16", "fill_f16", "concat_f16",
+            "contig_cpy_f32_f16", "contig_cpy_f16_f32",
+            "quantize_q8_1_x4",
+        ] {
+            let res = engine.record_to(cb, name, &[&dummy], &pc, (1, 1, 1));
+            assert!(
+                res.is_err(),
+                "expected shader '{name}' to no longer be compiled (dead code, never \
+                 dispatched anywhere), but record_to succeeded: {res:?}"
+            );
+        }
+
+        // The shaders actually used in production must still work.
+        for name in [
+            "gelu_f32", "tanh_f32", "add_f32_f32_f32", "mul_f32_f32_f32",
+            "rms_norm_f32", "rms_norm_f32_mul",
+            "mul_mat_vec_f32_f32_f32", "mul_mat_vec_f16_f32_f32", "mul_mat_vec_f32_f32_f32_subgroup",
+            "paged_kv_write_f16", "paged_kv_write_f32",
+            "paged_attn_decode_f16", "paged_attn_decode_f16_coop",
+            "paged_attn_decode_f32", "paged_attn_decode_f32_coop",
+        ] {
+            let res = engine.record_to(cb, name, &[&dummy], &pc, (1, 1, 1));
+            assert!(res.is_ok(), "shader '{name}' should still be compiled: {res:?}");
+        }
     }
 }
 
