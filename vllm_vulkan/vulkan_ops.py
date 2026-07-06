@@ -313,9 +313,69 @@ def _matvec_pc(T: int, K: int, N: int) -> bytes:  # noqa: N803
     )
 
 
+@lru_cache(maxsize=256)
+def _matmul_pc(m: int, t: int, k: int) -> bytes:  # noqa: N803
+    """Pack push constants for the tiled-matmul shaders (`matmul_f32_f32`
+    et al, from shaders/mul_mm.comp) — 16 uint32 fields, exactly matching
+    that shader's own `push_constant` block (mul_mm.comp:74-101), NOT
+    llama.cpp upstream's newer 17-field struct (see the `padded_N` note
+    at this shader's registration site in src/lib.rs). Verified against
+    a direct CPU reference before use — see `tiled_matmul_dispatch_tests`
+    in src/lib.rs.
+
+    For a single, unbatched Linear call computing
+    `out[T, out_features] = x[T, in_features] @ weight[out_features,
+    in_features]^T`: `m`=out_features (weight's row count), `t`=T
+    (activation row count), `k`=in_features (shared dimension). Both
+    `weight` and `x` must be row-major-contiguous with row stride
+    exactly `k` — true for any freshly-`.contiguous()`'d/uploaded
+    tensor, which `_to_bytes`/`_get_or_upload_weight` already guarantee.
+
+    `@lru_cache`d for the same reason as `_matvec_pc` above: a pure
+    function of (m, t, k), and while T varies per prefill call (unlike
+    decode's always-T=1), the number of *distinct* (m, t, k) triples in
+    any real chunked-prefill workload is still small and bounded (a
+    handful of Linear-module shapes x a handful of chunk sizes), so this
+    still avoids repeating the same `struct.pack` work across identical
+    calls.
+    """
+    return struct.pack(
+        "16I",
+        m,
+        t,
+        k,  # M, N, K
+        k,
+        k,
+        m,  # stride_a, stride_b, stride_d
+        m * k,
+        k * t,
+        m * t,  # batch_stride_a, batch_stride_b, batch_stride_d
+        0,  # base_work_group_z
+        1,  # num_batches
+        k,  # k_split = K (skip the multi-pass K-split reduce path — see
+        # `compile_matmul`'s doc comment in src/pipeline.rs for why this
+        # is always safe for realistic transformer K)
+        1,
+        1,
+        1,
+        1,  # ne02, ne12, broadcast2, broadcast3
+    )
+
+
+def _matmul_workgroups(m: int, t: int) -> tuple[int, int, int]:
+    """Workgroup dispatch count for the tiled-matmul shaders:
+    `(ceil(M/BM), ceil(N/BN), num_batches)`, using the BM=BN=64 these
+    shaders are actually compiled with (`compile_matmul` in
+    src/pipeline.rs — NOT llama.cpp's own named "l"/"m"/"s" tiling
+    presets, a different, unused-here parameter set).
+    """
+    bm = bn = 64
+    return ((m + bm - 1) // bm, (t + bn - 1) // bn, 1)
+
+
 # ─── RMS Norm ────────────────────────────────────────────────────────────────
 
-_MATVEC_THRESHOLD = 4  # T < this → matvec shader; T >= this → CPU
+_MATVEC_THRESHOLD = 4  # T < this → matvec shader; T >= this → tiled matmul/CPU
 # Weight matrices with fewer than this many elements (in_features *
 # out_features) always use the CPU path, regardless of T — see
 # `linear`'s doc comment for the measurement behind this cutoff.
@@ -350,19 +410,43 @@ _MATVEC_MIN_WEIGHT_ELEMENTS = 1_000_000
 # scales as O(T x in_features x out_features) — the same order as CPU's
 # cost, with none of a real tiled matmul's weight-tile-reuse advantage,
 # so GPU just pays that cost at a *worse* effective rate than CPU's own
-# BLAS routines here.
+# BLAS routines here. `linear()` therefore never raises this threshold
+# for matvec — see `test_matvec_batching_does_not_help_at_prefill_scale_t`
+# (tests/python/test_vulkan_ops.py) for the regression guard.
 #
-# A real prefill speedup would need the tiled matmul shaders this
-# backend already compiles but has never dispatched anywhere
-# (`matmul_f32_f16`/`matmul_f32_f16_aligned`/`matmul_f32_f32_fp32`/
-# `matmul_f16_f32_fp32`, from shaders/mul_mm.comp — a llama.cpp-derived
-# kernel with its own BM/BN/WM/WN/WMITER/TM/TN/TK/WARP specialization-
-# constant tiling scheme, substantial push-constant surface, and no
-# prior working example anywhere in this codebase's history to build
-# from) - a real, valuable, but substantially larger undertaking than
-# this threshold, deferred rather than attempted piecemeal. See
-# `test_matvec_batching_does_not_help_at_prefill_scale_t` (tests/python/
-# test_vulkan_ops.py) for the regression guard backing the numbers above.
+# The REAL prefill speedup this analysis pointed to — the tiled matmul
+# shaders (`matmul_f32_f16`/`matmul_f32_f16_aligned`/`matmul_f32_f32`/
+# `matmul_f32_f32_fp32`/`matmul_f16_f32_fp32`, from shaders/mul_mm.comp)
+# — is now wired up (`_vulkan_matmul` below), after two real Vulkan
+# pipeline-compilation bugs blocking it were found and fixed (see
+# `pipeline::PipelineCache::compile_matmul`'s doc comment in
+# src/pipeline.rs: an infinite-GPU-loop hang, then a silent half-tile-
+# of-zeros correctness bug — both invisible until this shader was
+# actually dispatched and checked against a direct CPU reference, not
+# just read). Unlike matvec, the tiled matmul shader genuinely reuses
+# weight tiles across the T dimension the way a real GEMM should, so it
+# *wins* at prefill scale, and the margin widens with T instead of
+# narrowing — measured directly at the same q_proj shape as the table
+# above (`matmul_f32_f32`, best-of-N trials):
+#
+#   T      CPU (torch.nn.functional.linear)   GPU (matmul_f32_f32)
+#   4        790.6us  (197.65us/token)           475.4us  (118.85us/token)
+#  16       1137.5us   (71.09us/token)           466.7us   (29.17us/token)
+#  64       3499.6us   (54.68us/token)          1090.8us   (17.04us/token)
+# 128       6540.5us   (51.10us/token)          1396.6us   (10.91us/token)
+# 512      24631.8us   (48.11us/token)          2088.9us    (4.08us/token)
+#
+# GPU is faster at every T tested (1.66x-11.79x here; 1.4x-17.3x across
+# all 3 real large-weight Linear shapes measured — see
+# `tiled_matmul_beats_cpu_at_prefill_scale_for_large_weights` in
+# src/lib.rs). For the *small*-weight case (k_proj/v_proj,
+# `< _MATVEC_MIN_WEIGHT_ELEMENTS`, same gate `_vulkan_matmul` uses), GPU
+# only pulls ahead once T is much larger than typical (measured
+# crossover between T=64 and T=128 — see
+# `tiled_matmul_small_weight_crossover_point`), so `linear()`
+# deliberately keeps that shape on the CPU-only path at every T, exactly
+# mirroring the decode matvec threshold's existing size gate rather than
+# adding a second, narrower one.
 
 
 def rms_norm(
@@ -417,16 +501,17 @@ def linear(
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Linear layer: decode path uses Vulkan matvec (for large-enough
-    weights), prefill uses CPU.
+    """Linear layer: decode uses Vulkan matvec, prefill uses Vulkan tiled
+    matmul — both only for large-enough weights; small weights always use
+    CPU.
 
-    `_MATVEC_THRESHOLD` alone (T < 4 → GPU) isn't the whole story: the
-    right dispatch decision also depends on the weight matrix's total
-    size (`in_features * out_features`), not just `T`. Measured directly
-    on this hardware at Gemma4-E2B's real Linear-module shapes: for
-    `k_proj`/`v_proj` (small, since `num_key_value_heads=1` gives an
-    `out_features` of only 256/512) the CPU path is faster at *every* T
-    tested (1, 2, 4, 8) — including the all-important T=1 decode case,
+    `_MATVEC_THRESHOLD` alone (T < 4 → decode GPU path) isn't the whole
+    story: the right dispatch decision also depends on the weight
+    matrix's total size (`in_features * out_features`), not just `T`.
+    Measured directly on this hardware at Gemma4-E2B's real Linear-module
+    shapes: for `k_proj`/`v_proj` (small, since `num_key_value_heads=1`
+    gives an `out_features` of only 256/512) the CPU path is faster at
+    *every* T tested — including the all-important T=1 decode case,
     where GPU dispatch measured ~1.1-2.0x *slower* than CPU there (e.g.
     ~164-209us GPU vs ~81-187us CPU) — while for `q_proj`/`o_proj`/
     `gate_proj`/`up_proj`/`down_proj` (all >=3.15M elements), GPU
@@ -436,7 +521,11 @@ def linear(
     (512*1536 = 0.79M, CPU-favoring even at T=1) and the smallest
     measured large-weight case (2048*1536 = 3.15M, GPU-favoring at
     T=1-2) — comfortably clear of either boundary rather than sitting
-    right at a fragile crossover point.
+    right at a fragile crossover point. The same size gate is reused for
+    the T>=_MATVEC_THRESHOLD (prefill) tiled-matmul path below — see
+    `_MATVEC_THRESHOLD`'s doc comment for the prefill-scale measurements
+    justifying that reuse rather than a second, separately-tuned
+    threshold.
 
     See `TestLinearMatvecDispatchThreshold` (tests/python/test_vulkan_ops.py)
     for the measurements this doc comment summarizes.
@@ -450,12 +539,19 @@ def linear(
     T = x_2d.shape[0]  # noqa: N806
 
     weight_elements = in_feat * out_feat
+    available_shaders = _cached_available_shaders(ctx)
     if (
         weight_elements >= _MATVEC_MIN_WEIGHT_ELEMENTS
         and T < _MATVEC_THRESHOLD
-        and "mul_mat_vec_f32_f32_f32" in _cached_available_shaders(ctx)
+        and "mul_mat_vec_f32_f32_f32" in available_shaders
     ):
         result = _vulkan_matvec(ctx, x_2d, weight)
+    elif (
+        weight_elements >= _MATVEC_MIN_WEIGHT_ELEMENTS
+        and T >= _MATVEC_THRESHOLD
+        and "matmul_f32_f32" in available_shaders
+    ):
+        result = _vulkan_matmul(ctx, x_2d, weight)
     else:
         result = torch.nn.functional.linear(
             x_2d, _get_or_convert_to_float32_cpu(weight)
@@ -514,6 +610,55 @@ def _vulkan_matvec(
     return _from_bytes(results[0][0], (T, N), torch.float32)
 
 
+def _vulkan_matmul(
+    ctx: VulkanContext,
+    x: torch.Tensor,  # [T, K] float32
+    weight: torch.Tensor,  # [M, K] any dtype
+) -> torch.Tensor:
+    """Dispatch `matmul_f32_f32` (the tiled matmul shader, mul_mm.comp)
+    for prefill (T >= _MATVEC_THRESHOLD, large-enough weight — see
+    `linear`'s dispatch decision).
+
+    Only the plain (non-`_aligned`) variant is dispatched: the
+    `_aligned` variants assume `K` is already a multiple of the tile
+    size and skip bounds-checking loads, silently producing wrong
+    results otherwise. `matmul_f32_f32` handles any `M`/`T`/`K` shape
+    safely — verified directly, including shapes deliberately NOT
+    aligned to this shader's BM=BN=64/BK=32 tile sizes, against a CPU
+    reference (see `tiled_matmul_dispatch_tests` in src/lib.rs) — so no
+    alignment check is needed here.
+
+    Shares `_get_or_upload_weight`'s GPU weight cache with
+    `_vulkan_matvec`: both shaders require the exact same buffer layout
+    (row-major `[out_features, in_features]`, `f32`), so the same
+    persistent upload serves either dispatch path for a given weight,
+    whichever T a given call happens to use.
+    """
+    w_gpu = _get_or_upload_weight(ctx, weight)
+
+    T, K = x.shape  # noqa: N806
+    M = weight.shape[0]  # noqa: N806
+    pc = _matmul_pc(M, T, K)
+    x_bytes = _to_bytes(x)
+    out_size = T * M * 4
+
+    w_binding = w_gpu if w_gpu is not None else _to_bytes(weight.float())
+
+    results = ctx.execute_batch(
+        [
+            (
+                "matmul_f32_f32",
+                [w_binding, x_bytes],
+                [out_size],
+                pc,
+                _matmul_workgroups(M, T),
+                False,
+            ),
+        ]
+    )
+    return _from_bytes(results[0][0], (T, M), torch.float32)
+
+
 # ─── Fused RMSNorm + Linear batch dispatch ───────────────────────────────────
 
 
@@ -543,7 +688,17 @@ def rms_norm_then_linear(
     in_feat = linear_weight.shape[1]
     out_feat = linear_weight.shape[0]
 
-    # Decode path only (T < threshold); prefill falls back to CPU for linear.
+    # Fused single-submit path only for decode (T < threshold); prefill
+    # falls back to separate rms_norm() + linear() calls — rms_norm()
+    # always runs on CPU (see its own doc comment) and linear() now
+    # dispatches the GPU tiled matmul for large-enough weights at
+    # prefill scale too (see `_vulkan_matmul`), so this fallback is not
+    # a full CPU path, just an un-fused one (2 Python-level calls instead
+    # of 1 chained GPU submit — fusing RMSNorm into the same submit as
+    # `_vulkan_matmul` is a possible future improvement, not attempted
+    # here: rms_norm() itself is CPU-only regardless, so there is no GPU
+    # intermediate buffer to keep on-device between the two steps the
+    # way there is for the decode matvec case below).
     available_shaders = _cached_available_shaders(ctx)
     if (
         T >= _MATVEC_THRESHOLD

@@ -791,6 +791,128 @@ class TestLinearMatvecDispatchThreshold:
         )
 
 
+class TestLinearTiledMatmulPrefillDispatch:
+    """`linear()` now dispatches the tiled matmul shader (`matmul_f32_f32`,
+    from shaders/mul_mm.comp — see `_vulkan_matmul`) for prefill-scale T
+    on large-enough weights, instead of always falling back to CPU — see
+    `_MATVEC_THRESHOLD`'s doc comment in vulkan_ops.py for the
+    measurements this is based on (GPU wins at every T from 4 up, unlike
+    the matvec case `TestLinearMatvecDispatchThreshold` above guards
+    against reusing at prefill scale).
+    """
+
+    def test_large_weight_matches_torch_reference_at_prefill_shapes(self, vulkan_ctx):
+        """Correctness at Gemma4-E2B's real q_proj shape, across several
+        representative prefill chunk sizes — including T=4 (right at
+        `_MATVEC_THRESHOLD`'s boundary) and shapes that straddle this
+        shader's BM=BN=64/BK=32 tile boundaries (T=63, not a multiple of
+        64)."""
+        out_features, in_features = 2048, 1536
+        weight = torch.randn(out_features, in_features, dtype=torch.float32)
+        for t in (4, 16, 63, 128, 512):
+            x = torch.randn(t, in_features, dtype=torch.float32)
+            result = vulkan_ops.linear(x, weight, None)
+            expected = torch.nn.functional.linear(x, weight, None)
+            torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-2)
+
+    def test_large_weight_prefill_uses_gpu_weight_cache_not_cpu_path(
+        self, vulkan_ctx, upload_counter
+    ):
+        """A weight at or above `_MATVEC_MIN_WEIGHT_ELEMENTS` at
+        prefill-scale T (128, well above `_MATVEC_THRESHOLD`) must take
+        the GPU tiled-matmul path (`_vulkan_matmul`, sharing
+        `_get_or_upload_weight`'s cache with the decode matvec path) —
+        not silently keep falling back to
+        `_get_or_convert_to_float32_cpu`."""
+        out_features, in_features = 2048, 1536
+        weight = torch.randn(out_features, in_features, dtype=torch.bfloat16)
+        x = torch.randn(128, in_features, dtype=torch.float32)
+
+        vulkan_ops.linear(x, weight, None)
+        assert vulkan_ops._weight_cache.get(weight) is not None, (
+            "a large weight at prefill-scale T must use the GPU tiled-matmul "
+            "path's weight cache"
+        )
+        assert upload_counter["n"] == 1
+        assert vulkan_ops._cpu_float32_cache.get(weight) is None, (
+            "the CPU float32 conversion cache must NOT be populated when the "
+            "GPU tiled-matmul path is taken"
+        )
+
+    def test_small_weight_still_uses_cpu_at_prefill_scale(
+        self, vulkan_ctx, upload_counter
+    ):
+        """A weight below `_MATVEC_MIN_WEIGHT_ELEMENTS` (k_proj/v_proj's
+        real shape) must still take the CPU path at prefill-scale T,
+        exactly as it already does at decode-scale T (see
+        `TestLinearMatvecDispatchThreshold.
+        test_small_weight_uses_cpu_path_not_gpu_weight_cache`) — the
+        tiled-matmul dispatch decision reuses the same size gate, not a
+        separate one, per `_MATVEC_THRESHOLD`'s doc comment."""
+        out_features, in_features = 256, 1536
+        weight = torch.randn(out_features, in_features, dtype=torch.bfloat16)
+        x = torch.randn(128, in_features, dtype=torch.float32)
+
+        vulkan_ops.linear(x, weight, None)
+        assert vulkan_ops._weight_cache.get(weight) is None, (
+            "a small weight (below _MATVEC_MIN_WEIGHT_ELEMENTS) must never "
+            "reach the GPU weight cache, even at prefill-scale T"
+        )
+        assert upload_counter["n"] == 1
+
+    def test_tiled_matmul_is_faster_than_cpu_at_prefill_scale(self, vulkan_ctx):
+        """Measures the actual speedup at Gemma4-E2B's real q_proj shape
+        (2048x1536) and T=128 (a representative prefill chunk size) —
+        the mirror image of
+        `TestLinearMatvecDispatchThreshold.test_matvec_batching_does_not_help_at_prefill_scale_t`
+        above: unlike matvec, the tiled matmul shader genuinely reuses
+        weight tiles across T, so GPU must win here, not lose. Uses this
+        file's own min-of-N-trials pattern (see that test's doc comment
+        for why it's safe here too: the underlying effect, measured
+        independently in src/lib.rs's `tiled_matmul_beats_cpu_at_prefill_scale_for_large_weights`,
+        is 1.5x-17x across shapes and T, far larger than plausible
+        measurement noise).
+        """
+        import time
+
+        out_features, in_features = 2048, 1536
+        weight = torch.randn(out_features, in_features, dtype=torch.float32)
+        t_prefill = 128
+        x = torch.randn(t_prefill, in_features, dtype=torch.float32)
+
+        for _ in range(3):
+            vulkan_ops._vulkan_matmul(vulkan_ctx, x, weight)
+            torch.nn.functional.linear(x, weight, None)
+
+        iters = 10
+        trials = 3
+
+        def timed(fn) -> float:
+            best = float("inf")
+            for _ in range(trials):
+                t0 = time.perf_counter()
+                for _ in range(iters):
+                    fn()
+                best = min(best, time.perf_counter() - t0)
+            return best
+
+        gpu_elapsed = timed(lambda: vulkan_ops._vulkan_matmul(vulkan_ctx, x, weight))
+        cpu_elapsed = timed(lambda: torch.nn.functional.linear(x, weight, None))
+
+        print(
+            f"\ntiled matmul at prefill scale (T={t_prefill}, 2048x1536), "
+            f"best-of-{trials}: GPU matmul {gpu_elapsed / iters * 1e6:.1f}us/call, "
+            f"CPU linear {cpu_elapsed / iters * 1e6:.1f}us/call, "
+            f"GPU speedup {cpu_elapsed / gpu_elapsed:.2f}x"
+        )
+        assert gpu_elapsed < cpu_elapsed, (
+            f"GPU tiled matmul ({gpu_elapsed:.4f}s/{iters}) was not faster than "
+            f"CPU ({cpu_elapsed:.4f}s/{iters}) at prefill-scale T={t_prefill} - "
+            f"see _MATVEC_THRESHOLD's doc comment before changing this dispatch "
+            f"decision based on this alone."
+        )
+
+
 class TestWrapRmsNormHoistsStaticLookups:
     """`_wrap_rms_norm` now captures `weight`/`eps`/the disable-ops env
     var once, at hook-install time, instead of re-deriving them (via
