@@ -933,6 +933,74 @@ fn compute_layer_gpu_caps(
     }).collect()
 }
 
+/// Precomputed once per layer at model-load time (see
+/// `compute_layer_cpu_weight_refs`): raw-pointer views into this layer's
+/// small CPU-resident norm/scalar weights (never dispatched to the GPU —
+/// RMSNorm/the final layer-scalar multiply run on the CPU regardless of
+/// GPU availability).
+///
+/// `forward_layer_gpu_matmuls`'s `w!()` macro used to re-derive these same
+/// 7-8 `RawSlice`s on every single decode step, for every layer, via
+/// `format!("model.layers.{layer_idx}.{name}")` +
+/// `Gemma4Weights::f32_slice` (itself a `HashMap::get`) each — the exact
+/// same class of invariant-after-load overhead `LayerGpuCaps` (above)
+/// already fixed for the fusion-tier booleans. Measured directly at
+/// Gemma4-E2B's real scale (35 layers, 8 weight names each — see
+/// `layer_cpu_weight_refs_tests::
+/// precomputed_lookup_is_faster_than_per_call_recomputation`): the
+/// repeated format!+HashMap-lookup version costs ~60us per decode step,
+/// versus ~0.12us for indexing a precomputed `Vec` by `layer_idx`.
+#[derive(Clone, Copy)]
+struct LayerCpuWeightRefs {
+    input_layernorm: RawSlice,
+    q_norm: RawSlice,
+    /// `None` for KV-shared layers (no separate K projection/norm).
+    k_norm: Option<RawSlice>,
+    post_attention_layernorm: RawSlice,
+    pre_feedforward_layernorm: RawSlice,
+    post_feedforward_layernorm: RawSlice,
+    post_per_layer_input_norm: RawSlice,
+    layer_scalar: f32,
+}
+
+/// Computes `LayerCpuWeightRefs` for `num_layers` layers, once, from
+/// `weights` — shared by `VulkanModel::new` (passing the model's real
+/// `cfg.num_hidden_layers`) and the test-only `build_test_model` helper
+/// (passing `1`, since that helper only ever populates layer 0's
+/// weights — `num_layers` is a separate parameter from `cfg`, rather
+/// than always using `cfg.num_hidden_layers` internally, specifically so
+/// tests can scope this to only the layers they actually populate,
+/// instead of panicking on `f32_slice`'s "weight not found" for every
+/// other layer `cfg` claims to have).
+///
+/// `weights`'s backing storage must outlive every `RawSlice` produced
+/// here (see `RawSlice`'s own safety doc comment) — true for both
+/// callers, since `weights`/`self.inner.weights` is immutable and pinned
+/// for the whole lifetime of the model once constructed.
+fn compute_layer_cpu_weight_refs(
+    num_layers: usize,
+    cfg: &model::Gemma4Config,
+    weights: &model::Gemma4Weights,
+) -> Vec<LayerCpuWeightRefs> {
+    (0..num_layers).map(|layer_idx| {
+        let ln = |s: &str| format!("model.layers.{layer_idx}.{s}");
+        let raw = |name: &str| {
+            let s = weights.f32_slice(&ln(name));
+            RawSlice { ptr: s.as_ptr(), len: s.len() }
+        };
+        LayerCpuWeightRefs {
+            input_layernorm: raw("input_layernorm.weight"),
+            q_norm: raw("self_attn.q_norm.weight"),
+            k_norm: if cfg.is_kv_shared(layer_idx) { None } else { Some(raw("self_attn.k_norm.weight")) },
+            post_attention_layernorm: raw("post_attention_layernorm.weight"),
+            pre_feedforward_layernorm: raw("pre_feedforward_layernorm.weight"),
+            post_feedforward_layernorm: raw("post_feedforward_layernorm.weight"),
+            post_per_layer_input_norm: raw("post_per_layer_input_norm.weight"),
+            layer_scalar: raw("layer_scalar")[0],
+        }
+    }).collect()
+}
+
 ///   logits = vk_model.forward(token_id, position)
 #[pyclass]
 
@@ -946,6 +1014,9 @@ pub struct VulkanModel {
     /// Per-layer GPU weight availability, precomputed once in `new()` —
     /// see `LayerGpuCaps`'s doc comment.
     layer_gpu_caps: Vec<LayerGpuCaps>,
+    /// Per-layer CPU norm/scalar weight raw-pointer views, precomputed
+    /// once in `new()` — see `LayerCpuWeightRefs`'s doc comment.
+    layer_cpu_weight_refs: Vec<LayerCpuWeightRefs>,
     /// Pre-allocated persistent activation buffers (fixed Vec, stable pointers)
     act_bufs: Vec<compute::Buffer>,
     /// Whether act_bufs are initialised for the current model config
@@ -1100,6 +1171,14 @@ impl VulkanModel {
         // once here (gpu_weights never changes after this point) instead
         // of repeating format!()+HashMap-lookup work on every decode step.
         let layer_gpu_caps = compute_layer_gpu_caps(cfg.num_hidden_layers, &gpu_weights);
+        // See LayerCpuWeightRefs's doc comment: same precomputation, for
+        // the small CPU-resident norm/scalar weights the `w!()` macro
+        // used to re-derive on every decode step. Computed before
+        // `weights` is moved into `Gemma4Model` below — safe regardless,
+        // since moving `weights` only relocates the `HashMap`/`SimpleTensor`
+        // struct headers, never the `Vec<f32>` heap buffers each
+        // `RawSlice` points into (see `RawSlice`'s own safety comment).
+        let layer_cpu_weight_refs = compute_layer_cpu_weight_refs(cfg.num_hidden_layers, &cfg, &weights);
 
         Ok(VulkanModel {
             inner: model::Gemma4Model { config: cfg, weights, kv_caches },
@@ -1107,6 +1186,7 @@ impl VulkanModel {
             engine: engine_opt,
             gpu_weights,
             layer_gpu_caps,
+            layer_cpu_weight_refs,
             act_bufs: Vec::new(),
             act_bufs_ready: false,
         })
@@ -1386,30 +1466,21 @@ impl VulkanModel {
 
         let ln = |s: &str| format!("model.layers.{layer_idx}.{s}");
 
-        // Helper: pack matvec push constants
-        // Pre-extract all needed weight slices as raw-pointer handles (avoids
-        // borrow conflicts with the later `&mut self` GPU calls below without
-        // paying for a heap allocation + memcpy on every single decode step).
-        // SAFETY: `self.inner.weights` is never mutated for the lifetime of
-        // `self`, so the underlying `Vec<f32>` backing storage never moves or
-        // is freed while `self` is alive — these pointers stay valid for as
-        // long as the `RawSlice` values derived from them are in scope here.
-        macro_rules! w {
-            ($name:expr) => {{
-                let s = self.inner.weights.f32_slice(&ln($name));
-                RawSlice { ptr: s.as_ptr(), len: s.len() }
-            }};
-        }
-
-        let inln_w   = w!("input_layernorm.weight");
-        let q_norm_w = w!("self_attn.q_norm.weight");
-        let k_norm_w = if !is_kv_shared { Some(w!("self_attn.k_norm.weight")) } else { None };
-        let pa_w     = w!("post_attention_layernorm.weight");
-        let pf_w     = w!("pre_feedforward_layernorm.weight");
-        let postff_w = w!("post_feedforward_layernorm.weight");
+        // These small CPU-resident norm/scalar weight raw-pointer views
+        // used to be re-derived here on every single decode step via a
+        // `w!()` macro (format!()+HashMap-lookup each) — see
+        // `LayerCpuWeightRefs`'s doc comment for the measured overhead
+        // this precomputation (done once, in `new()`) avoids.
+        let cpu_w = self.layer_cpu_weight_refs[layer_idx];
+        let inln_w   = cpu_w.input_layernorm;
+        let q_norm_w = cpu_w.q_norm;
+        let k_norm_w = cpu_w.k_norm;
+        let pa_w     = cpu_w.post_attention_layernorm;
+        let pf_w     = cpu_w.pre_feedforward_layernorm;
+        let postff_w = cpu_w.post_feedforward_layernorm;
         // gate_ple_w and ple_proj_w now dispatched via GPU
-        let ple_norm_w = w!("post_per_layer_input_norm.weight");
-        let layer_scalar = w!("layer_scalar")[0];
+        let ple_norm_w = cpu_w.post_per_layer_input_norm;
+        let layer_scalar = cpu_w.layer_scalar;
 
         // ── ATTENTION ──────────────────────────────────────────────────────
         // `hidden` is an immutable `&[f32]` for this whole call (the caller
@@ -2068,7 +2139,12 @@ struct RawSlice {
 // SAFETY: RawSlice is only ever constructed from a `&[f32]` borrowed out of
 // `VulkanModel::inner.weights`, which is immutable and pinned for the whole
 // lifetime of the model. Values are used only on the thread that created
-// them (Vulkan buffer handles are already !Send in this crate).
+// them (Vulkan buffer handles are already !Send in this crate, and
+// `compute::Buffer` already asserts `unsafe impl Send` under the same
+// reasoning — Python's GIL serializes access to the `#[pyclass]`
+// `VulkanModel` this is stored inside via `layer_cpu_weight_refs`).
+unsafe impl Send for RawSlice {}
+
 impl std::ops::Deref for RawSlice {
     type Target = [f32];
     fn deref(&self) -> &[f32] {
@@ -2490,17 +2566,24 @@ mod matvec_fusion_tests {
         }).collect();
 
         let layer_gpu_caps = compute_layer_gpu_caps(cfg.num_hidden_layers, &gpu_weights);
+        let weights = model::Gemma4Weights { tensors: cpu_tensors };
+        // Only 1 (not cfg.num_hidden_layers): this test model only ever
+        // populates layer 0's weights (see compute_layer_cpu_weight_refs's
+        // doc comment) — every test using build_test_model only calls
+        // forward_layer_gpu_matmuls(0, ...) anyway.
+        let layer_cpu_weight_refs = compute_layer_cpu_weight_refs(1, &cfg, &weights);
 
         Some(VulkanModel {
             inner: model::Gemma4Model {
                 config: cfg,
-                weights: model::Gemma4Weights { tensors: cpu_tensors },
+                weights,
                 kv_caches,
             },
             max_seq_len: 64,
             engine: Some(engine),
             gpu_weights,
             layer_gpu_caps,
+            layer_cpu_weight_refs,
             act_bufs: Vec::new(),
             act_bufs_ready: false,
         })
@@ -3534,6 +3617,137 @@ mod layer_gpu_caps_tests {
 
         println!(
             "layer_gpu_caps ({num_layers} layers/decode-step): old(recompute) {old_us:.2}us   new(precomputed) {new_us:.2}us   speedup {:.1}x",
+            old_us / new_us.max(0.001)
+        );
+        assert!(
+            new_us < old_us,
+            "precomputed lookup ({new_us:.2}us) was not faster than per-call recomputation ({old_us:.2}us)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod layer_cpu_weight_refs_tests {
+    //! `forward_layer_gpu_matmuls`'s `w!()` macro used to re-derive the
+    //! same 7-8 `RawSlice`s (small CPU-resident norm/scalar weights) on
+    //! every single decode step, for every layer, via
+    //! `format!("model.layers.{layer_idx}.{name}")` +
+    //! `Gemma4Weights::f32_slice` (a `HashMap::get`) each — the same
+    //! class of invariant-after-load overhead `LayerGpuCaps` (see
+    //! `layer_gpu_caps_tests`) already fixed for the fusion-tier
+    //! booleans. `compute_layer_cpu_weight_refs` now does this once, at
+    //! load time, and `forward_layer_gpu_matmuls` just indexes the
+    //! resulting `Vec<LayerCpuWeightRefs>` by `layer_idx`.
+    use super::*;
+
+    fn fake_random(len: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
+        (0..len)
+            .map(|_| {
+                state ^= state >> 12; state ^= state << 25; state ^= state >> 27;
+                let bits = state.wrapping_mul(0x2545F4914F6CDD1D);
+                ((bits >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    /// Reconstructs the OLD per-call computation (before this change) for
+    /// direct comparison — same weight names/logic as
+    /// `compute_layer_cpu_weight_refs`, just re-run from scratch (with
+    /// its own `format!()` calls) on every invocation instead of once.
+    fn old_way_recompute_every_call(
+        layer_idx: usize,
+        cfg: &model::Gemma4Config,
+        weights: &model::Gemma4Weights,
+    ) -> LayerCpuWeightRefs {
+        let ln = |s: &str| format!("model.layers.{layer_idx}.{s}");
+        let raw = |name: &str| {
+            let s = weights.f32_slice(&ln(name));
+            RawSlice { ptr: s.as_ptr(), len: s.len() }
+        };
+        LayerCpuWeightRefs {
+            input_layernorm: raw("input_layernorm.weight"),
+            q_norm: raw("self_attn.q_norm.weight"),
+            k_norm: if cfg.is_kv_shared(layer_idx) { None } else { Some(raw("self_attn.k_norm.weight")) },
+            post_attention_layernorm: raw("post_attention_layernorm.weight"),
+            pre_feedforward_layernorm: raw("pre_feedforward_layernorm.weight"),
+            post_feedforward_layernorm: raw("post_feedforward_layernorm.weight"),
+            post_per_layer_input_norm: raw("post_per_layer_input_norm.weight"),
+            layer_scalar: raw("layer_scalar")[0],
+        }
+    }
+
+    fn make_test_weights(cfg: &model::Gemma4Config, num_layers: usize) -> model::Gemma4Weights {
+        let h = cfg.hidden_size;
+        let head_dim = cfg.head_dim;
+        let mut tensors = std::collections::HashMap::new();
+        for layer_idx in 0..num_layers {
+            let ln = |s: &str| format!("model.layers.{layer_idx}.{s}");
+            let is_kv_shared = cfg.is_kv_shared(layer_idx);
+            tensors.insert(ln("input_layernorm.weight"), model::SimpleTensor { data: fake_random(h, 1), shape: vec![] });
+            tensors.insert(ln("self_attn.q_norm.weight"), model::SimpleTensor { data: fake_random(head_dim, 2), shape: vec![] });
+            if !is_kv_shared {
+                tensors.insert(ln("self_attn.k_norm.weight"), model::SimpleTensor { data: fake_random(head_dim, 3), shape: vec![] });
+            }
+            tensors.insert(ln("post_attention_layernorm.weight"), model::SimpleTensor { data: fake_random(h, 4), shape: vec![] });
+            tensors.insert(ln("pre_feedforward_layernorm.weight"), model::SimpleTensor { data: fake_random(h, 5), shape: vec![] });
+            tensors.insert(ln("post_feedforward_layernorm.weight"), model::SimpleTensor { data: fake_random(h, 6), shape: vec![] });
+            tensors.insert(ln("post_per_layer_input_norm.weight"), model::SimpleTensor { data: fake_random(h, 7), shape: vec![] });
+            tensors.insert(ln("layer_scalar"), model::SimpleTensor { data: fake_random(1, 8), shape: vec![] });
+        }
+        model::Gemma4Weights { tensors }
+    }
+
+    #[test]
+    fn compute_layer_cpu_weight_refs_matches_old_per_call_recomputation() {
+        let cfg = model::Gemma4Config::e2b();
+        let num_layers = 3.min(cfg.num_hidden_layers);
+        let weights = make_test_weights(&cfg, num_layers);
+
+        let new_refs = compute_layer_cpu_weight_refs(num_layers, &cfg, &weights);
+        for (layer_idx, new) in new_refs.iter().enumerate() {
+            let old = old_way_recompute_every_call(layer_idx, &cfg, &weights);
+            assert_eq!(&*old.input_layernorm, &*new.input_layernorm, "layer {layer_idx}: input_layernorm mismatch");
+            assert_eq!(&*old.q_norm, &*new.q_norm, "layer {layer_idx}: q_norm mismatch");
+            match (old.k_norm, new.k_norm) {
+                (Some(o), Some(n)) => assert_eq!(&*o, &*n, "layer {layer_idx}: k_norm mismatch"),
+                (None, None) => {}
+                _ => panic!("layer {layer_idx}: k_norm Some/None mismatch"),
+            }
+            assert_eq!(&*old.post_attention_layernorm, &*new.post_attention_layernorm, "layer {layer_idx}: post_attention_layernorm mismatch");
+            assert_eq!(&*old.pre_feedforward_layernorm, &*new.pre_feedforward_layernorm, "layer {layer_idx}: pre_feedforward_layernorm mismatch");
+            assert_eq!(&*old.post_feedforward_layernorm, &*new.post_feedforward_layernorm, "layer {layer_idx}: post_feedforward_layernorm mismatch");
+            assert_eq!(&*old.post_per_layer_input_norm, &*new.post_per_layer_input_norm, "layer {layer_idx}: post_per_layer_input_norm mismatch");
+            assert_eq!(old.layer_scalar, new.layer_scalar, "layer {layer_idx}: layer_scalar mismatch");
+        }
+    }
+
+    #[test]
+    fn precomputed_lookup_is_faster_than_per_call_recomputation() {
+        let cfg = model::Gemma4Config::e2b();
+        let num_layers = cfg.num_hidden_layers; // real Gemma4-E2B layer count (35)
+        let weights = make_test_weights(&cfg, num_layers);
+
+        let iters = 500;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            for layer_idx in 0..num_layers {
+                std::hint::black_box(old_way_recompute_every_call(layer_idx, &cfg, &weights));
+            }
+        }
+        let old_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+        let refs = compute_layer_cpu_weight_refs(num_layers, &cfg, &weights);
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            for &r in &refs {
+                std::hint::black_box(r);
+            }
+        }
+        let new_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+        println!(
+            "layer_cpu_weight_refs ({num_layers} layers/decode-step): old(recompute) {old_us:.2}us   new(precomputed) {new_us:.2}us   speedup {:.1}x",
             old_us / new_us.max(0.001)
         );
         assert!(
