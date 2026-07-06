@@ -302,11 +302,24 @@ impl VulkanContext {
     ///   (shader_name, bindings, output_sizes, push_constants, workgroups, barrier)
     /// where:
     ///   - shader_name:   &str
-    ///   - bindings:      list[GpuTensor | bytes]   — in binding-index order
+    ///   - bindings:      list[GpuTensor | bytes | (int, int)]   — in binding-index order
     ///   - output_sizes:  list[int]                 — byte sizes of output slots
     ///   - push_constants: bytes
     ///   - workgroups:    (int, int, int)
     ///   - barrier:       bool  — insert compute→compute barrier AFTER this op
+    ///
+    /// A binding may be a `(op_index, output_index)` int 2-tuple ("chain
+    /// ref") instead of a `GpuTensor`/`bytes`, referencing an EARLIER op's
+    /// (already-produced-within-this-same-batch) output buffer directly —
+    /// this is what lets e.g. a 3-op MLP (gate_up matmul → SwiGLU → down
+    /// matmul) run as ONE `vkQueueSubmit` instead of three, with the
+    /// intermediate activations never leaving the GPU or round-tripping
+    /// through Python at all. `op_index` must refer to an earlier op in
+    /// this same `ops` list (an op cannot reference itself or a later op —
+    /// its buffer wouldn't exist yet), and that earlier op must have
+    /// `barrier_after=True` so this op's read is guaranteed to see its
+    /// completed write (Vulkan gives no ordering guarantee between
+    /// dispatches in the same command buffer without an explicit barrier).
     ///
     /// Returns list (one per op) of lists (one per output) of bytes.
     #[pyo3(signature = (ops))]
@@ -327,9 +340,17 @@ impl VulkanContext {
         // We collect temp bufs (from byte inputs) and out bufs separately, then
         // build a flat mapping for each op.
 
+        // One entry per binding, in binding order, describing how Phase 2
+        // resolves it to a `&compute::Buffer`.
+        enum BindingKind {
+            Persistent(usize),        // index into persistent_bufs.
+            Temp(usize),              // index into temp_bufs.
+            Chain(usize, usize),      // (op_index, output_index) into out_bufs,
+                                      // resolved via op_meta once it's fully built.
+        }
+
         struct OpBuffers {
-            // Indices into global temp_bufs / out_bufs vectors.
-            temp_indices: Vec<usize>,   // one per bytes binding, in order
+            binding_kinds: Vec<BindingKind>,
             out_start:    usize,        // first output buf index in out_bufs
             out_count:    usize,
             barrier_after: bool,
@@ -338,28 +359,47 @@ impl VulkanContext {
         let mut temp_bufs: Vec<compute::Buffer> = Vec::new();
         let mut out_bufs: Vec<compute::Buffer> = Vec::new();
         let mut op_meta: Vec<OpBuffers> = Vec::new();
+        // Holds the actual pyo3 borrow guards for every `GpuTensor` binding,
+        // keyed by `BindingKind::Persistent`'s index. Reusing the `py` GIL
+        // token already given to this whole function (rather than
+        // re-acquiring one via `Python::with_gil` in a short-lived inner
+        // closure, as this used to do) means each guard's lifetime is tied
+        // to `py`'s — i.e. the entire function body — so Phase 2 below can
+        // borrow `&guard.buf` directly, safely, with no raw-pointer casts.
+        let mut persistent_bufs: Vec<PyRef<'_, GpuTensor>> = Vec::new();
 
-        for (_, bindings, output_sizes, _, _, barrier) in &ops {
-            let mut temp_indices = Vec::new();
+        for (op_index, (_, bindings, output_sizes, _, _, barrier)) in ops.iter().enumerate() {
+            let mut binding_kinds = Vec::with_capacity(bindings.len());
             for binding in bindings {
-                Python::with_gil(|py_inner| -> PyResult<()> {
-                    if binding.downcast_bound::<GpuTensor>(py_inner).is_ok() {
-                        // GpuTensor — no temp buffer needed; handled during record.
-                    } else if let Ok(bytes) = binding.downcast_bound::<pyo3::types::PyBytes>(py_inner) {
-                        let data = bytes.as_bytes();
-                        let buf = self.engine
-                            .alloc_host_coherent_storage(data.len() as u64)
-                            .map_err(PyRuntimeError::new_err)?;
-                        buf.write(data).map_err(PyRuntimeError::new_err)?;
-                        temp_indices.push(temp_bufs.len());
-                        temp_bufs.push(buf);
-                    } else {
-                        return Err(PyRuntimeError::new_err(
-                            "execute_batch: each binding must be GpuTensor or bytes"
-                        ));
+                if let Ok(gt) = binding.downcast_bound::<GpuTensor>(py) {
+                    let idx = persistent_bufs.len();
+                    persistent_bufs.push(gt.borrow());
+                    binding_kinds.push(BindingKind::Persistent(idx));
+                } else if let Ok(bytes) = binding.downcast_bound::<pyo3::types::PyBytes>(py) {
+                    let data = bytes.as_bytes();
+                    let buf = self.engine
+                        .alloc_host_coherent_storage(data.len() as u64)
+                        .map_err(PyRuntimeError::new_err)?;
+                    buf.write(data).map_err(PyRuntimeError::new_err)?;
+                    binding_kinds.push(BindingKind::Temp(temp_bufs.len()));
+                    temp_bufs.push(buf);
+                } else if let Ok(tup) = binding.downcast_bound::<pyo3::types::PyTuple>(py) {
+                    let ref_op_idx: usize = tup.get_item(0)?.extract()?;
+                    let ref_out_idx: usize = tup.get_item(1)?.extract()?;
+                    if ref_op_idx >= op_index {
+                        return Err(PyRuntimeError::new_err(format!(
+                            "execute_batch: chain ref (op {ref_op_idx}, out {ref_out_idx}) \
+                             at op {op_index} must reference an EARLIER op (its buffer \
+                             wouldn't exist yet otherwise)"
+                        )));
                     }
-                    Ok(())
-                })?;
+                    binding_kinds.push(BindingKind::Chain(ref_op_idx, ref_out_idx));
+                } else {
+                    return Err(PyRuntimeError::new_err(
+                        "execute_batch: each binding must be GpuTensor, bytes, or an \
+                         (op_index, output_index) chain-ref tuple"
+                    ));
+                }
             }
             let out_start = out_bufs.len();
             for &sz in output_sizes {
@@ -370,7 +410,7 @@ impl VulkanContext {
                 );
             }
             op_meta.push(OpBuffers {
-                temp_indices,
+                binding_kinds,
                 out_start,
                 out_count: output_sizes.len(),
                 barrier_after: *barrier,
@@ -380,24 +420,21 @@ impl VulkanContext {
         // ── Phase 2: record all dispatches into one command buffer ───────
         let cb = self.engine.begin_batch().map_err(PyRuntimeError::new_err)?;
 
-        for ((shader_name, bindings, _, push_constants, workgroups, _), meta) in
+        for ((shader_name, _, _, push_constants, workgroups, _), meta) in
             ops.iter().zip(op_meta.iter())
         {
             // Build the &Buffer slice in binding order.
             let mut all_refs: Vec<&compute::Buffer> = Vec::new();
-            let mut temp_cursor = 0usize;
-            for binding in bindings {
-                Python::with_gil(|py_inner| -> PyResult<()> {
-                    if let Ok(gt) = binding.downcast_bound::<GpuTensor>(py_inner) {
-                        // Safety: GpuTensor Python object lives for the call duration.
-                        let ptr = &gt.borrow().buf as *const compute::Buffer;
-                        all_refs.push(unsafe { &*ptr });
-                    } else {
-                        all_refs.push(&temp_bufs[meta.temp_indices[temp_cursor]]);
-                        temp_cursor += 1;
+            for kind in meta.binding_kinds.iter() {
+                match kind {
+                    BindingKind::Persistent(idx) => {
+                        all_refs.push(&persistent_bufs[*idx].buf);
                     }
-                    Ok(())
-                })?;
+                    BindingKind::Temp(idx) => all_refs.push(&temp_bufs[*idx]),
+                    BindingKind::Chain(ref_op_idx, ref_out_idx) => {
+                        all_refs.push(&out_bufs[op_meta[*ref_op_idx].out_start + ref_out_idx]);
+                    }
+                }
             }
             // Output buffers come after inputs.
             for i in 0..meta.out_count {
@@ -713,9 +750,25 @@ fn include_all_shaders() -> std::collections::HashMap<String, Vec<u8>> {
     spv!("add_f32_f32_f32");
 
     // ── GLU activations ─────────────────────────────────────────────────
-    // swiglu_f32/geglu_f32 were dead: this model's FFN activation is
-    // done as two separate dispatches (gelu_f32 then mul_f32_f32_f32),
-    // not a single fused GLU shader — see forward_layer_gpu_matmuls.
+    // geglu_f32 is still dead here: the standalone `VulkanModel` (Gemma4-
+    // E2B, forward_layer_gpu_matmuls) uses separate gate_proj/up_proj
+    // weights, so its GELU-gated FFN is two plain dispatches (gelu_f32
+    // then mul_f32_f32_f32) against two already-separate buffers, with no
+    // need for this shader's row-major gate/up-split indexing.
+    //
+    // swiglu_f32 IS dispatched, though not from that engine: vLLM's own
+    // Qwen2MLP/Qwen3MLP (a *merged* `gate_up_proj` producing one
+    // `[T, 2*intermediate]` tensor, gate and up interleaved per row) needs
+    // exactly this shader's `glu_main.glsl` indexing to correctly extract
+    // "column c of every row's first half" for T>1 -- a plain
+    // `silu_f32`-then-`mul_f32_f32_f32` pair reading raw buffer offsets
+    // (as if it were one flat, un-strided array) only produces the right
+    // answer at T=1, where "first half of the buffer" and "first half of
+    // every row" happen to coincide. See vulkan_ops.py's
+    // `_vulkan_fused_swiglu_mlp` for the real call site (vLLM's
+    // SiluAndMul.forward_native does `silu(x[..., :d]) * x[..., d:]`,
+    // matching this shader's `mode=0` "Default" branch exactly).
+    spv!("swiglu_f32");
 
     // ── Copy / reshape ──────────────────────────────────────────────────
     // get_rows_f32_f32/f16 (embedding gather), fill_f16, concat_f16, and
@@ -3471,7 +3524,7 @@ mod pipeline_cache_startup_tests {
         let pc = [0u8; 32];
         let cb = engine.begin_batch().unwrap();
 
-        // All 37 shader names below used to be registered (compiled via
+        // All 36 shader names below used to be registered (compiled via
         // `spv!()` in include_all_shaders) but were never actually
         // dispatched anywhere in this codebase (Rust or Python) —
         // confirmed via `grep -rn '"<name>"' src/ vllm_vulkan/ tests/`
@@ -3491,7 +3544,10 @@ mod pipeline_cache_startup_tests {
             "soft_max_f32_f16", "soft_max_large1_f32_f16", "soft_max_large2_f32_f16", "soft_max_large3_f32_f16",
             "add_f32_f32_f16", "add_f32_f16_f32", "mul_f32_f32_f16", "div_f32_f32_f16", "sub_f32_f32_f16",
             "add_rms_f32_f32_f32", "add_rms_f32_f32_f16",
-            "swiglu_f32", "geglu_f32",
+            // swiglu_f32 removed from this list: now registered and
+            // dispatched by vulkan_ops.py's `_vulkan_fused_swiglu_mlp` --
+            // see its registration site's doc comment above.
+            "geglu_f32",
             "rope_norm_f32_f16", "rope_norm_f16", "rope_neox_f32_f16", "rope_neox_f16",
             "rope_multi_f32_f16", "rope_multi_f16",
             "get_rows_f32_f32", "get_rows_f16", "fill_f16", "concat_f16",

@@ -1462,3 +1462,136 @@ class TestWrapLinearHoistsStaticLookups:
             f"hoisted lookups ({hoisted_elapsed:.4f}s/{iters}) were not faster "
             f"than per-call getattr/os.environ.get ({per_call_elapsed:.4f}s/{iters})"
         )
+
+
+class TestExecuteBatchChainRef:
+    """`VulkanContext.execute_batch`'s `(op_index, output_index)` chain-ref
+    binding: lets a later op in the same batch read an EARLIER op's output
+    directly, without it ever round-tripping through Python/CPU, so a
+    multi-op sequence still costs only one `vkQueueSubmit`. See its own doc
+    comment in src/lib.rs for the full binding-resolution contract this
+    exercises.
+
+    The mechanism's actual numerical correctness is validated thoroughly
+    by `TestFusedSwigluMlp` below (every one of those test cases exercises
+    two chain-refs per call: gate_up matmul -> SwiGLU, and SwiGLU -> down
+    matmul, checked against a real CPU/torch reference across 7 shapes,
+    bf16, and edge cases) -- this class only covers the input-validation
+    contract that doesn't need a full, real GPU dispatch (and therefore
+    doesn't need to get an unrelated shader's own push-constant struct
+    layout right) to exercise.
+    """
+
+    def test_chain_ref_to_a_later_op_is_rejected(self, vulkan_ctx):
+        """`op_index` must be strictly earlier than the referencing op --
+        its output buffer doesn't exist yet otherwise (see execute_batch's
+        Phase 1/Phase 2 doc comments in src/lib.rs: buffers are allocated
+        up-front, in op order, so a forward/self reference would read an
+        unrelated or not-yet-written buffer rather than erroring, if this
+        check weren't there)."""
+        ctx = vulkan_ctx
+        n = 64
+        pc = bytes(64)  # exact content is irrelevant: rejected before dispatch
+        with pytest.raises(RuntimeError, match="must reference an EARLIER op"):
+            ctx.execute_batch(
+                [
+                    (
+                        "swiglu_f32",
+                        [(0, 0), (0, 0)],  # op 0 referencing itself
+                        [n * 4],
+                        pc,
+                        (1, 1, 1),
+                        False,
+                    ),
+                ]
+            )
+
+
+class TestFusedSwigluMlp:
+    """`vulkan_ops.fused_swiglu_mlp`: `gate_up_proj -> silu(gate)*up ->
+    down_proj` (Qwen2MLP/Qwen3MLP's exact structure) in ONE `vkQueueSubmit`
+    via `execute_batch`'s chain-ref bindings, instead of `model_runner.py`'s
+    `_wrap_linear` hooks independently dispatching `gate_up_proj` and
+    `down_proj` as two separate submits with a CPU-side activation in
+    between. See `model_runner.py`'s `_wrap_swiglu_mlp` for the real
+    integration point.
+    """
+
+    @staticmethod
+    def _reference(x, gate_up_weight, down_weight):
+        gate_up = torch.nn.functional.linear(x.float(), gate_up_weight.float())
+        d = gate_up.shape[-1] // 2
+        gate, up = gate_up[..., :d], gate_up[..., d:]
+        act = torch.nn.functional.silu(gate) * up
+        return torch.nn.functional.linear(act, down_weight.float())
+
+    @pytest.mark.parametrize("t", [1, 2, 3, 4, 5, 16, 128])
+    def test_matches_torch_reference_across_decode_and_prefill_shapes(
+        self, vulkan_ctx, t
+    ):
+        torch.manual_seed(0)
+        hidden, intermediate = 1024, 3072
+        gate_up_weight = (
+            torch.randn(2 * intermediate, hidden, dtype=torch.float32) * 0.02
+        )
+        down_weight = torch.randn(hidden, intermediate, dtype=torch.float32) * 0.02
+        x = torch.randn(t, hidden, dtype=torch.float32)
+
+        result = vulkan_ops.fused_swiglu_mlp(x, gate_up_weight, down_weight)
+        expected = self._reference(x, gate_up_weight, down_weight)
+
+        assert result.shape == expected.shape
+        # rtol/atol matching this file's other f16-weight-upload tolerances
+        # (see test_linear_matches_torch_reference_at_realistic_hidden_size's
+        # doc comment) -- fused_swiglu_mlp uploads both weights as f16 via
+        # the same _get_or_upload_weight/prefer_f16=True path linear() uses.
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=5e-2)
+
+    def test_matches_torch_reference_with_bf16_weights_and_input(self, vulkan_ctx):
+        torch.manual_seed(1)
+        hidden, intermediate = 1024, 3072
+        gate_up_weight = (
+            torch.randn(2 * intermediate, hidden, dtype=torch.float32) * 0.02
+        ).to(torch.bfloat16)
+        down_weight = (
+            torch.randn(hidden, intermediate, dtype=torch.float32) * 0.02
+        ).to(torch.bfloat16)
+        x = torch.randn(1, hidden, dtype=torch.bfloat16)
+
+        result = vulkan_ops.fused_swiglu_mlp(x, gate_up_weight, down_weight)
+        expected = self._reference(x, gate_up_weight, down_weight)
+
+        # Confirmed regression guard: fused_swiglu_mlp itself always
+        # computes/returns float32 (GPU compute happens in float32/float16,
+        # never bf16) -- model_runner.py's _wrap_swiglu_mlp's vk_mlp_forward
+        # is responsible for the `.to(x.dtype)` conversion back to the
+        # caller's dtype, NOT this function. A caller that forgot that
+        # conversion previously crashed one full layer downstream inside
+        # the CPU attention kernel ("RuntimeError: expected scalar type
+        # Float but found BFloat16"), not here -- so this test only checks
+        # numerical correctness in float32, matching this function's real
+        # contract.
+        assert result.dtype == torch.float32
+        torch.testing.assert_close(result, expected.float(), rtol=1e-2, atol=5e-2)
+
+    def test_raises_fused_mlp_unavailable_for_small_weights(self, vulkan_ctx):
+        small_gate_up = torch.randn(64, 32, dtype=torch.float32)
+        small_down = torch.randn(32, 32, dtype=torch.float32)
+        x = torch.randn(1, 32, dtype=torch.float32)
+        with pytest.raises(vulkan_ops.FusedMlpUnavailableError):
+            vulkan_ops.fused_swiglu_mlp(x, small_gate_up, small_down)
+
+    def test_weight_cache_is_reused_across_repeated_calls(
+        self, vulkan_ctx, upload_counter
+    ):
+        hidden, intermediate = 1024, 3072
+        gate_up_weight = torch.randn(2 * intermediate, hidden, dtype=torch.float32)
+        down_weight = torch.randn(hidden, intermediate, dtype=torch.float32)
+
+        vulkan_ops.fused_swiglu_mlp(torch.randn(1, hidden), gate_up_weight, down_weight)
+        assert upload_counter["n"] == 2, "first call should upload both weights once"
+
+        vulkan_ops.fused_swiglu_mlp(torch.randn(1, hidden), gate_up_weight, down_weight)
+        assert upload_counter["n"] == 2, (
+            "second call (same weight objects) must not re-upload either weight"
+        )

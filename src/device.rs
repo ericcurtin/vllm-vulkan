@@ -48,12 +48,29 @@ unsafe fn init_vulkan() -> Option<VkState> {
         }
     };
 
-    // Application info (version 1.2 minimum).
+    // Application info. Must request >= 1.3: `scripts/compile_shaders.sh`
+    // compiles every shader with `glslangValidator --target-env vulkan1.3`
+    // (SPIR-V 1.6), which requires the `LocalSizeId` execution mode's
+    // `maintenance4` feature (core in Vulkan 1.3, not present at 1.2) and
+    // triggers validation errors under a 1.2 instance:
+    //   "Invalid SPIR-V binary version 1.6 for target environment SPIR-V
+    //   1.5 (under Vulkan 1.2 semantics)"
+    //   "SPIR-V OpExecutionMode LocalSizeId is used but maintenance4
+    //   feature was not enabled"
+    // Confirmed via `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation` that
+    // requesting only 1.2 here while compiling shaders for 1.3 is a real,
+    // spec-non-compliant version mismatch that some driver/process
+    // contexts tolerate silently and others (observed: inside a real vLLM
+    // multiprocessing-spawned worker on this hardware) do not, causing
+    // `vkCreateDevice`/pipeline creation to fail outright rather than just
+    // emitting a validation warning. See `ComputeDevice::create`'s
+    // `maintenance4`/`shader_subgroup_extended_types` feature enabling for
+    // the matching device-level half of this fix.
     let app_name = CString::new("vllm-vulkan").unwrap();
     let app_info = vk::ApplicationInfo::default()
         .application_name(&app_name)
         .application_version(vk::make_api_version(0, 0, 1, 0))
-        .api_version(vk::API_VERSION_1_2);
+        .api_version(vk::API_VERSION_1_3);
 
     // Enumerate available instance extensions.
     let available_exts = entry
@@ -272,22 +289,44 @@ impl ComputeDevice {
         let props = unsafe { instance.get_physical_device_properties(pd) };
 
         // f16 KV-cache shaders need both f16 storage buffers and f16 shader
-        // arithmetic/conversion.
-        let (storage_buffer_16_bit_access, shader_float16, has_float64) = unsafe {
+        // arithmetic/conversion. `maintenance4` and `shaderSubgroupExtendedTypes`
+        // are required by every compiled shader (SPIR-V 1.6, compiled with
+        // `--target-env vulkan1.3` — see `init_vulkan`'s doc comment) and by
+        // the subgroup-based shaders respectively; both are core Vulkan
+        // features (1.3 / 1.2) that still must be explicitly requested via
+        // `VkDeviceCreateInfo`'s feature chain even though the instance/
+        // device API version supports them.
+        let (
+            storage_buffer_16_bit_access,
+            shader_float16,
+            has_float64,
+            maintenance4,
+            shader_subgroup_extended_types,
+        ) = unsafe {
             let mut features16 = vk::PhysicalDevice16BitStorageFeatures::default();
             let mut float16_int8 = vk::PhysicalDeviceShaderFloat16Int8Features::default();
+            let mut maint4 = vk::PhysicalDeviceMaintenance4Features::default();
+            let mut subgroup_ext_types =
+                vk::PhysicalDeviceShaderSubgroupExtendedTypesFeatures::default();
             let p16 = &mut features16 as *mut vk::PhysicalDevice16BitStorageFeatures;
             let pf16 = &mut float16_int8 as *mut vk::PhysicalDeviceShaderFloat16Int8Features;
+            let pm4 = &mut maint4 as *mut vk::PhysicalDeviceMaintenance4Features;
+            let pset =
+                &mut subgroup_ext_types as *mut vk::PhysicalDeviceShaderSubgroupExtendedTypesFeatures;
             let mut features2 = vk::PhysicalDeviceFeatures2::default()
                 .push_next(&mut *pf16)
-                .push_next(&mut *p16);
+                .push_next(&mut *p16)
+                .push_next(&mut *pm4)
+                .push_next(&mut *pset);
             instance.get_physical_device_features2(pd, &mut features2);
             // Read results from the raw pointers — safe because Vulkan has
             // filled the structs and we are still within the unsafe block.
             let storage16_val = (*p16).storage_buffer16_bit_access == vk::TRUE;
             let shader_f16_val = (*pf16).shader_float16 == vk::TRUE;
             let f64_val  = features2.features.shader_float64 == vk::TRUE;
-            (storage16_val, shader_f16_val, f64_val)
+            let maint4_val = (*pm4).maintenance4 == vk::TRUE;
+            let subgroup_ext_types_val = (*pset).shader_subgroup_extended_types == vk::TRUE;
+            (storage16_val, shader_f16_val, f64_val, maint4_val, subgroup_ext_types_val)
         };
         let fp16 = storage_buffer_16_bit_access && shader_float16;
 
@@ -328,6 +367,14 @@ impl ComputeDevice {
             shader_float16: if shader_float16 { vk::TRUE } else { vk::FALSE },
             ..Default::default()
         };
+        let mut enabled_maintenance4 = vk::PhysicalDeviceMaintenance4Features {
+            maintenance4: if maintenance4 { vk::TRUE } else { vk::FALSE },
+            ..Default::default()
+        };
+        let mut enabled_subgroup_ext_types = vk::PhysicalDeviceShaderSubgroupExtendedTypesFeatures {
+            shader_subgroup_extended_types: if shader_subgroup_extended_types { vk::TRUE } else { vk::FALSE },
+            ..Default::default()
+        };
 
         let mut device_ci = vk::DeviceCreateInfo::default()
             .queue_create_infos(std::slice::from_ref(&queue_ci))
@@ -338,6 +385,16 @@ impl ComputeDevice {
         }
         if shader_float16 {
             device_ci = device_ci.push_next(&mut enabled_float16_int8);
+        }
+        // Required (core Vulkan 1.3) for every compiled shader — see
+        // `init_vulkan`'s doc comment. Not gated on availability with a
+        // silent skip like the optional f16 features above: every real
+        // Vulkan 1.3-capable driver supports it (it's a core, not optional-
+        // extension, feature), and every shader this crate compiles/dispatches
+        // needs it, so a device that somehow lacks it wouldn't work anyway.
+        device_ci = device_ci.push_next(&mut enabled_maintenance4);
+        if shader_subgroup_extended_types {
+            device_ci = device_ci.push_next(&mut enabled_subgroup_ext_types);
         }
 
         let device = unsafe { instance.create_device(pd, &device_ci, None) }

@@ -153,7 +153,7 @@ def _apply_module_hooks(model: nn.Module) -> None:
     scheduler, sampler, and KV-cache management unmodified. See
     ``scripts/bench_vulkan_model.py`` to exercise that engine directly.
     """
-    counts = {"rms_norm": 0, "linear": 0}
+    counts = {"rms_norm": 0, "linear": 0, "mlp_fused": 0}
     for _name, module in model.named_modules():
         cls_name = type(module).__name__
         if cls_name == "RMSNorm":
@@ -169,19 +169,30 @@ def _apply_module_hooks(model: nn.Module) -> None:
         ):
             _wrap_linear(module)
             counts["linear"] += 1
+        elif cls_name == "Qwen2MLP":
+            # Qwen3 reuses Qwen2's MLP block class unmodified (confirmed:
+            # `Qwen3ForCausalLM`'s decoder layer constructs a
+            # `vllm.model_executor.models.qwen2.Qwen2MLP`) — see
+            # `_wrap_swiglu_mlp`'s doc comment for what this fuses and why.
+            if _wrap_swiglu_mlp(module):
+                counts["mlp_fused"] += 1
     logger.info(
-        "Patched: %d RMSNorm, %d Linear modules for Vulkan dispatch.",
+        "Patched: %d RMSNorm, %d Linear modules (%d MLP blocks additionally "
+        "fused) for Vulkan dispatch.",
         counts["rms_norm"],
         counts["linear"],
+        counts["mlp_fused"],
     )
 
     # Pre-upload all weights to GPU.
     try:
         from vllm_vulkan import vulkan_ops  # noqa: PLC0415
-        from vllm_vulkan._rs import VulkanContext  # noqa: PLC0415
+        from vllm_vulkan.vulkan_bridge import (  # noqa: PLC0415
+            create_vulkan_context_with_fallback,
+        )
 
         if not vulkan_ops.is_ready():
-            ctx = VulkanContext(0)
+            ctx = create_vulkan_context_with_fallback(0)
             vulkan_ops.set_context(ctx)
 
         ctx = vulkan_ops.get_context()
@@ -189,7 +200,28 @@ def _apply_module_hooks(model: nn.Module) -> None:
         for _name, param in model.named_parameters():
             w = param.data
             if w.numel() > 0:
-                vulkan_ops._get_or_upload_weight(ctx, w)
+                # prefer_f16=True: MUST match what `_vulkan_matvec`/
+                # `_vulkan_matmul` (the only real dispatch call sites)
+                # request for this same weight later -- `_get_or_upload_weight`
+                # caches whatever GPU buffer dtype the *first* call for a
+                # given weight actually uploads, keyed only on the weight's
+                # identity, not on the caller's `prefer_f16` value. Pre-upload
+                # previously called this with the default `prefer_f16=False`,
+                # caching a float32 buffer; the real forward pass's
+                # `prefer_f16=True` call would then hit that cache (skipping
+                # its own upload) but still independently decide -- via the
+                # separately-cached `_weight_uses_f16` -- to dispatch the
+                # float16 *shader* variant against that float32 *buffer*.
+                # Confirmed directly: this silently produces wildly wrong
+                # output (100-1000x magnitude errors, not just precision
+                # loss) for every large-enough Linear weight, since the f16
+                # shader reads each 4-byte float as two garbage 2-byte
+                # halves. Previously unreachable in practice: pre-upload
+                # only ever ran on weights vLLM's CPU backend had already
+                # emptied to 0 elements (see `patches._patch_cpu_weight_removal`),
+                # so this loop uploaded nothing for any real Linear weight
+                # until that patch made a real weight available here at all.
+                vulkan_ops._get_or_upload_weight(ctx, w, prefer_f16=True)
                 total_bytes += w.nbytes
         logger.info("Pre-uploaded %.1fGB of weights to Vulkan GPU.", total_bytes / 1e9)
     except Exception as exc:
@@ -315,6 +347,31 @@ def _wrap_linear(module: nn.Module) -> None:
             return orig(x, *args, **kwargs)
         if not weight_dtype_ok:
             return orig(x, *args, **kwargs)
+        # `weight_dtype_ok` (a plain bool captured from the enclosing scope)
+        # already guarantees `weight is not None` at runtime here -- the
+        # `weight is None` half of this check exists purely so mypy can
+        # narrow `weight`'s type from `Any | None` on this same line, since
+        # it can't correlate that guarantee across the separate boolean
+        # above.
+        if weight is None or weight.numel() == 0:
+            # vLLM's `determine_available_memory()` profiling/warmup pass
+            # (run once, before any real request is served) exercises
+            # every Linear-family module with realistic *activation*
+            # shapes but a temporarily degenerate (0-element) `.weight` --
+            # observed directly: `weight.shape == torch.Size([0])` while
+            # `x.shape` is a normal batch/hidden-size pair -- to measure
+            # activation memory footprint in isolation from weight memory.
+            # `weight_dtype_ok` (computed once, at hook-install time, from
+            # the real weight) doesn't catch this since it only checks
+            # `dtype`, which an emptied weight still has; `weight.numel()`
+            # must be rechecked on every call since the *same* Parameter
+            # object referenced by this closure is what gets emptied/
+            # restored in place. Previously invisible: `vulkan_ops.linear()`
+            # was never actually reached during profiling before Vulkan
+            # dispatch worked at all (see `vulkan_bridge.py`), so this
+            # crashed with `IndexError: tuple index out of range` at
+            # `weight.shape[1]` as soon as it started being reached.
+            return orig(x, *args, **kwargs)
 
         try:
             # weight is passed through as-is (NOT weight.float()) so its
@@ -367,3 +424,134 @@ def _wrap_linear(module: nn.Module) -> None:
         return result
 
     module.forward = vk_forward
+
+
+def _wrap_swiglu_mlp(module: nn.Module) -> bool:
+    """Fuse a Qwen2MLP/Qwen3MLP block's `gate_up_proj(x) -> SiluAndMul ->
+    down_proj(...)` into ONE Vulkan GPU submit via
+    `vulkan_ops.fused_swiglu_mlp`, instead of two independent per-Linear-
+    module submits (`gate_up_proj`/`down_proj` are still separately
+    patched by `_wrap_linear`, since `_apply_module_hooks` walks every
+    module unconditionally — that per-module dispatch remains this
+    function's own fallback path whenever fusion isn't applicable for a
+    given call, e.g. weights too small, `swiglu_f32` not compiled, or any
+    other error).
+
+    This is the "fuse consecutively-dispatched matvecs/matmuls into one
+    submit" optimization `_wrap_linear`'s independent per-module hooks
+    cannot do on their own — `gate_up_proj` and `down_proj` are separate
+    `nn.Module`s with vLLM's own CPU activation call (`SiluAndMul`, a
+    plain PyTorch op) run on the CPU in between, so fusing across all
+    three into one GPU submit requires hooking the *containing* MLP
+    block's own `forward()`, not its constituent Linear modules.
+
+    Returns True if this module was actually patched (has the expected
+    `gate_up_proj`/`down_proj`/`act_fn` structure, no bias on either
+    Linear, and fusion isn't disabled via
+    `VLLM_VULKAN_DISABLE_MLP_FUSION`), False otherwise -- callers use this
+    only for the installed-module count logged at startup; the module is
+    left completely unmodified (still using whatever `_wrap_linear`/the
+    original `nn.Module.forward` already provide) when this returns
+    False.
+    """
+    gate_up_proj = getattr(module, "gate_up_proj", None)
+    down_proj = getattr(module, "down_proj", None)
+    act_fn = getattr(module, "act_fn", None)
+    if gate_up_proj is None or down_proj is None or act_fn is None:
+        return False
+    # Only fuse the exact activation this shader implements (see
+    # vulkan_ops.fused_swiglu_mlp's doc comment) -- a differently-named
+    # activation class (e.g. a clamped/limited SwiGLU variant some other
+    # model might use) would silently compute the wrong function if we
+    # assumed plain SiLU-gate-mul here.
+    if type(act_fn).__name__ != "SiluAndMul":
+        return False
+    # Qwen2MLP/Qwen3MLP construct both Linears with bias=False; bail out
+    # (leaving the module unpatched, using the safe per-Linear-module
+    # fallback) rather than silently dropping a bias term some other
+    # caller/config might have enabled -- `fused_swiglu_mlp` has no bias
+    # parameter at all.
+    if getattr(gate_up_proj, "bias", None) is not None:
+        return False
+    if getattr(down_proj, "bias", None) is not None:
+        return False
+    if os.environ.get("VLLM_VULKAN_DISABLE_MLP_FUSION"):
+        return False
+    # Under tensor parallelism, `gate_up_proj` is a MergedColumnParallelLinear
+    # (each rank holds a disjoint column-slice of gate_up's weight, needing no
+    # collective since the elementwise SwiGLU works fine on a sharded
+    # intermediate) and `down_proj` is a RowParallelLinear (each rank's matmul
+    # only produces a PARTIAL sum of the final output; vLLM's own
+    # `RowParallelLinear.forward` all-reduces across ranks before returning).
+    # `fused_swiglu_mlp` has no notion of any of this -- it just runs the
+    # three ops back-to-back in one local GPU submit -- so without
+    # replicating that reduction ourselves below, every rank would silently
+    # return its own partial sum instead of the true summed result. Same
+    # bug class _wrap_linear's own `row_reduce`/`gather_output` handling
+    # already guards against for individual Linear modules.
+    gu_tp_size = getattr(gate_up_proj, "tp_size", 1)
+    if getattr(gate_up_proj, "gather_output", False) and gu_tp_size > 1:
+        # Not the standard Qwen2MLP/Qwen3MLP column+row-parallel pairing
+        # this fusion was verified against -- bail out to the safe,
+        # per-Linear-module fallback rather than assume.
+        return False
+    dn_tp_size = getattr(down_proj, "tp_size", 1)
+    row_reduce = getattr(down_proj, "reduce_results", False) and dn_tp_size > 1
+
+    orig = module.forward
+
+    def vk_mlp_forward(x: torch.Tensor, *args, **kwargs):
+        from vllm_vulkan import vulkan_ops  # noqa: PLC0415
+
+        if not vulkan_ops.is_ready() or args or kwargs:
+            return orig(x, *args, **kwargs)
+
+        gu_weight = getattr(gate_up_proj, "weight", None)
+        dn_weight = getattr(down_proj, "weight", None)
+        # Same rationale as _wrap_linear's weight.numel() == 0 guard:
+        # vLLM's profiling/warm-up pass temporarily empties both weights.
+        if (
+            gu_weight is None
+            or dn_weight is None
+            or gu_weight.numel() == 0
+            or dn_weight.numel() == 0
+        ):
+            return orig(x, *args, **kwargs)
+
+        try:
+            # .to(x.dtype): fused_swiglu_mlp always computes/returns
+            # float32 (see vulkan_ops.linear's own identical `.to(x.dtype)`
+            # in _wrap_linear's vk_forward above, which this mirrors) --
+            # the surrounding model expects this MLP block's output to
+            # stay in the model's native dtype (bf16/fp16), since it feeds
+            # straight into a residual add against a bf16/fp16 hidden
+            # state and, further downstream, into the (dtype-sensitive)
+            # CPU attention kernels. Confirmed directly: omitting this
+            # crashed with "RuntimeError: expected scalar type Float but
+            # found BFloat16" inside the *next* layer's attention KV-cache
+            # write, not even inside this function -- the wrong dtype
+            # silently propagated one full layer forward before erroring.
+            result = vulkan_ops.fused_swiglu_mlp(x, gu_weight, dn_weight)
+            result = result.to(x.dtype)
+        except vulkan_ops.FusedMlpUnavailableError:
+            return orig(x, *args, **kwargs)
+        except Exception as exc:
+            logger.debug("Fused SwiGLU MLP failed (%s)", exc)
+            return orig(x, *args, **kwargs)
+
+        # Same reasoning as _wrap_linear's identical collective placement:
+        # run outside the try/except, and only on the success path, so
+        # every rank performs exactly one collective and stays in lockstep.
+        # Catching a failed collective here and re-running it via orig()
+        # would issue it twice on that rank and deadlock the group.
+        if row_reduce:
+            from vllm.distributed import (  # noqa: PLC0415
+                tensor_model_parallel_all_reduce,
+            )
+
+            result = tensor_model_parallel_all_reduce(result)
+
+        return result
+
+    module.forward = vk_mlp_forward
+    return True

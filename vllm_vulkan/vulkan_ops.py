@@ -870,6 +870,221 @@ def rms_norm_then_linear(
     return result.reshape(*orig_shape[:-1], out_feat)
 
 
+# ─── Fused SwiGLU MLP (gate_up_proj → silu(gate)*up → down_proj) ─────────────
+
+
+@lru_cache(maxsize=256)
+def _swiglu_pc(t: int, ne00: int, ne20: int) -> bytes:  # noqa: N803
+    """Pack push constants for `swiglu_f32` (shaders/swiglu.comp, via
+    `glu_head.glsl`'s 16-field struct), computing
+    `silu(src[..., :ne20]) * src[..., ne20:]` for a `[t, ne00]` (`ne00 ==
+    2*ne20`) row-major source into a `[t, ne20]` row-major destination —
+    exactly `vllm.model_executor.layers.activation.SiluAndMul.forward_native`'s
+    `silu(x[..., :d]) * x[..., d:]`.
+
+    `mode=0` ("Default"): reads `data_a[idx]` (gate) and
+    `data_a[idx + ne00/2]` (up) from the SAME buffer — matches a *merged*
+    `gate_up_proj` weight's single `[T, 2*intermediate]` output tensor
+    (Qwen2MLP/Qwen3MLP's `gate_up_proj`), gate and up interleaved per row.
+    `alpha`/`limit` are unused by this shader's `op()` (SiLU has no extra
+    parameters) — always 0.
+
+    `nb01`/`nb11` (row strides, in elements) are `ne00`/`ne20`
+    respectively: both source and destination are freshly-produced,
+    contiguous GPU buffers (this function's only caller,
+    `fused_swiglu_mlp`, always passes a chain-ref to another op's fresh
+    output — see `execute_batch`'s doc comment), so there is never a
+    non-default stride to account for. `ne01`/`ne02`/`ne11`/`ne12`
+    (batch dims) are `t`/`1` — no head/batch dimension beyond the token
+    axis for the same reason `_matvec_pc`'s `ne02`/`ne12`/broadcast fields
+    are inert here (see that function's own doc comment): this is always
+    a single unbatched `[T, ...]` 2D tensor. `nb02`/`nb03`/`nb12`/`nb13`
+    are consequently never read by `glu_main.glsl`'s indexing math (its
+    `i3`/`i2` always resolve to 0 when `ne02`/`ne12` == 1) but are set to
+    consistent (not garbage) values regardless, matching this file's
+    existing convention for similarly-inert fields elsewhere (see
+    `_matvec_pc`'s `ne02`/`ne12`/broadcast2/broadcast3 doc comment).
+    """
+    return struct.pack(
+        "4I2f10I",
+        t * ne20,
+        ne00,
+        ne20,
+        0,  # N, ne00, ne20, mode
+        0.0,
+        0.0,  # alpha, limit
+        ne00,
+        ne00 * t,
+        ne00 * t,  # nb01, nb02, nb03
+        t,
+        1,  # ne01, ne02
+        ne20,
+        ne20 * t,
+        ne20 * t,  # nb11, nb12, nb13
+        t,
+        1,  # ne11, ne12
+    )
+
+
+def _wg512(n: int) -> int:
+    """Workgroup count for `swiglu_f32`'s `local_size_x=512` (glu_head.glsl)."""
+    return (n + 511) // 512
+
+
+class FusedMlpUnavailableError(Exception):
+    """Raised by `fused_swiglu_mlp` when this weight/shape/shader
+    combination can't be dispatched as a single fused GPU submit (e.g. a
+    weight too small to be GPU-eligible at all, or `swiglu_f32` not
+    compiled). Callers should catch this and fall back to the separate
+    `gate_up_proj` → activation → `down_proj` calls.
+    """
+
+
+def fused_swiglu_mlp(
+    x: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+) -> torch.Tensor:
+    """SwiGLU MLP block (`gate_up_proj` → `silu(gate)*up` → `down_proj`)
+    in ONE `vkQueueSubmit`, using `execute_batch`'s chain-ref bindings
+    (see its doc comment) to keep both intermediate activations
+    (`gate_up_proj`'s `[T, 2*intermediate]` output and the SwiGLU
+    activation's `[T, intermediate]` output) on the GPU between the three
+    dispatches — only the block's final `[T, hidden]` output ever
+    round-trips back to Python/CPU.
+
+    This is the "fuse consecutively-dispatched matvecs/matmuls into one
+    submit" optimization the per-module `vk_forward` hooks in
+    model_runner.py cannot do on their own: `gate_up_proj` and
+    `down_proj` are independent `nn.Module`s, each independently
+    `execute_batch`-ing a single op today (see `linear()`) — there is no
+    way to fuse across two separate Python-level module calls without
+    hooking the *containing* MLP block's `forward()` instead of its
+    constituent Linear modules, which is what `model_runner.py`'s
+    `_wrap_qwen_mlp` (the caller of this function) does.
+
+    Raises `FusedMlpUnavailableError` if either weight is too small to be
+    GPU-eligible (mirrors `linear()`'s own `_MATVEC_MIN_WEIGHT_ELEMENTS`
+    gate) or the required shaders aren't compiled — callers should catch
+    this and fall back to separate `gate_up_proj(x)` /
+    `SiluAndMul()` / `down_proj(...)` calls, exactly as if this function
+    didn't exist.
+    """
+    ctx = get_context()
+
+    orig_shape = x.shape
+    hidden = gate_up_weight.shape[1]
+    x_2d = x.float().reshape(-1, hidden)
+    T = x_2d.shape[0]  # noqa: N806
+    two_intermediate = gate_up_weight.shape[0]
+    intermediate = two_intermediate // 2
+    out_features = down_weight.shape[0]
+
+    if (
+        hidden * two_intermediate < _MATVEC_MIN_WEIGHT_ELEMENTS
+        or intermediate * out_features < _MATVEC_MIN_WEIGHT_ELEMENTS
+    ):
+        raise FusedMlpUnavailableError("weight(s) too small to be GPU-eligible")
+
+    available_shaders = _cached_available_shaders(ctx)
+    if "swiglu_f32" not in available_shaders:
+        raise FusedMlpUnavailableError("swiglu_f32 not compiled")
+
+    use_f16_gate_up = _weight_uses_f16(ctx, gate_up_weight)
+    use_f16_down = _weight_uses_f16(ctx, down_weight)
+
+    if T < _MATVEC_THRESHOLD:
+        shader_gate_up = (
+            "mul_mat_vec_f16_f32_f32" if use_f16_gate_up else "mul_mat_vec_f32_f32_f32"
+        )
+        shader_down = (
+            "mul_mat_vec_f16_f32_f32" if use_f16_down else "mul_mat_vec_f32_f32_f32"
+        )
+        pc_gate_up = _matvec_pc(T, hidden, two_intermediate)
+        wg_gate_up = (two_intermediate, T, 1)
+        pc_down = _matvec_pc(T, intermediate, out_features)
+        wg_down = (out_features, T, 1)
+    else:
+        shader_gate_up = "matmul_f16_f32_fp32" if use_f16_gate_up else "matmul_f32_f32"
+        shader_down = "matmul_f16_f32_fp32" if use_f16_down else "matmul_f32_f32"
+        pc_gate_up = _matmul_pc(two_intermediate, T, hidden)
+        wg_gate_up = _matmul_workgroups(two_intermediate, T)
+        pc_down = _matmul_pc(out_features, T, intermediate)
+        wg_down = _matmul_workgroups(out_features, T)
+
+    if shader_gate_up not in available_shaders or shader_down not in available_shaders:
+        raise FusedMlpUnavailableError(
+            f"required matmul/matvec shader(s) not compiled: {shader_gate_up}, {shader_down}"
+        )
+
+    w_gate_up_gpu = _get_or_upload_weight(ctx, gate_up_weight, prefer_f16=True)
+    w_down_gpu = _get_or_upload_weight(ctx, down_weight, prefer_f16=True)
+
+    w_gate_up_binding = (
+        w_gate_up_gpu
+        if w_gate_up_gpu is not None
+        else (
+            _to_bytes(gate_up_weight.half())
+            if use_f16_gate_up
+            else _to_bytes(gate_up_weight.float())
+        )
+    )
+    w_down_binding = (
+        w_down_gpu
+        if w_down_gpu is not None
+        else (
+            _to_bytes(down_weight.half())
+            if use_f16_down
+            else _to_bytes(down_weight.float())
+        )
+    )
+
+    x_bytes = _to_bytes(x_2d)
+    gate_up_out_size = T * two_intermediate * 4
+    swiglu_out_size = T * intermediate * 4
+    down_out_size = T * out_features * 4
+    swiglu_pc = _swiglu_pc(T, two_intermediate, intermediate)
+
+    # Op 0: gate_up_proj matmul/matvec. Op 1 (SwiGLU) needs its output, so
+    # barrier_after=True.
+    # Op 1: SwiGLU — bindings are [A, B] per glu_head.glsl; mode=0 never
+    # reads B, but the shader still declares (and Vulkan still requires a
+    # bound buffer for) that binding, so both point at Op 0's output.
+    # Op 2 (down_proj) needs Op 1's output, so barrier_after=True.
+    # Op 2: down_proj matmul/matvec — this block's real, final output, so
+    # no barrier needed after it (nothing else in this batch reads it).
+    ops = [
+        (
+            shader_gate_up,
+            [w_gate_up_binding, x_bytes],
+            [gate_up_out_size],
+            pc_gate_up,
+            wg_gate_up,
+            True,
+        ),
+        (
+            "swiglu_f32",
+            [(0, 0), (0, 0)],
+            [swiglu_out_size],
+            swiglu_pc,
+            (_wg512(T * intermediate), 1, 1),
+            True,
+        ),
+        (
+            shader_down,
+            [w_down_binding, (1, 0)],
+            [down_out_size],
+            pc_down,
+            wg_down,
+            False,
+        ),
+    ]
+    results = ctx.execute_batch(ops)
+    final_bytes = results[2][0]
+    result = _from_bytes(final_bytes, (T, out_features), torch.float32)
+    return result.reshape(*orig_shape[:-1], out_features)
+
+
 # ─── Attention (SDPA fallback) ───────────────────────────────────────────────
 
 

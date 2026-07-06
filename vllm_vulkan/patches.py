@@ -13,6 +13,7 @@ monkey-patch the relevant vLLM modules.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import torch
@@ -58,9 +59,105 @@ def apply_patches() -> None:
         logger.warning("Failed to register gemma4 chat template fallback: %s", exc)
 
     try:
+        _patch_cpu_weight_removal()
+    except Exception as exc:
+        logger.warning("Failed to apply CPU weight-removal guard: %s", exc)
+
+    try:
         _patch_accelerator_synchronize()
     except Exception as exc:
         logger.warning("Failed to apply torch.accelerator.synchronize guard: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Patch: vLLM CPU backend's Linear.weight removal after oneDNN packing
+# ---------------------------------------------------------------------------
+
+
+def _patch_cpu_weight_removal() -> None:
+    """Stop vLLM's CPU backend from freeing ``Linear.weight`` after packing
+    it into a oneDNN GEMM handler.
+
+    ``UnquantizedLinearMethod.process_weights_after_loading`` (vLLM's own
+    code, `vllm/model_executor/layers/linear.py`) calls
+    ``dispatch_cpu_unquantized_gemm(layer, remove_weight=True)`` whenever
+    ``current_platform.is_cpu()`` is true -- true for this platform (see
+    ``VulkanPlatform.is_cpu()``'s own doc comment for why *that* override
+    is needed, for an unrelated cumem-allocator reason). That function
+    (`vllm/model_executor/layers/utils.py`) packs the weight into a
+    oneDNN-optimized GEMM handler for ``layer.cpu_linear``'s CPU fallback
+    path, then discards the original weight tensor entirely::
+
+        layer.weight = torch.nn.Parameter(torch.empty(0), requires_grad=False)
+
+    ``model_runner.py``'s ``_wrap_linear`` hook captures ``layer.weight``
+    at hook-install time specifically so it can pass the real weight
+    matrix to ``vulkan_ops.linear()`` on every call. If vLLM has already
+    emptied it by the time hooks are installed (confirmed: it has --
+    ``process_weights_after_loading`` runs as part of the same
+    ``load_model()`` call that happens immediately before hook
+    installation), every GPU dispatch attempt is silently unreachable:
+    ``_wrap_linear``'s own ``weight.numel() == 0`` guard catches this
+    gracefully rather than crashing, but the net effect is 100% CPU
+    fallback with zero GPU dispatch *ever* happening for any Linear-family
+    module, silently, indistinguishable from a healthy "GPU legitimately
+    isn't faster here" decision unless specifically profiled for.
+
+    Patched to always pass ``remove_weight=False`` instead. The oneDNN
+    packed handler is still built and still used for
+    ``layer.cpu_linear``'s CPU fallback path exactly as before -- this
+    doesn't disable or slow down that path at all -- just without freeing
+    the original weight, trading ~2x memory for every Linear weight (both
+    copies coexist) to keep GPU dispatch possible at all. On typical
+    hardware this plugin targets (tens to hundreds of GiB system RAM,
+    sub-GB-to-single-digit-GB model weights), that tradeoff is essentially
+    free.
+
+    Opt-in via ``VLLM_VULKAN_ENABLE_LINEAR_DISPATCH=1`` (default: disabled,
+    this patch is a no-op), for the same reason
+    ``vulkan_bridge.create_vulkan_context_with_fallback`` gates its own
+    subprocess fallback: this patch is the *sole enabler* of Vulkan GPU
+    dispatch ever running on a real Linear weight at all (without it,
+    every weight is emptied before hooks are installed, so
+    ``_wrap_linear``'s ``weight.numel() == 0`` guard makes every call a
+    silent, harmless CPU fallback). Measured directly on this project's
+    reference hardware (NVIDIA GB10): once this patch is enabled and GPU
+    dispatch is actually reachable, real end-to-end `vllm serve` throughput
+    measurably *drops* (roughly 2x, repeatable across concurrency levels
+    1-16) compared to leaving weights alone and letting every Linear call
+    fall back to vLLM's own oneDNN-packed CPU path -- vLLM's CPU backend
+    has apparently become fast enough (via that oneDNN packing) that
+    Vulkan's per-dispatch submission overhead no longer pays for itself
+    for this model's Linear shapes on this hardware, contradicting the
+    older, still-slower-CPU-baseline assumption `_MATVEC_MIN_WEIGHT_ELEMENTS`
+    was tuned against (see `vulkan_ops.linear`'s doc comment) -- that
+    threshold has not been re-validated against the oneDNN-packed
+    baseline. Enabling this by default would silently regress the common
+    case; set the env var to opt in anyway (e.g. to experiment with GPU
+    dispatch on a different model/shape/hardware combination where the
+    balance may favor it, or to work on re-tuning that threshold).
+    """
+    if os.environ.get("VLLM_VULKAN_ENABLE_LINEAR_DISPATCH") != "1":
+        return
+
+    try:
+        import vllm.model_executor.layers.utils as _vllm_layer_utils  # noqa: PLC0415
+    except ImportError:
+        return
+
+    orig_dispatch = getattr(_vllm_layer_utils, "dispatch_cpu_unquantized_gemm", None)
+    if orig_dispatch is None:
+        return
+
+    def _dispatch_keep_weight(layer, remove_weight: bool) -> None:  # noqa: ANN001, ARG001, FBT001
+        return orig_dispatch(layer, remove_weight=False)
+
+    _vllm_layer_utils.dispatch_cpu_unquantized_gemm = _dispatch_keep_weight
+    logger.debug(
+        "Patched dispatch_cpu_unquantized_gemm to keep Linear.weight "
+        "alive after oneDNN packing, so Vulkan GPU dispatch has a real "
+        "weight tensor to upload/use."
+    )
 
 
 # ---------------------------------------------------------------------------
