@@ -576,9 +576,16 @@ def test_cached_decode_support_data_matches_uncached_reference():
         torch.all(query_lens_ref[:num_actual_tokens] == 1).item()
     )
     expected_seq_lens = metadata.seq_lens[:num_actual_tokens].to("cpu")
-    expected_block_table = metadata.block_table[:num_actual_tokens].to("cpu")
+    # int64, not metadata.block_table's original int32: _cached_decode_support_data
+    # also normalizes the dtype (matching what kv_ops._block_table_to_u32 would
+    # otherwise convert independently, per row, on every per-token call) -- see
+    # its own doc comment.
+    expected_block_table = metadata.block_table[:num_actual_tokens].to(
+        device="cpu", dtype=torch.int64
+    )
 
     assert query_lens_all_ones == expected_all_ones
+    assert block_table_cpu.dtype == torch.int64
     torch.testing.assert_close(seq_lens_cpu, expected_seq_lens)
     torch.testing.assert_close(block_table_cpu, expected_block_table)
 
