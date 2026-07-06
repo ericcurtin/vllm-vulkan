@@ -220,16 +220,27 @@ impl PipelineCache {
 
     /// Compile a shader with the standard matvec specialization constants:
     /// BLOCK_SIZE=512, NUM_ROWS=1, NUM_COLS=1.
-    /// Also compiles NUM_ROWS=2 and NUM_ROWS=4 variants for larger matrices.
+    /// Also compiles a NUM_ROWS=4 variant for larger matrices.
+    ///
+    /// A NUM_ROWS=2 (`_r2`) variant used to be compiled here as well, but
+    /// was never actually dispatched anywhere in this codebase (Rust or
+    /// Python — every real matvec dispatch uses either this unsuffixed
+    /// base variant, the `_subgroup` unsuffixed variant, or `_r4`; `grep
+    /// -rn '_r2' src/ vllm_vulkan/ tests/` finds zero dispatch call
+    /// sites, only its own compilation). Compiling it cost ~400ms
+    /// (~22%) of `PipelineCache::new()`'s (i.e. model-load) wall time,
+    /// measured directly (~1865-1885ms with it vs ~1461-1467ms without,
+    /// consistently reproducible) before removing it — for a pipeline
+    /// that was pure dead weight, so it's removed rather than kept "just
+    /// in case". See `pipeline_cache_startup_tests::
+    /// r2_matvec_variant_is_no_longer_compiled` for a (non-timing-based,
+    /// CI-safe) regression guard confirming the removal.
     pub fn compile_matvec(&mut self, name: &str, spv: &[u8]) -> Result<(), String> {
         self.compile_one_with_spec(name, spv, &[
             (0, 512), // BLOCK_SIZE = 512
             (1, 1),   // NUM_ROWS = 1
             (2, 1),   // NUM_COLS = 1
         ])?;
-        // NUM_ROWS=2 variant for wider matrices
-        let r2 = format!("{name}_r2");
-        let _ = self.compile_one_with_spec(&r2, spv, &[(0, 512), (1, 2), (2, 1)]);
         // NUM_ROWS=4 variant, BLOCK_SIZE=32 (not 512): BLOCK_SIZE is tied
         // directly to the shader's local_size_x (`layout(local_size_x_id =
         // 0, ...)`), so this is a genuinely independent tuning axis from
