@@ -1593,8 +1593,8 @@ impl VulkanModel {
             let dw  = &self.gpu_weights[&ln("mlp.down_proj.weight")] as *const compute::Buffer;
 
             // Push constants for elementwise ops over ffn_inter elements
-            // gelu_inplace_f32: local_size_x=512, mul_f32_f32_f32: local_size_x=256
-            let gelu_wg = ((ffn_inter + 511) / 512) as u32;
+            // gelu_f32: local_size_x=128, mul_f32_f32_f32: local_size_x=256
+            let gelu_wg = ((ffn_inter + 127) / 128) as u32;
             let mul_wg  = ((ffn_inter + 255) / 256) as u32;
             let ew_wg = gelu_wg; // used below for gelu dispatch
 
@@ -1658,7 +1658,7 @@ impl VulkanModel {
             let pgw = &self.gpu_weights[&ln("per_layer_input_gate.weight")] as *const compute::Buffer;
             let ppw = &self.gpu_weights[&ln("per_layer_projection.weight")] as *const compute::Buffer;
 
-            let gelu_wg_ple = ((ple_dim + 511) / 512) as u32;
+            let gelu_wg_ple = ((ple_dim + 127) / 128) as u32;
             let mul_wg_ple  = ((ple_dim + 255) / 256) as u32;
 
             let eng = self.engine.as_mut().unwrap();
@@ -1786,7 +1786,7 @@ impl VulkanModel {
             eng.record_to(cb, shader, &[&*gw, &*ffi, &*gp], bytemuck::cast_slice(&mv_pc(h, ffn_inter, t)), (wg_r4(ffn_inter), t as u32, 1)).unwrap();
             eng.record_to(cb, shader, &[&*uw, &*ffi, &*up_p], bytemuck::cast_slice(&mv_pc(h, ffn_inter, t)), (wg_r4(ffn_inter), t as u32, 1)).unwrap();
             eng.record_barrier_to(cb);
-            eng.record_to(cb, "gelu_f32", &[&*gp, &*gelu_p], bytemuck::cast_slice(&unary_head_pc(ffn_inter)), (wg512(ffn_inter), 1, 1)).unwrap();
+            eng.record_to(cb, "gelu_f32", &[&*gp, &*gelu_p], bytemuck::cast_slice(&unary_head_pc(ffn_inter)), (wg128(ffn_inter), 1, 1)).unwrap();
             eng.record_barrier_to(cb);
             eng.record_to(cb, "mul_f32_f32_f32", &[&*gelu_p, &*up_p, &*mid_p], bytemuck::cast_slice(&binary_elementwise_pc(ffn_inter)), (wg256(ffn_inter), 1, 1)).unwrap();
             eng.record_barrier_to(cb);
@@ -1800,7 +1800,7 @@ impl VulkanModel {
             // PLE: gate -> gelu -> ×layer_ple -> proj
             eng.record_to(cb, shader, &[&*pgw, &*hidden3a_p, &*pg_p], bytemuck::cast_slice(&mv_pc(h, ple_dim, t)), (wg_r4(ple_dim), t as u32, 1)).unwrap();
             eng.record_barrier_to(cb);
-            eng.record_to(cb, "gelu_f32", &[&*pg_p, &*ple_gelu_p], bytemuck::cast_slice(&unary_head_pc(ple_dim)), (wg512(ple_dim), 1, 1)).unwrap();
+            eng.record_to(cb, "gelu_f32", &[&*pg_p, &*ple_gelu_p], bytemuck::cast_slice(&unary_head_pc(ple_dim)), (wg128(ple_dim), 1, 1)).unwrap();
             eng.record_barrier_to(cb);
             eng.record_to(cb, "mul_f32_f32_f32", &[&*ple_gelu_p, &*layer_p, &*ple_mid_p], bytemuck::cast_slice(&binary_elementwise_pc(ple_dim)), (wg256(ple_dim), 1, 1)).unwrap();
             eng.record_barrier_to(cb);
@@ -2152,10 +2152,19 @@ fn wg256(n: usize) -> u32 {
     n.div_ceil(256) as u32
 }
 
-/// Workgroup count for `gelu_f32` (512 threads/workgroup, 1 element/thread
-/// — see `gelu.comp`; matches the FFN's existing `gelu_wg` calculation).
+/// Workgroup count for `tanh_f32` (512 threads/workgroup, 1 element/thread
+/// — see `tanh.comp`). NOT used for `gelu_f32` (see `wg128` below): the two
+/// shaders have independently-tuned `local_size_x` values, so they need
+/// separate workgroup-count helpers even though both are 1-element/thread
+/// unary shaders.
 fn wg512(n: usize) -> u32 {
     n.div_ceil(512) as u32
+}
+
+/// Workgroup count for `gelu_f32` (128 threads/workgroup, 1 element/thread
+/// — see `gelu.comp`, tuned to 128 rather than the more common 512).
+fn wg128(n: usize) -> u32 {
+    n.div_ceil(128) as u32
 }
 
 /// Workgroup count for the `_r4` matvec shader variants
@@ -2675,6 +2684,59 @@ mod matvec_r4_tests {
             r4_us < base_us,
             "_r4 ({r4_us:.1}us) was not faster than the base variant ({base_us:.1}us)"
         );
+    }
+}
+
+#[cfg(test)]
+mod gelu_tests {
+    //! Validates `gelu_f32`'s GPU output against `model::cpu_gelu` at the
+    //! real Gemma4-E2B shapes the shader is actually dispatched at:
+    //! `ple_dim` (256 — where `gelu.comp`'s `local_size_x=128` tuning is
+    //! a measurable win over the more common 512, since 512 would leave
+    //! 3/4 of a single workgroup's lanes idle at this size) and
+    //! `ffn_inter` (6144 / 12288 — where 128 measured as a tie with 512,
+    //! no regression). Requires a real Vulkan device; skips cleanly (not
+    //! a failure) on headless CI runners with no GPU/ICD.
+    use super::*;
+
+    fn make_engine() -> Option<compute::ComputeEngine> {
+        let dev = match device::ComputeDevice::create(0) {
+            Ok(d) => d,
+            Err(e) => { eprintln!("skip: no Vulkan device available ({e})"); return None; }
+        };
+        let shader_spvs = include_all_shaders();
+        let refs: std::collections::HashMap<&str, &[u8]> = shader_spvs.iter()
+            .map(|(k, v)| (k.as_str(), v.as_slice())).collect();
+        Some(compute::ComputeEngine::new(
+            dev.instance.clone(), dev.physical_device, dev.device.clone(),
+            dev.compute_queue, dev.compute_queue_family, &refs,
+        ).expect("create ComputeEngine"))
+    }
+
+    #[test]
+    fn gpu_gelu_matches_cpu_reference() {
+        let _guard = gpu_test_guard();
+        let Some(mut engine) = make_engine() else { return };
+
+        for &n in &[256usize, 6144, 12288] {
+            let x: Vec<f32> = (0..n).map(|i| (i as f32 * 0.013).sin() * 3.0).collect();
+            let cpu_result = model::cpu_gelu(&x);
+
+            let inp = engine.alloc_host_coherent_storage((n * 4) as u64).unwrap();
+            inp.write(bytemuck::cast_slice(&x)).unwrap();
+            let out = engine.alloc_host_coherent_storage((n * 4) as u64).unwrap();
+
+            let cb = engine.begin_batch().unwrap();
+            engine.record_to(cb, "gelu_f32", &[&inp, &out], bytemuck::cast_slice(&unary_head_pc(n)), (wg128(n), 1, 1)).unwrap();
+            engine.submit_batch(cb).unwrap();
+            let gpu_result = read_f32_buf(&out, n);
+
+            let mut max_err = 0.0f32;
+            for (&a, &b) in cpu_result.iter().zip(gpu_result.iter()) {
+                max_err = max_err.max((a - b).abs());
+            }
+            assert!(max_err < 1e-4, "n={n}: GPU gelu_f32 (local_size_x=128) diverged from cpu_gelu: max abs err={max_err}");
+        }
     }
 }
 
