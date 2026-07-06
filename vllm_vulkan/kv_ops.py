@@ -153,23 +153,34 @@ def paged_kv_write_f32(
     )
 
 
-def _paged_kv_write(
-    ctx: VulkanContext,
+def _build_paged_kv_write_op(
     layout: VulkanPagedKVLayout,
     cache: GpuTensor,
+    spec: KVCacheLayerSpec,
     layer_index: int,
     k: torch.Tensor,
     v: torch.Tensor,
     slot_mapping: torch.Tensor | list[int] | tuple[int, ...],
     shader_name: str,
     dtype: torch.dtype,
-    dtype_size: int,
-) -> None:
-    spec = layout.layer_spec(layer_index)
-    _require_shader(ctx, shader_name)
-    _validate_cache_buffer(cache, layout)
-    _validate_layout_dtype(spec.dtype_size, dtype_size, shader_name)
+    barrier_after: bool,
+) -> tuple[str, list, list[int], bytes, tuple[int, int, int], bool]:
+    """Validate inputs and build one execute_batch op-tuple for a paged
+    KV-cache write, without submitting it.
 
+    Split out of `_paged_kv_write` so a caller that also wants to run
+    paged-attention decode against the just-written slots in the *same*
+    `ctx.execute_batch` call (`_paged_kv_write_and_decode_batch`) can
+    build this op with `barrier_after=True` and append the decode ops
+    after it in one list, instead of paying for two separate
+    vkQueueSubmit + fence-wait round trips (one for the write, one for
+    the decode) every attention layer, every decode step. `record_to`'s
+    barrier (`ComputeEngine::record_barrier_to`, SHADER_WRITE ->
+    SHADER_READ) is the same primitive `execute_chained`/`execute_batch`
+    already use for read-after-write hazards elsewhere (e.g.
+    `rms_norm_then_linear`) -- this reuses it rather than inventing a
+    new synchronization mechanism.
+    """
     k_cpu = k.detach().to(dtype=dtype, device="cpu").contiguous()
     v_cpu = v.detach().to(dtype=dtype, device="cpu").contiguous()
     if k_cpu.shape != v_cpu.shape:
@@ -199,23 +210,51 @@ def _paged_kv_write(
         1,
     )
 
-    ctx.execute_batch(
+    return (
+        shader_name,
         [
-            (
-                shader_name,
-                [
-                    _tensor_to_bytes(k_cpu),
-                    _tensor_to_bytes(v_cpu),
-                    slots.tobytes(),
-                    cache,
-                ],
-                [],
-                pc,
-                workgroups,
-                False,
-            )
-        ]
+            _tensor_to_bytes(k_cpu),
+            _tensor_to_bytes(v_cpu),
+            slots.tobytes(),
+            cache,
+        ],
+        [],
+        pc,
+        workgroups,
+        barrier_after,
     )
+
+
+def _paged_kv_write(
+    ctx: VulkanContext,
+    layout: VulkanPagedKVLayout,
+    cache: GpuTensor,
+    layer_index: int,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    slot_mapping: torch.Tensor | list[int] | tuple[int, ...],
+    shader_name: str,
+    dtype: torch.dtype,
+    dtype_size: int,
+) -> None:
+    spec = layout.layer_spec(layer_index)
+    _require_shader(ctx, shader_name)
+    _validate_cache_buffer(cache, layout)
+    _validate_layout_dtype(spec.dtype_size, dtype_size, shader_name)
+
+    op = _build_paged_kv_write_op(
+        layout=layout,
+        cache=cache,
+        spec=spec,
+        layer_index=layer_index,
+        k=k,
+        v=v,
+        slot_mapping=slot_mapping,
+        shader_name=shader_name,
+        dtype=dtype,
+        barrier_after=False,
+    )
+    ctx.execute_batch([op])
 
 
 def paged_attn_decode_f16(
@@ -579,6 +618,198 @@ def _paged_attn_decode_batch(
     results = ctx.execute_batch(ops)
     outputs = []
     for (num_q_heads, head_size), result in zip(shapes, results, strict=True):
+        output = np.frombuffer(result[0], dtype=np.float32).copy()
+        outputs.append(torch.from_numpy(output.reshape(num_q_heads, head_size)))
+    return outputs
+
+
+def paged_kv_write_and_decode_batch_f16(
+    ctx: VulkanContext,
+    layout: VulkanPagedKVLayout,
+    cache: GpuTensor,
+    layer_index: int,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    slot_mapping: torch.Tensor | list[int] | tuple[int, ...],
+    queries: list[torch.Tensor],
+    block_tables: list[torch.Tensor | list[int] | tuple[int, ...]],
+    seq_lens: list[int],
+    scale: float | None = None,
+) -> list[torch.Tensor]:
+    """f16 form of paged_kv_write_and_decode_batch_f32 - see its docstring."""
+    return _paged_kv_write_and_decode_batch(
+        ctx=ctx,
+        layout=layout,
+        cache=cache,
+        layer_index=layer_index,
+        k=k,
+        v=v,
+        slot_mapping=slot_mapping,
+        queries=queries,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        scale=scale,
+        write_shader_name=_PAGED_KV_WRITE_F16_SHADER,
+        decode_shader_name=_PAGED_ATTN_DECODE_F16_SHADER,
+        coop_shader_name=_PAGED_ATTN_DECODE_F16_COOP_SHADER,
+        coop_512_shader_name=_PAGED_ATTN_DECODE_F16_COOP_512_SHADER,
+        dtype=torch.float16,
+        dtype_size=2,
+    )
+
+
+def paged_kv_write_and_decode_batch_f32(
+    ctx: VulkanContext,
+    layout: VulkanPagedKVLayout,
+    cache: GpuTensor,
+    layer_index: int,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    slot_mapping: torch.Tensor | list[int] | tuple[int, ...],
+    queries: list[torch.Tensor],
+    block_tables: list[torch.Tensor | list[int] | tuple[int, ...]],
+    seq_lens: list[int],
+    scale: float | None = None,
+) -> list[torch.Tensor]:
+    """Write this step's new K/V tokens into the paged Vulkan KV cache AND
+    decode the whole batch of (query, block_table, seq_len) triples against
+    it - as a SINGLE ctx.execute_batch call (one vkQueueSubmit, one fence
+    wait) instead of two separate ones.
+
+    Every decode step, `attention.py` needs both of these in sequence: the
+    decode read genuinely depends on this step's write (the new token's own
+    K/V must be visible before paged-attention reads over the full
+    sequence including it), so a `record_barrier_to` (SHADER_WRITE ->
+    SHADER_READ) is inserted between the write dispatch and the decode
+    dispatches within the SAME command buffer - safe and correct because
+    `ComputeEngine::execute_batch` records every op into one command
+    buffer and only ever submits it once, after all ops (including the
+    barrier) are recorded; this is the exact mechanism `execute_chained`
+    and `rms_norm_then_linear` already rely on for read-after-write
+    hazards elsewhere in this codebase.
+
+    The real win is round trips, not shader work: `ctx.execute_batch`'s
+    own submit+fence-wait (measured directly on real hardware, see
+    src/lib.rs's buffer_pool_capacity_tests module and this function's
+    test in test_kv_ops.py) costs several hundred microseconds to over a
+    millisecond by itself, dwarfing the few microseconds of Python/Rust
+    marshalling on either side of it - so removing one whole round trip
+    per attention layer, per decode step (previously: one submit for the
+    write, one for the decode, called back-to-back from attention.py's
+    forward()) is worth far more than any shader-level tuning at this
+    call site.
+    """
+    return _paged_kv_write_and_decode_batch(
+        ctx=ctx,
+        layout=layout,
+        cache=cache,
+        layer_index=layer_index,
+        k=k,
+        v=v,
+        slot_mapping=slot_mapping,
+        queries=queries,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        scale=scale,
+        write_shader_name=_PAGED_KV_WRITE_SHADER,
+        decode_shader_name=_PAGED_ATTN_DECODE_SHADER,
+        coop_shader_name=_PAGED_ATTN_DECODE_COOP_SHADER,
+        coop_512_shader_name=_PAGED_ATTN_DECODE_COOP_512_SHADER,
+        dtype=torch.float32,
+        dtype_size=4,
+    )
+
+
+def _paged_kv_write_and_decode_batch(
+    ctx: VulkanContext,
+    layout: VulkanPagedKVLayout,
+    cache: GpuTensor,
+    layer_index: int,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    slot_mapping: torch.Tensor | list[int] | tuple[int, ...],
+    queries: list[torch.Tensor],
+    block_tables: list[torch.Tensor | list[int] | tuple[int, ...]],
+    seq_lens: list[int],
+    scale: float | None,
+    write_shader_name: str,
+    decode_shader_name: str,
+    coop_shader_name: str,
+    coop_512_shader_name: str,
+    dtype: torch.dtype,
+    dtype_size: int,
+) -> list[torch.Tensor]:
+    if not (len(queries) == len(block_tables) == len(seq_lens)):
+        raise ValueError(
+            "queries, block_tables, and seq_lens must have the same length "
+            f"(got {len(queries)}, {len(block_tables)}, {len(seq_lens)})"
+        )
+    if not queries:
+        # Matches _paged_attn_decode_batch's own empty-batch handling:
+        # an empty decode batch is a legitimate no-op, not an error, and
+        # calling _build_paged_kv_write_op below with zero tokens would
+        # raise ("K/V must contain at least one token") instead.
+        return []
+
+    # Both the write and the decode dispatch against the same KV-cache
+    # layer/layout, so shader-selection/cache-buffer/dtype resolution is
+    # shared between them and only done once - exactly like
+    # _resolve_paged_attn_decode_dispatch already does for the decode-only
+    # batch path.
+    dispatch_shader_name, coop_workgroup_size, spec, layer_base_offset = (
+        _resolve_paged_attn_decode_dispatch(
+            ctx=ctx,
+            layout=layout,
+            cache=cache,
+            layer_index=layer_index,
+            shader_name=decode_shader_name,
+            coop_shader_name=coop_shader_name,
+            coop_512_shader_name=coop_512_shader_name,
+            dtype_size=dtype_size,
+        )
+    )
+    _require_shader(ctx, write_shader_name)
+
+    write_op = _build_paged_kv_write_op(
+        layout=layout,
+        cache=cache,
+        spec=spec,
+        layer_index=layer_index,
+        k=k,
+        v=v,
+        slot_mapping=slot_mapping,
+        shader_name=write_shader_name,
+        dtype=dtype,
+        # The decode ops below read the slots this write just produced -
+        # they must not begin executing until the write's shader-memory
+        # writes are visible, hence barrier_after=True here (see this
+        # function's docstring).
+        barrier_after=True,
+    )
+
+    ops = [write_op]
+    shapes = []
+    for q, block_table, seq_len in zip(queries, block_tables, seq_lens, strict=True):
+        op, num_q_heads, head_size = _build_paged_attn_decode_op(
+            layout=layout,
+            cache=cache,
+            spec=spec,
+            layer_base_offset=layer_base_offset,
+            dispatch_shader_name=dispatch_shader_name,
+            coop_workgroup_size=coop_workgroup_size,
+            q=q,
+            block_table=block_table,
+            seq_len=seq_len,
+            scale=scale,
+        )
+        ops.append(op)
+        shapes.append((num_q_heads, head_size))
+
+    results = ctx.execute_batch(ops)
+    # results[0] is the write op's (empty) output list; decode outputs
+    # start at index 1.
+    outputs = []
+    for (num_q_heads, head_size), result in zip(shapes, results[1:], strict=True):
         output = np.frombuffer(result[0], dtype=np.float32).copy()
         outputs.append(torch.from_numpy(output.reshape(num_q_heads, head_size)))
     return outputs

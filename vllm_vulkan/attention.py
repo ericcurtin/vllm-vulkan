@@ -28,6 +28,8 @@ from vllm_vulkan.kv_layout import KVCacheLayerSpec, VulkanPagedKVLayout
 from vllm_vulkan.kv_ops import (
     paged_attn_decode_batch_f16,
     paged_attn_decode_batch_f32,
+    paged_kv_write_and_decode_batch_f16,
+    paged_kv_write_and_decode_batch_f32,
     paged_kv_write_f16,
     paged_kv_write_f32,
 )
@@ -286,6 +288,7 @@ class VulkanAttentionBackendImpl(CPUAttentionBackendImpl):
 
         # Keep vLLM's CPU KV cache updated first. This preserves the existing
         # fallback behavior and lets unsupported cases use CPU_ATTN immediately.
+        vulkan_write_and_decode_done = False
         if (
             self.kv_sharing_target_layer_name is None
             and key is not None
@@ -299,14 +302,38 @@ class VulkanAttentionBackendImpl(CPUAttentionBackendImpl):
                 attn_metadata.slot_mapping,
                 attn_metadata.isa,
             )
-            _try_write_tokens_to_vulkan_cache(
-                impl=self,
-                kv_cache=kv_cache,
-                key=key,
-                value=value,
-                slot_mapping=attn_metadata.slot_mapping,
-                num_tokens=num_actual_tokens,
-            )
+            # The merged write+decode path is only attempted for the
+            # common steady-state decode-only case, where the write and
+            # decode read cover exactly the same num_actual_tokens/
+            # slot_mapping (see _try_write_and_decode_vulkan's own doc
+            # comment). `use_sdpa_prefill` batches mix prefill and decode
+            # tokens and reduce num_actual_tokens further below, on a
+            # subset the write already covered but the decode wouldn't -
+            # that case keeps using the original, unmerged write-then-
+            # decode/CPU_ATTN sequence unchanged.
+            if not attn_metadata.use_sdpa_prefill:
+                vulkan_write_and_decode_done = _try_write_and_decode_vulkan(
+                    impl=self,
+                    query=query,
+                    key=key,
+                    value=value,
+                    kv_cache=kv_cache,
+                    attn_metadata=attn_metadata,
+                    output=output,
+                    num_actual_tokens=num_actual_tokens,
+                )
+            if not vulkan_write_and_decode_done:
+                _try_write_tokens_to_vulkan_cache(
+                    impl=self,
+                    kv_cache=kv_cache,
+                    key=key,
+                    value=value,
+                    slot_mapping=attn_metadata.slot_mapping,
+                    num_tokens=num_actual_tokens,
+                )
+
+        if vulkan_write_and_decode_done:
+            return output
 
         if attn_metadata.use_sdpa_prefill:
             allow_vulkan_decode = False
@@ -521,11 +548,154 @@ def _try_write_tokens_to_vulkan_cache(
         logger.debug("Vulkan KV cache mirror skipped: %s", exc)
 
 
+def _try_write_and_decode_vulkan(
+    *,
+    impl: VulkanAttentionBackendImpl,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    kv_cache: torch.Tensor,
+    attn_metadata: CPUAttentionMetadata,
+    output: torch.Tensor,
+    num_actual_tokens: int,
+) -> bool:
+    """Attempt the fully-merged Vulkan write+decode path for this step:
+    one ctx.execute_batch call that both mirrors this step's new K/V
+    tokens into the Vulkan paged KV cache AND runs paged-attention decode
+    against it, instead of the two separate ctx.execute_batch calls
+    (_try_write_tokens_to_vulkan_cache, then _try_vulkan_decode) this
+    replaces -- see paged_kv_write_and_decode_batch_f32's own docstring
+    in kv_ops.py for why removing one whole GPU round trip per attention
+    layer, per decode step, is worth doing (each ctx.execute_batch call's
+    own submit+fence-wait costs several hundred microseconds by itself on
+    real hardware, dwarfing the actual compute work at these shapes).
+
+    Only called from forward() when `not attn_metadata.use_sdpa_prefill`
+    (see its call site's comment) -- that's the common steady-state
+    decode-only case where the write and the decode cover *exactly* the
+    same `num_actual_tokens`/`slot_mapping`, unlike the mixed prefill+
+    decode batches `use_sdpa_prefill=True` represents, which keep using
+    the original, unmerged sequence unchanged.
+
+    Returns True if this step was fully handled (output already written,
+    including the KV-cache mirror) - the caller must skip its own write
+    and decode/CPU_ATTN fallback entirely in that case. Returns False if
+    the merged path isn't applicable or fails for any reason, WITHOUT
+    performing any write - the caller must then run its normal write-
+    then-decode/CPU_ATTN sequence from scratch exactly as if this
+    function had never been called, so there is no risk of writing the
+    same tokens twice or skipping a write that should have happened.
+    """
+    if num_actual_tokens <= 0:
+        # _supports_vulkan_decode's query_lens_all_ones check trivially
+        # passes on an empty batch (e.g. warmup/profiling calls with no
+        # real tokens), which would otherwise make this function pay for
+        # a Vulkan context lookup, a KV-cache-entry resolution, and a
+        # _vulkan_cache_has_sequences scan for genuinely nothing to do.
+        return False
+    if not impl._supports_vulkan_decode(
+        key=key,
+        value=value,
+        kv_cache=kv_cache,
+        attn_metadata=attn_metadata,
+        output=output,
+        num_actual_tokens=num_actual_tokens,
+    ):
+        return False
+    if envs.VLLM_VULKAN_DISABLE_ATTN:
+        return False
+
+    try:
+        ctx = _get_vulkan_context()
+        if ctx is None:
+            return False
+
+        entry = impl._get_kv_cache_entry(ctx, kv_cache)
+        _, seq_lens, block_table = _cached_decode_support_data(
+            attn_metadata, num_actual_tokens
+        )
+        # Every sequence's *prior* history must already be present -- this
+        # step's own new token(s) haven't been written yet at this point
+        # (the write and the decode read below happen together, in the
+        # same ctx.execute_batch call), so exclude_current_token=True.
+        if not _vulkan_cache_has_sequences(
+            entry, block_table, seq_lens, exclude_current_token=True
+        ):
+            return False
+
+        slot_mapping = (
+            attn_metadata.slot_mapping[:num_actual_tokens]
+            .detach()
+            .to(device="cpu", dtype=torch.int64)
+            .contiguous()
+        )
+        write_and_decode_batch = (
+            paged_kv_write_and_decode_batch_f16
+            if kv_cache.dtype == torch.float16
+            else paged_kv_write_and_decode_batch_f32
+        )
+        outs = write_and_decode_batch(
+            ctx,
+            entry.layout,
+            entry.cache,
+            _PER_LAYER_KV_CACHE_INDEX,
+            key[:num_actual_tokens],
+            value[:num_actual_tokens],
+            slot_mapping,
+            list(query[:num_actual_tokens].detach().to("cpu").unbind(0)),
+            list(block_table.unbind(0)),
+            seq_lens.tolist(),
+            impl.scale,
+        )
+
+        output[:num_actual_tokens].copy_(
+            torch.stack(outs).to(dtype=output.dtype, device=output.device)
+        )
+        _mark_vulkan_cache_slots_written(entry, slot_mapping)
+        # The write has now actually happened, so re-verify the full
+        # sequence (including this step's new token) to bump the
+        # verified-prefix cache the same way the old separate write-then-
+        # decode sequence would have -- otherwise the next decode step
+        # would needlessly re-scan this step's token in
+        # _vulkan_cache_has_sequences instead of getting an O(1) cache
+        # hit from _verified_prefix_len.
+        _vulkan_cache_has_sequences(entry, block_table, seq_lens)
+
+        logger.debug(
+            "Vulkan attention decode used (merged write+decode): "
+            "tokens=%d heads=%d head_size=%d dtype=%s",
+            num_actual_tokens,
+            impl.num_heads,
+            impl.head_size,
+            kv_cache.dtype,
+        )
+        impl._last_vulkan_decode_used = True
+        return True
+    except Exception as exc:
+        logger.debug("Vulkan write+decode fallback to separate calls: %s", exc)
+        return False
+
+
 def _vulkan_cache_has_sequences(
     entry: _VulkanKVCacheEntry,
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
+    *,
+    exclude_current_token: bool = False,
 ) -> bool:
+    """Returns whether every token this decode step needs to read from the
+    Vulkan cache has already been written there.
+
+    `exclude_current_token=True` checks one fewer token per sequence
+    (`seq_len - 1` instead of `seq_len`) -- used by
+    `_try_write_and_decode_vulkan` to verify a sequence's *prior* history
+    is already present *before* this step's own new token has been
+    written (that write and this check happen in the same
+    `ctx.execute_batch` call in the merged path, so at the time this
+    needs to run, the current token genuinely isn't written yet). A
+    sequence with `seq_len == 1` (its very first token) trivially passes
+    with no history to verify at all.
+    """
     layout = entry.layout
     spec = layout.layer_spec(_PER_LAYER_KV_CACHE_INDEX)
     block_size = spec.block_size
@@ -544,7 +714,18 @@ def _vulkan_cache_has_sequences(
     seq_lens_list = seq_lens.tolist()
     block_table_list = block_table.tolist()
 
-    for req_idx, seq_len in enumerate(seq_lens_list):
+    for req_idx, full_seq_len in enumerate(seq_lens_list):
+        if exclude_current_token:
+            # A brand new sequence's very first token (full_seq_len == 1)
+            # has no prior history to verify at all - skip it entirely,
+            # matching this function's non-excluding behavior for a
+            # genuinely empty sequence (seq_len == 0 below) rather than
+            # calling _active_block_ids/_remember_verified_prefix for it.
+            seq_len = full_seq_len - 1
+            if seq_len <= 0:
+                continue
+        else:
+            seq_len = full_seq_len
         row = block_table_list[req_idx]
         needed_blocks = (seq_len + block_size - 1) // block_size
         active_blocks = _active_block_ids(row, needed_blocks, num_blocks)
