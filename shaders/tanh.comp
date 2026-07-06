@@ -5,13 +5,29 @@
 
 #extension GL_EXT_control_flow_attributes : enable
 
-layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+// local_size_x=128 (not the more common 512): measured on this hardware
+// (marginal per-dispatch cost within a batched submit, averaged over
+// hundreds of iterations, at vocab=262144 — the only shape tanh_f32 is
+// actually dispatched at, for the LM head's logit softcap), 128 is a
+// clear, reproducible ~1.2-1.35x win over 512, monotonically improving
+// as local_size_x decreases from 1024 down to 128 (consistent across 4
+// repeated runs). Same tuning finding as gelu.comp's local_size_x=128
+// (see gelu_tests::gpu_gelu_matches_cpu_reference), though here it holds
+// even at a much larger element count.
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 layout (binding = 0) readonly buffer X {A_TYPE data_a[];};
 layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
 
 void main() {
-    const uint i = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
+    // Strides here must track local_size_x (128): every production call
+    // site currently dispatches with (wgX, 1, 1) only, so
+    // GlobalInvocationID.y/z are always 0 and these strides are inert
+    // today — but keeping them mismatched with local_size_x would be a
+    // silent correctness trap for any future multi-dimensional dispatch
+    // of this shader (128*512 = 65536, matching the same "512 groups
+    // before rolling over" convention as the original 512*512 = 262144).
+    const uint i = gl_GlobalInvocationID.z * 65536 + gl_GlobalInvocationID.y * 128 + gl_GlobalInvocationID.x;
 
     if (i >= p.KX) {
         return;
