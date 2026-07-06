@@ -35,6 +35,24 @@ class VulkanWorker(CPUWorker):
         from vllm.utils.torch_utils import set_random_seed
         from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
 
+        # Re-apply the top-k/top-p Triton-CUDA guard here. It is also
+        # attempted from vllm_vulkan's plugin-registration entrypoint
+        # (vllm_vulkan.patches.apply_patches, called extremely early via
+        # vLLM's lazy `current_platform` resolution), but that is too early
+        # for `import vllm.v1.sample.ops.topk_topp_sampler` to succeed
+        # (vllm.config is still mid-import at that point), so it silently
+        # no-ops there. By the time init_device() runs, vLLM's module graph
+        # is fully loaded, so this is where the patch actually takes effect.
+        try:
+            from vllm_vulkan.patches import _patch_topk_topp_triton
+
+            _patch_topk_topp_triton()
+        except Exception:
+            logger.warning(
+                "Failed to apply top-k/top-p Triton-CUDA guard from init_device().",
+                exc_info=True,
+            )
+
         # ── library presence checks ───────────────────────────────────────
         def check_preloaded_libs(name: str) -> None:
             ld_preload_list = os.environ.get("LD_PRELOAD", "")
