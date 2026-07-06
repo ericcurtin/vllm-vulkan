@@ -277,7 +277,7 @@ impl VulkanContext {
             .map(|buf| {
                 let mut data = vec![0u8; buf.size as usize];
                 buf.read(&mut data).map_err(PyRuntimeError::new_err)?;
-                Ok(pyo3::types::PyBytes::new(py, &data).into())
+                Ok(pyo3::types::PyByteArray::new(py, &data).into())
             })
             .collect();
 
@@ -424,7 +424,7 @@ impl VulkanContext {
                 let buf = &out_bufs[meta.out_start + i];
                 let mut data = vec![0u8; buf.size as usize];
                 buf.read(&mut data).map_err(PyRuntimeError::new_err)?;
-                op_out.push(pyo3::types::PyBytes::new(py, &data).into());
+                op_out.push(pyo3::types::PyByteArray::new(py, &data).into());
             }
             all_results.push(op_out);
         }
@@ -457,7 +457,7 @@ impl VulkanContext {
     fn read_activation<'py>(&self, py: Python<'py>, tensor: &GpuTensor) -> PyResult<PyObject> {
         let mut data = vec![0u8; tensor.nbytes as usize];
         tensor.buf.read(&mut data).map_err(PyRuntimeError::new_err)?;
-        Ok(pyo3::types::PyBytes::new(py, &data).into())
+        Ok(pyo3::types::PyByteArray::new(py, &data).into())
     }
 
     /// Execute two chained compute ops in one vkQueueSubmit where Op 1's input
@@ -584,8 +584,8 @@ impl VulkanContext {
         self.engine.return_to_pool(out1_buf);
 
         Ok((
-            pyo3::types::PyBytes::new(py, &data0).into(),
-            pyo3::types::PyBytes::new(py, &data1).into(),
+            pyo3::types::PyByteArray::new(py, &data0).into(),
+            pyo3::types::PyByteArray::new(py, &data1).into(),
         ))
     }
 
@@ -654,7 +654,7 @@ impl VulkanContext {
                 self.engine
                     .download(buf, &mut data)
                     .map_err(PyRuntimeError::new_err)?;
-                Ok(pyo3::types::PyBytes::new(py, &data).into())
+                Ok(pyo3::types::PyByteArray::new(py, &data).into())
             })
             .collect()
     }
