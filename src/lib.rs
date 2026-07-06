@@ -1082,6 +1082,89 @@ fn compute_layer_gpu_weight_refs(
     }).collect()
 }
 
+/// Which QKV GPU weight layout this layer has: the single concatenated
+/// `qkv_proj` weight (see `ACT_QKV_OUT`'s doc comment — lets the QKV
+/// submit dispatch one matvec instead of three), or the three separate
+/// q/k/v_proj weights (the fallback used whenever the fused weight
+/// wasn't built/uploaded, e.g. a partial upload failure).
+#[derive(Clone, Copy)]
+enum QkvGpuWeightRefs {
+    Fused(*const compute::Buffer),
+    Separate {
+        q: *const compute::Buffer,
+        k: *const compute::Buffer,
+        v: *const compute::Buffer,
+    },
+}
+
+/// Precomputed once per layer at model-load time: raw-pointer views into
+/// the GPU-resident weights the ATTENTION section of
+/// `forward_layer_gpu_matmuls` needs (as opposed to `LayerGpuWeightRefs`
+/// above, which covers the POST-attention fused chain).
+///
+/// `forward_layer_gpu_matmuls` used to re-derive `input_layernorm.weight`
+/// (always) and either `self_attn.qkv_proj.weight` (fused case) or all
+/// three of `self_attn.{q,k,v}_proj.weight` (non-fused case) on every
+/// single decode step, for every layer, via the same
+/// `format!("model.layers.{layer_idx}.{name}")` + `HashMap::index`
+/// pattern `LayerGpuWeightRefs` above already fixed for the
+/// post-attention chain. Measured directly at Gemma4-E2B's real scale
+/// (35 layers, 2 weight names each in the common fused-QKV case — see
+/// `layer_attn_gpu_weight_refs_tests::
+/// precomputed_lookup_is_faster_than_per_call_recomputation`): the
+/// repeated format!+HashMap-lookup version costs ~8us per decode step,
+/// versus ~8ns for indexing a precomputed `Vec` by `layer_idx`.
+///
+/// Only populated for layers where `LayerGpuCaps::has_gpu_weights` is
+/// true (the same condition `use_gpu` gates on in
+/// `forward_layer_gpu_matmuls`) — `None` otherwise, matching
+/// `LayerGpuWeightRefs`'s same reasoning for avoiding a panic on a
+/// missing key for GPU-incomplete layers.
+#[derive(Clone, Copy)]
+struct LayerAttnGpuWeightRefs {
+    input_layernorm: *const compute::Buffer,
+    qkv: QkvGpuWeightRefs,
+}
+
+// SAFETY: matches `LayerGpuWeightRefs`'s reasoning — `compute::Buffer`
+// already asserts `unsafe impl Send` in compute.rs, and Python's GIL
+// serializes access to the `#[pyclass]` `VulkanModel` this is stored
+// inside via `layer_attn_gpu_weight_refs`.
+unsafe impl Send for LayerAttnGpuWeightRefs {}
+
+/// Computes `Option<LayerAttnGpuWeightRefs>` for every layer, once, from
+/// `gpu_weights` and `layer_gpu_caps` — `None` for any layer where
+/// `has_gpu_weights` is false (matching `use_gpu` being false for such a
+/// layer in `forward_layer_gpu_matmuls`, so these pointers are never
+/// dereferenced). Shared by `VulkanModel::new` and the test-only
+/// `build_test_model` helper. Same `gpu_weights` mutation-ordering
+/// requirement as `compute_layer_gpu_weight_refs`.
+fn compute_layer_attn_gpu_weight_refs(
+    layer_gpu_caps: &[LayerGpuCaps],
+    gpu_weights: &std::collections::HashMap<String, compute::Buffer>,
+) -> Vec<Option<LayerAttnGpuWeightRefs>> {
+    layer_gpu_caps.iter().enumerate().map(|(layer_idx, caps)| {
+        if !caps.has_gpu_weights {
+            return None;
+        }
+        let ln = |s: &str| format!("model.layers.{layer_idx}.{s}");
+        let buf = |name: &str| &gpu_weights[&ln(name)] as *const compute::Buffer;
+        let qkv = if caps.has_fused_qkv_weights {
+            QkvGpuWeightRefs::Fused(buf("self_attn.qkv_proj.weight"))
+        } else {
+            QkvGpuWeightRefs::Separate {
+                q: buf("self_attn.q_proj.weight"),
+                k: buf("self_attn.k_proj.weight"),
+                v: buf("self_attn.v_proj.weight"),
+            }
+        };
+        Some(LayerAttnGpuWeightRefs {
+            input_layernorm: buf("input_layernorm.weight"),
+            qkv,
+        })
+    }).collect()
+}
+
 ///   logits = vk_model.forward(token_id, position)
 #[pyclass]
 
@@ -1102,6 +1185,10 @@ pub struct VulkanModel {
     /// `fused_post_attention`, precomputed once in `new()` — see
     /// `LayerGpuWeightRefs`'s doc comment.
     layer_gpu_weight_refs: Vec<Option<LayerGpuWeightRefs>>,
+    /// Per-layer GPU weight buffer raw-pointer views for the ATTENTION
+    /// section of `forward_layer_gpu_matmuls`, precomputed once in
+    /// `new()` — see `LayerAttnGpuWeightRefs`'s doc comment.
+    layer_attn_gpu_weight_refs: Vec<Option<LayerAttnGpuWeightRefs>>,
     /// Pre-allocated persistent activation buffers (fixed Vec, stable pointers)
     act_bufs: Vec<compute::Buffer>,
     /// Whether act_bufs are initialised for the current model config
@@ -1267,6 +1354,10 @@ impl VulkanModel {
         // See LayerGpuWeightRefs's doc comment: same precomputation, for
         // the GPU weight buffer pointers fused_post_attention needs.
         let layer_gpu_weight_refs = compute_layer_gpu_weight_refs(&layer_gpu_caps, &gpu_weights);
+        // See LayerAttnGpuWeightRefs's doc comment: same precomputation,
+        // for the GPU weight buffer pointers the ATTENTION section of
+        // forward_layer_gpu_matmuls needs.
+        let layer_attn_gpu_weight_refs = compute_layer_attn_gpu_weight_refs(&layer_gpu_caps, &gpu_weights);
 
         Ok(VulkanModel {
             inner: model::Gemma4Model { config: cfg, weights, kv_caches },
@@ -1276,6 +1367,7 @@ impl VulkanModel {
             layer_gpu_caps,
             layer_cpu_weight_refs,
             layer_gpu_weight_refs,
+            layer_attn_gpu_weight_refs,
             act_bufs: Vec::new(),
             act_bufs_ready: false,
         })
@@ -1593,10 +1685,11 @@ impl VulkanModel {
 
         // Whether the concatenated Q+K+V weight built in `new()` is
         // resident on the GPU, letting the QKV submit dispatch one matvec
-        // instead of three (see ACT_QKV_OUT's doc comment). Falls back to
-        // the three-separate-dispatch path below if not (e.g. a partial
-        // upload failure) rather than failing outright.
-        let use_fused_qkv = use_gpu && caps.has_fused_qkv_weights;
+        // instead of three (see ACT_QKV_OUT's doc comment) — reflected in
+        // `attn_gpu_w.qkv`'s `Fused`/`Separate` variant below rather than
+        // a separate boolean here. Falls back to the three-separate-
+        // dispatch path if not (e.g. a partial upload failure) rather
+        // than failing outright.
 
         // Whether every weight the fully-fused post-attention GPU chain
         // needs (see `fused_post_attention` below) is resident on the GPU.
@@ -1628,7 +1721,14 @@ impl VulkanModel {
 
             let raw_p = self.act_ptr(ACT_RAW_HIDDEN);
             let inp = self.act_ptr(ACT_QKV_IN);
-            let inln_w_gpu = &self.gpu_weights[&ln("input_layernorm.weight")] as *const compute::Buffer;
+            // Precomputed once in `new()` instead of re-derived via
+            // format!()+HashMap-lookup on every decode step — see
+            // `LayerAttnGpuWeightRefs`'s doc comment. `use_gpu` being true
+            // implies `caps.has_gpu_weights`, the exact condition
+            // `compute_layer_attn_gpu_weight_refs` gates `Some` on.
+            let attn_gpu_w = self.layer_attn_gpu_weight_refs[layer_idx]
+                .expect("use_gpu implies has_gpu_weights, which compute_layer_attn_gpu_weight_refs requires for Some");
+            let inln_w_gpu = attn_gpu_w.input_layernorm;
 
             // SUBMIT 1: input_layernorm, then Q, K, V (Q/K/V independent — no
             // barrier needed between them, only after the norm they all read).
@@ -1636,9 +1736,8 @@ impl VulkanModel {
             // When the fused Q+K+V weight is available, Q/K/V collapse into
             // ONE matvec dispatch producing [q_dim+2*kv_dim] outputs (see
             // ACT_QKV_OUT's doc comment) instead of three separate ones.
-            let (q_v, k_v, v_v) = if use_fused_qkv {
+            let (q_v, k_v, v_v) = if let QkvGpuWeightRefs::Fused(qkv_w) = attn_gpu_w.qkv {
                 let qkv_p = self.act_ptr(ACT_QKV_OUT);
-                let qkv_w = &self.gpu_weights[&ln("self_attn.qkv_proj.weight")] as *const compute::Buffer;
                 let qkv_dim = q_dim + 2 * kv_dim;
 
                 let eng = self.engine.as_mut().unwrap();
@@ -1668,12 +1767,12 @@ impl VulkanModel {
                 let v_v = read_f32_buf_at(qkv_buf_ref, q_dim + kv_dim, kv_dim);
                 (q_v, k_v, v_v)
             } else {
+                let QkvGpuWeightRefs::Separate { q: q_w, k: k_w, v: v_w } = attn_gpu_w.qkv else {
+                    unreachable!("QkvGpuWeightRefs only has two variants; the Fused case is handled above")
+                };
                 let q_p = self.act_ptr(ACT_Q_OUT);
                 let k_p = self.act_ptr(ACT_K_OUT);
                 let v_p = self.act_ptr(ACT_V_OUT);
-                let q_w = &self.gpu_weights[&ln("self_attn.q_proj.weight")] as *const compute::Buffer;
-                let k_w = &self.gpu_weights[&ln("self_attn.k_proj.weight")] as *const compute::Buffer;
-                let v_w = &self.gpu_weights[&ln("self_attn.v_proj.weight")] as *const compute::Buffer;
 
                 let eng = self.engine.as_mut().unwrap();
                 let cb = eng.begin_batch().unwrap();
@@ -2675,6 +2774,9 @@ mod matvec_fusion_tests {
         // this test model), so it safely returns None for layers 1..35
         // instead of panicking on a missing HashMap key.
         let layer_gpu_weight_refs = compute_layer_gpu_weight_refs(&layer_gpu_caps, &gpu_weights);
+        // Same reasoning as layer_gpu_weight_refs just above, but keyed
+        // off has_gpu_weights instead of has_fused_post_attn_weights.
+        let layer_attn_gpu_weight_refs = compute_layer_attn_gpu_weight_refs(&layer_gpu_caps, &gpu_weights);
 
         Some(VulkanModel {
             inner: model::Gemma4Model {
@@ -2688,6 +2790,7 @@ mod matvec_fusion_tests {
             layer_gpu_caps,
             layer_cpu_weight_refs,
             layer_gpu_weight_refs,
+            layer_attn_gpu_weight_refs,
             act_bufs: Vec::new(),
             act_bufs_ready: false,
         })
@@ -3992,6 +4095,145 @@ mod layer_gpu_weight_refs_tests {
 
         println!(
             "layer_gpu_weight_refs ({num_layers} layers/decode-step): old(recompute) {old_us:.2}us   new(precomputed) {new_us:.2}us   speedup {:.1}x",
+            old_us / new_us.max(0.001)
+        );
+        assert!(
+            new_us < old_us,
+            "precomputed lookup ({new_us:.2}us) was not faster than per-call recomputation ({old_us:.2}us)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod layer_attn_gpu_weight_refs_tests {
+    //! The ATTENTION section of `forward_layer_gpu_matmuls` used to
+    //! re-derive `input_layernorm.weight` (always) and either
+    //! `self_attn.qkv_proj.weight` (fused case) or all three of
+    //! `self_attn.{q,k,v}_proj.weight` (non-fused case) on every single
+    //! decode step, for every layer, via the same
+    //! format!()+HashMap-lookup pattern `layer_gpu_weight_refs_tests`
+    //! (see above) already fixed for the post-attention chain.
+    //! `compute_layer_attn_gpu_weight_refs` now does this once, at load
+    //! time, and `forward_layer_gpu_matmuls` just indexes the resulting
+    //! `Vec<Option<LayerAttnGpuWeightRefs>>` by `layer_idx`.
+    use super::*;
+
+    fn make_engine() -> Option<compute::ComputeEngine> {
+        let dev = match device::ComputeDevice::create(0) {
+            Ok(d) => d,
+            Err(e) => { eprintln!("skip: no Vulkan device available ({e})"); return None; }
+        };
+        let shader_spvs = include_all_shaders();
+        let refs: std::collections::HashMap<&str, &[u8]> = shader_spvs.iter()
+            .map(|(k, v)| (k.as_str(), v.as_slice())).collect();
+        Some(compute::ComputeEngine::new(
+            dev.instance.clone(), dev.physical_device, dev.device.clone(),
+            dev.compute_queue, dev.compute_queue_family, &refs,
+        ).expect("create ComputeEngine"))
+    }
+
+    /// Reconstructs the OLD per-call computation (before this change) for
+    /// direct comparison — same weight names/logic as
+    /// `compute_layer_attn_gpu_weight_refs`, just re-run from scratch
+    /// (with its own `format!()` calls) on every invocation instead of
+    /// once. Mirrors the real fused-QKV common path.
+    fn old_way_recompute_every_call_fused(
+        layer_idx: usize,
+        gpu_weights: &std::collections::HashMap<String, compute::Buffer>,
+    ) -> LayerAttnGpuWeightRefs {
+        let ln = |s: &str| format!("model.layers.{layer_idx}.{s}");
+        let buf = |name: &str| &gpu_weights[&ln(name)] as *const compute::Buffer;
+        LayerAttnGpuWeightRefs {
+            input_layernorm: buf("input_layernorm.weight"),
+            qkv: QkvGpuWeightRefs::Fused(buf("self_attn.qkv_proj.weight")),
+        }
+    }
+
+    fn make_test_gpu_weights(
+        engine: &mut compute::ComputeEngine, num_layers: usize,
+    ) -> std::collections::HashMap<String, compute::Buffer> {
+        let mut gpu_weights = std::collections::HashMap::new();
+        let names = [
+            "input_layernorm.weight", "self_attn.qkv_proj.weight",
+            "self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight",
+        ];
+        for layer_idx in 0..num_layers {
+            for n in &names {
+                let buf = engine.alloc_host_coherent_storage(4).unwrap();
+                gpu_weights.insert(format!("model.layers.{layer_idx}.{n}"), buf);
+            }
+        }
+        gpu_weights
+    }
+
+    #[test]
+    fn compute_layer_attn_gpu_weight_refs_matches_old_per_call_recomputation() {
+        let _guard = gpu_test_guard();
+        let Some(mut engine) = make_engine() else { return };
+
+        // Layer 0: fused QKV present. Layer 1: only separate q/k/v (no
+        // fused weight). Layer 2: has_gpu_weights=false.
+        let gpu_weights = make_test_gpu_weights(&mut engine, 2);
+        let layer_gpu_caps = vec![
+            LayerGpuCaps { has_gpu_weights: true, has_fused_qkv_weights: true, has_fused_post_attn_weights: false },
+            LayerGpuCaps { has_gpu_weights: true, has_fused_qkv_weights: false, has_fused_post_attn_weights: false },
+            LayerGpuCaps { has_gpu_weights: false, has_fused_qkv_weights: false, has_fused_post_attn_weights: false },
+        ];
+
+        let new_refs = compute_layer_attn_gpu_weight_refs(&layer_gpu_caps, &gpu_weights);
+        assert!(new_refs[2].is_none(), "layer 2 should have no attn GPU weight refs (has_gpu_weights=false)");
+
+        let new0 = new_refs[0].expect("layer 0 should have attn GPU weight refs");
+        let old0 = old_way_recompute_every_call_fused(0, &gpu_weights);
+        assert_eq!(old0.input_layernorm, new0.input_layernorm);
+        let QkvGpuWeightRefs::Fused(o) = old0.qkv else { panic!("old0 should be Fused") };
+        let QkvGpuWeightRefs::Fused(n) = new0.qkv else { panic!("new0 should be Fused") };
+        assert_eq!(o, n);
+
+        let new1 = new_refs[1].expect("layer 1 should have attn GPU weight refs");
+        let ln = |s: &str| format!("model.layers.1.{s}");
+        assert_eq!(new1.input_layernorm, &gpu_weights[&ln("input_layernorm.weight")] as *const compute::Buffer);
+        match new1.qkv {
+            QkvGpuWeightRefs::Separate { q, k, v } => {
+                assert_eq!(q, &gpu_weights[&ln("self_attn.q_proj.weight")] as *const compute::Buffer);
+                assert_eq!(k, &gpu_weights[&ln("self_attn.k_proj.weight")] as *const compute::Buffer);
+                assert_eq!(v, &gpu_weights[&ln("self_attn.v_proj.weight")] as *const compute::Buffer);
+            }
+            QkvGpuWeightRefs::Fused(_) => panic!("layer 1 has no fused QKV weight, expected Separate"),
+        }
+    }
+
+    #[test]
+    fn precomputed_lookup_is_faster_than_per_call_recomputation() {
+        let _guard = gpu_test_guard();
+        let Some(mut engine) = make_engine() else { return };
+
+        let num_layers = 35; // real Gemma4-E2B layer count
+        let gpu_weights = make_test_gpu_weights(&mut engine, num_layers);
+        let layer_gpu_caps: Vec<LayerGpuCaps> = (0..num_layers)
+            .map(|_| LayerGpuCaps { has_gpu_weights: true, has_fused_qkv_weights: true, has_fused_post_attn_weights: true })
+            .collect();
+
+        let iters = 500;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            for layer_idx in 0..num_layers {
+                std::hint::black_box(old_way_recompute_every_call_fused(layer_idx, &gpu_weights));
+            }
+        }
+        let old_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+        let refs = compute_layer_attn_gpu_weight_refs(&layer_gpu_caps, &gpu_weights);
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            for &r in &refs {
+                std::hint::black_box(r);
+            }
+        }
+        let new_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+        println!(
+            "layer_attn_gpu_weight_refs ({num_layers} layers/decode-step): old(recompute) {old_us:.2}us   new(precomputed) {new_us:.2}us   speedup {:.1}x",
             old_us / new_us.max(0.001)
         );
         assert!(
