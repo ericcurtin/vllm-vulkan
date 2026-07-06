@@ -41,6 +41,90 @@ _MAX_VERIFIED_SEQUENCE_KEYS = 4096
 # -- measured directly, see that function's docstring.
 _MARK_SLOTS_VECTORIZE_THRESHOLD = 64
 
+# Single-slot cache for `_cached_decode_support_data` below -- see that
+# function's doc comment. Holds a *strong* reference to the cached-for
+# `attn_metadata` (not just its `id()`) so the cache-hit check is a safe
+# `is` comparison between two live references, matching the same pattern
+# already used for `kv_ops._cached_available_shaders`/
+# `vulkan_ops._cached_available_shaders` (see either's doc comment for
+# why a bare `id()`-int comparison would be unsafe: CPython is free to
+# recycle a garbage-collected object's memory address for a later,
+# unrelated object).
+_decode_support_cache_metadata: CPUAttentionMetadata | None = None
+_decode_support_cache_num_tokens: int | None = None
+_decode_support_cache_result: tuple[bool, torch.Tensor, torch.Tensor] | None = None
+
+
+def _cached_decode_support_data(
+    attn_metadata: CPUAttentionMetadata, num_actual_tokens: int
+) -> tuple[bool, torch.Tensor, torch.Tensor]:
+    """Returns `(query_lens_all_ones, seq_lens_cpu, block_table_cpu)`,
+    computed once per distinct `(attn_metadata, num_actual_tokens)` pair
+    and cached instead of re-derived on every call.
+
+    vLLM's `GPUModelRunner` (which `CPUModelRunner` subclasses) builds
+    attention metadata once per KV-cache-group and assigns the *same*
+    `attn_metadata` object to every layer sharing that group's shape
+    (`vllm/v1/worker/gpu_model_runner.py`'s `_build_attn_group_metadata`:
+    `for layer_name in attn_group.layer_names: attn_metadata_dict[layer_name]
+    = attn_metadata_i` -- confirmed by reading that source directly).
+    For Gemma4-E2B, that's roughly two groups (sliding-window and
+    full-attention layers) spanning all 35 decoder layers, so this
+    `VulkanAttentionBackendImpl.forward`/`_supports_vulkan_decode`/
+    `_try_vulkan_decode` trio -- one instance per layer -- was
+    re-deriving the exact same result from the exact same
+    `attn_metadata` object roughly 15-20 times per group, ~35 times per
+    decode step total, before this change. `num_actual_tokens` is
+    itself always derived from `attn_metadata`'s own fields (either
+    `.num_actual_tokens` or, when `.use_sdpa_prefill` is set,
+    `.num_decode_tokens` -- see `forward()`), so for a fixed
+    `attn_metadata` object it's deterministically the same value on
+    every call; it's still included in the cache key defensively
+    (a cheap int comparison) rather than assumed.
+
+    Computes what `_supports_vulkan_decode` (the `query_lens_all_ones`
+    check) and `_try_vulkan_decode` (the `seq_lens`/`block_table` CPU
+    slices) each used to derive separately -- since both need
+    `attn_metadata`-derived data for the same call, computing all three
+    together here also avoids redoing the equivalent of two independent
+    tensor slice+`.to("cpu")` operations back to back within one
+    (uncached) call, not just across layers.
+
+    Measured directly on this hardware: the `query_lens` chain (slice ->
+    subtract -> `.to("cpu")` -> `==1` -> `.all()` -> `.item()`) costs
+    ~7.3us/call; the `seq_lens`/`block_table` `.to("cpu")` calls cost
+    ~1.1us each. At ~35 calls/decode-step (one per attention layer)
+    before caching, that's ~255-330us/decode-step of the exact same
+    result being recomputed from the exact same object.
+    """
+    global \
+        _decode_support_cache_metadata, \
+        _decode_support_cache_num_tokens, \
+        _decode_support_cache_result
+    if (
+        _decode_support_cache_metadata is not attn_metadata
+        or _decode_support_cache_num_tokens != num_actual_tokens
+    ):
+        query_lens = (
+            attn_metadata.query_start_loc[1:] - attn_metadata.query_start_loc[:-1]
+        ).to(device="cpu")
+        query_lens_all_ones = query_lens.numel() == num_actual_tokens and bool(
+            torch.all(query_lens[:num_actual_tokens] == 1).item()
+        )
+        seq_lens_cpu = attn_metadata.seq_lens[:num_actual_tokens].to("cpu")
+        block_table_cpu = attn_metadata.block_table[:num_actual_tokens].to("cpu")
+
+        _decode_support_cache_metadata = attn_metadata
+        _decode_support_cache_num_tokens = num_actual_tokens
+        _decode_support_cache_result = (
+            query_lens_all_ones,
+            seq_lens_cpu,
+            block_table_cpu,
+        )
+
+    assert _decode_support_cache_result is not None
+    return _decode_support_cache_result
+
 
 class VulkanAttentionBackend(CPUAttentionBackend):
     """CPU_ATTN-compatible backend that opportunistically uses Vulkan decode.
@@ -230,8 +314,9 @@ class VulkanAttentionBackendImpl(CPUAttentionBackendImpl):
 
                 decode_batch = paged_attn_decode_batch_f32
 
-            seq_lens = attn_metadata.seq_lens[:num_actual_tokens].to("cpu")
-            block_table = attn_metadata.block_table[:num_actual_tokens].to("cpu")
+            _, seq_lens, block_table = _cached_decode_support_data(
+                attn_metadata, num_actual_tokens
+            )
             if not _vulkan_cache_has_sequences(entry, block_table, seq_lens):
                 return False
 
@@ -304,12 +389,10 @@ class VulkanAttentionBackendImpl(CPUAttentionBackendImpl):
         if kv_cache.dtype not in (torch.float16, torch.float32):
             return False
 
-        query_lens = (
-            attn_metadata.query_start_loc[1:] - attn_metadata.query_start_loc[:-1]
-        ).to(device="cpu")
-        if query_lens.numel() != num_actual_tokens:
-            return False
-        return bool(torch.all(query_lens[:num_actual_tokens] == 1).item())
+        query_lens_all_ones, _, _ = _cached_decode_support_data(
+            attn_metadata, num_actual_tokens
+        )
+        return query_lens_all_ones
 
 
 def _try_write_tokens_to_vulkan_cache(

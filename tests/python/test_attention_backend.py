@@ -451,3 +451,191 @@ def test_vulkan_cache_has_sequences_is_faster_at_a_realistic_batch_size():
         f"new implementation ({new_s * 1e6:.1f}us) was not faster than the "
         f"reference ({old_s * 1e6:.1f}us)"
     )
+
+
+def _make_decode_metadata(num_reqs: int = 2, seq_len: int = 1) -> CPUAttentionMetadata:
+    return CPUAttentionMetadata(
+        isa="vec16",
+        num_actual_tokens=num_reqs,
+        max_query_len=1,
+        query_start_loc=torch.arange(num_reqs + 1, dtype=torch.int32),
+        max_seq_len=seq_len,
+        seq_lens=torch.full((num_reqs,), seq_len, dtype=torch.int32),
+        block_table=torch.arange(num_reqs, dtype=torch.int32).unsqueeze(1),
+        slot_mapping=torch.arange(num_reqs, dtype=torch.int64),
+        scheduler_metadata=None,
+        causal=True,
+    )
+
+
+def test_cached_decode_support_data_matches_uncached_reference():
+    """`_cached_decode_support_data` (see its own doc comment in
+    attention.py) must produce the exact same
+    `(query_lens_all_ones, seq_lens_cpu, block_table_cpu)` tuple a
+    from-scratch computation would -- pure Python/torch, no Vulkan
+    device needed (this function never touches the GPU itself)."""
+    metadata = _make_decode_metadata(num_reqs=3, seq_len=5)
+    num_actual_tokens = 3
+
+    query_lens_all_ones, seq_lens_cpu, block_table_cpu = (
+        attention_mod._cached_decode_support_data(metadata, num_actual_tokens)
+    )
+
+    query_lens_ref = (metadata.query_start_loc[1:] - metadata.query_start_loc[:-1]).to(
+        device="cpu"
+    )
+    expected_all_ones = query_lens_ref.numel() == num_actual_tokens and bool(
+        torch.all(query_lens_ref[:num_actual_tokens] == 1).item()
+    )
+    expected_seq_lens = metadata.seq_lens[:num_actual_tokens].to("cpu")
+    expected_block_table = metadata.block_table[:num_actual_tokens].to("cpu")
+
+    assert query_lens_all_ones == expected_all_ones
+    torch.testing.assert_close(seq_lens_cpu, expected_seq_lens)
+    torch.testing.assert_close(block_table_cpu, expected_block_table)
+
+
+def test_cached_decode_support_data_detects_non_decode_query_lens():
+    """A query_start_loc implying a query length > 1 for some request
+    (i.e. a prefill/chunked-prefill step, not pure decode) must still
+    correctly report `query_lens_all_ones=False` through the cached
+    path, exactly as the original uncached check did."""
+    metadata = _make_decode_metadata(num_reqs=2, seq_len=5)
+    metadata.query_start_loc = torch.tensor([0, 1, 4], dtype=torch.int32)  # lens [1, 3]
+
+    query_lens_all_ones, _, _ = attention_mod._cached_decode_support_data(metadata, 2)
+    assert query_lens_all_ones is False
+
+
+def test_cached_decode_support_data_hits_cache_for_same_metadata_object():
+    """Repeated calls with the *same* `attn_metadata` object and
+    `num_actual_tokens` must return the identical (not just equal)
+    cached tuple, not recompute from scratch every time -- the whole
+    point of this cache (see its own doc comment: real vLLM shares one
+    `attn_metadata` object across every attention layer within a
+    KV-cache-group, confirmed by reading
+    `vllm/v1/worker/gpu_model_runner.py`'s `_build_attn_group_metadata`
+    directly)."""
+    metadata = _make_decode_metadata(num_reqs=2, seq_len=3)
+
+    result1 = attention_mod._cached_decode_support_data(metadata, 2)
+    result2 = attention_mod._cached_decode_support_data(metadata, 2)
+    assert result1 is result2, (
+        "repeated calls with the same (attn_metadata, num_actual_tokens) must "
+        "hit the cache, returning the identical cached tuple"
+    )
+
+
+def test_cached_decode_support_data_recomputes_for_different_metadata_object():
+    """A second, distinct `attn_metadata` object (even with identical
+    field values) must not silently reuse the first object's cached
+    result -- the cache compares `attn_metadata` identity with `is`,
+    never `==` or a value-derived key (the same reasoning already
+    documented for `kv_ops._cached_available_shaders`/
+    `vulkan_ops._cached_available_shaders`)."""
+    metadata1 = _make_decode_metadata(num_reqs=2, seq_len=3)
+    metadata2 = _make_decode_metadata(num_reqs=2, seq_len=3)
+
+    result1 = attention_mod._cached_decode_support_data(metadata1, 2)
+    result2 = attention_mod._cached_decode_support_data(metadata2, 2)
+    # Equal values (both metadata objects have identical fields), but
+    # must not be the literal same cached tuple -- confirms the cache
+    # actually recomputed for metadata2 instead of returning metadata1's
+    # stale cached result.
+    assert result1[0] == result2[0]
+    torch.testing.assert_close(result1[1], result2[1])
+    torch.testing.assert_close(result1[2], result2[2])
+    assert result1 is not result2
+
+    # Re-querying metadata1 after metadata2 was cached must recompute
+    # for metadata1 again (single-slot cache, not a full dict) rather
+    # than incorrectly returning metadata2's cached value.
+    result1_again = attention_mod._cached_decode_support_data(metadata1, 2)
+    assert result1_again is not result1
+    assert result1_again[0] == result1[0]
+    torch.testing.assert_close(result1_again[1], result1[1])
+    torch.testing.assert_close(result1_again[2], result1[2])
+
+
+def test_multiple_layers_sharing_attn_metadata_produce_correct_results():
+    """End-to-end regression test for the real scenario this caching
+    change targets: multiple `VulkanAttentionBackendImpl` instances
+    (simulating multiple decoder layers within the same KV-cache-group,
+    as real vLLM constructs them -- see `_cached_decode_support_data`'s
+    doc comment) processing *different* query/key/value data but
+    sharing the exact same `attn_metadata` object, in sequence, within
+    one decode step. Each layer's own output must be correct and
+    independent -- the shared cache must never leak one layer's
+    KV-cache/query data into another's result.
+    """
+    _require_vulkan_context()
+
+    num_heads = 4
+    num_kv_heads = 2
+    head_size = 32
+    block_size = 16
+    num_blocks = 4
+    num_reqs = 2
+    scale = head_size**-0.5
+
+    metadata = CPUAttentionMetadata(
+        isa="vec16",
+        num_actual_tokens=num_reqs,
+        max_query_len=1,
+        query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+        max_seq_len=1,
+        seq_lens=torch.tensor([1, 1], dtype=torch.int32),
+        block_table=torch.tensor([[0], [1]], dtype=torch.int32),
+        slot_mapping=torch.tensor([0, block_size], dtype=torch.int64),
+        scheduler_metadata=None,
+        causal=True,
+    )
+
+    def make_impl() -> VulkanAttentionBackendImpl:
+        return VulkanAttentionBackendImpl(
+            num_heads=num_heads,
+            head_size=head_size,
+            scale=scale,
+            num_kv_heads=num_kv_heads,
+            alibi_slopes=None,
+            sliding_window=None,
+            kv_cache_dtype="auto",
+            logits_soft_cap=None,
+            attn_type=AttentionType.DECODER,
+            kv_sharing_target_layer_name=None,
+        )
+
+    gqa_ratio = num_heads // num_kv_heads
+    torch.manual_seed(42)
+    for _layer_idx in range(3):
+        query = torch.randn(num_reqs, num_heads, head_size, dtype=torch.float32)
+        key = torch.randn(num_reqs, num_kv_heads, head_size, dtype=torch.float16)
+        value = torch.randn(num_reqs, num_kv_heads, head_size, dtype=torch.float16)
+        kv_cache = torch.zeros(
+            (2, num_blocks, num_kv_heads, block_size, head_size),
+            dtype=torch.float16,
+        )
+        output = torch.empty((num_reqs, num_heads, head_size), dtype=torch.float32)
+
+        impl = make_impl()
+        result = impl.forward(
+            layer=None,  # type: ignore[arg-type]
+            query=query,
+            key=key,
+            value=value,
+            kv_cache=kv_cache,
+            attn_metadata=metadata,  # the *same* object, every "layer"
+            output=output,
+        )
+
+        expected = []
+        for req_idx in range(num_reqs):
+            rows = []
+            for q_head in range(num_heads):
+                rows.append(value[req_idx, q_head // gqa_ratio].float())
+            expected.append(torch.stack(rows))
+        expected = torch.stack(expected)
+
+        assert impl._last_vulkan_decode_used is True
+        assert result is output
+        torch.testing.assert_close(output, expected, rtol=5e-3, atol=5e-3)
