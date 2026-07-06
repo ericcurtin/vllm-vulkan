@@ -740,21 +740,23 @@ fn include_all_shaders() -> std::collections::HashMap<String, Vec<u8>> {
     spv!("mul_mat_vec_f32_f32_f32_subgroup");
     spv!("mul_mat_vec_f16_f32_f32");
     spv!("mul_mat_vec_f16_f32_f32_subgroup");
-    // Quantized weight × f32 activations → f32 output
-    spv!("mul_mat_vec_q4_0_f32_f32");
-    spv!("mul_mat_vec_q4_0_f32_f32_subgroup");
-    spv!("mul_mat_vec_q4_1_f32_f32");
-    spv!("mul_mat_vec_q5_0_f32_f32");
-    spv!("mul_mat_vec_q5_1_f32_f32");
-    spv!("mul_mat_vec_q8_0_f32_f32");
-    spv!("mul_mat_vec_q8_0_f32_f32_subgroup");
-    // Quant K-type: activations f16 → f32 (new naming convention)
-    spv!("mul_mat_vec_q2_k_f16_f32");
-    spv!("mul_mat_vec_q3_k_f16_f32");
-    spv!("mul_mat_vec_q4_k_f32_f32_subgroup");
-    spv!("mul_mat_vec_q5_k_f16_f32");
-    spv!("mul_mat_vec_q6_k_f32_f32_subgroup");
-    spv!("mul_mat_vec_iq4_nl_f32_f32");
+    // Quantized-weight matvec variants (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K/Q3_K/
+    // Q4_K/Q5_K/Q6_K/IQ4_NL) are NOT registered here: this backend only
+    // ever loads f16/f32 weights (see model_runner.py/vulkan_ops.py — no
+    // quantization scheme is referenced anywhere in the Python weight-
+    // loading path, and `VulkanPlatform.verify_quantization` is a no-op
+    // passthrough), so these were pure dead weight — compiled into 2
+    // pipelines each (base + _r4) via `compile_matvec` for zero benefit.
+    // Confirmed via `grep -rn 'q4_0\|q8_0\|...' src/ vllm_vulkan/ tests/`
+    // finding zero dispatch call sites for any of them. Measured
+    // `PipelineCache::new()`'s (i.e. model-load) wall time before/after
+    // removing them: ~1473-1474ms with vs ~733-747ms without — a
+    // further ~730ms (~50%) model-load reduction on top of the earlier
+    // `_r2` removal (#52), consistently reproducible across repeated
+    // runs. If quantized-weight support is added later, these shaders'
+    // `.comp` sources are untouched (only their `spv!`/`MATVEC_SHADERS`
+    // registration is removed here) — re-registering them is a
+    // one-line-per-shader change.
 
     // ── General matmul (prefill) ─────────────────────────────────────────
     spv!("matmul_f32_f16");
@@ -2895,6 +2897,56 @@ mod pipeline_cache_startup_tests {
             "expected '_r2' matvec variant to no longer be compiled (dead code, never \
              dispatched anywhere), but record_to succeeded: {res_r2:?}"
         );
+    }
+
+    #[test]
+    fn quantized_matvec_variants_are_no_longer_compiled() {
+        let _guard = gpu_test_guard();
+        let Some(mut engine) = make_engine() else { return };
+
+        // Trivial zero-filled data — see r2_matvec_variant_is_no_longer_compiled
+        // above for why numerical correctness is irrelevant to this test.
+        let k = 64usize;
+        let n = 4usize;
+        let weight = vec![0u8; n * k]; // dummy bytes, layout doesn't matter here
+        let x = vec![0.0f32; k];
+        let wbuf = engine.alloc_host_coherent_storage(weight.len() as u64).unwrap();
+        wbuf.write(&weight).unwrap();
+        let xbuf = engine.alloc_host_coherent_storage((k * 4) as u64).unwrap();
+        xbuf.write(bytemuck::cast_slice(&x)).unwrap();
+        let out = engine.alloc_host_coherent_storage((n * 4) as u64).unwrap();
+        let pc = mv_pc(k, n, 1);
+
+        let cb = engine.begin_batch().unwrap();
+        for name in [
+            "mul_mat_vec_q4_0_f32_f32",
+            "mul_mat_vec_q4_0_f32_f32_subgroup",
+            "mul_mat_vec_q4_1_f32_f32",
+            "mul_mat_vec_q5_0_f32_f32",
+            "mul_mat_vec_q5_1_f32_f32",
+            "mul_mat_vec_q8_0_f32_f32",
+            "mul_mat_vec_q8_0_f32_f32_subgroup",
+            "mul_mat_vec_q2_k_f16_f32",
+            "mul_mat_vec_q3_k_f16_f32",
+            "mul_mat_vec_q4_k_f32_f32_subgroup",
+            "mul_mat_vec_q5_k_f16_f32",
+            "mul_mat_vec_q6_k_f32_f32_subgroup",
+            "mul_mat_vec_iq4_nl_f32_f32",
+        ] {
+            let res = engine.record_to(cb, name, &[&wbuf, &xbuf, &out], bytemuck::cast_slice(&pc), (n as u32, 1, 1));
+            assert!(
+                res.is_err(),
+                "expected quantized matvec variant '{name}' to no longer be compiled \
+                 (dead code, never dispatched anywhere — this backend only ever loads \
+                 f16/f32 weights), but record_to succeeded: {res:?}"
+            );
+        }
+
+        // The f32/f16 variants actually used in production must still work.
+        let res_f32 = engine.record_to(cb, "mul_mat_vec_f32_f32_f32", &[&wbuf, &xbuf, &out], bytemuck::cast_slice(&pc), (n as u32, 1, 1));
+        assert!(res_f32.is_ok(), "mul_mat_vec_f32_f32_f32 should still be compiled: {res_f32:?}");
+        let res_f16 = engine.record_to(cb, "mul_mat_vec_f16_f32_f32", &[&wbuf, &xbuf, &out], bytemuck::cast_slice(&pc), (n as u32, 1, 1));
+        assert!(res_f16.is_ok(), "mul_mat_vec_f16_f32_f32 should still be compiled: {res_f16:?}");
     }
 }
 
