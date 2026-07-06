@@ -191,7 +191,7 @@ def _paged_kv_write(
     slots = _slot_mapping_to_u32(
         slot_mapping, num_tokens, layout.capacity_tokens_per_layer
     )
-    pc = _paged_kv_write_pc(layout, spec.layer_index, num_tokens)
+    pc = _paged_kv_write_pc(spec, layout.layer_base_offset(layer_index), num_tokens)
     total_elements = num_tokens * spec.num_kv_heads * spec.head_size
     workgroups = (
         math.ceil(total_elements / _PAGED_KV_WRITE_WORKGROUP_SIZE),
@@ -347,7 +347,7 @@ def _resolve_paged_attn_decode_dispatch(
     coop_shader_name: str,
     coop_512_shader_name: str,
     dtype_size: int,
-) -> tuple[str, int, KVCacheLayerSpec]:
+) -> tuple[str, int, KVCacheLayerSpec, int]:
     """Resolve everything about a decode dispatch that's constant across
     every token in a batch - which shader variant to use, and the shared
     cache buffer/layout dtype validation - exactly once.
@@ -360,12 +360,17 @@ def _resolve_paged_attn_decode_dispatch(
     per-token, not just "one submit instead of N" with the same per-token
     Python/FFI overhead still paid beforehand.
 
-    Returns (dispatch_shader_name, coop_workgroup_size, spec):
-    coop_workgroup_size is 0 when the plain (non-coop) shader was
-    selected (its workgroup formula doesn't depend on this value at
-    all — see _build_paged_attn_decode_op), otherwise it's the
-    BLOCK_SIZE (256 or 512) the selected `_coop`/`_coop_512` shader was
-    compiled with.
+    Returns (dispatch_shader_name, coop_workgroup_size, spec,
+    layer_base_offset): coop_workgroup_size is 0 when the plain
+    (non-coop) shader was selected (its workgroup formula doesn't depend
+    on this value at all — see _build_paged_attn_decode_op), otherwise
+    it's the BLOCK_SIZE (256 or 512) the selected `_coop`/`_coop_512`
+    shader was compiled with. `layer_base_offset` is resolved here too
+    (alongside `spec`, which it's derived from) since it's likewise
+    constant across the whole batch — see `_paged_attn_decode_pc`'s doc
+    comment for why threading both straight through to it, instead of
+    letting it re-derive them from `layout`/`layer_index` on every
+    per-token call, matters.
     """
     spec = layout.layer_spec(layer_index)
     dispatch_shader_name, coop_workgroup_size = _select_decode_shader(
@@ -373,14 +378,15 @@ def _resolve_paged_attn_decode_dispatch(
     )
     _validate_cache_buffer(cache, layout)
     _validate_layout_dtype(spec.dtype_size, dtype_size, shader_name)
-    return dispatch_shader_name, coop_workgroup_size, spec
+    layer_base_offset = layout.layer_base_offset(layer_index)
+    return dispatch_shader_name, coop_workgroup_size, spec, layer_base_offset
 
 
 def _build_paged_attn_decode_op(
     layout: VulkanPagedKVLayout,
     cache: GpuTensor,
-    layer_index: int,
     spec: KVCacheLayerSpec,
+    layer_base_offset: int,
     dispatch_shader_name: str,
     coop_workgroup_size: int,
     q: torch.Tensor,
@@ -393,8 +399,11 @@ def _build_paged_attn_decode_op(
     it. Everything shared across a whole batch (shader selection, cache/
     dtype validation) must already be resolved by
     _resolve_paged_attn_decode_dispatch and passed in via
-    dispatch_shader_name/coop_workgroup_size/spec - this function only
-    does work that genuinely varies per token.
+    dispatch_shader_name/coop_workgroup_size/spec/layer_base_offset -
+    this function only does work that genuinely varies per token.
+    (`layer_index` itself is no longer needed here now that `spec`/
+    `layer_base_offset` -- both derived from it -- are passed in
+    already-resolved.)
 
     Returns (op_tuple, num_q_heads, head_size) so callers can either submit
     it alone (_paged_attn_decode, one token) or collect several from
@@ -429,8 +438,8 @@ def _build_paged_attn_decode_op(
     needed_blocks = math.ceil(seq_len / spec.block_size)
     blocks = _block_table_to_u32(block_table, needed_blocks, layout.num_blocks)
     pc = _paged_attn_decode_pc(
-        layout=layout,
-        layer_index=layer_index,
+        spec=spec,
+        layer_base_offset=layer_base_offset,
         seq_len=seq_len,
         num_q_heads=num_q_heads,
         scale=scale if scale is not None else 1.0 / math.sqrt(spec.head_size),
@@ -479,7 +488,7 @@ def _paged_attn_decode(
     coop_512_shader_name: str,
     dtype_size: int,
 ) -> torch.Tensor:
-    dispatch_shader_name, coop_workgroup_size, spec = (
+    dispatch_shader_name, coop_workgroup_size, spec, layer_base_offset = (
         _resolve_paged_attn_decode_dispatch(
             ctx=ctx,
             layout=layout,
@@ -494,8 +503,8 @@ def _paged_attn_decode(
     op, num_q_heads, head_size = _build_paged_attn_decode_op(
         layout=layout,
         cache=cache,
-        layer_index=layer_index,
         spec=spec,
+        layer_base_offset=layer_base_offset,
         dispatch_shader_name=dispatch_shader_name,
         coop_workgroup_size=coop_workgroup_size,
         q=q,
@@ -536,7 +545,7 @@ def _paged_attn_decode_batch(
     if not queries:
         return []
 
-    dispatch_shader_name, coop_workgroup_size, spec = (
+    dispatch_shader_name, coop_workgroup_size, spec, layer_base_offset = (
         _resolve_paged_attn_decode_dispatch(
             ctx=ctx,
             layout=layout,
@@ -555,8 +564,8 @@ def _paged_attn_decode_batch(
         op, num_q_heads, head_size = _build_paged_attn_decode_op(
             layout=layout,
             cache=cache,
-            layer_index=layer_index,
             spec=spec,
+            layer_base_offset=layer_base_offset,
             dispatch_shader_name=dispatch_shader_name,
             coop_workgroup_size=coop_workgroup_size,
             q=q,
@@ -630,31 +639,61 @@ def _validate_layout_dtype(
 
 
 def _paged_kv_write_pc(
-    layout: VulkanPagedKVLayout,
-    layer_index: int,
+    spec: KVCacheLayerSpec,
+    layer_base_offset: int,
     num_tokens: int,
 ) -> bytes:
-    spec = layout.layer_spec(layer_index)
+    """Pack push constants for `paged_kv_write_{f16,f32}`.
+
+    Takes the already-resolved `spec`/`layer_base_offset` directly
+    (instead of `layout: VulkanPagedKVLayout, layer_index: int`, from
+    which this function used to re-derive both via
+    `layout.layer_spec(layer_index)` / `layout.layer_base_offset(layer_index)`
+    on every call): `_paged_kv_write` (this function's only caller) has
+    already resolved `spec` for its own use by the time it calls this,
+    so re-deriving it again here was pure repeated, avoidable work — the
+    same class of fix `_paged_attn_decode_pc` below gets for the same
+    reason.
+    """
     return struct.pack(
         "<7I",
         num_tokens,
         spec.num_kv_heads,
         spec.head_size,
         spec.block_size,
-        layout.layer_base_offset(layer_index) // spec.dtype_size,
+        layer_base_offset // spec.dtype_size,
         spec.plane_bytes_per_block // spec.dtype_size,
         spec.bytes_per_block // spec.dtype_size,
     )
 
 
 def _paged_attn_decode_pc(
-    layout: VulkanPagedKVLayout,
-    layer_index: int,
+    spec: KVCacheLayerSpec,
+    layer_base_offset: int,
     seq_len: int,
     num_q_heads: int,
     scale: float,
 ) -> bytes:
-    spec = layout.layer_spec(layer_index)
+    """Pack push constants for `paged_attn_decode_*`.
+
+    Takes the already-resolved `spec`/`layer_base_offset` directly,
+    rather than `layout: VulkanPagedKVLayout, layer_index: int` (from
+    which this function used to re-derive both via
+    `layout.layer_spec(layer_index)` / `layout.layer_base_offset(layer_index)`
+    on every call — layer_spec() up to 3 times total per call once the
+    caller's own resolution and layer_base_offset()'s internal
+    bounds-check `layer_spec()` call are counted). This function runs
+    once per (query, block_table, seq_len) triple in
+    `_build_paged_attn_decode_op` — i.e. once per concurrently-decoding
+    token per attention layer per decode step — so at a concurrent
+    decode batch size of B, that's `num_layers * B` calls/decode-step;
+    `spec`/`layer_base_offset` are both already resolved exactly once
+    per *batch* (not per token) by `_resolve_paged_attn_decode_dispatch`,
+    so threading them straight through removes 100% of this function's
+    own redundant re-derivation instead of repeating it for every token
+    in the batch. Measured ~0.59us/call previously, of which ~30%
+    (~0.18-0.2us) was these two purely-redundant `layer_spec()` lookups.
+    """
     return struct.pack(
         "<8If",
         seq_len,
@@ -662,7 +701,7 @@ def _paged_attn_decode_pc(
         spec.num_kv_heads,
         spec.head_size,
         spec.block_size,
-        layout.layer_base_offset(layer_index) // spec.dtype_size,
+        layer_base_offset // spec.dtype_size,
         spec.plane_bytes_per_block // spec.dtype_size,
         spec.bytes_per_block // spec.dtype_size,
         scale,

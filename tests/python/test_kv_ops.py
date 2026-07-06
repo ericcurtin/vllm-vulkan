@@ -672,3 +672,141 @@ def test_cached_available_shaders_recomputes_for_a_different_context():
     # again (single-slot cache, not a full dict) rather than incorrectly
     # returning ctx2's cached value.
     assert kv_ops._cached_available_shaders(ctx1) == shaders1
+
+
+def _old_paged_kv_write_pc_reference(
+    layout: VulkanPagedKVLayout, layer_index: int, num_tokens: int
+) -> bytes:
+    """Reconstructs the OLD `_paged_kv_write_pc` (before this change) for
+    direct comparison — re-derives `spec`/`layer_base_offset` from
+    `layout`/`layer_index` from scratch on every call, exactly as the
+    function itself used to."""
+    import struct
+
+    spec = layout.layer_spec(layer_index)
+    return struct.pack(
+        "<7I",
+        num_tokens,
+        spec.num_kv_heads,
+        spec.head_size,
+        spec.block_size,
+        layout.layer_base_offset(layer_index) // spec.dtype_size,
+        spec.plane_bytes_per_block // spec.dtype_size,
+        spec.bytes_per_block // spec.dtype_size,
+    )
+
+
+def _old_paged_attn_decode_pc_reference(
+    layout: VulkanPagedKVLayout,
+    layer_index: int,
+    seq_len: int,
+    num_q_heads: int,
+    scale: float,
+) -> bytes:
+    """Reconstructs the OLD `_paged_attn_decode_pc` (before this change),
+    same rationale as `_old_paged_kv_write_pc_reference` above."""
+    import struct
+
+    spec = layout.layer_spec(layer_index)
+    return struct.pack(
+        "<8If",
+        seq_len,
+        num_q_heads,
+        spec.num_kv_heads,
+        spec.head_size,
+        spec.block_size,
+        layout.layer_base_offset(layer_index) // spec.dtype_size,
+        spec.plane_bytes_per_block // spec.dtype_size,
+        spec.bytes_per_block // spec.dtype_size,
+        scale,
+    )
+
+
+def test_paged_kv_write_pc_matches_old_layout_based_reference():
+    """`_paged_kv_write_pc` now takes the already-resolved `spec`/
+    `layer_base_offset` directly instead of re-deriving them from
+    `layout`/`layer_index` internally — must still produce byte-identical
+    push constants to the old (slower, redundant) implementation. Pure
+    Python; `VulkanPagedKVLayout`/`KVCacheLayerSpec` are plain frozen
+    dataclasses, no Vulkan device needed.
+    """
+    from vllm_vulkan import kv_ops
+
+    spec, layout = _make_layout(dtype_size=4)
+    layer_base_offset = layout.layer_base_offset(spec.layer_index)
+
+    new_pc = kv_ops._paged_kv_write_pc(spec, layer_base_offset, num_tokens=3)
+    old_pc = _old_paged_kv_write_pc_reference(layout, spec.layer_index, num_tokens=3)
+    assert new_pc == old_pc
+
+
+def test_paged_attn_decode_pc_matches_old_layout_based_reference():
+    """Same check as `test_paged_kv_write_pc_matches_old_layout_based_reference`,
+    for `_paged_attn_decode_pc`."""
+    from vllm_vulkan import kv_ops
+
+    spec, layout = _make_layout(dtype_size=4)
+    layer_base_offset = layout.layer_base_offset(spec.layer_index)
+
+    new_pc = kv_ops._paged_attn_decode_pc(
+        spec, layer_base_offset, seq_len=12, num_q_heads=4, scale=0.125
+    )
+    old_pc = _old_paged_attn_decode_pc_reference(
+        layout, spec.layer_index, seq_len=12, num_q_heads=4, scale=0.125
+    )
+    assert new_pc == old_pc
+
+
+def test_paged_attn_decode_pc_resolved_spec_is_faster_than_relayout_lookup():
+    """Measures the actual speedup: passing an already-resolved `spec`/
+    `layer_base_offset` directly should be faster than re-deriving them
+    from `layout`/`layer_index` on every call (the old behavior) — the
+    exact class of redundant-lookup overhead `_resolve_paged_attn_decode_dispatch`
+    resolving both once per *batch* (not once per token) now fully
+    eliminates from this function specifically.
+
+    Takes the minimum elapsed time across several independent trials —
+    see `test_cached_available_shaders_matches_uncached_reference_and_is_faster`
+    (same file) for why (measurement noise under full-suite load).
+    """
+    import time
+
+    from vllm_vulkan import kv_ops
+
+    spec, layout = _make_layout(dtype_size=4)
+    layer_base_offset = layout.layer_base_offset(spec.layer_index)
+
+    iters = 5000
+    trials = 5
+
+    def timed(fn) -> float:
+        best = float("inf")
+        for _ in range(trials):
+            t0 = time.perf_counter()
+            for _ in range(iters):
+                fn()
+            best = min(best, time.perf_counter() - t0)
+        return best
+
+    old_elapsed = timed(
+        lambda: _old_paged_attn_decode_pc_reference(
+            layout, spec.layer_index, seq_len=12, num_q_heads=4, scale=0.125
+        )
+    )
+    new_elapsed = timed(
+        lambda: kv_ops._paged_attn_decode_pc(
+            spec, layer_base_offset, seq_len=12, num_q_heads=4, scale=0.125
+        )
+    )
+
+    print(
+        f"\n_paged_attn_decode_pc, best-of-{trials}: "
+        f"old (layout+layer_index) {old_elapsed / iters * 1e6:.3f}us/call, "
+        f"new (resolved spec) {new_elapsed / iters * 1e6:.3f}us/call, "
+        f"speedup {old_elapsed / new_elapsed:.2f}x"
+    )
+    assert new_elapsed < old_elapsed, (
+        f"resolved-spec _paged_attn_decode_pc ({new_elapsed:.4f}s/{iters}) was "
+        f"not faster than the old layout+layer_index reference "
+        f"({old_elapsed:.4f}s/{iters})"
+    )
