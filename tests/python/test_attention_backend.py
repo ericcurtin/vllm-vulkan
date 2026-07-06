@@ -921,8 +921,22 @@ def test_multiple_decode_steps_reuse_kv_cache_entry_and_stay_correct():
             max_seq_len=1,
             seq_lens=torch.tensor([1], dtype=torch.int32),
             block_table=torch.tensor([[step % num_blocks]], dtype=torch.int32),
+            # This is the very first (and only) token of a fresh,
+            # independent single-token sequence each step (seq_lens=[1]
+            # below), so it belongs at offset 0 of whichever block
+            # block_table assigns it - slot = block_id * block_size + 0.
+            # (A previous version of this test computed slot_mapping as
+            # `step % (num_blocks * block_size)`, which only happened to
+            # coincide with the correct slot at step=0; for step>=1 it
+            # named a slot inside a *different* block than block_table
+            # pointed at, so decode read back zeros instead of this
+            # step's just-written key/value - a real, if latent, bug in
+            # this test's own setup that a merged Vulkan write+decode
+            # path (see kv_ops.py's paged_kv_write_and_decode_batch_f32)
+            # surfaced by actually depending on write-then-read
+            # consistency within a single GPU submit.)
             slot_mapping=torch.tensor(
-                [step % (num_blocks * block_size)], dtype=torch.int64
+                [(step % num_blocks) * block_size], dtype=torch.int64
             ),
             scheduler_metadata=None,
             causal=True,
