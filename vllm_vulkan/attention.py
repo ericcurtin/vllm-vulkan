@@ -23,8 +23,14 @@ from vllm.v1.attention.backends.cpu_attn import (
     CPUAttentionMetadata,
 )
 
-from vllm_vulkan import envs
+from vllm_vulkan import envs, vulkan_ops
 from vllm_vulkan.kv_layout import KVCacheLayerSpec, VulkanPagedKVLayout
+from vllm_vulkan.kv_ops import (
+    paged_attn_decode_batch_f16,
+    paged_attn_decode_batch_f32,
+    paged_kv_write_f16,
+    paged_kv_write_f32,
+)
 
 if TYPE_CHECKING:
     from vllm_vulkan._rs import GpuTensor, VulkanContext
@@ -301,18 +307,11 @@ class VulkanAttentionBackendImpl(CPUAttentionBackendImpl):
                 return False
 
             entry = _get_or_create_vulkan_kv_cache(ctx, kv_cache)
-            if kv_cache.dtype == torch.float16:
-                from vllm_vulkan.kv_ops import (  # noqa: PLC0415
-                    paged_attn_decode_batch_f16,
-                )
-
-                decode_batch = paged_attn_decode_batch_f16
-            else:
-                from vllm_vulkan.kv_ops import (  # noqa: PLC0415
-                    paged_attn_decode_batch_f32,
-                )
-
-                decode_batch = paged_attn_decode_batch_f32
+            decode_batch = (
+                paged_attn_decode_batch_f16
+                if kv_cache.dtype == torch.float16
+                else paged_attn_decode_batch_f32
+            )
 
             _, seq_lens, block_table = _cached_decode_support_data(
                 attn_metadata, num_actual_tokens
@@ -413,14 +412,11 @@ def _try_write_tokens_to_vulkan_cache(
             return
 
         entry = _get_or_create_vulkan_kv_cache(ctx, kv_cache)
-        if kv_cache.dtype == torch.float16:
-            from vllm_vulkan.kv_ops import (  # noqa: PLC0415
-                paged_kv_write_f16 as write_kv,
-            )
-        else:
-            from vllm_vulkan.kv_ops import (  # noqa: PLC0415
-                paged_kv_write_f32 as write_kv,
-            )
+        write_kv = (
+            paged_kv_write_f16
+            if kv_cache.dtype == torch.float16
+            else paged_kv_write_f32
+        )
 
         slots = (
             slot_mapping[:num_tokens]
@@ -562,8 +558,23 @@ def _remember_verified_prefix(
 
 
 def _get_vulkan_context() -> VulkanContext | None:
+    # `vulkan_ops` is imported at module level (top of this file): it's a
+    # pure-Python module whose own references to `vllm_vulkan._rs` are
+    # themselves deferred to `TYPE_CHECKING`/local-import time (see its
+    # own imports), so importing it here doesn't need the compiled Rust
+    # extension to be available at all -- unlike `_rs.VulkanContext`
+    # itself, which genuinely does, and stays a local import so this
+    # function's surrounding try/except can keep gracefully falling back
+    # to CPU_ATTN (returning None) in an environment where the compiled
+    # extension isn't available, rather than failing at *module import*
+    # time merely by importing `attention.py`. Measured directly on this
+    # hardware: repeating `from vllm_vulkan import vulkan_ops` on every
+    # call (previously local here too) cost ~0.375us/call beyond
+    # `is_ready()`'s own ~0.08us -- this function (and the equivalent
+    # `kv_ops` function imports removed from `_try_vulkan_decode`/
+    # `_try_write_tokens_to_vulkan_cache`) runs up to ~70 times/decode
+    # step (once per attention layer for each of the two call sites).
     try:
-        from vllm_vulkan import vulkan_ops  # noqa: PLC0415
         from vllm_vulkan._rs import VulkanContext  # noqa: PLC0415
 
         if not vulkan_ops.is_ready():
