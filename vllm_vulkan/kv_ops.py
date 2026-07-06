@@ -21,8 +21,20 @@ _PAGED_KV_WRITE_F16_SHADER = "paged_kv_write_f16"
 _PAGED_ATTN_DECODE_F16_SHADER = "paged_attn_decode_f16"
 _PAGED_ATTN_DECODE_COOP_SHADER = "paged_attn_decode_f32_coop"
 _PAGED_ATTN_DECODE_F16_COOP_SHADER = "paged_attn_decode_f16_coop"
+# "_512" variants: same shader source, compiled with BLOCK_SIZE=512
+# instead of the default 256 (see paged_attn_decode_f32_coop.comp's
+# BLOCK_SIZE comment) — preferred over the 256 variant when head_size is
+# large enough (>=512, e.g. Gemma4-E2B's full-attention layers) to avoid
+# wasted/idle threads in the cooperative dot-product reduction. Measured
+# ~5-9% faster than BLOCK_SIZE=256 at head_size=512, while BLOCK_SIZE=256
+# remains ~9-14% faster at head_size=256 — matching BLOCK_SIZE to
+# head_size in both directions, not just unconditionally preferring the
+# larger one.
+_PAGED_ATTN_DECODE_COOP_512_SHADER = "paged_attn_decode_f32_coop_512"
+_PAGED_ATTN_DECODE_F16_COOP_512_SHADER = "paged_attn_decode_f16_coop_512"
 _PAGED_KV_WRITE_WORKGROUP_SIZE = 256
 _PAGED_ATTN_DECODE_WORKGROUP_SIZE = 256
+_PAGED_ATTN_DECODE_WORKGROUP_SIZE_LARGE = 512
 _F32_NBYTES = np.dtype(np.float32).itemsize
 
 
@@ -173,6 +185,7 @@ def paged_attn_decode_f16(
         scale=scale,
         shader_name=_PAGED_ATTN_DECODE_F16_SHADER,
         coop_shader_name=_PAGED_ATTN_DECODE_F16_COOP_SHADER,
+        coop_512_shader_name=_PAGED_ATTN_DECODE_F16_COOP_512_SHADER,
         dtype_size=2,
     )
 
@@ -205,6 +218,7 @@ def paged_attn_decode_f32(
         scale=scale,
         shader_name=_PAGED_ATTN_DECODE_SHADER,
         coop_shader_name=_PAGED_ATTN_DECODE_COOP_SHADER,
+        coop_512_shader_name=_PAGED_ATTN_DECODE_COOP_512_SHADER,
         dtype_size=4,
     )
 
@@ -234,6 +248,7 @@ def paged_attn_decode_batch_f16(
         scale=scale,
         shader_name=_PAGED_ATTN_DECODE_F16_SHADER,
         coop_shader_name=_PAGED_ATTN_DECODE_F16_COOP_SHADER,
+        coop_512_shader_name=_PAGED_ATTN_DECODE_F16_COOP_512_SHADER,
         dtype_size=2,
     )
 
@@ -263,6 +278,7 @@ def paged_attn_decode_batch_f32(
         scale=scale,
         shader_name=_PAGED_ATTN_DECODE_SHADER,
         coop_shader_name=_PAGED_ATTN_DECODE_COOP_SHADER,
+        coop_512_shader_name=_PAGED_ATTN_DECODE_COOP_512_SHADER,
         dtype_size=4,
     )
 
@@ -274,8 +290,9 @@ def _resolve_paged_attn_decode_dispatch(
     layer_index: int,
     shader_name: str,
     coop_shader_name: str,
+    coop_512_shader_name: str,
     dtype_size: int,
-) -> tuple[str, KVCacheLayerSpec]:
+) -> tuple[str, int, KVCacheLayerSpec]:
     """Resolve everything about a decode dispatch that's constant across
     every token in a batch - which shader variant to use, and the shared
     cache buffer/layout dtype validation - exactly once.
@@ -287,12 +304,21 @@ def _resolve_paged_attn_decode_dispatch(
     _paged_attn_decode_batch's single execute_batch call actually cheap
     per-token, not just "one submit instead of N" with the same per-token
     Python/FFI overhead still paid beforehand.
+
+    Returns (dispatch_shader_name, coop_workgroup_size, spec):
+    coop_workgroup_size is 0 when the plain (non-coop) shader was
+    selected (its workgroup formula doesn't depend on this value at
+    all — see _build_paged_attn_decode_op), otherwise it's the
+    BLOCK_SIZE (256 or 512) the selected `_coop`/`_coop_512` shader was
+    compiled with.
     """
     spec = layout.layer_spec(layer_index)
-    dispatch_shader_name = _select_decode_shader(ctx, shader_name, coop_shader_name)
+    dispatch_shader_name, coop_workgroup_size = _select_decode_shader(
+        ctx, shader_name, coop_shader_name, coop_512_shader_name, spec.head_size
+    )
     _validate_cache_buffer(cache, layout)
     _validate_layout_dtype(spec.dtype_size, dtype_size, shader_name)
-    return dispatch_shader_name, spec
+    return dispatch_shader_name, coop_workgroup_size, spec
 
 
 def _build_paged_attn_decode_op(
@@ -301,7 +327,7 @@ def _build_paged_attn_decode_op(
     layer_index: int,
     spec: KVCacheLayerSpec,
     dispatch_shader_name: str,
-    coop_shader_name: str,
+    coop_workgroup_size: int,
     q: torch.Tensor,
     block_table: torch.Tensor | list[int] | tuple[int, ...],
     seq_len: int,
@@ -312,8 +338,8 @@ def _build_paged_attn_decode_op(
     it. Everything shared across a whole batch (shader selection, cache/
     dtype validation) must already be resolved by
     _resolve_paged_attn_decode_dispatch and passed in via
-    dispatch_shader_name/spec - this function only does work that
-    genuinely varies per token.
+    dispatch_shader_name/coop_workgroup_size/spec - this function only
+    does work that genuinely varies per token.
 
     Returns (op_tuple, num_q_heads, head_size) so callers can either submit
     it alone (_paged_attn_decode, one token) or collect several from
@@ -355,10 +381,10 @@ def _build_paged_attn_decode_op(
         scale=scale if scale is not None else 1.0 / math.sqrt(spec.head_size),
     )
     total_elements = num_q_heads * spec.head_size
-    if dispatch_shader_name == coop_shader_name:
+    if coop_workgroup_size > 0:
         workgroups = (
             num_q_heads,
-            math.ceil(spec.head_size / _PAGED_ATTN_DECODE_WORKGROUP_SIZE),
+            math.ceil(spec.head_size / coop_workgroup_size),
             1,
         )
     else:
@@ -395,16 +421,20 @@ def _paged_attn_decode(
     scale: float | None,
     shader_name: str,
     coop_shader_name: str,
+    coop_512_shader_name: str,
     dtype_size: int,
 ) -> torch.Tensor:
-    dispatch_shader_name, spec = _resolve_paged_attn_decode_dispatch(
-        ctx=ctx,
-        layout=layout,
-        cache=cache,
-        layer_index=layer_index,
-        shader_name=shader_name,
-        coop_shader_name=coop_shader_name,
-        dtype_size=dtype_size,
+    dispatch_shader_name, coop_workgroup_size, spec = (
+        _resolve_paged_attn_decode_dispatch(
+            ctx=ctx,
+            layout=layout,
+            cache=cache,
+            layer_index=layer_index,
+            shader_name=shader_name,
+            coop_shader_name=coop_shader_name,
+            coop_512_shader_name=coop_512_shader_name,
+            dtype_size=dtype_size,
+        )
     )
     op, num_q_heads, head_size = _build_paged_attn_decode_op(
         layout=layout,
@@ -412,7 +442,7 @@ def _paged_attn_decode(
         layer_index=layer_index,
         spec=spec,
         dispatch_shader_name=dispatch_shader_name,
-        coop_shader_name=coop_shader_name,
+        coop_workgroup_size=coop_workgroup_size,
         q=q,
         block_table=block_table,
         seq_len=seq_len,
@@ -434,6 +464,7 @@ def _paged_attn_decode_batch(
     scale: float | None,
     shader_name: str,
     coop_shader_name: str,
+    coop_512_shader_name: str,
     dtype_size: int,
 ) -> list[torch.Tensor]:
     """Decode a whole batch of (query, block_table, seq_len) triples - one
@@ -450,14 +481,17 @@ def _paged_attn_decode_batch(
     if not queries:
         return []
 
-    dispatch_shader_name, spec = _resolve_paged_attn_decode_dispatch(
-        ctx=ctx,
-        layout=layout,
-        cache=cache,
-        layer_index=layer_index,
-        shader_name=shader_name,
-        coop_shader_name=coop_shader_name,
-        dtype_size=dtype_size,
+    dispatch_shader_name, coop_workgroup_size, spec = (
+        _resolve_paged_attn_decode_dispatch(
+            ctx=ctx,
+            layout=layout,
+            cache=cache,
+            layer_index=layer_index,
+            shader_name=shader_name,
+            coop_shader_name=coop_shader_name,
+            coop_512_shader_name=coop_512_shader_name,
+            dtype_size=dtype_size,
+        )
     )
 
     ops = []
@@ -469,7 +503,7 @@ def _paged_attn_decode_batch(
             layer_index=layer_index,
             spec=spec,
             dispatch_shader_name=dispatch_shader_name,
-            coop_shader_name=coop_shader_name,
+            coop_workgroup_size=coop_workgroup_size,
             q=q,
             block_table=block_table,
             seq_len=seq_len,
@@ -492,13 +526,34 @@ def _require_shader(ctx: VulkanContext, shader_name: str) -> None:
 
 
 def _select_decode_shader(
-    ctx: VulkanContext, shader_name: str, coop_shader_name: str
-) -> str:
+    ctx: VulkanContext,
+    shader_name: str,
+    coop_shader_name: str,
+    coop_512_shader_name: str,
+    head_size: int,
+) -> tuple[str, int]:
+    """Returns (dispatch_shader_name, coop_workgroup_size).
+
+    Prefers whichever `_coop`/`_coop_512` variant's BLOCK_SIZE best
+    matches `head_size` (see paged_attn_decode_f32_coop.comp's BLOCK_SIZE
+    comment for the measured rationale) — large enough head_size prefers
+    the 512-wide variant, otherwise the default 256-wide one, each falling
+    back to whichever coop variant IS available if the preferred one
+    isn't (e.g. an older build), and finally to the plain non-coop shader
+    if neither coop variant is available at all. `coop_workgroup_size` is
+    0 when the plain shader was selected (see _build_paged_attn_decode_op,
+    whose workgroup formula doesn't use this value in that case).
+    """
     available_shaders = ctx.available_shaders()
+    prefer_512 = head_size >= _PAGED_ATTN_DECODE_WORKGROUP_SIZE_LARGE
+    if prefer_512 and coop_512_shader_name in available_shaders:
+        return coop_512_shader_name, _PAGED_ATTN_DECODE_WORKGROUP_SIZE_LARGE
     if coop_shader_name in available_shaders:
-        return coop_shader_name
+        return coop_shader_name, _PAGED_ATTN_DECODE_WORKGROUP_SIZE
+    if coop_512_shader_name in available_shaders:
+        return coop_512_shader_name, _PAGED_ATTN_DECODE_WORKGROUP_SIZE_LARGE
     if shader_name in available_shaders:
-        return shader_name
+        return shader_name, 0
     raise RuntimeError(f"{shader_name} shader is not available")
 
 
