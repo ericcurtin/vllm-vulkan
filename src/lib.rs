@@ -5274,3 +5274,294 @@ mod tiled_matmul_dispatch_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod f16_weight_dispatch_tests {
+    //! First real dispatch of the f16-weight variants of both the
+    //! decode GEMV shader (`mul_mat_vec_f16_f32_f32`) and the prefill
+    //! GEMM shader (`matmul_f16_f32_fp32`) from `vulkan_ops.py`'s
+    //! `_vulkan_matvec`/`_vulkan_matmul` — both compiled by this backend
+    //! since its earliest history (scripts/compile_shaders.sh) and
+    //! already dispatched (and verified correct) from the *separate*
+    //! standalone Rust `VulkanModel` path (`VulkanModel::new`'s "Projection
+    //! weights are uploaded as f16 to halve memory bandwidth"), but never
+    //! wired up on the `VulkanContext`-based path `vulkan_ops.py` actually
+    //! uses to accelerate an arbitrary vLLM model's `nn.Linear` layers —
+    //! the same "compiled but never dispatched" gap #82 found and fixed
+    //! for the plain f32 tiled matmul shader.
+    //!
+    //! Following this codebase's established discipline for any shader
+    //! newly wired up to a real dispatch path (see
+    //! `subgroup_matvec_correctness_tests`'s doc comment on the bug this
+    //! discipline exists to catch, and `tiled_matmul_dispatch_tests` for
+    //! the most recent application of it): correctness against a CPU
+    //! reference comes first. The CPU reference here is computed from
+    //! the weight values ALREADY ROUNDED THROUGH f16 (`half::f16::
+    //! from_f32(v).to_f32()`) rather than the original f32 values — this
+    //! isolates whether the shader's own dispatch/binding/compute math is
+    //! correct from the *expected*, inherent precision loss of storing
+    //! the weight as f16 at all (a separate, already-accepted trade-off
+    //! `vulkan_ops._weight_safe_for_f16`'s overflow guard exists for, not
+    //! a shader correctness question).
+    use super::*;
+
+    fn fake_random(len: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
+        (0..len)
+            .map(|_| {
+                state ^= state >> 12; state ^= state << 25; state ^= state >> 27;
+                let bits = state.wrapping_mul(0x2545F4914F6CDD1D);
+                ((bits >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    /// Rounds every element through f16 first, matching the precision
+    /// the f16-weight shaders actually read from their buffer — see
+    /// this module's doc comment for why.
+    fn round_through_f16(data: &[f32]) -> Vec<f32> {
+        data.iter().map(|&v| half::f16::from_f32(v).to_f32()).collect()
+    }
+
+    fn make_engine() -> Option<compute::ComputeEngine> {
+        let dev = match device::ComputeDevice::create(0) {
+            Ok(d) => d,
+            Err(e) => { eprintln!("skip: no Vulkan device available ({e})"); return None; }
+        };
+        let shader_spvs = include_all_shaders();
+        let refs: std::collections::HashMap<&str, &[u8]> = shader_spvs.iter()
+            .map(|(k, v)| (k.as_str(), v.as_slice())).collect();
+        Some(compute::ComputeEngine::new(
+            dev.instance.clone(), dev.physical_device, dev.device.clone(),
+            dev.compute_queue, dev.compute_queue_family, &refs,
+        ).expect("create ComputeEngine"))
+    }
+
+    #[test]
+    fn mul_mat_vec_f16_f32_f32_matches_cpu_reference_at_realistic_k() {
+        let _guard = gpu_test_guard();
+        let Some(mut engine) = make_engine() else { return };
+
+        let n = 4usize;
+        let t = 1usize;
+        for &k in &[16usize, 64, 256, 512, 1536, 6144] {
+            let weight_f32 = fake_random(n * k, 1);
+            let weight_rounded = round_through_f16(&weight_f32);
+            let x = fake_random(t * k, 2);
+            let mut cpu_ref = vec![0.0f32; t * n];
+            for ni in 0..n {
+                let wr = &weight_rounded[ni * k..(ni + 1) * k];
+                cpu_ref[ni] = wr.iter().zip(x.iter()).map(|(&w, &v)| w * v).sum::<f32>();
+            }
+
+            let weight_f16_bytes = f32_to_f16_bytes(&weight_f32);
+            let wbuf = engine.alloc_host_coherent_storage(weight_f16_bytes.len() as u64).unwrap();
+            wbuf.write(&weight_f16_bytes).unwrap();
+            let xbuf = engine.alloc_host_coherent_storage((x.len() * 4) as u64).unwrap();
+            xbuf.write(bytemuck::cast_slice(&x)).unwrap();
+            let out = engine.alloc_host_coherent_storage((t * n * 4) as u64).unwrap();
+            let pc = mv_pc(k, n, t);
+
+            let cb = engine.begin_batch().unwrap();
+            engine.record_to(cb, "mul_mat_vec_f16_f32_f32", &[&wbuf, &xbuf, &out], bytemuck::cast_slice(&pc), (n as u32, t as u32, 1)).unwrap();
+            engine.submit_batch(cb).unwrap();
+            let r = read_f32_buf(&out, t * n);
+            let err = r.iter().zip(cpu_ref.iter()).map(|(&a, &b)| (a - b).abs()).fold(0.0f32, f32::max);
+            assert!(err < 1e-2, "k={k}: mul_mat_vec_f16_f32_f32 diverged from f16-rounded CPU reference: {err}");
+        }
+    }
+
+    /// Push constants for `matmul_f16_f32_fp32` — identical layout to
+    /// `tiled_matmul_dispatch_tests::mm_pc` (this shader's push_constant
+    /// block, mul_mm.comp:74-101, carries no dtype-dependent fields: all
+    /// strides are element counts into whichever `A_TYPE`/`B_TYPE` the
+    /// pipeline was compiled with, not byte offsets — see
+    /// `vulkan_ops._matmul_pc`'s doc comment for the same point made on
+    /// the Python side). Duplicated here (rather than sharing
+    /// `tiled_matmul_dispatch_tests::mm_pc`, a private fn in a sibling
+    /// `#[cfg(test)] mod`) to keep this module independently readable.
+    fn mm_pc(m: usize, n: usize, k: usize) -> [u32; 16] {
+        [
+            m as u32, n as u32, k as u32,
+            k as u32, k as u32, m as u32,
+            (m * k) as u32, (k * n) as u32, (m * n) as u32,
+            0, 1, k as u32,
+            1, 1, 1, 1,
+        ]
+    }
+
+    fn mm_workgroups(m: usize, n: usize) -> (u32, u32, u32) {
+        const BM: usize = 64;
+        const BN: usize = 64;
+        (m.div_ceil(BM) as u32, n.div_ceil(BN) as u32, 1)
+    }
+
+    #[test]
+    fn matmul_f16_f32_fp32_matches_cpu_reference_at_realistic_and_boundary_shapes() {
+        let _guard = gpu_test_guard();
+        let Some(mut engine) = make_engine() else { return };
+
+        // Same shape set as
+        // tiled_matmul_dispatch_tests::matmul_f32_f32_matches_cpu_reference_at_realistic_and_boundary_shapes:
+        // Gemma4-E2B's 3 real prefill shapes plus deliberately
+        // non-tile-aligned shapes exercising this (non-`_aligned`)
+        // variant's boundary-check loads.
+        let shapes = [
+            (2048usize, 128usize, 1536usize),
+            (6144, 128, 1536),
+            (1536, 128, 6144),
+            (65, 63, 33),
+            (16, 7, 5),
+            (127, 129, 96),
+            (64, 64, 64),
+        ];
+        for &(m, t, k) in &shapes {
+            let weight_f32 = fake_random(m * k, 1);
+            let weight_rounded = round_through_f16(&weight_f32);
+            let x = fake_random(t * k, 2);
+            let cpu_ref = model::cpu_matmul(&x, &weight_rounded, t, k, m);
+
+            let weight_f16_bytes = f32_to_f16_bytes(&weight_f32);
+            let wbuf = engine.alloc_host_coherent_storage(weight_f16_bytes.len() as u64).unwrap();
+            wbuf.write(&weight_f16_bytes).unwrap();
+            let xbuf = engine.alloc_host_coherent_storage((x.len() * 4) as u64).unwrap();
+            xbuf.write(bytemuck::cast_slice(&x)).unwrap();
+            let out = engine.alloc_host_coherent_storage((t * m * 4) as u64).unwrap();
+            let pc = mm_pc(m, t, k);
+            let wg = mm_workgroups(m, t);
+
+            let cb = engine.begin_batch().unwrap();
+            engine.record_to(cb, "matmul_f16_f32_fp32", &[&wbuf, &xbuf, &out], bytemuck::cast_slice(&pc), wg).unwrap();
+            engine.submit_batch(cb).unwrap();
+            let r = read_f32_buf(&out, t * m);
+
+            let err = r.iter().zip(cpu_ref.iter()).map(|(&a, &b)| (a - b).abs()).fold(0.0f32, f32::max);
+            println!("matmul_f16_f32_fp32 M={m} T={t} K={k}: max abs err vs f16-rounded CPU reference = {err:.6}");
+            assert!(
+                err < 1e-2,
+                "matmul_f16_f32_fp32 diverged from CPU reference at M={m} T={t} K={k}: max abs err {err}"
+            );
+        }
+    }
+
+    /// Companion measurement (not a hard assertion): relative GPU-buffer
+    /// dispatch time, f16-weight vs f32-weight, at Gemma4-E2B's real
+    /// q_proj decode/prefill shapes. NOT asserted `f16 < f32` here — the
+    /// bandwidth-reduction rationale (see this module's doc comment and
+    /// `vulkan_ops._get_or_upload_weight`'s) is a real, physical argument
+    /// about VRAM traffic on a discrete GPU, but the only Vulkan device
+    /// available to verify this specific change on is `llvmpipe` (a
+    /// software rasterizer backed by ordinary CPU memory, not a discrete
+    /// GPU's own VRAM/bus), which does not reliably model that argument —
+    /// exactly the same caveat `tiled_matmul_small_weight_crossover_point`
+    /// above already documents for a different measurement. Printed and
+    /// eyeballed so a real regression (e.g. a future change accidentally
+    /// making the f16 path pathologically slow) is still visible, without
+    /// hard-failing CI on a comparison this environment can't faithfully
+    /// make either way.
+    #[test]
+    fn f16_vs_f32_weight_relative_dispatch_time() {
+        let _guard = gpu_test_guard();
+        let Some(mut engine) = make_engine() else { return };
+
+        let (k, n) = (1536usize, 2048usize); // q_proj shape
+        let weight = fake_random(n * k, 1);
+        let x_decode = fake_random(k, 2); // T=1
+
+        let wbuf32 = engine.alloc_host_coherent_storage((weight.len() * 4) as u64).unwrap();
+        wbuf32.write(bytemuck::cast_slice(&weight)).unwrap();
+        let f16_bytes = f32_to_f16_bytes(&weight);
+        let wbuf16 = engine.alloc_host_coherent_storage(f16_bytes.len() as u64).unwrap();
+        wbuf16.write(&f16_bytes).unwrap();
+        let xbuf = engine.alloc_host_coherent_storage((x_decode.len() * 4) as u64).unwrap();
+        xbuf.write(bytemuck::cast_slice(&x_decode)).unwrap();
+        let out = engine.alloc_host_coherent_storage((n * 4) as u64).unwrap();
+        let pc = mv_pc(k, n, 1);
+
+        for _ in 0..3 {
+            let cb = engine.begin_batch().unwrap();
+            engine.record_to(cb, "mul_mat_vec_f32_f32_f32", &[&wbuf32, &xbuf, &out], bytemuck::cast_slice(&pc), (n as u32, 1, 1)).unwrap();
+            engine.submit_batch(cb).unwrap();
+            let cb = engine.begin_batch().unwrap();
+            engine.record_to(cb, "mul_mat_vec_f16_f32_f32", &[&wbuf16, &xbuf, &out], bytemuck::cast_slice(&pc), (n as u32, 1, 1)).unwrap();
+            engine.submit_batch(cb).unwrap();
+        }
+        let iters = 200;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let cb = engine.begin_batch().unwrap();
+            engine.record_to(cb, "mul_mat_vec_f32_f32_f32", &[&wbuf32, &xbuf, &out], bytemuck::cast_slice(&pc), (n as u32, 1, 1)).unwrap();
+            engine.submit_batch(cb).unwrap();
+        }
+        let f32_us = t0.elapsed().as_micros() as f64 / iters as f64;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let cb = engine.begin_batch().unwrap();
+            engine.record_to(cb, "mul_mat_vec_f16_f32_f32", &[&wbuf16, &xbuf, &out], bytemuck::cast_slice(&pc), (n as u32, 1, 1)).unwrap();
+            engine.submit_batch(cb).unwrap();
+        }
+        let f16_us = t0.elapsed().as_micros() as f64 / iters as f64;
+        println!(
+            "matvec (decode, q_proj 2048x1536) f32-weight {f32_us:.1}us/call  \
+             f16-weight {f16_us:.1}us/call  ratio {:.2}x",
+            f32_us / f16_us
+        );
+
+        let (m, kk, tt) = (2048usize, 1536usize, 128usize); // q_proj prefill shape
+        let weight2 = fake_random(m * kk, 3);
+        let xx = fake_random(tt * kk, 4);
+        let wbuf32b = engine.alloc_host_coherent_storage((weight2.len() * 4) as u64).unwrap();
+        wbuf32b.write(bytemuck::cast_slice(&weight2)).unwrap();
+        let f16b = f32_to_f16_bytes(&weight2);
+        let wbuf16b = engine.alloc_host_coherent_storage(f16b.len() as u64).unwrap();
+        wbuf16b.write(&f16b).unwrap();
+        let xbuf2 = engine.alloc_host_coherent_storage((xx.len() * 4) as u64).unwrap();
+        xbuf2.write(bytemuck::cast_slice(&xx)).unwrap();
+        let out2 = engine.alloc_host_coherent_storage((tt * m * 4) as u64).unwrap();
+        let pc2 = mm_pc(m, tt, kk);
+        let wg = mm_workgroups(m, tt);
+
+        for _ in 0..3 {
+            let cb = engine.begin_batch().unwrap();
+            engine.record_to(cb, "matmul_f32_f32", &[&wbuf32b, &xbuf2, &out2], bytemuck::cast_slice(&pc2), wg).unwrap();
+            engine.submit_batch(cb).unwrap();
+            let cb = engine.begin_batch().unwrap();
+            engine.record_to(cb, "matmul_f16_f32_fp32", &[&wbuf16b, &xbuf2, &out2], bytemuck::cast_slice(&pc2), wg).unwrap();
+            engine.submit_batch(cb).unwrap();
+        }
+        let iters2 = 30;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters2 {
+            let cb = engine.begin_batch().unwrap();
+            engine.record_to(cb, "matmul_f32_f32", &[&wbuf32b, &xbuf2, &out2], bytemuck::cast_slice(&pc2), wg).unwrap();
+            engine.submit_batch(cb).unwrap();
+        }
+        let mm_f32_us = t0.elapsed().as_micros() as f64 / iters2 as f64;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters2 {
+            let cb = engine.begin_batch().unwrap();
+            engine.record_to(cb, "matmul_f16_f32_fp32", &[&wbuf16b, &xbuf2, &out2], bytemuck::cast_slice(&pc2), wg).unwrap();
+            engine.submit_batch(cb).unwrap();
+        }
+        let mm_f16_us = t0.elapsed().as_micros() as f64 / iters2 as f64;
+        println!(
+            "matmul (prefill T=128, q_proj 2048x1536) f32-weight {mm_f32_us:.1}us/call  \
+             f16-weight {mm_f16_us:.1}us/call  ratio {:.2}x",
+            mm_f32_us / mm_f16_us
+        );
+    }
+
+    /// Direct, hardware-independent verification of the actual, tangible
+    /// win: the f16-weight buffer really is half the bytes of the
+    /// f32-weight buffer for the exact same logical weight — unlike the
+    /// timing comparison above, this doesn't depend on the Vulkan
+    /// device's memory subsystem at all, so it's exactly as meaningful on
+    /// `llvmpipe` as on a discrete GPU.
+    #[test]
+    fn f16_weight_buffer_is_half_the_bytes_of_f32() {
+        let weight = fake_random(2048 * 1536, 1);
+        let f32_bytes = weight.len() * 4;
+        let f16_bytes = f32_to_f16_bytes(&weight).len();
+        assert_eq!(f16_bytes * 2, f32_bytes);
+    }
+}

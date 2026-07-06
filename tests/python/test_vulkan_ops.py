@@ -54,6 +54,12 @@ def vulkan_ctx():
         pytest.skip("Vulkan device is a software renderer; GPU dispatch disabled")
     prev_cache = vulkan_ops._weight_cache
     prev_cpu_cache = vulkan_ops._cpu_float32_cache
+    # `set_context` above already resets `_weight_f16_decision_cache` to a
+    # fresh `_WeightCache()` (see its doc comment) since `ctx` is a newly
+    # constructed `VulkanContext` every call — saved/restored here anyway,
+    # for the same explicit symmetry with `_weight_cache`/
+    # `_cpu_float32_cache` this fixture already keeps.
+    prev_f16_decision_cache = vulkan_ops._weight_f16_decision_cache
     vulkan_ops._weight_cache = vulkan_ops._WeightCache()
     vulkan_ops._cpu_float32_cache = vulkan_ops._WeightCache()
     try:
@@ -62,6 +68,7 @@ def vulkan_ctx():
         vulkan_ops._ctx = prev_ctx
         vulkan_ops._weight_cache = prev_cache
         vulkan_ops._cpu_float32_cache = prev_cpu_cache
+        vulkan_ops._weight_f16_decision_cache = prev_f16_decision_cache
 
 
 @pytest.fixture
@@ -333,6 +340,33 @@ def test_set_context_invalidates_the_shader_cache():
     finally:
         vulkan_ops._ctx = prev_ctx
         vulkan_ops._available_shaders_cache = prev_cache
+
+
+def test_set_context_invalidates_the_f16_decision_cache():
+    """Same regression this file already guards for
+    `_available_shaders_cache` (`test_set_context_invalidates_the_shader_cache`
+    above), for `_weight_f16_decision_cache`: `_weight_uses_f16`'s per-weight
+    decision depends on the *context* too (via `available_shaders()`), not
+    just the weight's own values, so a fresh `set_context` call must
+    invalidate it — otherwise a weight tensor queried against two
+    different `VulkanContext` instances with different compiled shader
+    sets (a real risk this project's review process caught before merge)
+    could silently keep reading a decision computed for the *previous*
+    context. Pure Python/state behaviour on the module-level cache
+    directly — doesn't need a real Vulkan device."""
+    prev_ctx = vulkan_ops._ctx
+    prev_cache = vulkan_ops._weight_f16_decision_cache
+    try:
+        stale_cache = vulkan_ops._WeightCache()
+        vulkan_ops._weight_f16_decision_cache = stale_cache
+        vulkan_ops.set_context(object())  # type: ignore[arg-type]
+        assert vulkan_ops._weight_f16_decision_cache is not stale_cache, (
+            "set_context must invalidate (replace with a fresh _WeightCache) "
+            "any previously cached _weight_uses_f16 decisions"
+        )
+    finally:
+        vulkan_ops._ctx = prev_ctx
+        vulkan_ops._weight_f16_decision_cache = prev_cache
 
 
 def test_cached_available_shaders_is_faster_than_uncached_repeated_calls(
@@ -910,6 +944,160 @@ class TestLinearTiledMatmulPrefillDispatch:
             f"CPU ({cpu_elapsed:.4f}s/{iters}) at prefill-scale T={t_prefill} - "
             f"see _MATVEC_THRESHOLD's doc comment before changing this dispatch "
             f"decision based on this alone."
+        )
+
+
+class TestVulkanF16WeightUpload:
+    """`_get_or_upload_weight(..., prefer_f16=True)` (now used by both
+    `_vulkan_matvec` and `_vulkan_matmul`) uploads a large weight as
+    float16 instead of float32 whenever `_weight_uses_f16` judges it safe
+    to — halving both the one-time upload cost and, more importantly
+    since the same persistent buffer is re-read from GPU memory on every
+    matvec/matmul dispatch against it, the bytes every one of those calls
+    has to move. This mirrors the standalone Rust `VulkanModel` path's
+    own weight upload (src/lib.rs's `VulkanModel::new`, "Projection
+    weights are uploaded as f16 to halve memory bandwidth") — this
+    (separate) `VulkanContext`-based path never had that applied even
+    though the matching f16 shaders (`mul_mat_vec_f16_f32_f32`,
+    `matmul_f16_f32_fp32`) were already compiled and available for it,
+    per this project's established "compiled but never dispatched"
+    pattern (see e.g. #82).
+
+    These tests use `_require_vulkan_context()` directly rather than the
+    `vulkan_ctx` fixture: the fixture deliberately disables GPU dispatch
+    entirely on a software Vulkan renderer (see `set_context`'s doc
+    comment) as a safety net for the *real* serving path, but that would
+    also skip these tests everywhere a discrete GPU isn't available for
+    CI/local testing — while the underlying dispatch/byte-layout
+    correctness this file verifies is exactly as meaningful on a
+    software renderer as a discrete GPU (same Vulkan pipeline, same
+    SPIR-V, same push-constant contract), unlike a timing comparison.
+    """
+
+    def test_weight_safe_for_f16_true_for_realistic_model_weights(self):
+        """Real transformer weights (bf16-loaded, roughly unit-scale after
+        training normalization) must be judged safe for f16 — the
+        overwhelmingly common case this optimization exists for."""
+        weight = torch.randn(2048, 1536, dtype=torch.bfloat16) * 0.1
+        assert vulkan_ops._weight_safe_for_f16(weight) is True
+
+    def test_weight_safe_for_f16_false_for_values_exceeding_f16_range(self):
+        """float16's exponent range (5 bits, max ~6.5e4) is much smaller
+        than bf16/float32's (8 bits, max ~3.4e38 — see
+        `_weight_safe_for_f16`'s doc comment): a weight containing even
+        one value beyond that range must be rejected, not silently cast
+        to +/-inf."""
+        weight = torch.randn(16, 8, dtype=torch.float32)
+        weight[3, 2] = 1e6  # finite in float32, overflows float16's range
+        assert vulkan_ops._weight_safe_for_f16(weight) is False
+
+    def test_weight_safe_for_f16_false_for_existing_nan_or_inf(self):
+        """Not this function's job to fix (a NaN/inf weight is already
+        broken before it reaches here), but it must not crash and must
+        not claim such a weight is "safe" — `torch.isfinite` is already
+        False for either."""
+        weight = torch.randn(16, 8, dtype=torch.float32)
+        weight[0, 0] = float("inf")
+        assert vulkan_ops._weight_safe_for_f16(weight) is False
+
+    def test_get_or_upload_weight_prefer_f16_halves_buffer_size_for_safe_weight(self):
+        """Direct, hardware-independent verification that this actually
+        reduces GPU memory footprint: a safe-for-f16 weight's persistent
+        buffer must be exactly half the bytes of the same-shaped weight
+        uploaded as float32 — not a timing measurement (this project's
+        own history shows those can be misleading on a software Vulkan
+        renderer, see e.g. `tiled_matmul_beats_cpu_at_prefill_scale_for_large_weights`'s
+        doc comment in src/lib.rs), but a deterministic byte-count
+        comparison that holds identically on any Vulkan device.
+        """
+        ctx = _require_vulkan_context()
+        if "mul_mat_vec_f16_f32_f32" not in ctx.available_shaders():
+            pytest.skip("mul_mat_vec_f16_f32_f32 shader unavailable")
+
+        out_features, in_features = 2048, 1536
+        weight_f16 = torch.randn(out_features, in_features, dtype=torch.bfloat16)
+        weight_f32 = torch.randn(out_features, in_features, dtype=torch.bfloat16)
+
+        gpu_f16 = vulkan_ops._get_or_upload_weight(ctx, weight_f16, prefer_f16=True)
+        gpu_f32 = vulkan_ops._get_or_upload_weight(ctx, weight_f32, prefer_f16=False)
+
+        assert gpu_f16 is not None
+        assert gpu_f32 is not None
+        assert vulkan_ops._weight_uses_f16(ctx, weight_f16) is True
+        assert gpu_f16.nbytes == out_features * in_features * 2
+        assert gpu_f32.nbytes == out_features * in_features * 4
+        assert gpu_f16.nbytes == gpu_f32.nbytes // 2
+
+    def test_get_or_upload_weight_falls_back_to_f32_for_overflowing_weight(self):
+        """A weight containing an out-of-f16-range value must still
+        upload as float32 even when `prefer_f16=True` is passed — the
+        safety fallback, not a crash or silent wrong data."""
+        ctx = _require_vulkan_context()
+        if "mul_mat_vec_f16_f32_f32" not in ctx.available_shaders():
+            pytest.skip("mul_mat_vec_f16_f32_f32 shader unavailable")
+
+        out_features, in_features = 16, 8
+        weight = torch.randn(out_features, in_features, dtype=torch.float32)
+        weight[0, 0] = 1e6
+
+        gpu = vulkan_ops._get_or_upload_weight(ctx, weight, prefer_f16=True)
+        assert gpu is not None
+        assert vulkan_ops._weight_uses_f16(ctx, weight) is False
+        assert gpu.nbytes == out_features * in_features * 4
+
+    def test_vulkan_matvec_f16_weight_matches_cpu_reference(self):
+        """End-to-end correctness: `_vulkan_matvec` dispatching the
+        f16-weight shader (`mul_mat_vec_f16_f32_f32`) must match
+        `torch.nn.functional.linear`'s float32 reference within the
+        precision loss f16 weight storage alone accounts for."""
+        ctx = _require_vulkan_context()
+        if "mul_mat_vec_f16_f32_f32" not in ctx.available_shaders():
+            pytest.skip("mul_mat_vec_f16_f32_f32 shader unavailable")
+
+        out_features, in_features = 2048, 1536
+        weight = torch.randn(out_features, in_features, dtype=torch.float32) * 0.1
+        x = torch.randn(1, in_features, dtype=torch.float32)
+
+        result = vulkan_ops._vulkan_matvec(ctx, x, weight)
+        expected = torch.nn.functional.linear(x, weight, None)
+        torch.testing.assert_close(result, expected, rtol=2e-2, atol=2e-2)
+
+    def test_vulkan_matmul_f16_weight_matches_cpu_reference(self):
+        """Same correctness check, for the prefill tiled-matmul path
+        (`_vulkan_matmul` dispatching `matmul_f16_f32_fp32`)."""
+        ctx = _require_vulkan_context()
+        if "matmul_f16_f32_fp32" not in ctx.available_shaders():
+            pytest.skip("matmul_f16_f32_fp32 shader unavailable")
+
+        out_features, in_features = 2048, 1536
+        weight = torch.randn(out_features, in_features, dtype=torch.float32) * 0.1
+        x = torch.randn(128, in_features, dtype=torch.float32)
+
+        result = vulkan_ops._vulkan_matmul(ctx, x, weight)
+        expected = torch.nn.functional.linear(x, weight, None)
+        torch.testing.assert_close(result, expected, rtol=2e-2, atol=2e-2)
+
+    def test_rms_norm_then_linear_still_uses_f32_weight_unchanged(
+        self, vulkan_ctx, upload_counter
+    ):
+        """`rms_norm_then_linear` (the fused decode-only RMSNorm+Linear
+        path, unlike the plain `_vulkan_matvec`/`_vulkan_matmul` above)
+        deliberately keeps calling `_get_or_upload_weight` without
+        `prefer_f16=True` — it hardcodes dispatching
+        `mul_mat_vec_f32_f32_f32`, not the f16-weight variant, so its
+        weight upload must keep matching that shader's expected byte
+        layout exactly, unchanged by this optimization."""
+        norm_weight = torch.randn(8, dtype=torch.float32)
+        linear_weight = torch.randn(16, 8, dtype=torch.float32)
+        x = torch.randn(1, 8, dtype=torch.float32)
+
+        vulkan_ops.rms_norm_then_linear(x, norm_weight, 1e-6, linear_weight, None)
+        gpu = vulkan_ops._weight_cache.get(linear_weight)
+        assert gpu is not None
+        assert gpu.nbytes == 16 * 8 * 4, (
+            "rms_norm_then_linear's linear_weight must still upload as "
+            "float32 (matching the mul_mat_vec_f32_f32_f32 it hardcodes), "
+            "not float16"
         )
 
 

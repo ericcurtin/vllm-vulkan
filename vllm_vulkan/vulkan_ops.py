@@ -40,9 +40,19 @@ _available_shaders_cache: frozenset[str] | None = None
 
 
 def set_context(ctx: VulkanContext) -> None:
-    global _ctx, _available_shaders_cache
+    global _ctx, _available_shaders_cache, _weight_f16_decision_cache
     _ctx = ctx
     _available_shaders_cache = None
+    # `_weight_f16_decision_cache` (see `_weight_uses_f16`'s doc comment)
+    # caches a per-weight decision that depends on the *context* too (via
+    # `_cached_available_shaders(ctx)`), not just the weight's own values
+    # — reset it here for exactly the same reason `_available_shaders_cache`
+    # is reset above: without this, a weight tensor object queried against
+    # two different `VulkanContext` instances with different compiled
+    # shader sets (e.g. sequential tests, or a real caller that swaps
+    # devices) could silently keep reading a decision computed for the
+    # *previous* context instead of the current one.
+    _weight_f16_decision_cache = _WeightCache()
 
     # Detect software renderer and disable GPU dispatch.
     try:
@@ -165,16 +175,107 @@ class _WeightCache:
 
 _weight_cache = _WeightCache()
 _cpu_float32_cache = _WeightCache()
+# Per-weight decision cache for `_weight_uses_f16` — see its doc comment.
+_weight_f16_decision_cache = _WeightCache()
 
 
-def _get_or_upload_weight(ctx: VulkanContext, weight: torch.Tensor) -> object | None:
-    """Return a persistent GpuTensor for weight, uploading once on first use."""
+def _weight_safe_for_f16(weight: torch.Tensor) -> bool:
+    """True if every element of `weight` round-trips through float16
+    without overflowing to +/-inf.
+
+    bf16 (the dtype real checkpoints load projection weights as — see
+    module docstring) has the same 8-bit exponent as float32, so its
+    representable range is ~3.4e38; float16 has only a 5-bit exponent,
+    range ~6.5e4. A value that's perfectly finite in bf16/float32 can
+    therefore silently become +/-inf in float16 — not an error, just a
+    wrong number quietly propagating through every downstream matvec/
+    matmul that reads it, exactly the kind of silent-wrong-output failure
+    `mul_mat_vec_f32_f32_f32_subgroup`'s postmortem (src/lib.rs's
+    `subgroup_matvec_correctness_tests`) established this codebase must
+    check for directly rather than assume away. Real transformer weights
+    are essentially always small (normalized to roughly unit scale by
+    training), so this is expected to return True in practice — but
+    "expected" is exactly the assumption that shader's bug hid behind.
+    """
+    return bool(torch.isfinite(weight.half()).all())
+
+
+def _weight_uses_f16(ctx: VulkanContext, weight: torch.Tensor) -> bool:
+    """Whether `weight`'s persistent GPU buffer should be (and, once
+    `_get_or_upload_weight` has run for it, was) uploaded as float16
+    instead of float32.
+
+    A pure, cached function of `weight`'s identity + values (same
+    weak-ref-keyed convention as `_weight_cache` itself — see
+    `_WeightCache`'s docstring): both `_vulkan_matvec` and `_vulkan_matmul`
+    need this exact same decision twice (once to pick which shader
+    variant to dispatch, once inside `_get_or_upload_weight` to pick which
+    dtype to upload), and `_weight_safe_for_f16` costs a full weight-sized
+    `.half()` conversion + `isfinite` scan — real, avoidable, repeated
+    work if redone on every single decode-step/prefill-chunk call instead
+    of once per distinct weight tensor, same rationale as `_weight_cache`
+    avoiding a re-upload on every call.
+
+    Gated on both f16-weight shader variants
+    (`mul_mat_vec_f16_f32_f32`/`matmul_f16_f32_fp32`) actually being
+    compiled — unconditionally true for this backend's fixed shader set
+    today (see scripts/compile_shaders.sh), but checked the same
+    defensive way every other shader dispatch in this file gates on
+    `_cached_available_shaders`, rather than assuming a future build
+    always has them.
+    """
+    cached = _weight_f16_decision_cache.get(weight)
+    if cached is not None:
+        return cast("bool", cached)
+    available_shaders = _cached_available_shaders(ctx)
+    decision = (
+        "mul_mat_vec_f16_f32_f32" in available_shaders
+        and "matmul_f16_f32_fp32" in available_shaders
+        and _weight_safe_for_f16(weight)
+    )
+    _weight_f16_decision_cache.put(weight, decision)
+    return decision
+
+
+def _get_or_upload_weight(
+    ctx: VulkanContext, weight: torch.Tensor, prefer_f16: bool = False
+) -> object | None:
+    """Return a persistent GpuTensor for weight, uploading once on first use.
+
+    `prefer_f16`: if True AND `_weight_uses_f16` agrees (safe range, f16
+    shaders available), upload/cache a float16 buffer — HALF the bytes
+    of the usual float32 upload, and (more importantly, since this same
+    buffer is re-read from GPU memory on every matvec/matmul dispatch
+    against it, not just once here) half the bytes every dispatch has to
+    move for this weight. This mirrors the standalone Rust `VulkanModel`
+    path's own weight upload (src/lib.rs's `VulkanModel::new`, "Projection
+    weights are uploaded as f16 to halve memory bandwidth") — this
+    (separate, `VulkanContext`-based) code path never had that applied
+    even though the matching f16 shaders were compiled and available for
+    it too, per this project's established "compiled but never
+    dispatched" pattern (see e.g. #82's `matmul_f32_f32`/#77's fused
+    decode dispatch).
+
+    Only `_vulkan_matvec`/`_vulkan_matmul` pass `prefer_f16=True` — every
+    other caller (RMSNorm's `norm_weight` via `rms_norm_then_linear`,
+    which has no matching f16-weight shader wired up here) keeps this at
+    its default and gets the exact same float32-always behaviour as
+    before this change.
+
+    Callers needing to know whether f16 was actually used (to pick a
+    matching shader variant) must call `_weight_uses_f16` themselves —
+    the same cached decision this function uses internally, so the two
+    can never disagree for a given weight.
+    """
     try:
         cached = _weight_cache.get(weight)
         if cached is not None:
             return cached
-        w_f32 = weight.float() if weight.dtype != torch.float32 else weight
-        gpu = ctx.upload_tensor(_to_bytes(w_f32))
+        if prefer_f16 and _weight_uses_f16(ctx, weight):
+            gpu = ctx.upload_tensor(_to_bytes(weight.half()))
+        else:
+            w_f32 = weight.float() if weight.dtype != torch.float32 else weight
+            gpu = ctx.upload_tensor(_to_bytes(w_f32))
         _weight_cache.put(weight, gpu)
         return gpu
     except Exception as exc:
@@ -568,7 +669,7 @@ def _vulkan_matvec(
     x: torch.Tensor,  # [T, K] float32
     weight: torch.Tensor,  # [N, K] any dtype
 ) -> torch.Tensor:
-    """Dispatch mul_mat_vec_f32_f32_f32 for decode (T<4).
+    """Dispatch mul_mat_vec_{f16,f32}_f32_f32 for decode (T<4).
 
     NOT mul_mat_vec_f32_f32_f32_subgroup: that variant was found to
     silently diverge from the correct result for ncols>=~256 (i.e.
@@ -578,14 +679,26 @@ def _vulkan_matvec(
     plain, non-subgroup variant) has an identical binding/push-constant/
     workgroup-dispatch convention and was confirmed correct at every
     size tested.
+
+    Uploads (and dispatches against) `weight` as float16 instead of
+    float32 whenever `_weight_uses_f16` says it's safe to — halving the
+    bytes this (large, per-call, re-read-from-GPU-memory) weight buffer
+    costs to move. `mul_mat_vec_f16_f32_f32` shares `mul_mat_vec_base.glsl`
+    with the f32 variant and only differs in `A_TYPE`
+    (scripts/compile_shaders.sh), converting each element to float on
+    load before the identical dot-product math either variant runs — see
+    `f16_weight_dispatch_tests::mul_mat_vec_f16_f32_f32_matches_cpu_reference_at_realistic_k`
+    (src/lib.rs) for the direct correctness verification against a CPU
+    reference computed from the same f16-rounded weight values.
     """
-    # Cache key on original weight (before .float()) - and the .float()
+    # Cache key on original weight (before .float()/.half()) - and that
     # conversion itself only happens lazily, in the `w_gpu is None`
     # fallback branch below, since on the (overwhelmingly common) cache-hit
     # path the GPU-resident buffer already holds the converted weight and
-    # recomputing weight.float() here would just be a wasted full
-    # weight-matrix copy, every single call, for a value nothing else uses.
-    w_gpu = _get_or_upload_weight(ctx, weight)
+    # recomputing it here would just be a wasted full weight-matrix copy,
+    # every single call, for a value nothing else uses.
+    use_f16 = _weight_uses_f16(ctx, weight)
+    w_gpu = _get_or_upload_weight(ctx, weight, prefer_f16=True)
 
     T, K = x.shape  # noqa: N806
     N = weight.shape[0]  # noqa: N806
@@ -593,12 +706,16 @@ def _vulkan_matvec(
     x_bytes = _to_bytes(x)
     out_size = T * N * 4
 
-    w_binding = w_gpu if w_gpu is not None else _to_bytes(weight.float())
+    if w_gpu is not None:
+        w_binding = w_gpu
+    else:
+        w_binding = _to_bytes(weight.half()) if use_f16 else _to_bytes(weight.float())
 
+    shader = "mul_mat_vec_f16_f32_f32" if use_f16 else "mul_mat_vec_f32_f32_f32"
     results = ctx.execute_batch(
         [
             (
-                "mul_mat_vec_f32_f32_f32",
+                shader,
                 [w_binding, x_bytes],
                 [out_size],
                 pc,
@@ -615,26 +732,30 @@ def _vulkan_matmul(
     x: torch.Tensor,  # [T, K] float32
     weight: torch.Tensor,  # [M, K] any dtype
 ) -> torch.Tensor:
-    """Dispatch `matmul_f32_f32` (the tiled matmul shader, mul_mm.comp)
-    for prefill (T >= _MATVEC_THRESHOLD, large-enough weight — see
-    `linear`'s dispatch decision).
+    """Dispatch `matmul_{f16,f32}_f32` (the tiled matmul shader,
+    mul_mm.comp) for prefill (T >= _MATVEC_THRESHOLD, large-enough
+    weight — see `linear`'s dispatch decision).
 
-    Only the plain (non-`_aligned`) variant is dispatched: the
+    Only the plain (non-`_aligned`) variants are dispatched: the
     `_aligned` variants assume `K` is already a multiple of the tile
     size and skip bounds-checking loads, silently producing wrong
-    results otherwise. `matmul_f32_f32` handles any `M`/`T`/`K` shape
-    safely — verified directly, including shapes deliberately NOT
-    aligned to this shader's BM=BN=64/BK=32 tile sizes, against a CPU
-    reference (see `tiled_matmul_dispatch_tests` in src/lib.rs) — so no
-    alignment check is needed here.
+    results otherwise. `matmul_f32_f32`/`matmul_f16_f32_fp32` handle any
+    `M`/`T`/`K` shape safely — verified directly, including shapes
+    deliberately NOT aligned to this shader's BM=BN=64/BK=32 tile sizes,
+    against a CPU reference (see `tiled_matmul_dispatch_tests` and
+    `f16_weight_dispatch_tests` in src/lib.rs) — so no alignment check is
+    needed here.
 
     Shares `_get_or_upload_weight`'s GPU weight cache with
     `_vulkan_matvec`: both shaders require the exact same buffer layout
-    (row-major `[out_features, in_features]`, `f32`), so the same
-    persistent upload serves either dispatch path for a given weight,
-    whichever T a given call happens to use.
+    (row-major `[out_features, in_features]`, same dtype as
+    `_weight_uses_f16` decided for this weight), so the same persistent
+    upload serves either dispatch path for a given weight, whichever T a
+    given call happens to use — `_weight_uses_f16`'s own cache guarantees
+    both call sites agree on that dtype for the same weight tensor.
     """
-    w_gpu = _get_or_upload_weight(ctx, weight)
+    use_f16 = _weight_uses_f16(ctx, weight)
+    w_gpu = _get_or_upload_weight(ctx, weight, prefer_f16=True)
 
     T, K = x.shape  # noqa: N806
     M = weight.shape[0]  # noqa: N806
@@ -642,12 +763,16 @@ def _vulkan_matmul(
     x_bytes = _to_bytes(x)
     out_size = T * M * 4
 
-    w_binding = w_gpu if w_gpu is not None else _to_bytes(weight.float())
+    if w_gpu is not None:
+        w_binding = w_gpu
+    else:
+        w_binding = _to_bytes(weight.half()) if use_f16 else _to_bytes(weight.float())
 
+    shader = "matmul_f16_f32_fp32" if use_f16 else "matmul_f32_f32"
     results = ctx.execute_batch(
         [
             (
-                "matmul_f32_f32",
+                shader,
                 [w_binding, x_bytes],
                 [out_size],
                 pc,
