@@ -340,6 +340,65 @@ def test_vulkan_attention_backend_rejects_unsupported_decode_features():
     )
 
 
+def test_try_write_and_decode_vulkan_returns_false_for_zero_tokens():
+    """num_actual_tokens == 0 (e.g. a warmup/profiling call with no real
+    tokens) must make _try_write_and_decode_vulkan bail out immediately,
+    without touching the Vulkan context/KV-cache entry at all -
+    _supports_vulkan_decode's query_lens_all_ones check trivially passes
+    on an empty batch, so without an explicit guard this would otherwise
+    proceed into unnecessary Vulkan setup work for nothing to actually
+    write or decode.
+    """
+    num_heads = 2
+    num_kv_heads = 1
+    head_size = 8
+    block_size = 4
+
+    impl = VulkanAttentionBackendImpl(
+        num_heads=num_heads,
+        head_size=head_size,
+        scale=head_size**-0.5,
+        num_kv_heads=num_kv_heads,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="auto",
+        logits_soft_cap=None,
+        attn_type=AttentionType.DECODER,
+        kv_sharing_target_layer_name=None,
+    )
+    metadata = CPUAttentionMetadata(
+        isa="vec16",
+        num_actual_tokens=0,
+        max_query_len=1,
+        query_start_loc=torch.tensor([0], dtype=torch.int32),
+        max_seq_len=1,
+        seq_lens=torch.tensor([], dtype=torch.int32),
+        block_table=torch.zeros((0, 1), dtype=torch.int32),
+        slot_mapping=torch.tensor([], dtype=torch.int64),
+        scheduler_metadata=None,
+        causal=True,
+    )
+    kv_cache = torch.zeros(
+        (2, 1, num_kv_heads, block_size, head_size), dtype=torch.float16
+    )
+
+    result = attention_mod._try_write_and_decode_vulkan(
+        impl=impl,
+        query=torch.zeros(0, num_heads, head_size, dtype=torch.float32),
+        key=torch.zeros(0, num_kv_heads, head_size, dtype=torch.float16),
+        value=torch.zeros(0, num_kv_heads, head_size, dtype=torch.float16),
+        kv_cache=kv_cache,
+        attn_metadata=metadata,
+        output=torch.empty(0, num_heads, head_size, dtype=torch.float32),
+        num_actual_tokens=0,
+    )
+
+    assert result is False
+    # The Vulkan KV-cache-entry cache must never have been populated -
+    # confirms the function returned before doing any real work.
+    assert impl._cached_kv_cache_entry is None
+
+
 # ---------------------------------------------------------------------------
 # _vulkan_cache_has_sequences / _mark_vulkan_cache_slots_written / _active_block_ids
 #

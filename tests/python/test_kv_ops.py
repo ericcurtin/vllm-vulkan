@@ -18,6 +18,8 @@ from vllm_vulkan.kv_ops import (  # noqa: E402
     paged_attn_decode_batch_f32,
     paged_attn_decode_f16,
     paged_attn_decode_f32,
+    paged_kv_write_and_decode_batch_f16,
+    paged_kv_write_and_decode_batch_f32,
     paged_kv_write_f16,
     paged_kv_write_f32,
 )
@@ -423,6 +425,44 @@ def test_paged_attn_decode_batch_empty_returns_empty_list():
     assert (
         paged_attn_decode_batch_f32(
             ctx, layout, cache, 0, queries=[], block_tables=[], seq_lens=[]
+        )
+        == []
+    )
+
+
+def test_paged_kv_write_and_decode_batch_empty_returns_empty_list_without_writing():
+    """An empty decode batch must be a legitimate no-op (matching
+    paged_attn_decode_batch_f32's own empty-batch handling above), not an
+    error - calling _build_paged_kv_write_op with zero tokens would raise
+    ValueError("K/V must contain at least one token") otherwise. Also
+    passes empty (0-token) k/v/slot_mapping tensors, since that's the
+    shape attention.py's _try_write_and_decode_vulkan would actually
+    build when num_actual_tokens == 0.
+    """
+    ctx = _require_vulkan_context()
+    _require_shader(ctx, "paged_kv_write_f32")
+    _require_shader(ctx, "paged_attn_decode_f32", "paged_attn_decode_f32_coop")
+
+    spec, layout = _make_layout(dtype_size=4)
+    cache = ctx.alloc_activation(layout.total_bytes)
+    ctx.update_activation(cache, bytes(layout.total_bytes))
+
+    empty_k = torch.zeros((0, spec.num_kv_heads, spec.head_size), dtype=torch.float32)
+    empty_v = torch.zeros_like(empty_k)
+    empty_slot_mapping = torch.zeros((0,), dtype=torch.int64)
+
+    assert (
+        paged_kv_write_and_decode_batch_f32(
+            ctx,
+            layout,
+            cache,
+            0,
+            empty_k,
+            empty_v,
+            empty_slot_mapping,
+            queries=[],
+            block_tables=[],
+            seq_lens=[],
         )
         == []
     )
@@ -920,4 +960,291 @@ def test_block_table_whole_batch_int64_conversion_is_faster_than_per_row():
     assert whole_batch_elapsed < per_row_elapsed, (
         f"whole-batch conversion ({whole_batch_elapsed:.4f}s/{iters}) was not "
         f"faster than per-row conversion ({per_row_elapsed:.4f}s/{iters})"
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "torch_dtype",
+        "dtype_size",
+        "write_fn",
+        "decode_batch_fn",
+        "write_and_decode_batch_fn",
+        "write_shader",
+        "decode_shaders",
+        "seed",
+        "rtol",
+        "atol",
+    ),
+    [
+        (
+            torch.float32,
+            4,
+            paged_kv_write_f32,
+            paged_attn_decode_batch_f32,
+            paged_kv_write_and_decode_batch_f32,
+            "paged_kv_write_f32",
+            ("paged_attn_decode_f32", "paged_attn_decode_f32_coop"),
+            0,
+            1e-4,
+            1e-4,
+        ),
+        (
+            torch.float16,
+            2,
+            paged_kv_write_f16,
+            paged_attn_decode_batch_f16,
+            paged_kv_write_and_decode_batch_f16,
+            "paged_kv_write_f16",
+            ("paged_attn_decode_f16", "paged_attn_decode_f16_coop"),
+            1,
+            5e-3,
+            5e-3,
+        ),
+    ],
+)
+def test_paged_kv_write_and_decode_batch_matches_separate_calls_and_torch_reference(
+    torch_dtype: torch.dtype,
+    dtype_size: int,
+    write_fn: Callable,
+    decode_batch_fn: Callable,
+    write_and_decode_batch_fn: Callable,
+    write_shader: str,
+    decode_shaders: tuple[str, ...],
+    seed: int,
+    rtol: float,
+    atol: float,
+):
+    """paged_kv_write_and_decode_batch_{f16,f32} - one ctx.execute_batch
+    call (one vkQueueSubmit, one fence wait) that writes this step's new
+    K/V tokens AND decodes the whole batch against them - must produce
+    exactly the same results as the old two-call sequence attention.py
+    used before this: paged_kv_write_{f16,f32} (writing the new tokens)
+    followed by paged_attn_decode_batch_{f16,f32} (a separate
+    ctx.execute_batch call).
+
+    Mirrors a realistic incremental decode step: each sequence already
+    has some prior history written to the cache (from earlier steps, via
+    the plain per-step write path), and this step contributes exactly one
+    new token per sequence, which must be visible to the decode read that
+    immediately follows it in the same submit.
+    """
+    ctx = _require_vulkan_context()
+    _require_shader(ctx, write_shader)
+    _require_shader(ctx, *decode_shaders)
+
+    spec, layout = _make_layout(dtype_size)
+
+    torch.manual_seed(seed)
+
+    # Two independent "requests", each with some already-written history
+    # (seq_len - 1 tokens) plus one new token this step (at seq_len - 1),
+    # matching real incremental decode.
+    seq_lens = [6, 3]
+    block_tables = [
+        torch.tensor([2, 0], dtype=torch.int64),
+        torch.tensor([1], dtype=torch.int64),
+    ]
+    scale = spec.head_size**-0.5
+
+    ks, vs, qs, slot_mappings, new_slots = [], [], [], [], []
+    for seq_len, block_table in zip(seq_lens, block_tables, strict=True):
+        k = torch.randn(seq_len, spec.num_kv_heads, spec.head_size, dtype=torch_dtype)
+        v = torch.randn_like(k)
+        q = torch.randn(4, spec.head_size, dtype=torch.float32)
+        slot_mapping = _slot_mapping_from_block_table(
+            block_table, seq_len, spec.block_size
+        )
+        ks.append(k)
+        vs.append(v)
+        qs.append(q)
+        slot_mappings.append(slot_mapping)
+        new_slots.append(slot_mapping[-1:])
+
+    def populate_history(cache) -> None:
+        """Write every token except the last (this step's new one) for
+        both sequences, establishing prior decode-step history."""
+        for k, v, slot_mapping in zip(ks, vs, slot_mappings, strict=True):
+            write_fn(ctx, layout, cache, 0, k[:-1], v[:-1], slot_mapping[:-1])
+
+    # This step's new tokens: one per sequence, combined the way vLLM's
+    # own per-step write batches every sequence's new token in one call.
+    new_k = torch.stack([k[-1] for k in ks])
+    new_v = torch.stack([v[-1] for v in vs])
+    new_slot_mapping = torch.cat(new_slots)
+
+    # Reference: old behaviour, two separate ctx.execute_batch calls.
+    ref_cache = ctx.alloc_activation(layout.total_bytes)
+    ctx.update_activation(ref_cache, bytes(layout.total_bytes))
+    populate_history(ref_cache)
+    write_fn(ctx, layout, ref_cache, 0, new_k, new_v, new_slot_mapping)
+    ref_outs = decode_batch_fn(
+        ctx, layout, ref_cache, 0, qs, block_tables, seq_lens, scale
+    )
+
+    # Under test: one merged ctx.execute_batch call, against a fresh cache
+    # with the identical pre-populated history.
+    merged_cache = ctx.alloc_activation(layout.total_bytes)
+    ctx.update_activation(merged_cache, bytes(layout.total_bytes))
+    populate_history(merged_cache)
+    merged_outs = write_and_decode_batch_fn(
+        ctx,
+        layout,
+        merged_cache,
+        0,
+        new_k,
+        new_v,
+        new_slot_mapping,
+        qs,
+        block_tables,
+        seq_lens,
+        scale,
+    )
+
+    assert len(merged_outs) == len(ref_outs)
+    for i, (merged_out, ref_out) in enumerate(zip(merged_outs, ref_outs, strict=True)):
+        torch.testing.assert_close(
+            merged_out,
+            ref_out,
+            rtol=rtol,
+            atol=atol,
+            msg=f"merged write+decode output {i} diverged from the separate-call reference",
+        )
+
+    # Cross-check directly against the pure-PyTorch attention reference too.
+    for i in range(len(seq_lens)):
+        expected = _attention_reference(qs[i], ks[i], vs[i], scale)
+        torch.testing.assert_close(merged_outs[i], expected, rtol=rtol, atol=atol)
+
+
+def test_paged_kv_write_and_decode_batch_is_faster_than_two_separate_submits():
+    """Measures the actual round-trip savings: one ctx.execute_batch call
+    doing both the write and the decode batch (paged_kv_write_and_decode_
+    batch_f32) must be faster wall-clock than the old sequence of two
+    separate ctx.execute_batch calls (paged_kv_write_f32 then
+    paged_attn_decode_batch_f32) it replaces in attention.py -- each
+    ctx.execute_batch call pays a real vkQueueSubmit + fence-wait round
+    trip that, measured directly on real hardware, costs several hundred
+    microseconds by itself (see src/lib.rs's buffer_pool_capacity_tests
+    module and this session's other execute_batch-phase measurements) --
+    dwarfing the actual compute work for these small shapes, so removing
+    one whole round trip should be clearly measurable even at this
+    microbenchmark's small batch size.
+
+    Uses interleaved, alternating-order timing (one call of each variant
+    per repetition, flipping which one goes first every other repetition)
+    rather than this file's usual "run N iterations of A, then N of B,
+    keep the faster block" pattern (see e.g.
+    test_block_table_whole_batch_int64_conversion_is_faster_than_per_row).
+    That sequential-block pattern was tried first here and gave an
+    inverted, misleading result: on this GPU (Apple M1 via Mesa's
+    Honeykrisp Vulkan driver), whichever variant's block of N back-to-
+    back iterations ran INSIDE a tight loop reached a warmer/higher clock
+    state than a variant tested in a separate block afterward - a
+    systematic, directional bias (not the kind of symmetric noise
+    "keep the minimum of several trials" is designed to filter), and it
+    happened to favor whichever function was measured with more frequent,
+    smaller submits. Alternating A/B on every repetition means both
+    variants experience the same sequence of GPU clock states, so the
+    comparison isolates the actual per-call cost difference instead of
+    which one got the warmer GPU.
+    """
+    import time
+
+    ctx = _require_vulkan_context()
+    _require_shader(ctx, "paged_kv_write_f32")
+    _require_shader(ctx, "paged_attn_decode_f32", "paged_attn_decode_f32_coop")
+
+    spec, layout = _make_layout(dtype_size=4)
+
+    torch.manual_seed(0)
+    seq_lens = [6, 3]
+    block_tables = [
+        torch.tensor([2, 0], dtype=torch.int64),
+        torch.tensor([1], dtype=torch.int64),
+    ]
+    scale = spec.head_size**-0.5
+
+    ks, vs, qs, slot_mappings = [], [], [], []
+    for seq_len, block_table in zip(seq_lens, block_tables, strict=True):
+        k = torch.randn(seq_len, spec.num_kv_heads, spec.head_size, dtype=torch.float32)
+        v = torch.randn_like(k)
+        q = torch.randn(4, spec.head_size, dtype=torch.float32)
+        slot_mapping = _slot_mapping_from_block_table(
+            block_table, seq_len, spec.block_size
+        )
+        ks.append(k)
+        vs.append(v)
+        qs.append(q)
+        slot_mappings.append(slot_mapping)
+
+    new_k = torch.stack([k[-1] for k in ks])
+    new_v = torch.stack([v[-1] for v in vs])
+    new_slot_mapping = torch.cat([s[-1:] for s in slot_mappings])
+
+    cache = ctx.alloc_activation(layout.total_bytes)
+    ctx.update_activation(cache, bytes(layout.total_bytes))
+    for k, v, slot_mapping in zip(ks, vs, slot_mappings, strict=True):
+        paged_kv_write_f32(ctx, layout, cache, 0, k[:-1], v[:-1], slot_mapping[:-1])
+
+    def two_separate_submits() -> None:
+        paged_kv_write_f32(ctx, layout, cache, 0, new_k, new_v, new_slot_mapping)
+        paged_attn_decode_batch_f32(
+            ctx, layout, cache, 0, qs, block_tables, seq_lens, scale
+        )
+
+    def one_merged_submit() -> None:
+        paged_kv_write_and_decode_batch_f32(
+            ctx,
+            layout,
+            cache,
+            0,
+            new_k,
+            new_v,
+            new_slot_mapping,
+            qs,
+            block_tables,
+            seq_lens,
+            scale,
+        )
+
+    # Warm up both paths together before measuring.
+    for _ in range(150):
+        two_separate_submits()
+        one_merged_submit()
+
+    reps = 400
+    two_submits_total = 0.0
+    merged_total = 0.0
+    for i in range(reps):
+        if i % 2 == 0:
+            t0 = time.perf_counter()
+            two_separate_submits()
+            two_submits_total += time.perf_counter() - t0
+
+            t0 = time.perf_counter()
+            one_merged_submit()
+            merged_total += time.perf_counter() - t0
+        else:
+            t0 = time.perf_counter()
+            one_merged_submit()
+            merged_total += time.perf_counter() - t0
+
+            t0 = time.perf_counter()
+            two_separate_submits()
+            two_submits_total += time.perf_counter() - t0
+
+    two_submits_mean = two_submits_total / reps
+    merged_mean = merged_total / reps
+
+    print(
+        f"\npaged kv-write + decode, mean of {reps} alternating-order reps: "
+        f"two separate execute_batch calls {two_submits_mean * 1e6:.1f}us/step, "
+        f"one merged execute_batch call {merged_mean * 1e6:.1f}us/step, "
+        f"speedup {two_submits_mean / merged_mean:.2f}x"
+    )
+    assert merged_mean < two_submits_mean, (
+        f"merged write+decode call ({merged_mean * 1e6:.1f}us/step) was not "
+        f"faster than two separate execute_batch calls "
+        f"({two_submits_mean * 1e6:.1f}us/step)"
     )
