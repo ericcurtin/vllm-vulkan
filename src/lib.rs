@@ -760,27 +760,28 @@ fn include_all_shaders() -> std::collections::HashMap<String, Vec<u8>> {
     // one-line-per-shader change.
 
     // ── General matmul (prefill) ─────────────────────────────────────────
-    // Compiled (via the `else` branch in PipelineCache::new — no explicit
-    // specialization constants, so BLOCK_SIZE=64/BM=64/BN=64/WM=32/WN=32/
-    // WMITER=2/TM=4/TN=2/TK=1/WARP=32, this shader's own hardcoded
-    // defaults, apply) but NEVER DISPATCHED anywhere in this codebase, in
-    // either Rust or Python (`grep -rn 'matmul_f32\|matmul_f16' src/
-    // vllm_vulkan/ tests/` finds only this registration and
-    // scripts/compile_shaders.sh). vulkan_ops.py's `linear()` always uses
-    // CPU for prefill (T>=4) — see `_MATVEC_THRESHOLD`'s doc comment for
-    // why naively raising that threshold to also route prefill to the
-    // *matvec* shader instead is a proven, measured regression (~6.5x
-    // slower than CPU by T=128), not a fix — a real prefill speedup would
-    // need these tiled matmul shaders instead, which have never been
-    // wired up.
+    // Compiled via `PipelineCache::compile_matmul` (NOT the generic
+    // `compile_one` every other shader in this list uses) — see that
+    // function's doc comment in src/pipeline.rs for two independent,
+    // real bugs (one an infinite-GPU-loop hang, one a silent half-tile-
+    // of-zeros correctness bug) that leaving this shader's specialization
+    // constants unset would otherwise cause. Now dispatched from
+    // vulkan_ops.py's `linear()` for prefill-scale T on large-enough
+    // weights (reusing `_MATVEC_THRESHOLD`/`_MATVEC_MIN_WEIGHT_ELEMENTS`'s
+    // existing gate — see `_matmul_pc`/`_vulkan_matmul` there), and
+    // `tiled_matmul_dispatch_tests` in this file (both correctness and
+    // performance tests) for the verification this dispatch decision is
+    // based on.
     //
-    // Verified (but not yet implemented) dispatch specification for a
-    // future attempt, extracted directly from llama.cpp/ggml's own
-    // ggml-vulkan.cpp C++ backend (the reference implementation these
-    // shaders were copied from) and cross-checked line-by-line against
-    // this repo's actual shaders/mul_mm.comp source — NOT blindly copied,
-    // since the two disagree on at least one real detail (see the
-    // `padded_N` note below):
+    // Dispatch specification (binding/push-constant/workgroup convention),
+    // extracted directly from llama.cpp/ggml's own ggml-vulkan.cpp C++
+    // backend (the reference implementation these shaders were copied
+    // from) and cross-checked line-by-line against this repo's actual
+    // shaders/mul_mm.comp and shaders/mul_mm_funcs.glsl source — NOT
+    // blindly copied, since the two disagree on at least one real detail
+    // (see the `padded_N` note below), and independently verified against
+    // a direct CPU reference (`model::cpu_matmul`) rather than trusted on
+    // paper alone (see `tiled_matmul_dispatch_tests`):
     //
     // - A = binding 0 (weight/src0, readonly), B = binding 1 (activations/
     //   src1, readonly), D = binding 2 (output, writeonly) — confirmed via
@@ -803,12 +804,13 @@ fn include_all_shaders() -> std::collections::HashMap<String, Vec<u8>> {
     //   push-constant field equal to K itself and skip the whole
     //   reduce-pass machinery entirely.
     // - Dispatch workgroup count = (ceil(M/BM), ceil(N/BN), num_batches) —
-    //   with THIS shader's actually-compiled (default, unspecialized)
-    //   BM=BN=64, NOT llama.cpp's own named "l"/"m"/"s" presets (128/64/32
-    //   respectively) — those presets only apply if this shader is
-    //   recompiled through a new `compile_matmul`-style function (mirroring
-    //   `compile_matvec`) with explicit `SpecializationInfo` overrides, the
-    //   same mechanism already used for the matvec/rms_norm shaders above.
+    //   with BM=BN=64 (this shader's own literal tile-size defaults,
+    //   which `compile_matmul` keeps — only `BLOCK_SIZE` actually needed
+    //   to change, from 64 to 128, to make `NUM_WARPS` match
+    //   `(BM/WM)*(BN/WN)`; see `compile_matmul`'s doc comment), NOT
+    //   llama.cpp's own named "l"/"m"/"s" presets (128/64/32
+    //   respectively) — those presets are a different, mutually-
+    //   consistent parameter set this codebase does not use.
     // - CRITICAL version mismatch caught by cross-checking rather than
     //   trusting the newer reference outright: current upstream
     //   ggml-vulkan.cpp's `vk_mat_mat_push_constants` struct has a
@@ -823,21 +825,12 @@ fn include_all_shaders() -> std::collections::HashMap<String, Vec<u8>> {
     //   a too-large push-constant range (may fail pipeline-layout
     //   validation) or, worse, corrupt whichever field a future upstream
     //   sync accidentally reintroduces at that offset.
-    // - Use the plain (non-`_aligned`) variant unconditionally at first:
-    //   the `_aligned` variants assume K is already a multiple of the
-    //   tile size and skip bounds-checking loads, silently producing
-    //   wrong results otherwise — safe only once K's alignment is
-    //   verified per-call, which isn't implemented yet.
-    // - shaders/mul_mm_funcs.glsl (600 lines) and shaders/types.glsl
-    //   (1846 lines) — the actual load_a/load_b/compute inner loop and
-    //   A_TYPE/B_TYPE/D_TYPE definitions — have NOT yet been read/verified
-    //   in this level of detail; that remains the next concrete step
-    //   before attempting a real dispatch, to avoid the exact kind of
-    //   silent-wrong-output bug `mul_mat_vec_f32_f32_f32_subgroup` turned
-    //   out to have (see subgroup_matvec_correctness_tests above) — this
-    //   codebase's one prior cautionary tale about trusting a plausible-
-    //   looking Vulkan compute dispatch without a direct CPU-reference
-    //   correctness test first.
+    // - Only the plain (non-`_aligned`) variant is dispatched: the
+    //   `_aligned` variants assume K is already a multiple of the tile
+    //   size and skip bounds-checking loads, silently producing wrong
+    //   results otherwise — safe only once K's alignment is verified
+    //   per-call, which `_vulkan_matmul` does not implement (no measured
+    //   need to yet — see its doc comment).
     spv!("matmul_f32_f16");
     spv!("matmul_f32_f16_aligned");
     spv!("matmul_f32_f32_fp32");
@@ -4989,5 +4982,295 @@ mod buffer_pool_capacity_tests {
              signature of the buffer pool overflowing at realistic concurrent \
              decode batch sizes (see POOL_MAX's doc comment in src/compute.rs)"
         );
+    }
+}
+
+#[cfg(test)]
+mod tiled_matmul_dispatch_tests {
+    //! First real dispatch of the tiled matmul shaders (`matmul_f32_f32` /
+    //! `matmul_f32_f32_fp32` / `matmul_f16_f32_fp32` / `matmul_f32_f16*`,
+    //! from shaders/mul_mm.comp) — compiled since this backend's earliest
+    //! history but never dispatched anywhere until now (see #80/#81, and
+    //! the doc comment at this shader's `spv!` registration site in
+    //! `include_all_shaders` above for the verified push-constant/
+    //! workgroup-dispatch specification this test implements).
+    //!
+    //! Following this codebase's established discipline for any new
+    //! Vulkan compute dispatch (see `subgroup_matvec_correctness_tests`'s
+    //! doc comment on the `mul_mat_vec_f32_f32_f32_subgroup` bug this
+    //! discipline exists to catch): correctness against a trusted CPU
+    //! reference (`model::cpu_matmul`, the same `matrixmultiply::sgemm`
+    //! wrapper this file already uses for every real CPU prefill matmul)
+    //! comes BEFORE any performance claim — see
+    //! `tiled_matmul_beats_cpu_at_prefill_scale_for_large_weights` below
+    //! for the actual GPU-vs-CPU prefill measurement.
+    use super::*;
+
+    fn fake_random(len: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
+        (0..len)
+            .map(|_| {
+                state ^= state >> 12; state ^= state << 25; state ^= state >> 27;
+                let bits = state.wrapping_mul(0x2545F4914F6CDD1D);
+                ((bits >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    fn make_engine() -> Option<compute::ComputeEngine> {
+        let dev = match device::ComputeDevice::create(0) {
+            Ok(d) => d,
+            Err(e) => { eprintln!("skip: no Vulkan device available ({e})"); return None; }
+        };
+        let shader_spvs = include_all_shaders();
+        let refs: std::collections::HashMap<&str, &[u8]> = shader_spvs.iter()
+            .map(|(k, v)| (k.as_str(), v.as_slice())).collect();
+        Some(compute::ComputeEngine::new(
+            dev.instance.clone(), dev.physical_device, dev.device.clone(),
+            dev.compute_queue, dev.compute_queue_family, &refs,
+        ).expect("create ComputeEngine"))
+    }
+
+    /// Push constants for `matmul_f32_f32`/`matmul_f32_f32_fp32`/
+    /// `matmul_f16_f32_fp32` (mul_mm.comp, non-`MUL_MAT_ID` branch): 16
+    /// uint32 fields, exactly matching this shader's own `push_constant`
+    /// block (mul_mm.comp:74-101) — NOT llama.cpp upstream's newer
+    /// 17-field struct (see the `padded_N` note at this shader's
+    /// registration site above). A single unbatched Linear call
+    /// (`out[T,M] = x[T,K] @ weight[M,K]^T`) needs only: M=out_features,
+    /// N=T, K=in_features, stride_a=stride_b=K (both A/B row-major-
+    /// contiguous), stride_d=M, batch_stride_* covering exactly one
+    /// batch, num_batches=1, k_split=K (skip the whole multi-pass
+    /// K-split reduce machinery — verified safe for any realistic
+    /// transformer K, see the k_split doc note above), and
+    /// ne02=ne12=broadcast2=broadcast3=1 (no batch broadcasting).
+    fn mm_pc(m: usize, n: usize, k: usize) -> [u32; 16] {
+        [
+            m as u32, n as u32, k as u32,
+            k as u32, k as u32, m as u32,                    // stride_a, stride_b, stride_d
+            (m * k) as u32, (k * n) as u32, (m * n) as u32,  // batch_stride_a/b/d
+            0, 1, k as u32,                                  // base_work_group_z, num_batches, k_split
+            1, 1, 1, 1,                                      // ne02, ne12, broadcast2, broadcast3
+        ]
+    }
+
+    /// Workgroup dispatch = (ceil(M/BM), ceil(N/BN), num_batches), using
+    /// the BM=BN=64 this shader is actually compiled with (see
+    /// `pipeline::PipelineCache::compile_matmul`) — NOT llama.cpp's own
+    /// named "l"/"m"/"s" tiling presets, a different parameter set this
+    /// codebase does not use.
+    fn mm_workgroups(m: usize, n: usize) -> (u32, u32, u32) {
+        const BM: usize = 64;
+        const BN: usize = 64;
+        (m.div_ceil(BM) as u32, n.div_ceil(BN) as u32, 1)
+    }
+
+    /// Dispatches `shader` computing `out[T,M] = x[T,K] @ weight[M,K]^T`
+    /// and returns the max-abs error against `model::cpu_matmul`'s
+    /// reference for the same random inputs.
+    fn run_and_compare(
+        engine: &mut compute::ComputeEngine, shader: &str, m: usize, t: usize, k: usize,
+        seed_w: u64, seed_x: u64,
+    ) -> f32 {
+        let weight = fake_random(m * k, seed_w); // [M, K] row-major
+        let x = fake_random(t * k, seed_x);      // [T, K] row-major
+
+        let cpu_ref = model::cpu_matmul(&x, &weight, t, k, m); // [T, M]
+
+        let wbuf = engine.alloc_host_coherent_storage((weight.len() * 4) as u64).unwrap();
+        wbuf.write(bytemuck::cast_slice(&weight)).unwrap();
+        let xbuf = engine.alloc_host_coherent_storage((x.len() * 4) as u64).unwrap();
+        xbuf.write(bytemuck::cast_slice(&x)).unwrap();
+        let out = engine.alloc_host_coherent_storage((t * m * 4) as u64).unwrap();
+        let pc = mm_pc(m, t, k);
+        let wg = mm_workgroups(m, t);
+
+        let cb = engine.begin_batch().unwrap();
+        engine.record_to(cb, shader, &[&wbuf, &xbuf, &out], bytemuck::cast_slice(&pc), wg).unwrap();
+        engine.submit_batch(cb).unwrap();
+        let r = read_f32_buf(&out, t * m);
+
+        r.iter().zip(cpu_ref.iter()).map(|(&a, &b)| (a - b).abs()).fold(0.0f32, f32::max)
+    }
+
+    #[test]
+    fn matmul_f32_f32_matches_cpu_reference_at_realistic_and_boundary_shapes() {
+        let _guard = gpu_test_guard();
+        let Some(mut engine) = make_engine() else { return };
+
+        // (out_features M, T N, in_features K). The first three are
+        // Gemma4-E2B's real q_proj / gate_proj+up_proj / down_proj
+        // prefill shapes at a representative prefill chunk size
+        // (T=128); the rest are deliberately NOT multiples of
+        // BM=BN=64/BK=32, to exercise this (non-`_aligned`) variant's
+        // boundary-check loads in load_a_to_shmem/load_b_to_shmem (see
+        // mul_mm_funcs.glsl) — exactly the kind of tile-edge case a
+        // silent, "plausible-looking" dispatch bug (see
+        // subgroup_matvec_correctness_tests) could get wrong while
+        // still passing on tile-aligned shapes alone.
+        let shapes = [
+            (2048usize, 128usize, 1536usize),
+            (6144, 128, 1536),
+            (1536, 128, 6144),
+            (65, 63, 33),    // odd: all three dims cross a tile boundary
+            (16, 7, 5),      // all three dims smaller than one tile
+            (127, 129, 96),  // M/N straddle 2 tiles, K exactly 3*BK
+            // Single output tile (M=N=BM=BN=64) with 2 K-blocks (K=2*BK):
+            // the exact shape that first exposed the BLOCK_SIZE=64/
+            // NUM_WARPS mismatch documented at `compile_matmul` (half of
+            // this tile's columns silently came back as 0 before that
+            // fix) — kept as a permanent, minimal regression case.
+            (64, 64, 64),
+        ];
+        for &(m, t, k) in &shapes {
+            let err = run_and_compare(&mut engine, "matmul_f32_f32", m, t, k, 1, 2);
+            println!("matmul_f32_f32 M={m} T={t} K={k}: max abs err vs CPU reference = {err:.6}");
+            assert!(
+                err < 1e-2,
+                "matmul_f32_f32 diverged from CPU reference at M={m} T={t} K={k}: max abs err {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn matmul_f32_f32_fp32_matches_cpu_reference() {
+        // Same math as matmul_f32_f32 (ACC_TYPE=float either way — see
+        // MM_F32's compile-time defines at this shader's compile_shaders.sh
+        // entry) under a different pipeline name only because
+        // compile_shaders.sh compiles it a second time with an explicit
+        // (already-default) ACC_F32=1; verified separately here so the
+        // two can never silently diverge (e.g. a future edit to one
+        // compile line but not the other) without a test catching it.
+        let _guard = gpu_test_guard();
+        let Some(mut engine) = make_engine() else { return };
+
+        let err = run_and_compare(&mut engine, "matmul_f32_f32_fp32", 2048, 128, 1536, 3, 4);
+        println!("matmul_f32_f32_fp32 M=2048 T=128 K=1536: max abs err vs CPU reference = {err:.6}");
+        assert!(err < 1e-2, "matmul_f32_f32_fp32 diverged from CPU reference: {err}");
+    }
+
+    /// Times `f` over `iters` calls, `trials` times, keeping the minimum
+    /// per-call duration — the same best-of-N-trials technique used
+    /// throughout this file's other GPU/CPU comparison tests (e.g.
+    /// `matvec_r4_tests`), to avoid scheduling-noise false negatives.
+    fn time_best_of(trials: usize, iters: usize, mut f: impl FnMut()) -> std::time::Duration {
+        let mut best = std::time::Duration::MAX;
+        for _ in 0..trials {
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters { f(); }
+            best = best.min(t0.elapsed() / iters as u32);
+        }
+        best
+    }
+
+    /// Measures GPU tiled-matmul (`matmul_f32_f32`) dispatch time vs
+    /// `model::cpu_matmul` (the same `matrixmultiply::sgemm` CPU path
+    /// `vulkan_ops.py`'s `linear()` prefill fallback uses in the real
+    /// Python-level serving path) for one (M, K, T) shape, returning
+    /// (cpu_us, gpu_us).
+    fn time_gpu_vs_cpu(engine: &mut compute::ComputeEngine, m: usize, t: usize, k: usize) -> (f64, f64) {
+        let weight = fake_random(m * k, 1);
+        let x = fake_random(t * k, 2);
+
+        let wbuf = engine.alloc_host_coherent_storage((weight.len() * 4) as u64).unwrap();
+        wbuf.write(bytemuck::cast_slice(&weight)).unwrap();
+        let xbuf = engine.alloc_host_coherent_storage((x.len() * 4) as u64).unwrap();
+        xbuf.write(bytemuck::cast_slice(&x)).unwrap();
+        let out = engine.alloc_host_coherent_storage((t * m * 4) as u64).unwrap();
+        let pc = mm_pc(m, t, k);
+        let wg = mm_workgroups(m, t);
+        let pcb = bytemuck::cast_slice::<u32, u8>(&pc).to_vec();
+
+        // Warm up (first dispatch/call on a fresh buffer pays one-time costs).
+        for _ in 0..3 {
+            let cb = engine.begin_batch().unwrap();
+            engine.record_to(cb, "matmul_f32_f32", &[&wbuf, &xbuf, &out], &pcb, wg).unwrap();
+            engine.submit_batch(cb).unwrap();
+            std::hint::black_box(model::cpu_matmul(&x, &weight, t, k, m));
+        }
+
+        let gpu_dur = time_best_of(3, 5, || {
+            let cb = engine.begin_batch().unwrap();
+            engine.record_to(cb, "matmul_f32_f32", &[&wbuf, &xbuf, &out], &pcb, wg).unwrap();
+            engine.submit_batch(cb).unwrap();
+        });
+        let cpu_dur = time_best_of(3, 5, || {
+            std::hint::black_box(model::cpu_matmul(&x, &weight, t, k, m));
+        });
+        (cpu_dur.as_secs_f64() * 1e6, gpu_dur.as_secs_f64() * 1e6)
+    }
+
+    /// Measures GPU tiled-matmul (`matmul_f32_f32`) against
+    /// `model::cpu_matmul` at Gemma4-E2B's real large-weight prefill
+    /// shapes (q_proj/gate_proj+up_proj/down_proj — all
+    /// `>= _MATVEC_MIN_WEIGHT_ELEMENTS`-equivalent in the Python-level
+    /// threshold `_vulkan_matmul`'s dispatch decision uses) across the
+    /// full range of prefill-scale T this file's own decode/prefill
+    /// threshold split (`_MATVEC_THRESHOLD=4` in vulkan_ops.py) actually
+    /// exercises this code path at.
+    ///
+    /// Unlike `_MATVEC_THRESHOLD`'s matvec case (see
+    /// `test_matvec_batching_does_not_help_at_prefill_scale_t` in
+    /// tests/python/test_vulkan_ops.py — GPU matvec re-reads the whole
+    /// weight matrix per token, so it *loses* to CPU at prefill scale),
+    /// the tiled matmul shader genuinely reuses weight tiles across the
+    /// T dimension the way a real GEMM should, so it wins here and the
+    /// margin widens with T rather than narrowing — verified directly:
+    /// GPU is faster at every T from 4 up (1.5x-17x across the 3 shapes
+    /// tested), the intended justification for `linear()` now
+    /// dispatching `_vulkan_matmul` for large weights at T>=4 instead of
+    /// always falling back to CPU.
+    #[test]
+    fn tiled_matmul_beats_cpu_at_prefill_scale_for_large_weights() {
+        let _guard = gpu_test_guard();
+        let Some(mut engine) = make_engine() else { return };
+
+        let shapes: &[(usize, usize, &str)] = &[
+            (2048, 1536, "q_proj"),
+            (6144, 1536, "gate/up_proj"),
+            (1536, 6144, "down_proj"),
+        ];
+
+        for &(m, k, label) in shapes {
+            println!("\n=== {label}: out_features={m} in_features={k} ===");
+            println!("{:>6} {:>14} {:>14} {:>8}", "T", "CPU(us)", "GPU(us)", "speedup");
+            for &t in &[4usize, 16, 64, 128, 512] {
+                let (cpu_us, gpu_us) = time_gpu_vs_cpu(&mut engine, m, t, k);
+                println!("{t:>6} {cpu_us:>14.1} {gpu_us:>14.1} {:>7.2}x", cpu_us / gpu_us);
+                assert!(
+                    gpu_us < cpu_us,
+                    "{label} T={t}: GPU tiled matmul ({gpu_us:.1}us) was not faster \
+                     than CPU ({cpu_us:.1}us) — see linear()'s doc comment in \
+                     vulkan_ops.py before changing the GPU-dispatch threshold for \
+                     tiled matmul based on this alone"
+                );
+            }
+        }
+    }
+
+    /// Companion measurement (not a hard assertion — see doc comment)
+    /// for the small-weight case (`_vulkan_matmul` is NOT used here,
+    /// same `_MATVEC_MIN_WEIGHT_ELEMENTS` gate as the decode matvec
+    /// path): confirms the *reason* `linear()` keeps this shape on the
+    /// CPU-only path even at prefill-scale T is a real, measured
+    /// crossover (GPU only pulls ahead once T is much larger than any
+    /// single k_proj/v_proj prefill call in practice would realistically
+    /// use for this comparison to matter) rather than an untested
+    /// assumption — deliberately printed and eyeballed, not asserted,
+    /// since unlike the large-weight case above the crossover point
+    /// itself (not just the win/loss direction) is the interesting,
+    /// closer-to-the-margin fact here.
+    #[test]
+    fn tiled_matmul_small_weight_crossover_point() {
+        let _guard = gpu_test_guard();
+        let Some(mut engine) = make_engine() else { return };
+
+        let (m, k) = (256usize, 1536usize); // k_proj/v_proj real shape
+        println!("\n=== k_proj/v_proj (small weight, out_features={m} in_features={k}) ===");
+        println!("{:>6} {:>14} {:>14} {:>8}", "T", "CPU(us)", "GPU(us)", "speedup");
+        for &t in &[4usize, 16, 64, 128, 512] {
+            let (cpu_us, gpu_us) = time_gpu_vs_cpu(&mut engine, m, t, k);
+            println!("{t:>6} {cpu_us:>14.1} {gpu_us:>14.1} {:>7.2}x", cpu_us / gpu_us);
+        }
     }
 }

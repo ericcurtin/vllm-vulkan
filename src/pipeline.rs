@@ -79,6 +79,18 @@ impl PipelineCache {
             "mul_mat_vec_f16_f32_f32",
         ];
 
+        // Tiled matmul shaders (mul_mm.comp — see `compile_matmul`'s doc
+        // comment for why these CANNOT safely go through the generic
+        // `compile_one` path, unlike most other shaders compiled with no
+        // specialization constants).
+        const MATMUL_SHADERS: &[&str] = &[
+            "matmul_f32_f16",
+            "matmul_f32_f16_aligned",
+            "matmul_f32_f32",
+            "matmul_f32_f32_fp32",
+            "matmul_f16_f32_fp32",
+        ];
+
         let mut failed = 0usize;
         for (&name, &spv) in shader_spvs {
             let result = if RMSNORM_SHADERS.contains(&name) {
@@ -86,6 +98,8 @@ impl PipelineCache {
                 cache.compile_rms_norm(name, spv)
             } else if MATVEC_SHADERS.contains(&name) {
                 cache.compile_matvec(name, spv)
+            } else if MATMUL_SHADERS.contains(&name) {
+                cache.compile_matmul(name, spv)
             } else {
                 cache.compile_one(name, spv)
             };
@@ -272,6 +286,97 @@ impl PipelineCache {
         let r4 = format!("{name}_r4");
         self.compile_one_with_spec(&r4, spv, &[(0, 32), (1, 4), (2, 1)])?;
         Ok(())
+    }
+
+    /// Compile a tiled-matmul shader (`mul_mm.comp` — `matmul_f32_f16`/
+    /// `matmul_f32_f16_aligned`/`matmul_f32_f32`/`matmul_f32_f32_fp32`/
+    /// `matmul_f16_f32_fp32`) with EXPLICIT specialization constants for
+    /// every `constant_id` this shader declares — NOT this shader's own
+    /// literal GLSL defaults (`BLOCK_SIZE=BM=BN=64`), which are two
+    /// independent, real bugs waiting to happen if left unspecialized
+    /// (both found and fixed together while first wiring up this
+    /// shader's dispatch — see `tiled_matmul_dispatch_tests` in
+    /// src/lib.rs for the correctness tests this configuration is
+    /// verified against):
+    ///
+    /// 1. **`BLOCK_SIZE`'s `layout(local_size_x_id = 0)` binding has two
+    ///    silently-disagreeing embedded defaults.** `mul_mm.comp`
+    ///    declares `layout(local_size_x_id = 0)` (its workgroup's local
+    ///    size X is *itself* a specialization constant, tied to
+    ///    `BLOCK_SIZE`) — and disassembling this shader's compiled
+    ///    SPIR-V (`spirv-dis`) shows glslang emits **two separate**
+    ///    `OpSpecConstant` instructions both decorated `SpecId 0`: one
+    ///    used by the `OpExecutionModeId ... LocalSizeId` instruction
+    ///    (embedded default literal **1**), and a second, textually-
+    ///    later one used by the shader body's own reads of `BLOCK_SIZE`
+    ///    (embedded default **64**, matching the GLSL source's `= 64`
+    ///    initializer). Per the SPIR-V/Vulkan spec, providing a
+    ///    `VkSpecializationMapEntry` for a given `constant_id` overrides
+    ///    *every* `OpSpecConstant` decorated with that `SpecId`
+    ///    uniformly — but leaving it unspecified (as `compile_one` does)
+    ///    lets each instruction fall back to its *own*, independently-
+    ///    embedded default, and here those two defaults silently
+    ///    disagree. Concretely, compiling this shader via `compile_one`
+    ///    (verified directly — see git history for the failing version
+    ///    of this function) makes the GPU actually dispatch with a
+    ///    **real** local workgroup size of 1×1×1 (from the
+    ///    LocalSizeId-bound instruction's default of 1) while every read
+    ///    of `BLOCK_SIZE` *inside* the shader body still evaluates to 64
+    ///    (its own separate default) — so `loadstride_a`/`loadstride_b`
+    ///    (`gl_WorkGroupSize.x * ... / BK`, mul_mm.comp lines 201-202)
+    ///    compute as `1 * 2 / 32 = 0` (integer division), and the
+    ///    shared-memory load loop (`for (uint l = 0; l < BM; l +=
+    ///    loadstride_a)`) never advances — an infinite GPU loop, observed
+    ///    directly as `wait_for_fences` returning `ERROR_DEVICE_LOST` (a
+    ///    GPU/driver TDR-style reset) on every dispatch, reproducing even
+    ///    at the smallest possible single-tile shape (M=N=64, K=32) — not
+    ///    a shape-dependent edge case.
+    ///
+    /// 2. **Even fixed, `BLOCK_SIZE=64` (this shader's own literal
+    ///    default) is internally inconsistent with its other defaults.**
+    ///    The non-coopmat store/compute path assigns each warp a fixed
+    ///    `(warp_r, warp_c) = (warp_i % (BM/WM), warp_i / (BM/WM))` tile
+    ///    of the output, which only covers the *entire* `BM x BN` tile
+    ///    without gaps or overlap if `NUM_WARPS == (BM/WM) * (BN/WN)`
+    ///    exactly. With this shader's own literal defaults
+    ///    (`BM=BN=64`, `WM=WN=32` → `(BM/WM)*(BN/WN) = 2*2 = 4`) that
+    ///    requires `NUM_WARPS = 4`, i.e. `BLOCK_SIZE = 4 * WARP = 128` —
+    ///    but the shader's own literal `BLOCK_SIZE` default is 64
+    ///    (`NUM_WARPS = 64/32 = 2`), so `warp_c` (`warp_i / (BM/WM)`)
+    ///    can only ever evaluate to 0, never 1: half of every `BN`-wide
+    ///    output tile (`warp_c=1`'s columns) is never written by any
+    ///    thread at all. Verified directly: with `BLOCK_SIZE=64`, every
+    ///    output row at `T >= BN/2` (i.e. the un-covered half of the
+    ///    *first* `BN`-tile) came back as exactly 0 (the host-coherent
+    ///    output buffer's untouched initial contents), while covered
+    ///    elements matched `model::cpu_matmul` exactly — a silent,
+    ///    shape-independent correctness bug, not a crash, and so
+    ///    considerably more dangerous than bug #1 above. `BLOCK_SIZE=128`
+    ///    (used below) makes `NUM_WARPS=4` match `(BM/WM)*(BN/WN)=4`
+    ///    exactly, and also keeps `WARP == (WSUBM/TM)*(WSUBN/TN)`
+    ///    (`WSUBM=WM/WMITER=16`, `WSUBN=WN/WNITER=16`,
+    ///    `(16/TM=4)*(16/TN=2) = 4*8 = 32 = WARP`) — every per-thread
+    ///    tiling equation in this shader satisfied simultaneously, not
+    ///    just the ones needed to avoid a hang.
+    ///
+    /// The remaining constant IDs (BM/BN/WM/WN/WMITER/TM/TN/TK/WARP) are
+    /// pinned explicitly here too, rather than left to each shader's own
+    /// embedded default, as cheap insurance against a future glslang
+    /// version silently changing an embedded default out from under this
+    /// shader's now-verified dispatch math.
+    pub fn compile_matmul(&mut self, name: &str, spv: &[u8]) -> Result<(), String> {
+        self.compile_one_with_spec(name, spv, &[
+            (0, 128), // BLOCK_SIZE (also drives LocalSizeId — see doc comment above)
+            (1, 64),  // BM
+            (2, 64),  // BN
+            (4, 32),  // WM
+            (5, 32),  // WN
+            (6, 2),   // WMITER
+            (7, 4),   // TM
+            (8, 2),   // TN
+            (9, 1),   // TK (coopmat-only; inert for the non-coopmat variants compiled here)
+            (10, 32), // WARP
+        ])
     }
 
     /// Compile rms_norm variants: plain (do_multiply=false) and weight-multiplying
