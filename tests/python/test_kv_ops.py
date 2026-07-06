@@ -549,3 +549,126 @@ def test_select_decode_shader_prefers_block_size_matching_head_size():
     )
     assert name_512 == "paged_attn_decode_f32_coop_512"
     assert wg_512 == 512
+
+
+def test_cached_available_shaders_matches_uncached_reference_and_is_faster():
+    """`kv_ops._cached_available_shaders` must return the exact same set
+    of shader names as calling `ctx.available_shaders()` directly, just
+    computed once per distinct context object instead of on every call
+    (`_select_decode_shader`/`_require_shader` both use it now) — see its
+    own doc comment in kv_ops.py, and
+    `vulkan_ops._cached_available_shaders` (same fix, applied first to
+    `linear()`'s much hotter call site) for the measurement this is based
+    on.
+
+    Also measures the actual speedup here directly, taking the minimum
+    elapsed time across several independent trials rather than a single
+    timed loop — see vulkan_ops.py's `TestLinearMatvecDispatchThreshold`
+    for why (measurement noise under full-suite load).
+    """
+    import time
+
+    from vllm_vulkan import kv_ops
+
+    ctx = _require_vulkan_context()
+
+    cached = kv_ops._cached_available_shaders(ctx)
+    assert cached == frozenset(ctx.available_shaders())
+    # Must actually be cached, not recomputed on every call: repeated
+    # calls return the identical (not just equal) frozenset object.
+    assert kv_ops._cached_available_shaders(ctx) is cached
+
+    iters = 2000
+    trials = 5
+
+    def timed(fn) -> float:
+        best = float("inf")
+        for _ in range(trials):
+            t0 = time.perf_counter()
+            for _ in range(iters):
+                fn()
+            best = min(best, time.perf_counter() - t0)
+        return best
+
+    uncached_elapsed = timed(ctx.available_shaders)
+    cached_elapsed = timed(lambda: kv_ops._cached_available_shaders(ctx))
+
+    print(
+        f"\nkv_ops available_shaders(), best-of-{trials}: "
+        f"uncached {uncached_elapsed / iters * 1e6:.3f}us/call, "
+        f"cached {cached_elapsed / iters * 1e6:.3f}us/call, "
+        f"speedup {uncached_elapsed / cached_elapsed:.1f}x"
+    )
+    assert cached_elapsed < uncached_elapsed, (
+        f"cached available_shaders ({cached_elapsed:.4f}s/{iters}) was not "
+        f"faster than the uncached reference ({uncached_elapsed:.4f}s/{iters})"
+    )
+
+
+def test_cached_available_shaders_uses_identity_not_equality():
+    """Guards against a regression back to a naive `id(ctx)`-integer (or
+    `==`-based) cache key: two distinct objects that happen to compare
+    `==` to each other (as two garbage-collected-then-reallocated
+    objects at the same memory address effectively would under a bare
+    `id()` comparison) must still be treated as different contexts —
+    only a strict `is` identity check on a live, held reference gets
+    this right in every case. Pure Python; doesn't need a real Vulkan
+    device (`_cached_available_shaders` only ever calls
+    `ctx.available_shaders()`, so a minimal duck-typed stand-in works).
+    """
+    from vllm_vulkan import kv_ops
+
+    class _FakeCtx:
+        def __init__(self, shaders: list[str]) -> None:
+            self._shaders = shaders
+
+        def available_shaders(self) -> list[str]:
+            return list(self._shaders)
+
+        def __eq__(self, other: object) -> bool:
+            return True  # deliberately "equal" to any other _FakeCtx
+
+        def __hash__(self) -> int:
+            return 0
+
+    prev_ctx = kv_ops._available_shaders_cache_ctx
+    prev_cache = kv_ops._available_shaders_cache
+    try:
+        ctx_a = _FakeCtx(["shader_a"])
+        ctx_b = _FakeCtx(["shader_b"])
+
+        result_a = kv_ops._cached_available_shaders(ctx_a)  # type: ignore[arg-type]
+        assert result_a == frozenset({"shader_a"})
+
+        result_b = kv_ops._cached_available_shaders(ctx_b)  # type: ignore[arg-type]
+        assert result_b == frozenset({"shader_b"}), (
+            "a distinct (but == equal) context object must not incorrectly "
+            "reuse the previous context's cached shader set"
+        )
+    finally:
+        kv_ops._available_shaders_cache_ctx = prev_ctx
+        kv_ops._available_shaders_cache = prev_cache
+
+
+def test_cached_available_shaders_recomputes_for_a_different_context():
+    """A second, distinct `VulkanContext` object must not silently reuse
+    the first context's cached shader set — the single-slot cache
+    compares against a stored strong reference to the cached-for context
+    with `is` specifically to catch this (see
+    `kv_ops._cached_available_shaders`'s doc comment for why a bare
+    `id(ctx)` integer comparison would be unsafe here)."""
+    from vllm_vulkan import kv_ops
+
+    ctx1 = _require_vulkan_context()
+    ctx2 = _require_vulkan_context()
+
+    shaders1 = kv_ops._cached_available_shaders(ctx1)
+    shaders2 = kv_ops._cached_available_shaders(ctx2)
+    # Different context objects (even from the same device/build) must
+    # each get their own freshly-computed (if equal-valued) result, not
+    # silently reuse a cache entry meant for a different context object.
+    assert shaders1 == shaders2
+    # Re-querying ctx1 after ctx2 was cached must recompute for ctx1
+    # again (single-slot cache, not a full dict) rather than incorrectly
+    # returning ctx2's cached value.
+    assert kv_ops._cached_available_shaders(ctx1) == shaders1

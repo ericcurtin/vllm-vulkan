@@ -37,6 +37,61 @@ _PAGED_ATTN_DECODE_WORKGROUP_SIZE = 256
 _PAGED_ATTN_DECODE_WORKGROUP_SIZE_LARGE = 512
 _F32_NBYTES = np.dtype(np.float32).itemsize
 
+# Single-slot cache for `_cached_available_shaders` below — see that
+# function's doc comment. `_available_shaders_cache_ctx` holds a *strong*
+# reference to the cached-for context (not just its `id()`) specifically
+# so the cache-hit check below is a safe `is` comparison between two
+# live objects, never a comparison against a possibly-stale, possibly-
+# recycled address (see this module's doc comment for why `id()` alone
+# would be unsafe here).
+_available_shaders_cache_ctx: VulkanContext | None = None
+_available_shaders_cache: frozenset[str] | None = None
+
+
+def _cached_available_shaders(ctx: VulkanContext) -> frozenset[str]:
+    """Returns `ctx.available_shaders()`, computed once per distinct
+    `ctx` object and cached instead of re-queried (and re-marshalled from
+    Rust into a fresh Python list via PyO3) on every call.
+
+    `_require_shader`/`_select_decode_shader` are already only called
+    once per batch, not once per token, within this module (see
+    `_resolve_paged_attn_decode_dispatch`'s own doc comment for that
+    design) — but that's still once per attention layer, per decode
+    step (~35 calls/decode-step for Gemma4-E2B), and `available_shaders`
+    is a pure function of the context, fixed for its whole lifetime, so
+    even that lower call frequency doesn't need to pay the ~1.1us/call
+    PyO3 round-trip repeatedly. See `vllm_vulkan.vulkan_ops.
+    _cached_available_shaders` for the same fix applied to `linear()`'s
+    much hotter call site (~175-210 calls/decode-step there), including
+    the direct measurement this doc comment's numbers are based on.
+
+    Unlike `vulkan_ops.py` (which has a single well-defined global
+    context lifecycle via `set_context`), this module receives `ctx` as
+    a plain parameter from whatever caller holds one — so this cache is
+    a single-slot cache (not a dict, since realistically only one
+    `VulkanContext` is ever active at a time in this codebase), and
+    transparently recomputes if a different context object is ever
+    passed in.
+
+    Compares `ctx` against the cached context with `is` (identity of two
+    live references), *not* by comparing `id(ctx)` against a previously
+    stored integer: `id()` is only guaranteed unique among objects that
+    are simultaneously alive — if the originally-cached `VulkanContext`
+    were garbage collected, CPython would be free to reuse its memory
+    address for an unrelated, later object, which a bare `id()`-int
+    comparison could then wrongly treat as "the same" context and return
+    a stale shader set for it. Holding a strong reference to the cached
+    context (`_available_shaders_cache_ctx`) sidesteps this entirely:
+    the comparison is always between two objects guaranteed to be alive
+    at the same time, which is exactly what `is` requires to be safe.
+    """
+    global _available_shaders_cache_ctx, _available_shaders_cache
+    if _available_shaders_cache_ctx is not ctx:
+        _available_shaders_cache = frozenset(ctx.available_shaders())
+        _available_shaders_cache_ctx = ctx
+    assert _available_shaders_cache is not None
+    return _available_shaders_cache
+
 
 def paged_kv_write_f16(
     ctx: VulkanContext,
@@ -521,7 +576,7 @@ def _paged_attn_decode_batch(
 
 
 def _require_shader(ctx: VulkanContext, shader_name: str) -> None:
-    if shader_name not in ctx.available_shaders():
+    if shader_name not in _cached_available_shaders(ctx):
         raise RuntimeError(f"{shader_name} shader is not available")
 
 
@@ -544,7 +599,7 @@ def _select_decode_shader(
     0 when the plain shader was selected (see _build_paged_attn_decode_op,
     whose workgroup formula doesn't use this value in that case).
     """
-    available_shaders = ctx.available_shaders()
+    available_shaders = _cached_available_shaders(ctx)
     prefer_512 = head_size >= _PAGED_ATTN_DECODE_WORKGROUP_SIZE_LARGE
     if prefer_512 and coop_512_shader_name in available_shaders:
         return coop_512_shader_name, _PAGED_ATTN_DECODE_WORKGROUP_SIZE_LARGE
