@@ -40,8 +40,8 @@ def _require_vulkan_context():
         ctx = _rs.VulkanContext(0)
     except RuntimeError as exc:
         pytest.skip(f"VulkanContext unavailable: {exc}")
-    if "mul_mat_vec_f32_f32_f32_subgroup" not in ctx.available_shaders():
-        pytest.skip("mul_mat_vec_f32_f32_f32_subgroup shader unavailable")
+    if "mul_mat_vec_f32_f32_f32" not in ctx.available_shaders():
+        pytest.skip("mul_mat_vec_f32_f32_f32 shader unavailable")
     return ctx
 
 
@@ -78,6 +78,32 @@ def upload_counter(monkeypatch):
 
     monkeypatch.setattr(vulkan_ops._WeightCache, "put", counting_put)
     return counts
+
+
+def test_linear_matches_torch_reference_at_realistic_hidden_size(vulkan_ctx):
+    """Direct numerical correctness check for vulkan_ops.linear()'s GPU
+    decode path (T < _MATVEC_THRESHOLD) against `torch.nn.functional.linear`
+    as ground truth, at a realistic transformer hidden size (1536, matching
+    Gemma4-E2B) -- not just the tiny in_features=8 shapes the other tests in
+    this file use to exercise the weight cache.
+
+    This specific gap (no test comparing the GPU decode-matvec path's
+    OUTPUT against a real reference at a realistic K) is what let a real
+    correctness bug in mul_mat_vec_f32_f32_f32_subgroup go unnoticed: that
+    shader silently diverged from the correct result for any K>=~256 while
+    happening to still be correct at the small K (8) every other test here
+    uses -- see subgroup_matvec_correctness_tests in src/lib.rs for the
+    measured divergence, and this file's `_require_vulkan_context` /
+    vulkan_ops.py's `linear`/`_vulkan_matvec` for the fix (now dispatching
+    mul_mat_vec_f32_f32_f32, the plain non-subgroup variant, instead).
+    """
+    out_features, in_features = 512, 1536
+    weight = torch.randn(out_features, in_features, dtype=torch.float32)
+    x = torch.randn(1, in_features, dtype=torch.float32)  # T=1 < _MATVEC_THRESHOLD
+
+    result = vulkan_ops.linear(x, weight, None)
+    expected = torch.nn.functional.linear(x, weight, None)
+    torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
 
 
 def test_get_or_upload_weight_hits_cache_for_same_tensor_object(

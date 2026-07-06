@@ -3066,6 +3066,143 @@ mod pipeline_cache_startup_tests {
 }
 
 #[cfg(test)]
+mod subgroup_matvec_correctness_tests {
+    //! `mul_mat_vec_f32_f32_f32_subgroup` (previously dispatched from
+    //! vulkan_ops.py's `_vulkan_matvec` — the generic PyTorch-facing
+    //! `linear()` op's decode-path, T<4, GPU implementation used
+    //! whenever this backend replaces an arbitrary vLLM model's
+    //! `nn.Linear` layers, not just Gemma4-E2B's native Rust path) was
+    //! found to silently produce WRONG results for any `ncols` (K) >=
+    //! ~256 — i.e. essentially every real transformer hidden/intermediate
+    //! size — while producing correct results for smaller K (e.g. 16,
+    //! 64). Confirmed via direct comparison against a CPU dot-product
+    //! reference across K in {16, 64, 256, 511, 512, 513, 768, 1024,
+    //! 1025, 1536, 6144}: `mul_mat_vec_f32_f32_f32_subgroup`'s error
+    //! jumps from 0.0 (K<=64) to double-digit absolute error (K>=256),
+    //! while `mul_mat_vec_f32_f32_f32` (the plain, non-subgroup variant,
+    //! identical bindings/push-constants/workgroup-dispatch convention)
+    //! stays exactly correct (error 0.0) at every K tested. The root
+    //! cause looks like mul_mat_vec_base.glsl's `USE_SUBGROUP_ADD`
+    //! cross-subgroup shared-memory reduction (`[[unroll]] for (uint s
+    //! = 0; s < gl_NumSubgroups; ++s)`), which unrolls a loop bounded by
+    //! a value that may not be reliably compile-time-constant on every
+    //! driver — not fully root-caused, but irrelevant to the fix: since
+    //! this backend already has a proven-correct alternative
+    //! (`mul_mat_vec_f32_f32_f32`) with an identical calling convention,
+    //! vulkan_ops.py now dispatches that instead (see the fix in
+    //! vulkan_ops.py's `linear`/`_vulkan_matvec`).
+    //!
+    //! This test is the permanent regression guard: it documents the bug
+    //! (subgroup variant, if ever re-introduced as a dispatch target,
+    //! must not silently diverge again) and confirms the shader
+    //! vulkan_ops.py now actually uses remains correct at every one of
+    //! these shapes.
+    use super::*;
+
+    fn fake_random(len: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
+        (0..len)
+            .map(|_| {
+                state ^= state >> 12; state ^= state << 25; state ^= state >> 27;
+                let bits = state.wrapping_mul(0x2545F4914F6CDD1D);
+                ((bits >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    fn make_engine() -> Option<compute::ComputeEngine> {
+        let dev = match device::ComputeDevice::create(0) {
+            Ok(d) => d,
+            Err(e) => { eprintln!("skip: no Vulkan device available ({e})"); return None; }
+        };
+        let shader_spvs = include_all_shaders();
+        let refs: std::collections::HashMap<&str, &[u8]> = shader_spvs.iter()
+            .map(|(k, v)| (k.as_str(), v.as_slice())).collect();
+        Some(compute::ComputeEngine::new(
+            dev.instance.clone(), dev.physical_device, dev.device.clone(),
+            dev.compute_queue, dev.compute_queue_family, &refs,
+        ).expect("create ComputeEngine"))
+    }
+
+    #[test]
+    fn mul_mat_vec_f32_f32_f32_subgroup_diverges_from_cpu_reference_at_realistic_k() {
+        let _guard = gpu_test_guard();
+        let Some(mut engine) = make_engine() else { return };
+
+        let n = 4usize;
+        let t = 1usize;
+        // At K<=64 the subgroup variant happens to still be correct; the
+        // divergence appears at K=256 and persists at every larger size
+        // tested, covering every realistic Gemma4-E2B (and general
+        // transformer) hidden/intermediate dimension.
+        let mut saw_divergence = false;
+        for &k in &[256usize, 512, 1536, 6144] {
+            let weight = fake_random(n * k, 1);
+            let x = fake_random(t * k, 2);
+            let mut cpu_ref = vec![0.0f32; t * n];
+            for ni in 0..n {
+                let wr = &weight[ni * k..(ni + 1) * k];
+                cpu_ref[ni] = wr.iter().zip(x.iter()).map(|(&w, &v)| w * v).sum::<f32>();
+            }
+            let wbuf = engine.alloc_host_coherent_storage((weight.len() * 4) as u64).unwrap();
+            wbuf.write(bytemuck::cast_slice(&weight)).unwrap();
+            let xbuf = engine.alloc_host_coherent_storage((x.len() * 4) as u64).unwrap();
+            xbuf.write(bytemuck::cast_slice(&x)).unwrap();
+            let out = engine.alloc_host_coherent_storage((t * n * 4) as u64).unwrap();
+            let pc = mv_pc(k, n, t);
+
+            let cb = engine.begin_batch().unwrap();
+            engine.record_to(cb, "mul_mat_vec_f32_f32_f32_subgroup", &[&wbuf, &xbuf, &out], bytemuck::cast_slice(&pc), (n as u32, t as u32, 1)).unwrap();
+            engine.submit_batch(cb).unwrap();
+            let r = read_f32_buf(&out, t * n);
+            let err = r.iter().zip(cpu_ref.iter()).map(|(&a, &b)| (a - b).abs()).fold(0.0f32, f32::max);
+            if err > 1.0 {
+                saw_divergence = true;
+            }
+        }
+        assert!(
+            saw_divergence,
+            "expected mul_mat_vec_f32_f32_f32_subgroup to diverge from the CPU reference at \
+             at least one of the tested (known-bad) K values — if this now passes, the shader \
+             or driver behavior has changed and vulkan_ops.py might safely use this variant \
+             again, but that should be a deliberate decision backed by this test passing \
+             consistently, not just this one run"
+        );
+    }
+
+    #[test]
+    fn mul_mat_vec_f32_f32_f32_matches_cpu_reference_at_realistic_k() {
+        let _guard = gpu_test_guard();
+        let Some(mut engine) = make_engine() else { return };
+
+        let n = 4usize;
+        let t = 1usize;
+        for &k in &[16usize, 64, 256, 512, 1536, 6144] {
+            let weight = fake_random(n * k, 1);
+            let x = fake_random(t * k, 2);
+            let mut cpu_ref = vec![0.0f32; t * n];
+            for ni in 0..n {
+                let wr = &weight[ni * k..(ni + 1) * k];
+                cpu_ref[ni] = wr.iter().zip(x.iter()).map(|(&w, &v)| w * v).sum::<f32>();
+            }
+            let wbuf = engine.alloc_host_coherent_storage((weight.len() * 4) as u64).unwrap();
+            wbuf.write(bytemuck::cast_slice(&weight)).unwrap();
+            let xbuf = engine.alloc_host_coherent_storage((x.len() * 4) as u64).unwrap();
+            xbuf.write(bytemuck::cast_slice(&x)).unwrap();
+            let out = engine.alloc_host_coherent_storage((t * n * 4) as u64).unwrap();
+            let pc = mv_pc(k, n, t);
+
+            let cb = engine.begin_batch().unwrap();
+            engine.record_to(cb, "mul_mat_vec_f32_f32_f32", &[&wbuf, &xbuf, &out], bytemuck::cast_slice(&pc), (n as u32, t as u32, 1)).unwrap();
+            engine.submit_batch(cb).unwrap();
+            let r = read_f32_buf(&out, t * n);
+            let err = r.iter().zip(cpu_ref.iter()).map(|(&a, &b)| (a - b).abs()).fold(0.0f32, f32::max);
+            assert!(err < 1e-2, "k={k}: mul_mat_vec_f32_f32_f32 diverged from CPU reference: {err}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod record_to_tests {
     //! Validates `ComputeEngine::record_to`'s stack-allocated descriptor-
     //! write buffers (see its doc comment) — specifically the
