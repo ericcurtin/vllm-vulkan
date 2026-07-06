@@ -321,6 +321,49 @@ _MATVEC_THRESHOLD = 4  # T < this → matvec shader; T >= this → CPU
 # `linear`'s doc comment for the measurement behind this cutoff.
 _MATVEC_MIN_WEIGHT_ELEMENTS = 1_000_000
 
+# Do NOT "fix" prefill performance by simply raising _MATVEC_THRESHOLD so
+# larger T also dispatches to mul_mat_vec_f32_f32_f32 — measured directly
+# on this hardware, at Gemma4-E2B's real q_proj shape (in_features=1536,
+# out_features=2048), this makes prefill dramatically SLOWER, not faster:
+#
+#   T      CPU (torch.nn.functional.linear)   GPU (mul_mat_vec_f32_f32_f32)
+#   1        873.2us  (873.21us/token)           388.5us  (388.48us/token)
+#   4        815.4us  (203.86us/token)            980.1us  (245.01us/token)
+#  16        988.0us   (61.75us/token)           3387.8us  (211.74us/token)
+#  64       2304.4us   (36.01us/token)          12767.6us  (199.49us/token)
+# 128       3917.5us   (30.61us/token)          25378.4us  (198.27us/token)
+# 256       7370.5us   (28.79us/token)          50219.2us  (196.17us/token)
+# 512      14736.1us   (28.78us/token)          99819.7us  (194.96us/token)
+#
+# GPU is already ~6.5x slower than CPU by T=128, and the gap keeps
+# widening. Root cause: mul_mat_vec's per-token dispatch (workgroups =
+# (N, T, 1), see `_vulkan_matvec`) is a genuine batched matrix-VECTOR
+# multiply — each of the T "batch" workgroup-rows independently re-reads
+# the *entire* weight matrix from GPU memory (see mul_mat_vec_base.glsl's
+# `get_offsets()`: every batch_idx in [0, T) resolves to the same
+# `a_offset` since the shader's ne02/ne12/broadcast2/broadcast3 push
+# constants are set up for "same weight, T independent inputs"
+# broadcasting, not weight-tile reuse across inputs). That's fine at
+# T<4 (decode) where the fixed per-dispatch driver overhead dominates
+# and re-reading a ~3-12MB weight matrix a handful of times is cheap
+# relative to it, but at prefill-scale T it means GPU bandwidth cost
+# scales as O(T x in_features x out_features) — the same order as CPU's
+# cost, with none of a real tiled matmul's weight-tile-reuse advantage,
+# so GPU just pays that cost at a *worse* effective rate than CPU's own
+# BLAS routines here.
+#
+# A real prefill speedup would need the tiled matmul shaders this
+# backend already compiles but has never dispatched anywhere
+# (`matmul_f32_f16`/`matmul_f32_f16_aligned`/`matmul_f32_f32_fp32`/
+# `matmul_f16_f32_fp32`, from shaders/mul_mm.comp — a llama.cpp-derived
+# kernel with its own BM/BN/WM/WN/WMITER/TM/TN/TK/WARP specialization-
+# constant tiling scheme, substantial push-constant surface, and no
+# prior working example anywhere in this codebase's history to build
+# from) - a real, valuable, but substantially larger undertaking than
+# this threshold, deferred rather than attempted piecemeal. See
+# `test_matvec_batching_does_not_help_at_prefill_scale_t` (tests/python/
+# test_vulkan_ops.py) for the regression guard backing the numbers above.
+
 
 def rms_norm(
     x: torch.Tensor,

@@ -727,6 +727,69 @@ class TestLinearMatvecDispatchThreshold:
         )
         assert upload_counter["n"] == 1
 
+    def test_matvec_batching_does_not_help_at_prefill_scale_t(self, vulkan_ctx):
+        """Regression guard for `_MATVEC_THRESHOLD=4`: do NOT raise this
+        threshold to also dispatch larger (prefill-scale) T to the GPU
+        matvec shader - see `_MATVEC_THRESHOLD`'s doc comment in
+        vulkan_ops.py for the full measurement and root-cause
+        explanation (mul_mat_vec_f32_f32_f32's per-token dispatch
+        re-reads the entire weight matrix from GPU memory for every one
+        of the T "batch" rows, with none of a real tiled matmul's
+        weight-tile-reuse - bandwidth cost scales as O(T x in_features x
+        out_features), the same order as CPU's cost but at a worse
+        effective rate here).
+
+        Measured at Gemma4-E2B's real q_proj shape (2048x1536) and
+        T=128 (a representative prefill chunk size, well above
+        `_MATVEC_THRESHOLD`): CPU must remain clearly faster. Uses this
+        file's own min-of-N-trials pattern (see
+        test_small_weight_cpu_path_is_faster_than_gpu_dispatch_at_decode_shape
+        just above) - safe here since the underlying effect (measured
+        independently at ~6.5x and widening with T) is far larger than
+        any plausible measurement noise, unlike cases where a similar
+        pattern was found to be misleading for near-tied comparisons
+        (see kv_ops.py's paged_kv_write_and_decode_batch test in this
+        session's history for that finding).
+        """
+        import time
+
+        out_features, in_features = 2048, 1536
+        weight = torch.randn(out_features, in_features, dtype=torch.float32)
+        t_prefill = 128
+        x = torch.randn(t_prefill, in_features, dtype=torch.float32)
+
+        for _ in range(3):
+            vulkan_ops._vulkan_matvec(vulkan_ctx, x, weight)
+            torch.nn.functional.linear(x, weight, None)
+
+        iters = 10
+        trials = 3
+
+        def timed(fn) -> float:
+            best = float("inf")
+            for _ in range(trials):
+                t0 = time.perf_counter()
+                for _ in range(iters):
+                    fn()
+                best = min(best, time.perf_counter() - t0)
+            return best
+
+        gpu_elapsed = timed(lambda: vulkan_ops._vulkan_matvec(vulkan_ctx, x, weight))
+        cpu_elapsed = timed(lambda: torch.nn.functional.linear(x, weight, None))
+
+        print(
+            f"\nmatvec batching at prefill scale (T={t_prefill}, 2048x1536), "
+            f"best-of-{trials}: GPU batched-matvec {gpu_elapsed / iters * 1e6:.1f}us/call, "
+            f"CPU linear {cpu_elapsed / iters * 1e6:.1f}us/call, "
+            f"CPU speedup {gpu_elapsed / cpu_elapsed:.2f}x"
+        )
+        assert cpu_elapsed < gpu_elapsed, (
+            f"CPU ({cpu_elapsed:.4f}s/{iters}) was not faster than GPU batched-matvec "
+            f"({gpu_elapsed:.4f}s/{iters}) at prefill-scale T={t_prefill} - if this "
+            f"genuinely changed (e.g. a future driver/hardware improvement), see "
+            f"_MATVEC_THRESHOLD's doc comment before raising it based on this alone."
+        )
+
 
 class TestWrapRmsNormHoistsStaticLookups:
     """`_wrap_rms_norm` now captures `weight`/`eps`/the disable-ops env
