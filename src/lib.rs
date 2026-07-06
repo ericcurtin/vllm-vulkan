@@ -739,7 +739,14 @@ fn include_all_shaders() -> std::collections::HashMap<String, Vec<u8>> {
     // f32/f16 weights → f32 output
     spv!("mul_mat_vec_f32_f32_f32_subgroup");
     spv!("mul_mat_vec_f16_f32_f32");
-    spv!("mul_mat_vec_f16_f32_f32_subgroup");
+    // `mul_mat_vec_f16_f32_f32_subgroup` is NOT registered here: unlike its
+    // f32 counterpart (`_f32_f32_f32_subgroup`, dispatched from
+    // vulkan_ops.py's fused RMSNorm→Linear path), it was never actually
+    // dispatched anywhere — confirmed via `grep -rn
+    // 'mul_mat_vec_f16_f32_f32_subgroup' src/ vllm_vulkan/ tests/` finding
+    // zero call sites outside its own registration. See the doc comment
+    // on `compile_matvec` for the measured model-load time savings from
+    // removing this and the other now-unregistered dead matvec variants.
     // Quantized-weight matvec variants (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K/Q3_K/
     // Q4_K/Q5_K/Q6_K/IQ4_NL) are NOT registered here: this backend only
     // ever loads f16/f32 weights (see model_runner.py/vulkan_ops.py — no
@@ -2836,10 +2843,16 @@ mod pipeline_cache_startup_tests {
     //! removing it): ~1865-1885ms with `_r2` vs ~1461-1467ms without,
     //! consistently reproducible across repeated runs — a ~400ms
     //! (~22%) model-load startup-time win from removing this dead
-    //! pipeline. This test is a deterministic (non-flaky) structural
-    //! regression guard confirming `_r2` variants are no longer compiled
-    //! at all, rather than a wall-clock assertion (which would be
-    //! sensitive to the specific CI runner's absolute performance).
+    //! pipeline (see #52). The same audit later found the 13 quantized-
+    //! weight matvec variants (#53, ~730ms/~50% further reduction) and
+    //! `mul_mat_vec_f16_f32_f32_subgroup` (below) were equally dead —
+    //! unlike its f32 counterpart (`_f32_f32_f32_subgroup`, dispatched
+    //! from vulkan_ops.py's fused RMSNorm→Linear path), the f16 variant
+    //! was never actually dispatched anywhere. These tests are
+    //! deterministic (non-flaky) structural regression guards confirming
+    //! specific variants are no longer compiled, rather than wall-clock
+    //! assertions (which would be sensitive to the specific CI runner's
+    //! absolute performance).
     use super::*;
 
     fn make_engine() -> Option<compute::ComputeEngine> {
@@ -2906,9 +2919,14 @@ mod pipeline_cache_startup_tests {
 
         // Trivial zero-filled data — see r2_matvec_variant_is_no_longer_compiled
         // above for why numerical correctness is irrelevant to this test.
+        // Sized generously (n*k*4 bytes) to be large enough for both the f16
+        // (n*k*2 bytes) and f32 (n*k*4 bytes) shader variants dispatched
+        // below — this test never submits the batch, but an undersized
+        // buffer would still be technically incorrect (out-of-bounds reads
+        // if ever submitted, or under strict validation layers).
         let k = 64usize;
         let n = 4usize;
-        let weight = vec![0u8; n * k]; // dummy bytes, layout doesn't matter here
+        let weight = vec![0u8; n * k * 4];
         let x = vec![0.0f32; k];
         let wbuf = engine.alloc_host_coherent_storage(weight.len() as u64).unwrap();
         wbuf.write(&weight).unwrap();
@@ -2945,6 +2963,49 @@ mod pipeline_cache_startup_tests {
         // The f32/f16 variants actually used in production must still work.
         let res_f32 = engine.record_to(cb, "mul_mat_vec_f32_f32_f32", &[&wbuf, &xbuf, &out], bytemuck::cast_slice(&pc), (n as u32, 1, 1));
         assert!(res_f32.is_ok(), "mul_mat_vec_f32_f32_f32 should still be compiled: {res_f32:?}");
+        let res_f16 = engine.record_to(cb, "mul_mat_vec_f16_f32_f32", &[&wbuf, &xbuf, &out], bytemuck::cast_slice(&pc), (n as u32, 1, 1));
+        assert!(res_f16.is_ok(), "mul_mat_vec_f16_f32_f32 should still be compiled: {res_f16:?}");
+    }
+
+    #[test]
+    fn f16_subgroup_matvec_variant_is_no_longer_compiled() {
+        let _guard = gpu_test_guard();
+        let Some(mut engine) = make_engine() else { return };
+
+        // Trivial zero-filled data — see r2_matvec_variant_is_no_longer_compiled
+        // above for why numerical correctness is irrelevant to this test.
+        // Sized generously (n*k*4 bytes) to be large enough for both the f16
+        // (n*k*2 bytes) and f32 (n*k*4 bytes) shader variants dispatched
+        // below — this test never submits the batch, but an undersized
+        // buffer would still be technically incorrect (out-of-bounds reads
+        // if ever submitted, or under strict validation layers).
+        let k = 64usize;
+        let n = 4usize;
+        let weight = vec![0u8; n * k * 4];
+        let x = vec![0.0f32; k];
+        let wbuf = engine.alloc_host_coherent_storage(weight.len() as u64).unwrap();
+        wbuf.write(&weight).unwrap();
+        let xbuf = engine.alloc_host_coherent_storage((k * 4) as u64).unwrap();
+        xbuf.write(bytemuck::cast_slice(&x)).unwrap();
+        let out = engine.alloc_host_coherent_storage((n * 4) as u64).unwrap();
+        let pc = mv_pc(k, n, 1);
+
+        let cb = engine.begin_batch().unwrap();
+        let res_dead = engine.record_to(
+            cb, "mul_mat_vec_f16_f32_f32_subgroup", &[&wbuf, &xbuf, &out], bytemuck::cast_slice(&pc), (n as u32, 1, 1),
+        );
+        assert!(
+            res_dead.is_err(),
+            "expected 'mul_mat_vec_f16_f32_f32_subgroup' to no longer be compiled \
+             (dead code, never dispatched anywhere), but record_to succeeded: {res_dead:?}"
+        );
+
+        // Its f32 counterpart (actually dispatched from vulkan_ops.py) and
+        // the non-subgroup f16 base variant must still work.
+        let res_f32_subgroup = engine.record_to(
+            cb, "mul_mat_vec_f32_f32_f32_subgroup", &[&wbuf, &xbuf, &out], bytemuck::cast_slice(&pc), (n as u32, 1, 1),
+        );
+        assert!(res_f32_subgroup.is_ok(), "mul_mat_vec_f32_f32_f32_subgroup should still be compiled: {res_f32_subgroup:?}");
         let res_f16 = engine.record_to(cb, "mul_mat_vec_f16_f32_f32", &[&wbuf, &xbuf, &out], bytemuck::cast_slice(&pc), (n as u32, 1, 1));
         assert!(res_f16.is_ok(), "mul_mat_vec_f16_f32_f32 should still be compiled: {res_f16:?}");
     }
