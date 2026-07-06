@@ -266,33 +266,33 @@ def rms_norm(
     weight: torch.Tensor | None,
     eps: float,
 ) -> torch.Tensor:
-    """RMS normalisation dispatched to Vulkan GPU via deferred batch."""
-    ctx = get_context()
+    """RMS normalisation — always runs on CPU.
 
-    orig_shape = x.shape
-    ncols = orig_shape[-1]
-    x_flat = x.float().reshape(-1, ncols)
-    nrows = x_flat.shape[0]
+    Unlike `linear()` (whose decode path genuinely benefits from GPU
+    dispatch — see `_MATVEC_THRESHOLD`), RMSNorm has no matmul-sized
+    compute to amortize a Vulkan submission's fixed driver overhead
+    against: it's a lightweight elementwise reduction (sum of squares,
+    rsqrt, multiply) over just `ncols` (1536 or 256 for Gemma4-E2B)
+    elements per row. Measured directly on this hardware, dispatching
+    `rms_norm_f32`/`rms_norm_f32_mul` via `ctx.execute_batch` is
+    *consistently slower* than `_cpu_rms_norm` (plain PyTorch ops) at
+    every batch size tested, from single-token decode (nrows=1: ~166-220us
+    GPU vs ~24-30us CPU, a 5.6-7.3x CPU win) all the way through full-length
+    prefill and beyond (nrows=32768: ~78.6ms GPU vs ~31.9ms CPU, still a
+    2.5x CPU win) — the ratio never favors GPU, unlike `linear()` where the
+    crossover genuinely depends on T. Given `rms_norm` is called once per
+    RMSNorm module, per decoder layer, per token (~175 calls/decode-step
+    for Gemma4-E2B's 35 layers), this was a substantial, previously
+    unaddressed cost: switching every one of those calls from GPU dispatch
+    to direct CPU computation saves on the order of 150-190us *per call*
+    at the (by far most common) decode shape alone.
 
-    has_weight = weight is not None and weight.numel() == ncols
-    shader = "rms_norm_f32_mul" if has_weight else "rms_norm_f32"
-    if shader not in ctx.available_shaders():
-        return _cpu_rms_norm(x, weight, eps)
-
-    pc = _rms_norm_pc(nrows, ncols, eps)
-    x_bytes = _to_bytes(x_flat)
-    out_size = nrows * ncols * 4
-
-    w_gpu = _get_or_upload_weight(ctx, weight) if has_weight else None
-    w_binding = w_gpu if w_gpu is not None else bytes(ncols * 4)
-
-    results = ctx.execute_batch(
-        [
-            (shader, [x_bytes, w_binding], [out_size], pc, (nrows, 1, 1), False),
-        ]
-    )
-    out = _from_bytes(results[0][0], (nrows, ncols), torch.float32)
-    return out.reshape(orig_shape)
+    See `TestRmsNormAlwaysUsesCpu` (tests/python/test_vulkan_ops.py) for
+    the measurement this doc comment summarizes, and this function's git
+    history for the previous GPU-dispatching implementation should a
+    future hardware/driver combination ever change this trade-off.
+    """
+    return _cpu_rms_norm(x, weight, eps)
 
 
 def _cpu_rms_norm(

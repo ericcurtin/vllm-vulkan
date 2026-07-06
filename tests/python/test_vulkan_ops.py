@@ -355,3 +355,126 @@ def test_matvec_pc_repeated_calls_faster_than_uncached_reference():
         f"cached _matvec_pc ({cached_elapsed:.4f}s/{iters}) was not faster than "
         f"the uncached reference ({uncached_elapsed:.4f}s/{iters})"
     )
+
+
+def _reference_gpu_rms_norm_dispatch(
+    ctx, x: torch.Tensor, weight: torch.Tensor | None, eps: float
+) -> torch.Tensor:
+    """Reconstructs the OLD Vulkan-dispatching `rms_norm()` implementation
+    (before this change) for direct comparison — same logic as the
+    function used to have, just kept here as an independent reference
+    instead of in the real (now CPU-only) `rms_norm`.
+    """
+    orig_shape = x.shape
+    ncols = orig_shape[-1]
+    x_flat = x.float().reshape(-1, ncols)
+    nrows = x_flat.shape[0]
+
+    has_weight = weight is not None and weight.numel() == ncols
+    shader = "rms_norm_f32_mul" if has_weight else "rms_norm_f32"
+
+    pc = vulkan_ops._rms_norm_pc(nrows, ncols, eps)
+    x_bytes = vulkan_ops._to_bytes(x_flat)
+    out_size = nrows * ncols * 4
+
+    w_gpu = vulkan_ops._get_or_upload_weight(ctx, weight) if has_weight else None
+    w_binding = w_gpu if w_gpu is not None else bytes(ncols * 4)
+
+    results = ctx.execute_batch(
+        [(shader, [x_bytes, w_binding], [out_size], pc, (nrows, 1, 1), False)]
+    )
+    out = vulkan_ops._from_bytes(results[0][0], (nrows, ncols), torch.float32)
+    return out.reshape(orig_shape)
+
+
+class TestRmsNormAlwaysUsesCpu:
+    """`rms_norm()` now always computes on CPU rather than dispatching to
+    Vulkan — measured directly on this hardware to be consistently
+    slower via GPU at every batch size tested (see `rms_norm`'s own doc
+    comment in vulkan_ops.py for the full writeup). These tests confirm
+    (a) the CPU path is still numerically correct, and (b) the measured
+    speedup this change is based on actually holds, using the shader
+    dispatch machinery (`_reference_gpu_rms_norm_dispatch` above) as an
+    independent, direct comparison rather than trusting the doc comment's
+    numbers alone.
+    """
+
+    def test_matches_reference_rms_norm_math(self):
+        """Pure-math correctness check, independent of any Vulkan device:
+        RMSNorm(x) = x * rsqrt(mean(x^2) + eps), optionally scaled by a
+        weight vector — verified against a from-scratch reference
+        implementation (not `_cpu_rms_norm` itself, to avoid comparing an
+        implementation against a copy of itself)."""
+        torch.manual_seed(0)
+        x = torch.randn(4, 1536, dtype=torch.float32)
+        weight = torch.randn(1536, dtype=torch.float32)
+        eps = 1e-6
+
+        result = vulkan_ops.rms_norm(x, weight, eps)
+
+        variance = (x.double() ** 2).mean(dim=-1, keepdim=True)
+        expected = (x.double() * torch.rsqrt(variance + eps) * weight.double()).float()
+        torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-5)
+
+    def test_matches_reference_rms_norm_math_no_weight(self):
+        torch.manual_seed(1)
+        x = torch.randn(2, 256, dtype=torch.float32)
+        eps = 1e-6
+
+        result = vulkan_ops.rms_norm(x, None, eps)
+
+        variance = (x.double() ** 2).mean(dim=-1, keepdim=True)
+        expected = (x.double() * torch.rsqrt(variance + eps)).float()
+        torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-5)
+
+    def test_cpu_path_matches_gpu_dispatch_reference(self, vulkan_ctx):
+        """The CPU-only `rms_norm()` must still agree numerically with
+        the Vulkan-dispatching path it replaced (within float32
+        tolerance) — confirms this was purely a dispatch-target
+        performance decision, not a behavior change."""
+        torch.manual_seed(2)
+        x = torch.randn(3, 1536, dtype=torch.float32)
+        weight = torch.randn(1536, dtype=torch.float32)
+        eps = 1e-6
+
+        cpu_result = vulkan_ops.rms_norm(x, weight, eps)
+        gpu_result = _reference_gpu_rms_norm_dispatch(vulkan_ctx, x, weight, eps)
+        torch.testing.assert_close(cpu_result, gpu_result, rtol=1e-3, atol=1e-4)
+
+    def test_cpu_path_is_faster_than_gpu_dispatch_at_decode_shape(self, vulkan_ctx):
+        """Measures the actual speedup at the real Gemma4-E2B decode
+        shape (nrows=1, ncols=1536) — the single most common call
+        pattern (once per RMSNorm module, per decoder layer, per
+        generated token)."""
+        import time
+
+        x = torch.randn(1, 1536, dtype=torch.float32)
+        weight = torch.randn(1536, dtype=torch.float32)
+        eps = 1e-6
+
+        # Warm up (pipeline/cache creation) before timing either path.
+        for _ in range(5):
+            vulkan_ops.rms_norm(x, weight, eps)
+            _reference_gpu_rms_norm_dispatch(vulkan_ctx, x, weight, eps)
+
+        iters = 200
+        t0 = time.perf_counter()
+        for _ in range(iters):
+            _reference_gpu_rms_norm_dispatch(vulkan_ctx, x, weight, eps)
+        gpu_elapsed = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        for _ in range(iters):
+            vulkan_ops.rms_norm(x, weight, eps)
+        cpu_elapsed = time.perf_counter() - t0
+
+        print(
+            f"\nrms_norm at decode shape (nrows=1, ncols=1536): "
+            f"GPU dispatch {gpu_elapsed / iters * 1e6:.1f}us/call, "
+            f"CPU (current) {cpu_elapsed / iters * 1e6:.1f}us/call, "
+            f"speedup {gpu_elapsed / cpu_elapsed:.2f}x"
+        )
+        assert cpu_elapsed < gpu_elapsed, (
+            f"CPU rms_norm ({cpu_elapsed:.4f}s/{iters}) was not faster than "
+            f"GPU dispatch ({gpu_elapsed:.4f}s/{iters})"
+        )
