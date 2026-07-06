@@ -760,6 +760,84 @@ fn include_all_shaders() -> std::collections::HashMap<String, Vec<u8>> {
     // one-line-per-shader change.
 
     // ── General matmul (prefill) ─────────────────────────────────────────
+    // Compiled (via the `else` branch in PipelineCache::new — no explicit
+    // specialization constants, so BLOCK_SIZE=64/BM=64/BN=64/WM=32/WN=32/
+    // WMITER=2/TM=4/TN=2/TK=1/WARP=32, this shader's own hardcoded
+    // defaults, apply) but NEVER DISPATCHED anywhere in this codebase, in
+    // either Rust or Python (`grep -rn 'matmul_f32\|matmul_f16' src/
+    // vllm_vulkan/ tests/` finds only this registration and
+    // scripts/compile_shaders.sh). vulkan_ops.py's `linear()` always uses
+    // CPU for prefill (T>=4) — see `_MATVEC_THRESHOLD`'s doc comment for
+    // why naively raising that threshold to also route prefill to the
+    // *matvec* shader instead is a proven, measured regression (~6.5x
+    // slower than CPU by T=128), not a fix — a real prefill speedup would
+    // need these tiled matmul shaders instead, which have never been
+    // wired up.
+    //
+    // Verified (but not yet implemented) dispatch specification for a
+    // future attempt, extracted directly from llama.cpp/ggml's own
+    // ggml-vulkan.cpp C++ backend (the reference implementation these
+    // shaders were copied from) and cross-checked line-by-line against
+    // this repo's actual shaders/mul_mm.comp source — NOT blindly copied,
+    // since the two disagree on at least one real detail (see the
+    // `padded_N` note below):
+    //
+    // - A = binding 0 (weight/src0, readonly), B = binding 1 (activations/
+    //   src1, readonly), D = binding 2 (output, writeonly) — confirmed via
+    //   ggml_vk_get_mul_mat_mat_pipeline's src0_type/src1_type dispatch.
+    // - For a Linear layer computing out[T, out_features] = x[T,
+    //   in_features] @ weight[out_features, in_features]^T (weight=A,
+    //   x=B): M=out_features, N=T, K=in_features, stride_a=K, stride_b=K
+    //   (both A/B must be row-major-contiguous with row stride exactly K —
+    //   ggml_vk_mul_mat_q_f16 hardcodes stride_a=stride_b=ne10=K rather
+    //   than reading it from the tensor's own strides, relying on an
+    //   earlier dequant/contiguity pass to guarantee it), stride_d=
+    //   out_features (contiguous dst).
+    // - No batching needed for a plain Linear call: batch_stride_a=M*K,
+    //   batch_stride_b=K*N, batch_stride_d=M*N, base_work_group_z=0,
+    //   num_batches=1, ne02=ne12=1, broadcast2=broadcast3=1.
+    // - k_split=1 is always safe to assume for realistic transformer K
+    //   (llama.cpp's own ggml_vk_guess_split_k only ever considers
+    //   splitting when k>=2048, and even then only for GPUs/shapes that
+    //   would otherwise underutilize compute units) — set the `k_split`
+    //   push-constant field equal to K itself and skip the whole
+    //   reduce-pass machinery entirely.
+    // - Dispatch workgroup count = (ceil(M/BM), ceil(N/BN), num_batches) —
+    //   with THIS shader's actually-compiled (default, unspecialized)
+    //   BM=BN=64, NOT llama.cpp's own named "l"/"m"/"s" presets (128/64/32
+    //   respectively) — those presets only apply if this shader is
+    //   recompiled through a new `compile_matmul`-style function (mirroring
+    //   `compile_matvec`) with explicit `SpecializationInfo` overrides, the
+    //   same mechanism already used for the matvec/rms_norm shaders above.
+    // - CRITICAL version mismatch caught by cross-checking rather than
+    //   trusting the newer reference outright: current upstream
+    //   ggml-vulkan.cpp's `vk_mat_mat_push_constants` struct has a
+    //   trailing `padded_N` field (17 uint32s) that this repo's own
+    //   shaders/mul_mm.comp does NOT declare anywhere (confirmed via
+    //   `grep -n padded_N shaders/mul_mm.comp shaders/*.glsl` — no
+    //   matches) — this repo's copy predates that field's introduction
+    //   upstream. The push-constant buffer for THIS shader must be sized
+    //   for exactly 16 uint32s (M,N,K, stride_a/b/d, batch_stride_a/b/d,
+    //   base_work_group_z, num_batches, k_split, ne02, ne12, broadcast2,
+    //   broadcast3) — appending a 17th field would either silently send
+    //   a too-large push-constant range (may fail pipeline-layout
+    //   validation) or, worse, corrupt whichever field a future upstream
+    //   sync accidentally reintroduces at that offset.
+    // - Use the plain (non-`_aligned`) variant unconditionally at first:
+    //   the `_aligned` variants assume K is already a multiple of the
+    //   tile size and skip bounds-checking loads, silently producing
+    //   wrong results otherwise — safe only once K's alignment is
+    //   verified per-call, which isn't implemented yet.
+    // - shaders/mul_mm_funcs.glsl (600 lines) and shaders/types.glsl
+    //   (1846 lines) — the actual load_a/load_b/compute inner loop and
+    //   A_TYPE/B_TYPE/D_TYPE definitions — have NOT yet been read/verified
+    //   in this level of detail; that remains the next concrete step
+    //   before attempting a real dispatch, to avoid the exact kind of
+    //   silent-wrong-output bug `mul_mat_vec_f32_f32_f32_subgroup` turned
+    //   out to have (see subgroup_matvec_correctness_tests above) — this
+    //   codebase's one prior cautionary tale about trusting a plausible-
+    //   looking Vulkan compute dispatch without a direct CPU-reference
+    //   correctness test first.
     spv!("matmul_f32_f16");
     spv!("matmul_f32_f16_aligned");
     spv!("matmul_f32_f32_fp32");
