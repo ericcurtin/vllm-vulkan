@@ -53,6 +53,22 @@ class VulkanWorker(CPUWorker):
                 exc_info=True,
             )
 
+        # Same rationale as the topk/topp re-apply just above: this patch
+        # must be in place before `load_model()` -> `process_weights_after_
+        # loading()` runs (which happens later in this same worker's
+        # startup sequence, well after init_device()), so re-attempting it
+        # here -- in case the plugin-registration-time attempt no-op'd due
+        # to circular-import timing -- is cheap, safe insurance.
+        try:
+            from vllm_vulkan.patches import _patch_cpu_weight_removal
+
+            _patch_cpu_weight_removal()
+        except Exception:
+            logger.warning(
+                "Failed to apply CPU weight-removal guard from init_device().",
+                exc_info=True,
+            )
+
         # ── library presence checks ───────────────────────────────────────
         def check_preloaded_libs(name: str) -> None:
             ld_preload_list = os.environ.get("LD_PRELOAD", "")
