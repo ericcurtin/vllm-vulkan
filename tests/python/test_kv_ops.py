@@ -810,3 +810,114 @@ def test_paged_attn_decode_pc_resolved_spec_is_faster_than_relayout_lookup():
         f"not faster than the old layout+layer_index reference "
         f"({old_elapsed:.4f}s/{iters})"
     )
+
+
+def test_block_table_to_u32_matches_reference_for_int32_and_int64_input():
+    """`_block_table_to_u32` must produce the same result whether given
+    an int32 block-table row (vLLM's own on-device dtype -- see
+    `vllm/v1/worker/block_table.py`) or an already-int64 one (what
+    `attention._cached_decode_support_data` now hands it, having
+    normalized the whole 2-D table once before splitting into per-row
+    views -- see that function's own doc comment). Pure Python/numpy;
+    no Vulkan device needed.
+    """
+    from vllm_vulkan import kv_ops
+
+    row_int32 = torch.tensor([2, 0, 3, 1], dtype=torch.int32)
+    row_int64 = row_int32.to(torch.int64)
+
+    result_int32 = kv_ops._block_table_to_u32(row_int32, needed_blocks=3, num_blocks=8)
+    result_int64 = kv_ops._block_table_to_u32(row_int64, needed_blocks=3, num_blocks=8)
+
+    np.testing.assert_array_equal(result_int32, result_int64)
+    np.testing.assert_array_equal(result_int32, np.array([2, 0, 3], dtype=np.uint32))
+
+
+def test_block_table_to_u32_skips_dtype_conversion_for_already_int64_input(
+    monkeypatch,
+):
+    """When given an already-int64, already-CPU, already-contiguous
+    tensor, `_block_table_to_u32`'s internal `.to(device="cpu",
+    dtype=torch.int64)` call must be a genuine no-op (return `self`,
+    no new tensor/copy) -- confirmed by checking the returned tensor's
+    `data_ptr()` is unchanged, not just its dtype.
+    """
+    from vllm_vulkan import kv_ops
+
+    row = torch.tensor([2, 0, 3, 1], dtype=torch.int64).contiguous()
+    detached = row.detach()
+    original_data_ptr = detached.data_ptr()
+
+    converted = detached.to(device="cpu", dtype=torch.int64)
+    assert converted.data_ptr() == original_data_ptr, (
+        "Tensor.to() with a matching device/dtype should be a true no-op "
+        "(same underlying storage), not a fresh copy"
+    )
+
+    # Sanity: _block_table_to_u32 itself still produces correct output
+    # end-to-end for this already-normalized input.
+    result = kv_ops._block_table_to_u32(row, needed_blocks=3, num_blocks=8)
+    np.testing.assert_array_equal(result, np.array([2, 0, 3], dtype=np.uint32))
+
+
+def test_block_table_whole_batch_int64_conversion_is_faster_than_per_row():
+    """Measures the actual speedup: converting a whole (B, blocks_per_row)
+    int32 block table to int64 once, before splitting into per-row
+    views, is faster than converting each row independently after
+    splitting -- the exact pattern `attention._cached_decode_support_data`
+    now uses (converting the whole table once, shared across every
+    attention layer using the same `attn_metadata`) versus what
+    `_paged_attn_decode_batch`'s per-token loop used to force via
+    `_block_table_to_u32`'s own internal conversion on each
+    already-split row.
+
+    Takes the minimum elapsed time across several independent trials --
+    see `test_paged_attn_decode_pc_resolved_spec_is_faster_than_relayout_lookup`
+    (same file) for why (measurement noise under full-suite load).
+    """
+    import time
+
+    from vllm_vulkan import kv_ops
+
+    batch_size = 16
+    blocks_per_row = 64
+    table_int32 = torch.randint(0, 100, (batch_size, blocks_per_row), dtype=torch.int32)
+
+    iters = 300
+    trials = 5
+
+    def timed(fn) -> float:
+        best = float("inf")
+        for _ in range(trials):
+            t0 = time.perf_counter()
+            for _ in range(iters):
+                fn()
+            best = min(best, time.perf_counter() - t0)
+        return best
+
+    def per_row_convert() -> None:
+        for row in table_int32.unbind(0):
+            kv_ops._block_table_to_u32(
+                row, needed_blocks=blocks_per_row, num_blocks=100
+            )
+
+    def whole_batch_then_split() -> None:
+        table_int64 = table_int32.to(device="cpu", dtype=torch.int64).contiguous()
+        for row in table_int64.unbind(0):
+            kv_ops._block_table_to_u32(
+                row, needed_blocks=blocks_per_row, num_blocks=100
+            )
+
+    per_row_elapsed = timed(per_row_convert)
+    whole_batch_elapsed = timed(whole_batch_then_split)
+
+    print(
+        f"\nblock_table dtype conversion (B={batch_size}), best-of-{trials}: "
+        f"per-row {per_row_elapsed / iters * 1e6:.1f}us/batch, "
+        f"whole-batch-then-split {whole_batch_elapsed / iters * 1e6:.1f}us/batch, "
+        f"speedup {per_row_elapsed / whole_batch_elapsed:.2f}x"
+    )
+    assert whole_batch_elapsed < per_row_elapsed, (
+        f"whole-batch conversion ({whole_batch_elapsed:.4f}s/{iters}) was not "
+        f"faster than per-row conversion ({per_row_elapsed:.4f}s/{iters})"
+    )
