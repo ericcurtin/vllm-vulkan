@@ -198,11 +198,42 @@ def _apply_module_hooks(model: nn.Module) -> None:
 
 def _wrap_rms_norm(module: nn.Module) -> None:
     orig = module.forward
+    # Captured once, at hook-install time, rather than re-derived on every
+    # forward call: `_apply_module_hooks` (this function's only caller,
+    # via `_VulkanCPUModelRunner.load_model`) runs strictly after
+    # `self._runner.load_model(**kwargs)` has fully populated every
+    # module's `.weight` Parameter and static config, so none of these
+    # ever change again for the lifetime of this wrapped module -- the
+    # same reasoning `_wrap_linear`'s `_returns_tuple` below already
+    # relies on for its own hoisted value. `os.environ.get(...)` also
+    # can't meaningfully change mid-process (env vars are read once at
+    # process/worker startup in every realistic deployment), so it's
+    # hoisted for the same reason. Measured on this hardware: each of
+    # these was a small (~0.2-0.5us) but purely repeated cost, paid once
+    # per RMSNorm module, per decoder layer, per generated token
+    # (~175 calls/decode-step for Gemma4-E2B's 35 layers) -- see
+    # `TestWrapRmsNormHoistsStaticLookups`/`TestWrapLinearHoistsStaticLookups`
+    # (tests/python/test_vulkan_ops.py) for the measurement and the
+    # equivalent fix applied to `_wrap_linear` just below.
+    weight = getattr(module, "weight", None)
+    # `vulkan_ops.rms_norm` (always CPU now, see its own doc comment) ->
+    # `_cpu_rms_norm` does `weight.float()` internally on every call --
+    # for a bf16/fp16-loaded model (the common case), that's a fresh
+    # [hidden_size]-sized allocation + copy every single time. Since
+    # `weight` itself is already known to be stable for this module's
+    # lifetime (see above), so is its float32 conversion -- computed
+    # once here instead, and passed straight through `_cpu_rms_norm`'s
+    # `weight.float()` as a no-op (`Tensor.float()` on an already-float32
+    # tensor returns `self`, no new allocation). Measured ~0.9-1.1us/call
+    # for Gemma4-E2B's real RMSNorm weight sizes (256/1536 elements).
+    weight_f32 = weight.float() if weight is not None else None
+    eps = getattr(module, "variance_epsilon", getattr(module, "eps", 1e-6))
+    disable_ops = bool(os.environ.get("VLLM_VULKAN_DISABLE_OPS"))
 
     def vk_forward(x: torch.Tensor, residual=None):
         from vllm_vulkan import vulkan_ops  # noqa: PLC0415
 
-        if not vulkan_ops.is_ready() or os.environ.get("VLLM_VULKAN_DISABLE_OPS"):
+        if not vulkan_ops.is_ready() or disable_ops:
             return orig(x, residual)
         if x.dtype not in (torch.float32, torch.float16, torch.bfloat16):
             return orig(x, residual)
@@ -211,11 +242,8 @@ def _wrap_rms_norm(module: nn.Module) -> None:
             x = x + residual
             residual_out = x
 
-        weight = getattr(module, "weight", None)
-        eps = getattr(module, "variance_epsilon", getattr(module, "eps", 1e-6))
-
         try:
-            result = vulkan_ops.rms_norm(x, weight, eps)
+            result = vulkan_ops.rms_norm(x, weight_f32, eps)
             result = result.to(x.dtype)
         except Exception as exc:
             logger.debug("Vulkan rms_norm failed (%s)", exc)
@@ -235,34 +263,59 @@ def _wrap_linear(module: nn.Module) -> None:
     _returns_tuple = getattr(module, "return_bias", False) or getattr(
         module, "skip_bias_add", False
     )
+    # Captured once, at hook-install time, rather than re-derived on every
+    # forward call — see `_wrap_rms_norm`'s doc comment just above for
+    # why this is safe (hooks install only after `load_model()` has
+    # fully populated every module's weight/bias Parameters and
+    # parallelism config, and env vars don't change mid-process).
+    # Measured on this hardware: `os.environ.get()` costs ~0.3-0.5us/call
+    # and `getattr()` costs ~0.2us/call; with ~175-210 Linear-family
+    # module calls/decode-step across Gemma4-E2B's 35 layers (2 env
+    # checks + up to 4 getattrs each, previously), that's on the order
+    # of 150-250us/decode-step of pure, repeated, avoidable lookups now
+    # paid once at hook-install time instead.
+    weight = getattr(module, "weight", None)
+    weight_dtype_ok = weight is not None and weight.dtype in (
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
+    )
+    bias = getattr(module, "bias", None)
+    # vulkan_ops.linear() does `bias.float()` internally on every call
+    # for a non-None bias -- same class of repeated-per-call allocation
+    # as `_wrap_rms_norm`'s `weight.float()` above (measured
+    # ~0.9-1.7us/call for Gemma4-E2B's real Linear-module bias sizes),
+    # avoided the same way: converted once here instead. `matmul_bias`
+    # (passed to vulkan_ops.linear()) uses the float32 copy; the
+    # row_reduce path below deliberately keeps using the original
+    # (possibly non-float32) `bias`, since that addition happens after
+    # `result` has already been cast back to `x.dtype` and doesn't go
+    # through vulkan_ops.linear()'s own `.float()` call at all.
+    bias_f32 = bias.float() if bias is not None else None
+    skip_bias = getattr(module, "skip_bias_add", False)
+    tp_size = getattr(module, "tp_size", 1)
+    # RowParallelLinear sums partial results across tensor-parallel ranks and
+    # applies bias after the reduction, not inside the (sharded) matmul. The
+    # bare matmul below produces only this rank's partial sum, so without the
+    # all-reduce the model emits garbage under tensor parallelism.
+    row_reduce = getattr(module, "reduce_results", False) and tp_size > 1
+    matmul_bias = None if (row_reduce or skip_bias) else bias_f32
+    gather_output = getattr(module, "gather_output", False) and tp_size > 1
+    disable_linear = bool(
+        os.environ.get("VLLM_VULKAN_DISABLE_OPS")
+        or os.environ.get("VLLM_VULKAN_DISABLE_LINEAR")
+    )
 
     def vk_forward(x: torch.Tensor, *args, **kwargs):
         from vllm_vulkan import vulkan_ops  # noqa: PLC0415
 
         if not vulkan_ops.is_ready() or args or kwargs:
             return orig(x, *args, **kwargs)
-        if os.environ.get("VLLM_VULKAN_DISABLE_OPS") or os.environ.get(
-            "VLLM_VULKAN_DISABLE_LINEAR"
-        ):
+        if disable_linear:
+            return orig(x, *args, **kwargs)
+        if not weight_dtype_ok:
             return orig(x, *args, **kwargs)
 
-        weight = getattr(module, "weight", None)
-        if weight is None or weight.dtype not in (
-            torch.float32,
-            torch.float16,
-            torch.bfloat16,
-        ):
-            return orig(x, *args, **kwargs)
-
-        bias = getattr(module, "bias", None)
-        skip_bias = getattr(module, "skip_bias_add", False)
-        tp_size = getattr(module, "tp_size", 1)
-        # RowParallelLinear sums partial results across tensor-parallel ranks and
-        # applies bias after the reduction, not inside the (sharded) matmul. The
-        # bare matmul below produces only this rank's partial sum, so without the
-        # all-reduce the model emits garbage under tensor parallelism.
-        row_reduce = getattr(module, "reduce_results", False) and tp_size > 1
-        matmul_bias = None if (row_reduce or skip_bias) else bias
         try:
             # weight is passed through as-is (NOT weight.float()) so its
             # tensor identity - and hence vulkan_ops's persistent GPU
@@ -275,7 +328,14 @@ def _wrap_linear(module: nn.Module) -> None:
             # call instead of once. vulkan_ops.linear()/_vulkan_matvec()
             # do their own float32 conversion internally, lazily, only on
             # a cache miss (see _get_or_upload_weight).
-            result = vulkan_ops.linear(x.float(), weight, matmul_bias)
+            #
+            # `x` is passed through as-is too (NOT x.float()): linear()
+            # already does that conversion internally on its own first
+            # line, so converting here first was pure duplicated work
+            # (measured ~0.34us/call -- small individually, but the same
+            # class of avoidable per-call cost as everything else hoisted
+            # in this function).
+            result = vulkan_ops.linear(x, weight, matmul_bias)
             result = result.to(x.dtype)
         except Exception as exc:
             logger.debug("Vulkan linear failed (%s)", exc)
@@ -294,7 +354,7 @@ def _wrap_linear(module: nn.Module) -> None:
             result = tensor_model_parallel_all_reduce(result)
             if bias is not None and not skip_bias:
                 result = result + bias
-        elif getattr(module, "gather_output", False) and tp_size > 1:
+        elif gather_output:
             from vllm.distributed import (  # noqa: PLC0415
                 tensor_model_parallel_all_gather,
             )
