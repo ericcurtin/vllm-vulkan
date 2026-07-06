@@ -150,3 +150,74 @@ def test_layout_from_hf_config_computes_total_bytes():
     # All three specs are 2 * 16 * 128 * 2 = 8192 bytes/block.
     assert layout.total_bytes == 3 * 4 * 8192
     assert layout.bytes_per_token == 3 * 2 * 128 * 2
+
+
+def test_kv_cache_layer_spec_derived_properties_match_reference_formulas():
+    """`KVCacheLayerSpec`'s derived byte-layout properties
+    (`elements_per_token`/`bytes_per_token_per_plane`/`bytes_per_token`/
+    `plane_bytes_per_block`/`bytes_per_block`) are now cached as plain
+    fields at construction time (`__post_init__`) instead of recomputed
+    on every access -- see that method's own doc comment. This must not
+    change their values: verified against the same formulas directly."""
+    spec = KVCacheLayerSpec(
+        layer_index=0, num_kv_heads=4, head_size=64, block_size=16, dtype_size=2
+    )
+
+    assert spec.elements_per_token == 4 * 64
+    assert spec.bytes_per_token_per_plane == (4 * 64) * 2
+    assert spec.bytes_per_token == 2 * ((4 * 64) * 2)
+    assert spec.plane_bytes_per_block == 16 * ((4 * 64) * 2)
+    assert spec.bytes_per_block == 2 * (16 * ((4 * 64) * 2))
+
+
+def test_kv_cache_layer_spec_properties_are_faster_than_live_computation():
+    """Measures the actual speedup: cached-field property access should
+    be faster than recomputing from scratch on every access (the
+    pre-existing behavior), especially for `bytes_per_block` (which
+    used to require 2 nested property dispatches --
+    `bytes_per_block` -> `plane_bytes_per_block` -> `elements_per_token`
+    -- plus 2 multiplications on every single access).
+
+    Takes the minimum elapsed time across several independent trials --
+    the same measurement-noise-robustness approach already used
+    throughout this session's other timing tests (e.g.
+    tests/python/test_kv_ops.py's
+    `test_paged_attn_decode_pc_resolved_spec_is_faster_than_relayout_lookup`).
+    """
+    import time
+
+    spec = KVCacheLayerSpec(
+        layer_index=0, num_kv_heads=4, head_size=64, block_size=16, dtype_size=2
+    )
+
+    def live_bytes_per_block(s: KVCacheLayerSpec) -> int:
+        elements_per_token = s.num_kv_heads * s.head_size
+        bytes_per_token_per_plane = elements_per_token * s.dtype_size
+        plane_bytes_per_block = s.block_size * bytes_per_token_per_plane
+        return 2 * plane_bytes_per_block
+
+    iters = 20000
+    trials = 5
+
+    def timed(fn) -> float:
+        best = float("inf")
+        for _ in range(trials):
+            t0 = time.perf_counter()
+            for _ in range(iters):
+                fn()
+            best = min(best, time.perf_counter() - t0)
+        return best
+
+    live_elapsed = timed(lambda: live_bytes_per_block(spec))
+    cached_elapsed = timed(lambda: spec.bytes_per_block)
+
+    print(
+        f"\nKVCacheLayerSpec.bytes_per_block, best-of-{trials}: "
+        f"live computation {live_elapsed / iters * 1e6:.3f}us/call, "
+        f"cached field {cached_elapsed / iters * 1e6:.3f}us/call, "
+        f"speedup {live_elapsed / cached_elapsed:.2f}x"
+    )
+    assert cached_elapsed < live_elapsed, (
+        f"cached bytes_per_block ({cached_elapsed:.4f}s/{iters}) was not "
+        f"faster than live computation ({live_elapsed:.4f}s/{iters})"
+    )
