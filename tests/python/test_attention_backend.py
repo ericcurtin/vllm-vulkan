@@ -734,3 +734,162 @@ def test_multiple_layers_sharing_attn_metadata_produce_correct_results():
         assert impl._last_vulkan_decode_used is True
         assert result is output
         torch.testing.assert_close(output, expected, rtol=5e-3, atol=5e-3)
+
+
+def test_get_kv_cache_entry_hits_instance_cache_for_same_tensor():
+    """`VulkanAttentionBackendImpl._get_kv_cache_entry` (see its own doc
+    comment) must return the identical (not just equal) cached entry on
+    repeated calls with the same `kv_cache` tensor object -- the whole
+    point of this per-layer instance cache (real vLLM binds a layer's
+    `kv_cache` tensor exactly once, at `initialize_kv_cache()` time, and
+    passes that same object on every decode step thereafter).
+    """
+    _require_vulkan_context()
+
+    impl = VulkanAttentionBackendImpl(
+        num_heads=2,
+        head_size=8,
+        scale=8**-0.5,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="auto",
+        logits_soft_cap=None,
+        attn_type=AttentionType.DECODER,
+        kv_sharing_target_layer_name=None,
+    )
+    ctx = _require_vulkan_context()
+    kv_cache = torch.zeros((2, 4, 1, 16, 8), dtype=torch.float16)
+
+    entry1 = impl._get_kv_cache_entry(ctx, kv_cache)
+    entry2 = impl._get_kv_cache_entry(ctx, kv_cache)
+    assert entry1 is entry2, (
+        "repeated calls with the same kv_cache tensor object must hit the "
+        "instance cache, returning the identical entry"
+    )
+
+
+def test_get_kv_cache_entry_recomputes_for_a_different_tensor():
+    """A second, distinct `kv_cache` tensor (even with identical shape/
+    dtype) must not silently reuse the first tensor's cached entry --
+    the per-instance cache compares tensor identity with `is`, matching
+    the same reasoning already documented for
+    `attention._cached_decode_support_data`/
+    `kv_ops._cached_available_shaders`/`vulkan_ops._cached_available_shaders`.
+    """
+    _require_vulkan_context()
+
+    impl = VulkanAttentionBackendImpl(
+        num_heads=2,
+        head_size=8,
+        scale=8**-0.5,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="auto",
+        logits_soft_cap=None,
+        attn_type=AttentionType.DECODER,
+        kv_sharing_target_layer_name=None,
+    )
+    ctx = _require_vulkan_context()
+    kv_cache_1 = torch.zeros((2, 4, 1, 16, 8), dtype=torch.float16)
+    kv_cache_2 = torch.zeros((2, 4, 1, 16, 8), dtype=torch.float16)
+
+    entry1 = impl._get_kv_cache_entry(ctx, kv_cache_1)
+    entry2 = impl._get_kv_cache_entry(ctx, kv_cache_2)
+    assert entry1 is not entry2, (
+        "a different kv_cache tensor object must not reuse the previous "
+        "tensor's cached entry"
+    )
+
+    # Re-querying kv_cache_1 after kv_cache_2 was cached must recompute
+    # for kv_cache_1 again (single-slot instance cache, not a full
+    # dict) rather than incorrectly returning kv_cache_2's cached entry.
+    entry1_again = impl._get_kv_cache_entry(ctx, kv_cache_1)
+    assert entry1_again is entry1
+
+
+def test_multiple_decode_steps_reuse_kv_cache_entry_and_stay_correct():
+    """End-to-end regression test for the real scenario this caching
+    change targets: several consecutive decode steps (as would happen
+    across a real serving session) through the *same*
+    `VulkanAttentionBackendImpl` instance with the *same* `kv_cache`
+    tensor object each time. The cached KV-cache entry must be reused
+    (not just correct) across those calls, and each step's own output
+    must remain numerically correct.
+    """
+    _require_vulkan_context()
+
+    num_heads = 4
+    num_kv_heads = 2
+    head_size = 32
+    block_size = 16
+    num_blocks = 4
+    scale = head_size**-0.5
+
+    kv_cache = torch.zeros(
+        (2, num_blocks, num_kv_heads, block_size, head_size),
+        dtype=torch.float16,
+    )
+    impl = VulkanAttentionBackendImpl(
+        num_heads=num_heads,
+        head_size=head_size,
+        scale=scale,
+        num_kv_heads=num_kv_heads,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="auto",
+        logits_soft_cap=None,
+        attn_type=AttentionType.DECODER,
+        kv_sharing_target_layer_name=None,
+    )
+
+    gqa_ratio = num_heads // num_kv_heads
+    torch.manual_seed(7)
+    cached_entry = None
+    for step in range(3):
+        num_reqs = 1
+        query = torch.randn(num_reqs, num_heads, head_size, dtype=torch.float32)
+        key = torch.randn(num_reqs, num_kv_heads, head_size, dtype=torch.float16)
+        value = torch.randn(num_reqs, num_kv_heads, head_size, dtype=torch.float16)
+        output = torch.empty((num_reqs, num_heads, head_size), dtype=torch.float32)
+
+        metadata = CPUAttentionMetadata(
+            isa="vec16",
+            num_actual_tokens=num_reqs,
+            max_query_len=1,
+            query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+            max_seq_len=1,
+            seq_lens=torch.tensor([1], dtype=torch.int32),
+            block_table=torch.tensor([[step % num_blocks]], dtype=torch.int32),
+            slot_mapping=torch.tensor(
+                [step % (num_blocks * block_size)], dtype=torch.int64
+            ),
+            scheduler_metadata=None,
+            causal=True,
+        )
+
+        result = impl.forward(
+            layer=None,  # type: ignore[arg-type]
+            query=query,
+            key=key,
+            value=value,
+            kv_cache=kv_cache,  # the *same* tensor object, every step
+            attn_metadata=metadata,
+            output=output,
+        )
+
+        expected = torch.stack(
+            [value[0, q_head // gqa_ratio].float() for q_head in range(num_heads)]
+        )
+        assert impl._last_vulkan_decode_used is True
+        assert result is output
+        torch.testing.assert_close(output[0], expected, rtol=5e-3, atol=5e-3)
+
+        if cached_entry is None:
+            cached_entry = impl._cached_kv_cache_entry
+        else:
+            assert impl._cached_kv_cache_entry is cached_entry, (
+                "the same kv_cache tensor across decode steps must keep "
+                "reusing the identical cached entry, not re-resolve it"
+            )
