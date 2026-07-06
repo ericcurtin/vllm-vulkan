@@ -206,7 +206,7 @@ def _rms_norm_pc(nrows: int, ncols: int, eps: float) -> bytes:
 
 
 def _matvec_pc(T: int, K: int, N: int) -> bytes:  # noqa: N803
-    """Pack push constants for mul_mat_vec_f32_f32_f32_subgroup."""
+    """Pack push constants for mul_mat_vec_f32_f32_f32."""
     return struct.pack(
         "13I",
         K,
@@ -291,10 +291,7 @@ def linear(
     x_2d = x.float().reshape(-1, in_feat)
     T = x_2d.shape[0]  # noqa: N806
 
-    if (
-        T < _MATVEC_THRESHOLD
-        and "mul_mat_vec_f32_f32_f32_subgroup" in ctx.available_shaders()
-    ):
+    if T < _MATVEC_THRESHOLD and "mul_mat_vec_f32_f32_f32" in ctx.available_shaders():
         result = _vulkan_matvec(ctx, x_2d, weight)
     else:
         result = torch.nn.functional.linear(
@@ -312,7 +309,17 @@ def _vulkan_matvec(
     x: torch.Tensor,  # [T, K] float32
     weight: torch.Tensor,  # [N, K] any dtype
 ) -> torch.Tensor:
-    """Dispatch mul_mat_vec_f32_f32_f32_subgroup for decode (T<4)."""
+    """Dispatch mul_mat_vec_f32_f32_f32 for decode (T<4).
+
+    NOT mul_mat_vec_f32_f32_f32_subgroup: that variant was found to
+    silently diverge from the correct result for ncols>=~256 (i.e.
+    essentially every real hidden/intermediate size) -- see
+    subgroup_matvec_correctness_tests in src/lib.rs for the measured
+    divergence and root-cause discussion. mul_mat_vec_f32_f32_f32 (the
+    plain, non-subgroup variant) has an identical binding/push-constant/
+    workgroup-dispatch convention and was confirmed correct at every
+    size tested.
+    """
     # Cache key on original weight (before .float()) - and the .float()
     # conversion itself only happens lazily, in the `w_gpu is None`
     # fallback branch below, since on the (overwhelmingly common) cache-hit
@@ -332,7 +339,7 @@ def _vulkan_matvec(
     results = ctx.execute_batch(
         [
             (
-                "mul_mat_vec_f32_f32_f32_subgroup",
+                "mul_mat_vec_f32_f32_f32",
                 [w_binding, x_bytes],
                 [out_size],
                 pc,
@@ -377,7 +384,7 @@ def rms_norm_then_linear(
     if (
         T >= _MATVEC_THRESHOLD
         or "rms_norm_f32_mul" not in ctx.available_shaders()
-        or "mul_mat_vec_f32_f32_f32_subgroup" not in ctx.available_shaders()
+        or "mul_mat_vec_f32_f32_f32" not in ctx.available_shaders()
     ):
         normed = rms_norm(x, norm_weight, eps)
         return linear(normed, linear_weight, bias)
@@ -407,7 +414,7 @@ def rms_norm_then_linear(
         norm_out_size,
         norm_pc,
         (nrows, 1, 1),
-        "mul_mat_vec_f32_f32_f32_subgroup",
+        "mul_mat_vec_f32_f32_f32",
         [w_lin_binding],  # Op1 gets [weight, inter_buf(auto), out_buf(auto)]
         matvec_out_size,
         matvec_pc,
