@@ -2735,6 +2735,94 @@ mod gelu_tests {
 }
 
 #[cfg(test)]
+mod binary_elementwise_tests {
+    //! Validates `mul_f32_f32_f32` / `add_f32_f32_f32`'s GPU output
+    //! against a CPU reference at the real Gemma4-E2B shapes they're
+    //! actually dispatched at (`ple_dim`=256, `hidden_size`=1536,
+    //! `ffn_inter`=6144/12288, `vocab`=262144), after removing their
+    //! redundant `num_iter=2` second iteration (see mul.comp/add.comp's
+    //! `main()` doc comments for the full coverage-math argument for why
+    //! `num_iter=1` is sufficient — each workgroup's `num_iter=2` second
+    //! iteration wrote exactly the same range the next workgroup's first
+    //! iteration wrote, so it was pure redundant GPU work, not additional
+    //! coverage). Requires a real Vulkan device; skips cleanly (not a
+    //! failure) on headless CI runners with no GPU/ICD.
+    use super::*;
+
+    fn make_engine() -> Option<compute::ComputeEngine> {
+        let dev = match device::ComputeDevice::create(0) {
+            Ok(d) => d,
+            Err(e) => { eprintln!("skip: no Vulkan device available ({e})"); return None; }
+        };
+        let shader_spvs = include_all_shaders();
+        let refs: std::collections::HashMap<&str, &[u8]> = shader_spvs.iter()
+            .map(|(k, v)| (k.as_str(), v.as_slice())).collect();
+        Some(compute::ComputeEngine::new(
+            dev.instance.clone(), dev.physical_device, dev.device.clone(),
+            dev.compute_queue, dev.compute_queue_family, &refs,
+        ).expect("create ComputeEngine"))
+    }
+
+    #[test]
+    fn mul_matches_cpu_reference() {
+        let _guard = gpu_test_guard();
+        let Some(mut engine) = make_engine() else { return };
+
+        for &n in &[256usize, 1536, 6144, 12288, 262144] {
+            let a: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01).sin()).collect();
+            let b: Vec<f32> = (0..n).map(|i| (i as f32 * 0.017).cos()).collect();
+            let cpu_result: Vec<f32> = a.iter().zip(b.iter()).map(|(&x, &y)| x * y).collect();
+
+            let ab = engine.alloc_host_coherent_storage((n * 4) as u64).unwrap();
+            ab.write(bytemuck::cast_slice(&a)).unwrap();
+            let bb = engine.alloc_host_coherent_storage((n * 4) as u64).unwrap();
+            bb.write(bytemuck::cast_slice(&b)).unwrap();
+            let out = engine.alloc_host_coherent_storage((n * 4) as u64).unwrap();
+
+            let cb = engine.begin_batch().unwrap();
+            engine.record_to(cb, "mul_f32_f32_f32", &[&ab, &bb, &out], bytemuck::cast_slice(&binary_elementwise_pc(n)), (wg256(n), 1, 1)).unwrap();
+            engine.submit_batch(cb).unwrap();
+            let gpu_result = read_f32_buf(&out, n);
+
+            let mut max_err = 0.0f32;
+            for (&x, &y) in cpu_result.iter().zip(gpu_result.iter()) {
+                max_err = max_err.max((x - y).abs());
+            }
+            assert!(max_err < 1e-5, "n={n}: GPU mul_f32_f32_f32 (num_iter=1) diverged from CPU reference: max abs err={max_err}");
+        }
+    }
+
+    #[test]
+    fn add_matches_cpu_reference() {
+        let _guard = gpu_test_guard();
+        let Some(mut engine) = make_engine() else { return };
+
+        for &n in &[256usize, 1536, 6144, 12288, 262144] {
+            let a: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01).sin()).collect();
+            let b: Vec<f32> = (0..n).map(|i| (i as f32 * 0.017).cos()).collect();
+            let cpu_result: Vec<f32> = a.iter().zip(b.iter()).map(|(&x, &y)| x + y).collect();
+
+            let ab = engine.alloc_host_coherent_storage((n * 4) as u64).unwrap();
+            ab.write(bytemuck::cast_slice(&a)).unwrap();
+            let bb = engine.alloc_host_coherent_storage((n * 4) as u64).unwrap();
+            bb.write(bytemuck::cast_slice(&b)).unwrap();
+            let out = engine.alloc_host_coherent_storage((n * 4) as u64).unwrap();
+
+            let cb = engine.begin_batch().unwrap();
+            engine.record_to(cb, "add_f32_f32_f32", &[&ab, &bb, &out], bytemuck::cast_slice(&binary_elementwise_pc(n)), (wg256(n), 1, 1)).unwrap();
+            engine.submit_batch(cb).unwrap();
+            let gpu_result = read_f32_buf(&out, n);
+
+            let mut max_err = 0.0f32;
+            for (&x, &y) in cpu_result.iter().zip(gpu_result.iter()) {
+                max_err = max_err.max((x - y).abs());
+            }
+            assert!(max_err < 1e-5, "n={n}: GPU add_f32_f32_f32 (num_iter=1) diverged from CPU reference: max abs err={max_err}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod record_to_tests {
     //! Validates `ComputeEngine::record_to`'s stack-allocated descriptor-
     //! write buffers (see its doc comment) — specifically the
