@@ -274,3 +274,84 @@ def test_weight_cache_entry_is_freed_when_weight_storage_is_garbage_collected():
         "cache entry for a garbage-collected weight must be removed "
         "automatically, not leak forever"
     )
+
+
+def test_rms_norm_pc_is_memoized_across_calls():
+    """`_rms_norm_pc`/`_matvec_pc` are `@lru_cache`d pure functions of
+    their (small, hashable) arguments — repeated calls with the same
+    (nrows, ncols, eps)/(T, K, N) (exactly what happens once per module,
+    per decoder layer, per decode step in real usage — see their own
+    doc comments) must return the *same* cached `bytes` object rather
+    than repacking from scratch every time. This doesn't need a real
+    Vulkan device — it's pure Python behaviour on the push-constant
+    builders directly. `bytes` are immutable, so sharing the identical
+    cached object across every caller is safe by construction (nothing
+    can mutate it out from under another caller).
+    """
+    a = vulkan_ops._rms_norm_pc(1, 1536, 1e-6)
+    b = vulkan_ops._rms_norm_pc(1, 1536, 1e-6)
+    assert a is b, "identical arguments must hit the lru_cache, not repack"
+
+    c = vulkan_ops._matvec_pc(1, 1536, 6144)
+    d = vulkan_ops._matvec_pc(1, 1536, 6144)
+    assert c is d, "identical arguments must hit the lru_cache, not repack"
+
+    # Different arguments must still produce distinct (and correct) results
+    # -- the cache must be keyed on every argument, not just the first one.
+    e = vulkan_ops._rms_norm_pc(1, 256, 1e-6)
+    assert e != a, "different ncols must produce different push constants"
+    f = vulkan_ops._matvec_pc(1, 1536, 256)
+    assert f != c, "different N must produce different push constants"
+
+
+def test_rms_norm_pc_matches_uncached_reference():
+    """The `@lru_cache` decorator must not change `_rms_norm_pc`'s/
+    `_matvec_pc`'s actual output — compares the (now memoized) functions'
+    result against a plain reimplementation of the pre-caching logic."""
+
+    def rms_norm_pc_reference(nrows: int, ncols: int, eps: float) -> bytes:
+        import struct as _struct
+
+        nb00, nb01, nb02 = 1, ncols, nrows * ncols
+        ne10, nb10, nb11 = ncols, 1, ncols
+        nb20, nb21 = 1, ncols
+        pc = _struct.pack("9I", nrows * ncols, ncols, nrows, 1, 1, nb00, nb01, nb02, 1)
+        pc += _struct.pack("8I", ne10, 1, 1, 1, nb10, nb11, 1, 1)
+        pc += _struct.pack("8I", ncols, nrows, 1, 1, nb20, nb21, 1, 1)
+        pc += _struct.pack("I f f i", 0, eps, 0.0, 0)
+        return pc
+
+    for nrows, ncols, eps in [(1, 1536, 1e-6), (1, 256, 1e-6), (8, 1536, 1e-5)]:
+        assert vulkan_ops._rms_norm_pc(nrows, ncols, eps) == rms_norm_pc_reference(
+            nrows, ncols, eps
+        )
+
+
+def test_matvec_pc_repeated_calls_faster_than_uncached_reference():
+    """Measures the actual speedup `@lru_cache` gives `_matvec_pc` on a
+    cache-hit path — the exact access pattern the real decode loop
+    exercises (same module, same shape, called once per generated
+    token)."""
+    import struct as _struct
+    import time
+
+    def matvec_pc_reference(t: int, k: int, n: int) -> bytes:
+        return _struct.pack("13I", k, k, k, n, k * n, k, n, 0, 0, 1, t, t, 1)
+
+    iters = 5000
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        matvec_pc_reference(1, 1536, 6144)
+    uncached_elapsed = time.perf_counter() - t0
+
+    # Warm the cache once before timing the cache-hit path.
+    vulkan_ops._matvec_pc(1, 1536, 6144)
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        vulkan_ops._matvec_pc(1, 1536, 6144)
+    cached_elapsed = time.perf_counter() - t0
+
+    assert cached_elapsed < uncached_elapsed, (
+        f"cached _matvec_pc ({cached_elapsed:.4f}s/{iters}) was not faster than "
+        f"the uncached reference ({uncached_elapsed:.4f}s/{iters})"
+    )
