@@ -68,9 +68,14 @@ impl PipelineCache {
         ];
 
         // Shaders using layout(local_size_x_id=0) need BLOCK_SIZE specialization.
+        // "mul_mat_vec_f32_f32_f32_subgroup" is NOT registered here: it was
+        // found to silently produce wrong output for any ncols>=~256 (see
+        // #57 and subgroup_matvec_correctness_tests in src/lib.rs) and,
+        // since vulkan_ops.py no longer dispatches it, is now both dead
+        // code AND actively dangerous to leave compiled/available for
+        // some future caller to accidentally pick up again.
         const MATVEC_SHADERS: &[&str] = &[
             "mul_mat_vec_f32_f32_f32",
-            "mul_mat_vec_f32_f32_f32_subgroup",
             "mul_mat_vec_f16_f32_f32",
         ];
 
@@ -104,7 +109,13 @@ impl PipelineCache {
         self.compile_one_with_spec(name, spv, &[])
     }
 
-    fn compile_one_with_spec(
+    // pub(crate) rather than private: exploratory tests (see
+    // src/lib.rs's matvec-related test modules) need to compile
+    // additional specialization-constant combinations beyond the fixed
+    // set compile_matvec hardcodes, to measure whether a given BLOCK_SIZE/
+    // NUM_ROWS combination is worth adding as a real, permanent variant
+    // before committing to it.
+    pub(crate) fn compile_one_with_spec(
         &mut self,
         name: &str,
         spv: &[u8],
@@ -205,8 +216,8 @@ impl PipelineCache {
     }
 
     /// Compile a shader with the standard matvec specialization constants:
-    /// BLOCK_SIZE=512, NUM_ROWS=1, NUM_COLS=1.
-    /// Also compiles a NUM_ROWS=4 variant for larger matrices.
+    /// BLOCK_SIZE=128, NUM_ROWS=1, NUM_COLS=1.
+    /// Also compiles a NUM_ROWS=4 variant (BLOCK_SIZE=32) for larger matrices.
     ///
     /// A NUM_ROWS=2 (`_r2`) variant used to be compiled here as well, but
     /// was never actually dispatched anywhere in this codebase (Rust or
@@ -223,10 +234,23 @@ impl PipelineCache {
     /// CI-safe) regression guard confirming the removal.
     pub fn compile_matvec(&mut self, name: &str, spv: &[u8]) -> Result<(), String> {
         self.compile_one_with_spec(name, spv, &[
-            (0, 512), // BLOCK_SIZE = 512
+            (0, 128), // BLOCK_SIZE = 128 (not 512, see below)
             (1, 1),   // NUM_ROWS = 1
             (2, 1),   // NUM_COLS = 1
         ])?;
+        // BLOCK_SIZE=128 (not the more common 512): measured across the
+        // 3 real Gemma4-E2B-scale shapes this base (NUM_ROWS=1) variant
+        // is actually used at (via vulkan_ops.py's `_vulkan_matvec`/
+        // `rms_norm_then_linear`, both fixed by #57 to dispatch this
+        // shader instead of the broken `_subgroup` one): 128 is
+        // consistently the best or tied-best of {32, 64, 128, 256, 512}
+        // tried — ~1.35x faster than 512 at k=1536/n=1536, ~1.20x at
+        // k=1536/n=6144, ~1.02-1.04x at k=6144/n=1536 (never worse) —
+        // reproducible across repeated runs. Same tuning axis/technique
+        // as the `_r4` variant's BLOCK_SIZE=32 finding below, applied to
+        // NUM_ROWS=1 instead of NUM_ROWS=4; see plain_matvec_tests::
+        // block_size_128_matches_bs512_at_gemma4_e2b_shapes /
+        // block_size_128_is_faster_than_bs512_at_gemma4_e2b_shapes.
         // NUM_ROWS=4 variant, BLOCK_SIZE=32 (not 512): BLOCK_SIZE is tied
         // directly to the shader's local_size_x (`layout(local_size_x_id =
         // 0, ...)`), so this is a genuinely independent tuning axis from

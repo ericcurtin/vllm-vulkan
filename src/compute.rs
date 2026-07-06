@@ -333,6 +333,19 @@ impl ComputeEngine {
         Ok(engine)
     }
 
+    /// Compile an additional pipeline variant with custom specialization
+    /// constants, beyond what's registered by name at construction time.
+    /// pub(crate)-only: used by exploratory tests to measure whether a
+    /// given BLOCK_SIZE/NUM_ROWS/NUM_COLS combination is worth adding as
+    /// a real, permanent variant before committing to it (see
+    /// `pipeline::PipelineCache::compile_one_with_spec`).
+    #[cfg(test)]
+    pub(crate) fn compile_extra_variant(
+        &mut self, name: &str, spv: &[u8], spec_constants: &[(u32, u32)],
+    ) -> Result<(), String> {
+        self.pipeline_cache.compile_one_with_spec(name, spv, spec_constants)
+    }
+
     fn grow_descriptor_pool(&mut self) -> Result<(), String> {
         let pool_sizes = [vk::DescriptorPoolSize {
             ty: vk::DescriptorType::STORAGE_BUFFER,
