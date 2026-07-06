@@ -23,6 +23,12 @@ _patches_applied = False
 
 _TEMPLATES_DIR = Path(__file__).parent
 
+# Keeps torch.library.Library fragments alive for the process lifetime; a
+# Library object unregisters all of its ops when garbage-collected, so a
+# module-level reference is required for _patch_cpu_memory_env's fallback op
+# to remain callable.
+_KEEPALIVE_LIBS: list[torch.library.Library] = []
+
 
 def apply_patches() -> None:
     """Apply all patches.  Safe to call multiple times (idempotent)."""
@@ -32,14 +38,134 @@ def apply_patches() -> None:
     _patches_applied = True
 
     try:
+        _patch_cpu_memory_env()
+    except Exception as exc:
+        logger.warning("Failed to apply vllm._C.init_cpu_memory_env patch: %s", exc)
+
+    try:
         _patch_cpu_triton_utils()
     except Exception as exc:
         logger.warning("Failed to apply vllm._C patches: %s", exc)
 
     try:
+        _patch_topk_topp_triton()
+    except Exception as exc:
+        logger.warning("Failed to apply top-k/top-p Triton-CUDA guard: %s", exc)
+
+    try:
         _register_gemma4_chat_template()
     except Exception as exc:
         logger.warning("Failed to register gemma4 chat template fallback: %s", exc)
+
+    try:
+        _patch_accelerator_synchronize()
+    except Exception as exc:
+        logger.warning("Failed to apply torch.accelerator.synchronize guard: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Patch: torch.accelerator.synchronize() on platforms with no torch accelerator
+# ---------------------------------------------------------------------------
+
+
+def _patch_accelerator_synchronize() -> None:
+    """Make ``torch.accelerator.synchronize()``/``empty_cache()`` no-ops when
+    no torch accelerator (CUDA/XPU/etc.) is registered.
+
+    ``vllm.v1.worker.gpu_model_runner.GPUModelRunner._cleanup_profiling_kv_cache``
+    (reused by ``_VulkanCPUModelRunner`` via ``CPUModelRunner``) unconditionally
+    calls both during worker shutdown. Their docstrings say they're a no-op
+    if the current accelerator is not initialized, but the implementation
+    doesn't actually honor that for a device_type="cpu" platform like this
+    one (no torch accelerator is ever registered): each raises
+        RuntimeError: Cannot access accelerator device when none is available.
+    This doesn't corrupt or lose any already-generated output (it only fires
+    during worker teardown, after results have been returned), but it turns
+    every clean shutdown -- including a normal ``LLM()`` object being garbage
+    collected, or ``vllm serve`` receiving Ctrl-C -- into a scary, confusing
+    traceback in the logs. Guard both so shutdown is quiet when there truly
+    is no accelerator.
+    """
+    if not hasattr(torch, "accelerator"):
+        return
+
+    for name in ("synchronize", "empty_cache"):
+        orig_func = getattr(torch.accelerator, name, None)
+        if orig_func is None:
+            continue
+
+        def _make_safe(orig):  # noqa: ANN001
+            def _safe(*args, **kwargs):
+                if not torch.accelerator.is_available():
+                    return None
+                return orig(*args, **kwargs)
+
+            return _safe
+
+        setattr(torch.accelerator, name, _make_safe(orig_func))
+
+    logger.debug(
+        "Guarded torch.accelerator.synchronize()/empty_cache() to no-op "
+        "when no torch accelerator is registered (Vulkan/CPU platform)."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Patch: vllm.v1.sample.ops.topk_topp_sampler's Triton fast path
+# ---------------------------------------------------------------------------
+
+
+def _patch_topk_topp_triton() -> None:
+    """Force the PyTorch top-k/top-p sampling fallback on this platform.
+
+    ``vllm.v1.sample.ops.topk_topp_sampler.apply_top_k_top_p`` unconditionally
+    dispatches to ``apply_top_k_top_p_triton`` whenever ``vllm.triton_utils
+    .HAS_TRITON`` is true and the batch size is >= 8 -- with no platform
+    check. That Triton kernel is CUDA-only (it launches through
+    ``triton.backends.nvidia.driver``), so it crashes as soon as
+    ``triton`` happens to be importable in the environment, which is common:
+    it is a normal transitive dependency of vLLM (e.g. via structured-output
+    backends) even for CPU-only installs, so a Vulkan-plugin user need not
+    have installed it deliberately. Since this platform's tensors always sit
+    on ``torch.device("cpu")`` (compute is offloaded to the GPU only inside
+    the model's own forward pass, not vLLM's post-hoc sampler), the kernel's
+    ``ValueError: Pointer argument (at 0) cannot be accessed from Triton (cpu
+    tensor?)`` fires on essentially every request with a batch size >= 8.
+
+    We patch ``HAS_TRITON`` to ``False`` inside the already-imported
+    ``topk_topp_sampler`` module only (not globally), so the module's
+    ``apply_top_k_top_p`` falls back to ``apply_top_k_top_p_pytorch``, which
+    is a plain, device-agnostic PyTorch sort-based implementation.
+    """
+    # NOTE: this is deliberately *not* only called from apply_patches() at
+    # plugin-registration time. That runs extremely early (from inside
+    # vLLM's own lazy ``current_platform`` resolution, itself triggered
+    # while ``vllm.config`` and friends may still be mid-import), so
+    # importing ``vllm.v1.sample.ops.topk_topp_sampler`` at that point
+    # reliably raises:
+    #   ImportError: cannot import name 'CUDAGraphMode' from partially
+    #   initialized module 'vllm.config' (most likely due to a circular
+    #   import)
+    # which is swallowed here and by apply_patches()'s caller, silently
+    # making the patch a no-op. ``VulkanWorker.init_device()`` also calls
+    # this function directly, at a point where vLLM's module graph is
+    # already fully imported, which is where this patch actually takes
+    # effect in practice.
+    try:
+        import vllm.v1.sample.ops.topk_topp_sampler as _sampler_mod  # noqa: PLC0415
+    except ImportError:
+        return
+
+    if not getattr(_sampler_mod, "HAS_TRITON", False):
+        return  # Already false; e.g. triton genuinely not installed.
+
+    _sampler_mod.HAS_TRITON = False
+    logger.info(
+        "Disabled vLLM's CUDA-only Triton top-k/top-p sampling kernel for "
+        "the Vulkan/CPU platform; falling back to the PyTorch "
+        "implementation (vllm.v1.sample.ops.topk_topp_sampler."
+        "apply_top_k_top_p_pytorch)."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -131,13 +257,88 @@ class _FuncWrapper:
         return self.func
 
 
+# ---------------------------------------------------------------------------
+# Patch: vllm._C.init_cpu_memory_env
+# ---------------------------------------------------------------------------
+
+
+def _patch_cpu_memory_env() -> None:
+    """Register a no-op fallback for ``vllm._C.init_cpu_memory_env``.
+
+    ``CPUWorker.__init__`` (vLLM's base class for our ``VulkanWorker``) calls
+    ``torch.ops._C.init_cpu_memory_env(...)`` unconditionally, before
+    ``VulkanWorker.init_device()`` even runs, to bind the process to a NUMA
+    memory node for the CPU backend's AVX-optimized kernels.
+
+    Some vLLM CPU wheels (observed on aarch64 builds, where the heavy
+    AVX-512 CPU kernel sources are not compiled) ship a ``vllm._C`` module
+    that imports successfully but registers *zero* ops under the ``_C``
+    torch.library namespace. ``_patch_cpu_triton_utils`` below already
+    handles the case where ``import vllm._C`` fails outright, but it cannot
+    detect this "importable but empty" case, so ``torch.ops._C.init_cpu_memory_env``
+    raises an uncaught ``AttributeError`` and engine startup crashes:
+
+        AttributeError: '_OpNamespace' '_C' object has no attribute
+        'init_cpu_memory_env'
+
+    The Vulkan plugin runs on ``device_type=cpu`` purely as a host/scheduling
+    shim -- all matmul/norm/attention compute is dispatched to the GPU via
+    Vulkan -- so NUMA-local memory binding is irrelevant here and safe to
+    skip entirely, exactly like the existing ``init_cpu_threads_env``
+    try/except in ``VulkanWorker.init_device``.
+    """
+    try:
+        import vllm._C  # noqa: PLC0415, F401
+    except (ImportError, ModuleNotFoundError):
+        # vllm._C missing entirely; CPUWorker.__init__ will still fail the
+        # same way, but that is a separate, pre-existing limitation (running
+        # vLLM without any compiled extension at all) outside this patch's
+        # scope.
+        return
+
+    if hasattr(torch.ops._C, "init_cpu_memory_env"):
+        return  # Real op is present and registered; nothing to do.
+
+    lib = torch.library.Library("_C", "FRAGMENT")
+    lib.define("init_cpu_memory_env(SymInt[] node_ids) -> ()")
+    lib.impl(
+        "init_cpu_memory_env",
+        lambda node_ids: None,
+        "CompositeExplicitAutograd",
+    )
+    # Prevent the Library (and therefore the op registration) from being
+    # garbage-collected once this function returns.
+    _KEEPALIVE_LIBS.append(lib)
+
+    logger.info(
+        "Registered no-op fallback for vllm._C.init_cpu_memory_env "
+        "(op not present in this vLLM CPU build); NUMA-local memory "
+        "binding is skipped. Compute is dispatched to the GPU via Vulkan "
+        "regardless, so this has no effect on functionality."
+    )
+
+
 def _patch_cpu_triton_utils() -> None:
-    """Monkey-patch ``vllm.utils.cpu_triton_utils`` if ``vllm._C`` is absent."""
+    """Monkey-patch ``vllm.utils.cpu_triton_utils`` if ``vllm._C`` is absent.
+
+    Checking only ``import vllm._C`` succeeding is not sufficient: some vLLM
+    CPU wheels (observed on aarch64 builds) ship a ``vllm._C`` module that
+    imports fine but registers *zero* ops under the ``_C`` torch.library
+    namespace (see ``_patch_cpu_memory_env`` above for the same situation
+    with a different op). ``vllm.utils.cpu_triton_utils.compute_slot_mapping_kernel``
+    unconditionally calls ``torch.ops._C.compute_slot_mapping_kernel_impl``
+    with no fallback of its own, so in that "importable but empty" case this
+    crashes on every forward pass with:
+        AttributeError: '_OpNamespace' '_C' object has no attribute
+        'compute_slot_mapping_kernel_impl'
+    Check for the specific op instead of just the module's importability.
+    """
     try:
         import vllm._C  # noqa: PLC0415, F401
 
-        # If we reach here, the C extension IS available — no patch needed.
-        return
+        if hasattr(torch.ops._C, "compute_slot_mapping_kernel_impl"):
+            # The real op IS available — no patch needed.
+            return
     except (ImportError, ModuleNotFoundError):
         pass  # Extension absent; apply the pure-Python fallback.
 

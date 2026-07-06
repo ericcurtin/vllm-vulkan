@@ -140,6 +140,27 @@ class VulkanPlatform(Platform):
         except (ImportError, OSError):
             return 0
 
+    @classmethod
+    def num_compute_units(cls, device_id: int = 0) -> int:
+        """Parallelism hint for vLLM's Triton CPU top-k/top-p sampler
+        (``vllm.v1.sample.ops.topk_topp_triton``), which launches its grid
+        sized to ``min(num_compute_units(), batch_size)``.
+
+        That kernel operates on the sampler's logits tensor, which lives on
+        ``torch.device("cpu")`` (this platform's ``device_type``) regardless
+        of Vulkan GPU offload elsewhere in the model's forward pass, so CPU
+        core count -- not a Vulkan-specific notion of "compute units" -- is
+        the right answer here.
+
+        The base ``Platform.num_compute_units`` raises ``NotImplementedError``
+        (only CUDA/ROCm/XPU override it); previously this crashed engine
+        warm-up as soon as ``triton`` happened to be importable in the
+        environment and the profiling batch size reached 8, which happens
+        whenever anything else in the environment (e.g. torch itself, on
+        some platforms) pulls in `triton` as a transitive dependency.
+        """
+        return os.cpu_count() or 1
+
     # ─── Device management ───────────────────────────────────────────────────
 
     @classmethod
@@ -163,6 +184,41 @@ class VulkanPlatform(Platform):
     @classmethod
     def get_torch_device(cls, device_id: int = 0) -> torch.device:
         return torch.device("cpu")
+
+    @classmethod
+    def is_cpu(cls) -> bool:
+        """Report this platform as CPU-like to vLLM's generic capability
+        checks.
+
+        The base ``Platform.is_cpu()`` returns ``self._enum ==
+        PlatformEnum.CPU``, which is ``False`` here since out-of-tree
+        plugins use ``PlatformEnum.OOT`` -- even though this platform's
+        ``device_type`` is ``"cpu"`` and it reuses vLLM's ``CPUWorker``/
+        ``CPUModelRunner`` throughout. Several call sites gate CUDA/XPU-only
+        features (e.g. ``Worker._maybe_get_memory_pool_context``'s sleep-mode
+        cumem allocator) behind ``current_platform.is_cpu()`` to skip them
+        with a plain ``nullcontext()``; without this override those checks
+        fall through to ``get_mem_allocator_instance()``, which raises::
+
+            RuntimeError: Sleep mode allocator is not available on platform
+            VulkanPlatform (device_type=cpu).
+
+        on every model load, since this platform is (correctly) absent from
+        that allocator's supported-platform list.
+        """
+        return True
+
+    @classmethod
+    def manual_seed_all(cls, seed: int) -> None:
+        """No-op: the torch device is "cpu" (torch.manual_seed already covers
+        it), and Vulkan compute buffers don't participate in torch's RNG
+        state. The base ``Platform.manual_seed_all`` raises
+        ``NotImplementedError`` by default, which previously crashed
+        ``VulkanWorker.init_device`` -> ``set_random_seed`` on every startup.
+        vLLM's own CPU platform (`CpuPlatform.manual_seed_all`) is likewise a
+        no-op for the same reason.
+        """
+        pass
 
     # ─── vLLM config integration ─────────────────────────────────────────────
 

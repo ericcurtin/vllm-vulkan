@@ -73,14 +73,33 @@ def vulkan_ctx():
 
 @pytest.fixture
 def upload_counter(monkeypatch):
-    """Count real GPU uploads (_WeightCache.put calls) deterministically,
-    independent of the weak-ref cache's final size (see module docstring
-    for why the latter can be misleading)."""
+    """Count real GPU-weight/CPU-float32-cache-populating `_WeightCache.put`
+    calls deterministically, independent of the weak-ref cache's final size
+    (see module docstring for why the latter can be misleading).
+
+    Used by callers that assert on either `_weight_cache` (a real GPU
+    upload) or `_cpu_float32_cache` (a real host-side float32 conversion)
+    being populated exactly once — historically the same thing, since
+    counting *any* `_WeightCache.put` call was equivalent to counting
+    "real, potentially-expensive conversion/upload work done" when those
+    were the only two `_WeightCache` instances in this module.
+
+    Excludes `_weight_f16_decision_cache` specifically (added in #83):
+    `_weight_uses_f16` caches its own per-weight decision there — a cheap
+    cached bool, not a GPU upload or CPU conversion — so counting its
+    `put` calls alongside the other two would double-count "1 real
+    upload" as 2 (one decision-cache `put`, one actual weight-cache
+    `put`) for any weight that goes through
+    `_get_or_upload_weight(..., prefer_f16=True)`, exactly the weights
+    several of this fixture's callers (>= _MATVEC_MIN_WEIGHT_ELEMENTS)
+    use.
+    """
     counts = {"n": 0}
     orig_put = vulkan_ops._WeightCache.put
 
     def counting_put(self, w, gpu):
-        counts["n"] += 1
+        if self is not vulkan_ops._weight_f16_decision_cache:
+            counts["n"] += 1
         return orig_put(self, w, gpu)
 
     monkeypatch.setattr(vulkan_ops._WeightCache, "put", counting_put)
@@ -118,7 +137,23 @@ def test_linear_matches_torch_reference_at_realistic_hidden_size(vulkan_ctx):
 
     result = vulkan_ops.linear(x, weight, None)
     expected = torch.nn.functional.linear(x, weight, None)
-    torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
+    # rtol=1e-2/atol=5e-2 (not 1e-3/1e-3): since #83, `linear()`'s GPU decode
+    # path uploads/dispatches this (>= _MATVEC_MIN_WEIGHT_ELEMENTS) weight as
+    # float16 whenever `_weight_uses_f16` says it's safe to (see
+    # `_get_or_upload_weight`'s doc comment) — a deliberate, expected
+    # precision/bandwidth tradeoff, not a correctness bug: the result matches
+    # a CPU reference computed from the *same* f16-rounded weight values to
+    # within ~2e-4 (well inside f16's own ~1e-3 relative precision), while
+    # diverging from this fp32-weight `torch.nn.functional.linear` reference
+    # by up to ~0.032 at this shape/dtype across repeated runs on real
+    # (non-mock) Vulkan hardware — the two are simply no longer expected to
+    # agree at 1e-3/1e-3 now that the weight itself is stored more coarsely
+    # on the GPU. rtol=1e-2/atol=5e-2 comfortably covers the observed ~0.03
+    # max abs error (including near-zero-`expected` elements, where relative
+    # error alone spikes) with margin, without being so loose it'd miss an
+    # actual dispatch/binding/stride bug reintroducing errors an order of
+    # magnitude larger than f16 rounding alone explains.
+    torch.testing.assert_close(result, expected, rtol=1e-2, atol=5e-2)
 
 
 def test_get_or_upload_weight_hits_cache_for_same_tensor_object(
@@ -847,7 +882,14 @@ class TestLinearTiledMatmulPrefillDispatch:
             x = torch.randn(t, in_features, dtype=torch.float32)
             result = vulkan_ops.linear(x, weight, None)
             expected = torch.nn.functional.linear(x, weight, None)
-            torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-2)
+            # rtol=1e-2/atol=5e-2 (not 1e-3/1e-2): same rationale as
+            # `test_linear_matches_torch_reference_at_realistic_hidden_size`
+            # above — since #83, this weight (>= _MATVEC_MIN_WEIGHT_ELEMENTS)
+            # is uploaded/dispatched as float16 by `_vulkan_matmul` too, so
+            # this fp32-weight `torch.nn.functional.linear` reference is no
+            # longer expected to match at 1e-2 absolute; observed max abs
+            # error across these T values on real Vulkan hardware is ~0.045.
+            torch.testing.assert_close(result, expected, rtol=1e-2, atol=5e-2)
 
     def test_large_weight_prefill_uses_gpu_weight_cache_not_cpu_path(
         self, vulkan_ctx, upload_counter
