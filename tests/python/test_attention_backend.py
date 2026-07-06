@@ -108,6 +108,94 @@ def test_vulkan_attention_backend_uses_paged_decode_for_single_token_batch(monke
     torch.testing.assert_close(output, expected, rtol=5e-3, atol=5e-3)
 
 
+def test_vulkan_attention_backend_uses_paged_decode_for_single_token_batch_f32(
+    monkeypatch,
+):
+    """Same scenario as
+    `test_vulkan_attention_backend_uses_paged_decode_for_single_token_batch`
+    above, but with a float32 KV cache — every other test in this file
+    uses float16, so this is the only coverage exercising the
+    `paged_attn_decode_batch_f32`/`paged_kv_write_f32` branch of
+    `_try_vulkan_decode`/`_try_write_tokens_to_vulkan_cache`'s dtype
+    selection (now a plain ternary hoisted to module-level imports,
+    rather than a conditional local import — see attention.py's
+    `_get_vulkan_context` doc comment)."""
+    _require_vulkan_context()
+    logged_messages = []
+    monkeypatch.setattr(
+        attention_mod.logger,
+        "debug",
+        lambda msg, *args, **kwargs: logged_messages.append(msg % args),
+    )
+
+    num_heads = 4
+    num_kv_heads = 2
+    head_size = 32
+    block_size = 16
+    num_blocks = 4
+    num_reqs = 2
+    scale = head_size**-0.5
+
+    query = torch.randn(num_reqs, num_heads, head_size, dtype=torch.float32)
+    key = torch.randn(num_reqs, num_kv_heads, head_size, dtype=torch.float32)
+    value = torch.randn(num_reqs, num_kv_heads, head_size, dtype=torch.float32)
+    kv_cache = torch.zeros(
+        (2, num_blocks, num_kv_heads, block_size, head_size),
+        dtype=torch.float32,
+    )
+    output = torch.empty((num_reqs, num_heads, head_size), dtype=torch.float32)
+
+    metadata = CPUAttentionMetadata(
+        isa="vec16",
+        num_actual_tokens=num_reqs,
+        max_query_len=1,
+        query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+        max_seq_len=1,
+        seq_lens=torch.tensor([1, 1], dtype=torch.int32),
+        block_table=torch.tensor([[0], [1]], dtype=torch.int32),
+        slot_mapping=torch.tensor([0, block_size], dtype=torch.int64),
+        scheduler_metadata=None,
+        causal=True,
+    )
+    impl = VulkanAttentionBackendImpl(
+        num_heads=num_heads,
+        head_size=head_size,
+        scale=scale,
+        num_kv_heads=num_kv_heads,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="auto",
+        logits_soft_cap=None,
+        attn_type=AttentionType.DECODER,
+        kv_sharing_target_layer_name=None,
+    )
+
+    result = impl.forward(
+        layer=None,  # type: ignore[arg-type]
+        query=query,
+        key=key,
+        value=value,
+        kv_cache=kv_cache,
+        attn_metadata=metadata,
+        output=output,
+    )
+
+    expected = []
+    gqa_ratio = num_heads // num_kv_heads
+    for req_idx in range(num_reqs):
+        rows = []
+        for q_head in range(num_heads):
+            rows.append(value[req_idx, q_head // gqa_ratio].float())
+        expected.append(torch.stack(rows))
+    expected = torch.stack(expected)
+
+    assert impl._last_vulkan_decode_used is True
+    assert result is output
+    assert any("Vulkan attention decode used" in msg for msg in logged_messages)
+
+    torch.testing.assert_close(output, expected, rtol=5e-3, atol=5e-3)
+
+
 def test_vulkan_attention_backend_mirrors_prefill_kv_before_decode():
     _require_vulkan_context()
 
