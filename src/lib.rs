@@ -3081,16 +3081,32 @@ mod subgroup_matvec_correctness_tests {
     //! jumps from 0.0 (K<=64) to double-digit absolute error (K>=256),
     //! while `mul_mat_vec_f32_f32_f32` (the plain, non-subgroup variant,
     //! identical bindings/push-constants/workgroup-dispatch convention)
-    //! stays exactly correct (error 0.0) at every K tested. The root
-    //! cause looks like mul_mat_vec_base.glsl's `USE_SUBGROUP_ADD`
-    //! cross-subgroup shared-memory reduction (`[[unroll]] for (uint s
-    //! = 0; s < gl_NumSubgroups; ++s)`), which unrolls a loop bounded by
-    //! a value that may not be reliably compile-time-constant on every
-    //! driver — not fully root-caused, but irrelevant to the fix: since
-    //! this backend already has a proven-correct alternative
-    //! (`mul_mat_vec_f32_f32_f32`) with an identical calling convention,
-    //! vulkan_ops.py now dispatches that instead (see the fix in
-    //! vulkan_ops.py's `linear`/`_vulkan_matvec`).
+    //! stays exactly correct (error 0.0) at every K tested.
+    //!
+    //! Root cause: this shader is compiled (see scripts/compile_shaders.sh)
+    //! with `USE_SUBGROUP_ADD_NO_SHMEM=1`, whose `reduce_result` (see
+    //! mul_mat_vec_base.glsl) calls `subgroupAdd(temp[j][n])` — which
+    //! only sums within ONE subgroup — and then has `tid == 0` write
+    //! that value directly as the final result, with NO cross-subgroup
+    //! combination step at all. This is only correct if the entire
+    //! workgroup is a single subgroup (BLOCK_SIZE <= subgroup size). But
+    //! `compile_matvec` compiles the base (non-`_r4`) variant — which is
+    //! what "_subgroup" is — with BLOCK_SIZE=512, while GPU subgroup
+    //! sizes are typically 32-64: with BLOCK_SIZE=512, `tid==0`'s
+    //! subgroup only ever sees ~1/8-1/16 of the workgroup's threads, so
+    //! the written result silently omits every other subgroup's partial
+    //! sum. Small K (<=64) happens to still work because every non-zero
+    //! partial dot-product contribution lands within the first
+    //! subgroup's thread range purely by coincidence of this shader's
+    //! per-thread work assignment (see mul_mat_vec.comp's `iter`/
+    //! `compute_outputs`) — not because the reduction is actually
+    //! correct at that size, just because there's nothing outside the
+    //! first subgroup to lose. Since this backend already has a proven-
+    //! correct alternative (`mul_mat_vec_f32_f32_f32`, not using
+    //! `USE_SUBGROUP_ADD_NO_SHMEM` at all) with an identical calling
+    //! convention, vulkan_ops.py now dispatches that instead (see the
+    //! fix in vulkan_ops.py's `linear`/`_vulkan_matvec`) rather than
+    //! trying to fix the BLOCK_SIZE/subgroup-size mismatch in place.
     //!
     //! This test is the permanent regression guard: it documents the bug
     //! (subgroup variant, if ever re-introduced as a dispatch target,
