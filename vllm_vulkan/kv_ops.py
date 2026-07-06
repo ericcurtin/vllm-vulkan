@@ -552,7 +552,11 @@ def _paged_attn_decode(
         scale=scale,
     )
     results = ctx.execute_batch([op])
-    output = np.frombuffer(results[0][0], dtype=np.float32).copy()
+    # ctx.execute_batch returns a writable bytearray (not bytes)
+    # specifically so this frombuffer view doesn't need a defensive
+    # `.copy()` before torch.from_numpy can use it - see
+    # vulkan_ops._from_bytes's doc comment for the measured saving.
+    output = np.frombuffer(results[0][0], dtype=np.float32)
     return torch.from_numpy(output.reshape(num_q_heads, head_size))
 
 
@@ -617,8 +621,9 @@ def _paged_attn_decode_batch(
 
     results = ctx.execute_batch(ops)
     outputs = []
+    # No `.copy()` needed - see the single-token _paged_attn_decode above.
     for (num_q_heads, head_size), result in zip(shapes, results, strict=True):
-        output = np.frombuffer(result[0], dtype=np.float32).copy()
+        output = np.frombuffer(result[0], dtype=np.float32)
         outputs.append(torch.from_numpy(output.reshape(num_q_heads, head_size)))
     return outputs
 
@@ -807,10 +812,11 @@ def _paged_kv_write_and_decode_batch(
 
     results = ctx.execute_batch(ops)
     # results[0] is the write op's (empty) output list; decode outputs
-    # start at index 1.
+    # start at index 1. No `.copy()` needed - see the single-token
+    # _paged_attn_decode above.
     outputs = []
     for (num_q_heads, head_size), result in zip(shapes, results[1:], strict=True):
-        output = np.frombuffer(result[0], dtype=np.float32).copy()
+        output = np.frombuffer(result[0], dtype=np.float32)
         outputs.append(torch.from_numpy(output.reshape(num_q_heads, head_size)))
     return outputs
 
