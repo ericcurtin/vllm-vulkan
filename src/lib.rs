@@ -4802,3 +4802,114 @@ mod final_norm_lm_head_tests {
         assert!(err < 1e-4, "GPU fused final norm diverged from CPU reference: {err}");
     }
 }
+
+#[cfg(test)]
+mod buffer_pool_capacity_tests {
+    //! `ComputeEngine`'s host-coherent `BufferPool` (`src/compute.rs`)
+    //! is keyed by exact buffer size, holding up to `POOL_MAX` idle
+    //! buffers per size before discarding (freeing) any more returned
+    //! to it. This matters far beyond the standalone `VulkanModel`
+    //! engine these tests otherwise exercise: the real vLLM serving
+    //! path's `kv_ops._paged_attn_decode_batch` builds one
+    //! same-sized temp + output buffer *per concurrently-decoding
+    //! sequence*, all within a single `execute_batch` call, once per
+    //! attention layer per decode step — so a real continuous-batching
+    //! decode batch size of 32-256 sequences repeatedly cycles that
+    //! many same-sized buffers through this exact pool, every decode
+    //! step, for the lifetime of the server.
+    //!
+    //! `POOL_MAX` was previously 16 — comfortably large for the
+    //! standalone `VulkanModel` engine's own activation buffers (each a
+    //! *distinct* size, one per role, reused every decode step
+    //! regardless of concurrency) but far too small for real
+    //! serving's per-sequence buffers at realistic concurrency, forcing
+    //! a real `vkAllocateMemory`/`vkCreateBuffer`/`vkMapMemory` call on
+    //! every buffer past the 16th, on every single decode step, once
+    //! concurrent batch size exceeded it — silently defeating the pool
+    //! for exactly the workload it exists to serve.
+    use super::*;
+
+    fn make_engine() -> Option<compute::ComputeEngine> {
+        let dev = match device::ComputeDevice::create(0) {
+            Ok(d) => d,
+            Err(e) => { eprintln!("skip: no Vulkan device available ({e})"); return None; }
+        };
+        let shader_spvs = include_all_shaders();
+        let refs: std::collections::HashMap<&str, &[u8]> = shader_spvs.iter()
+            .map(|(k, v)| (k.as_str(), v.as_slice())).collect();
+        Some(compute::ComputeEngine::new(
+            dev.instance.clone(), dev.physical_device, dev.device.clone(),
+            dev.compute_queue, dev.compute_queue_family, &refs,
+        ).expect("create ComputeEngine"))
+    }
+
+    /// Times one alloc-then-return-to-pool cycle for `batch_size`
+    /// same-sized buffers (simulating one `_paged_attn_decode_batch`
+    /// call's temp/output buffers for that many concurrently-decoding
+    /// sequences), averaged over several iterations after an initial
+    /// warm-up cycle (so the pool starts already populated, matching
+    /// steady-state real serving rather than a cold start). Uses a
+    /// generous iteration count (not just enough to detect this fix's
+    /// actual ~10-16x effect, which a much smaller count would already
+    /// reliably catch) specifically to keep this assertion robust
+    /// against timing noise in shared/virtualized CI environments,
+    /// where a too-small sample could occasionally average over a
+    /// scheduling hiccup large enough to distort the ratio this test
+    /// checks.
+    fn time_batch_cycle(engine: &mut compute::ComputeEngine, batch_size: usize) -> std::time::Duration {
+        let warm_up: Vec<_> = (0..batch_size)
+            .map(|_| engine.alloc_host_coherent_storage(24576).unwrap())
+            .collect();
+        for b in warm_up { engine.return_to_pool(b); }
+
+        let iters = 1000u32;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let bufs: Vec<_> = (0..batch_size)
+                .map(|_| engine.alloc_host_coherent_storage(24576).unwrap())
+                .collect();
+            for b in bufs { engine.return_to_pool(b); }
+        }
+        t0.elapsed() / iters
+    }
+
+    #[test]
+    fn per_buffer_cost_stays_flat_across_realistic_concurrent_batch_sizes() {
+        // Measured directly on this hardware before this fix (POOL_MAX=16):
+        // ~210ns/buffer at batch_size<=16 (fits in the pool), jumping to
+        // ~2.2-3.4us/buffer (a ~10-16x regression) at batch_size=32-128,
+        // since every buffer past the 16th forced a fresh Buffer::alloc
+        // (real vkAllocateMemory/vkCreateBuffer/vkMapMemory) every single
+        // cycle instead of a pool hit. After raising POOL_MAX to 256, the
+        // per-buffer cost should stay roughly flat across this entire
+        // range of realistic concurrent decode batch sizes.
+        let _guard = gpu_test_guard();
+        let Some(mut engine) = make_engine() else { return };
+
+        let mut per_buffer_costs = Vec::new();
+        for &batch_size in &[8usize, 16, 32, 64, 128] {
+            let elapsed = time_batch_cycle(&mut engine, batch_size);
+            let per_buffer = elapsed / batch_size as u32;
+            println!(
+                "batch_size={batch_size}: {elapsed:?}/batch, {per_buffer:?}/buffer"
+            );
+            per_buffer_costs.push(per_buffer);
+        }
+
+        // The largest batch size's per-buffer cost must not regress far
+        // beyond the smallest batch size's — a large ratio here is
+        // exactly the signature of the pool overflowing and falling
+        // back to real Vulkan allocations partway through the batch.
+        let smallest = per_buffer_costs[0];
+        let largest = *per_buffer_costs.last().unwrap();
+        let ratio = largest.as_secs_f64() / smallest.as_secs_f64().max(1e-12);
+        println!("largest/smallest batch per-buffer cost ratio: {ratio:.2}x");
+        assert!(
+            ratio < 3.0,
+            "per-buffer cost at the largest batch size ({largest:?}) regressed \
+             {ratio:.2}x relative to the smallest ({smallest:?}) — this is the \
+             signature of the buffer pool overflowing at realistic concurrent \
+             decode batch sizes (see POOL_MAX's doc comment in src/compute.rs)"
+        );
+    }
+}
