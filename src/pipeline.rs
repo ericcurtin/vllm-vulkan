@@ -72,7 +72,6 @@ impl PipelineCache {
             "mul_mat_vec_f32_f32_f32",
             "mul_mat_vec_f32_f32_f32_subgroup",
             "mul_mat_vec_f16_f32_f32",
-            "mul_mat_vec_f16_f32_f32_subgroup",
         ];
 
         let mut failed = 0usize;
