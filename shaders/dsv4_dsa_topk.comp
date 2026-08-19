@@ -1,0 +1,77 @@
+#version 450
+// DeepSeek-V4-Flash Phase 2e — DSA Lightning-Indexer causal TOP-512 SELECT kernel.
+// Consumes the `index_scores[S, n_win]` emitted by `dsv4_dsa_index_score` and
+// produces, per query row, the causal top-k(512) window indices with the `-1`
+// sentinel — the sparse-attention candidate set that gates the dense MLA pass.
+//
+// Ports the reference selection (validated bit-exact in
+// scripts/dsv4/hc_dsa_oracle.py::indexer_fwd and mirrored by the host
+// `dsa_topk_causal` in src/debug_api.rs):
+//
+//   thr[s]      = (pos0 + s + 1) / compress_rate           // causal_threshold
+//   masked[w]   = (w >= thr) ? -inf : index_scores[s, w]   // future windows masked
+//   top_idx     = argsort(-masked)[:k],  k = min(top_k, n_win)
+//   top_idx[i]  = -1  where  top_idx[i] >= thr             // padding beyond valid
+//
+// The selection is order-free (compared to the reference as a SET, ignoring
+// sentinels), so rank-of-window is a well-defined strict order:
+//   rank[w] = #{ w2 valid : score[w2] > score[w] || (score[w2]==score[w] && w2<w) }
+// window w is selected iff (w < thr) && rank[w] < k, written at out[rank[w]].
+// Ties on continuous scores are measure-zero; the index tie-break makes the
+// order total and deterministic (set-match vs argsort regardless of argsort kind).
+//
+// Dispatch: grid (S, 1, 1); one workgroup per query s. BLOCK_SIZE lanes stride
+// the windows. O(n_win^2) per query (correctness gate; a production long-context
+// top-k would use a radix/threshold select — this matches the host mirror exactly).
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 0) const uint BLOCK_SIZE = 64;
+
+layout(push_constant) uniform parameter {
+    uint seq_len;        // S
+    uint n_windows;      // n_win (compressed length)
+    uint top_k;          // index_topk (512)
+    uint compress_rate;  // m
+    uint pos0;           // position of query 0 (0 for prefill; kv offset in decode)
+} p;
+
+layout(binding = 0) readonly  buffer Scr { float scores[]; };  // [S, n_win]
+layout(binding = 1) writeonly buffer Out { int   sel[];    };  // [S, top_k]
+
+void main() {
+    const uint s    = gl_WorkGroupID.x;
+    const uint lane = gl_LocalInvocationID.x;
+    const uint nw   = p.n_windows;
+    const uint tk   = p.top_k;
+    const uint thr  = (p.pos0 + s + 1u) / p.compress_rate;   // causal_threshold
+    // Valid windows are w < thr AND w < nw; clamp so score reads stay in bounds
+    // when thr > nw (short compressed length relative to the causal cutoff).
+    const uint vthr = min(thr, nw);
+    const uint k    = min(tk, nw);
+    const uint sbase = s * nw;
+    const uint obase = s * tk;
+
+    // Clear the output row to the -1 sentinel (covers padding beyond valid_count
+    // and beyond n_win up to top_k).
+    for (uint i = lane; i < tk; i += BLOCK_SIZE) {
+        sel[obase + i] = -1;
+    }
+    barrier();
+
+    // Rank-scatter: each valid window computes its strict rank; if < k, write it.
+    for (uint w = lane; w < vthr; w += BLOCK_SIZE) {
+        float sw = scores[sbase + w];
+        uint rank = 0u;
+        for (uint w2 = 0u; w2 < vthr; ++w2) {       // only valid windows can outrank
+            if (w2 == w) continue;
+            float s2 = scores[sbase + w2];
+            if (s2 > sw || (s2 == sw && w2 < w)) {
+                ++rank;
+                if (rank >= k) break;               // early out: rank already >= k
+            }
+        }
+        if (rank < k) {
+            sel[obase + rank] = int(w);
+        }
+    }
+}

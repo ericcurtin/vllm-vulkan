@@ -1,0 +1,130 @@
+#version 450
+// DeepSeek-V4-Flash Phase 2d — DSA compressor-POOL + dual-RoPE(yarn) GPU kernel.
+// Ports the reference `DeepseekV4Indexer` / `DeepseekV4CSACompressor` compression
+// path validated bit-exact in scripts/dsv4/hc_dsa_oracle.py::indexer_fwd (the
+// "DSA.compressed(Ca/Cb pool+norm)" + yarn_inv_freq oracle rows). Produces the
+// post-RoPE `compressed_kv[n_win, hd]` consumed by the SHIPPED
+// `dsv4_dsa_index_score` kernel — so the two compose into the full indexer.
+//
+// Per reference (compress_rate m=4, index_head_dim hd=128):
+//   chunk_kv   = kv[:usable].reshape(n_win, m, 2*hd)          # kv = hs@kv_proj.T
+//   chunk_gate = (gate[:usable]+position_bias).reshape(n_win,m,2*hd)
+//   # two-series windowed lookback into 2m slots:
+//   new_kv[win]  slots [m,2m) = chunk_kv[win , :, hd:]        (Cb: current, 2nd half)
+//                slots [0,m)  = chunk_kv[win-1,:, :hd]        (Ca: previous, 1st half; 0 if win==0)
+//   new_gate[win] same layout, +position_bias; ABSENT slots = -inf
+//   pooled[win,d] = sum_k new_kv[win,k,d] * softmax_k(new_gate[win,:,d])   # over the 2m axis, per-channel
+//   compressed_prerope = RMSNorm(pooled, kv_norm)             # over hd
+//   compressed = apply_rope_interleaved(compressed_prerope, positions=win*m)  # dual-RoPE yarn
+//
+// Composability: kv/gate are the PRECOMPUTED 6-bit(mlx6) matvec outputs (mirrors
+// how dsv4_dsa_index_score takes precomputed q/ckv). inv_freq is the clean-room
+// yarn buffer (θ=160000; cos=1.0 vs the torch compress_inv_freq buffer).
+//
+// Dispatch: grid (n_win, 1, 1); one workgroup per window. BLOCK_SIZE<=64 => one
+// subgroup on GFX1013 (wave64): threads stride the hd channels; the RMSNorm
+// sum-of-squares is a single subgroupAdd (no LDS tree). hd=128 => 2 channels/lane.
+
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 0) const uint BLOCK_SIZE = 64;
+
+const uint HDMAX = 512u;   // >= max(mla.head_dim=512, index_head_dim=128); the outer
+                           // CSA/HCA compressor dispatches at head_dim=512, so 256 let
+                           // s_pooled[256..511] overflow -> pass-2 RMSNorm OOB -> ckv
+                           // corruption (on-node cos ~0.707=sqrt(0.5)). Fix from the
+                           // parallel DSA reconcile (fix/dsv4-dsa-compressor @531f349).
+
+layout(push_constant) uniform parameter {
+    uint seq_len;     // S
+    uint m;           // compress_rate (4)
+    uint head_dim;    // hd (index_head_dim = 128)
+    uint rope_dim;    // 2*n_freq: trailing channels that get RoPE'd (nope = hd-rope_dim)
+    uint n_windows;   // n_win = (S/m)
+    float rms_eps;
+} p;
+
+layout(binding = 0) readonly  buffer Kv    { float kv[];    };   // [S, 2*hd]
+layout(binding = 1) readonly  buffer Gate  { float gate[];  };   // [S, 2*hd]
+layout(binding = 2) readonly  buffer PBias { float pbias[]; };   // [m, 2*hd] position_bias
+layout(binding = 3) readonly  buffer KNorm { float knorm[]; };   // [hd] kv_norm weight
+layout(binding = 4) readonly  buffer IFreq { float ifreq[]; };   // [rope_dim/2] yarn inv_freq
+layout(binding = 5) writeonly buffer Out   { float outc[];  };   // [n_win, hd] post-RoPE
+
+shared float s_pooled[HDMAX];   // compressed_prerope (pre-norm pooled) then normed
+
+void main() {
+    const uint win  = gl_WorkGroupID.x;
+    const uint lane = gl_LocalInvocationID.x;
+    const uint m    = p.m;
+    const uint hd   = p.head_dim;
+    const uint twohd = 2u * hd;
+    const uint twom = 2u * m;
+
+    // ── pass 1: per-channel softmax-gated pool over the 2m windowed slots ────────
+    // For channel d: slots [0,m)=prev-window 1st-half (Ca), [m,2m)=cur-window 2nd-half (Cb).
+    for (uint d = lane; d < hd; d += BLOCK_SIZE) {
+        // gather the 2m (gate, kv) pairs; ABSENT (win==0 lookback) => gate=-inf
+        float g[8];   // 2m <= 8 for m<=4
+        float v[8];
+        float gmax = -3.4e38;
+        for (uint t = 0u; t < m; ++t) {
+            // slot t in [0,m): Ca lookback = previous window token t, 1st-half channel d
+            if (win >= 1u) {
+                const uint tok = (win - 1u) * m + t;
+                g[t] = gate[tok * twohd + d]           + pbias[t * twohd + d];
+                v[t] = kv[tok * twohd + d];
+            } else {
+                g[t] = -3.4e38; v[t] = 0.0;
+            }
+            // slot m+t in [m,2m): Cb current window token t, 2nd-half channel hd+d
+            const uint tokc = win * m + t;
+            g[m + t] = gate[tokc * twohd + hd + d] + pbias[t * twohd + hd + d];
+            v[m + t] = kv[tokc * twohd + hd + d];
+            gmax = max(gmax, max(g[t], g[m + t]));
+        }
+        // softmax over the 2m gates, weighted sum of v
+        float denom = 0.0, acc = 0.0;
+        for (uint k = 0u; k < twom; ++k) {
+            const float e = exp(g[k] - gmax);   // -inf slot => 0
+            denom += e;
+            acc += e * v[k];
+        }
+        s_pooled[d] = acc / denom;
+    }
+    barrier();
+
+    // ── pass 2: RMSNorm over hd (max-factored-free: pooled is well-scaled) ──────
+    float ss = 0.0;
+    for (uint d = lane; d < hd; d += BLOCK_SIZE) { ss += s_pooled[d] * s_pooled[d]; }
+    ss = subgroupAdd(ss);
+    const float inv = inversesqrt(ss / float(hd) + p.rms_eps);
+
+    // ── pass 3: normalise, apply kv_norm weight, then interleaved dual-RoPE ─────
+    // rope covers the trailing rope_dim channels; nope = [0, hd-rope_dim) untouched.
+    const uint nope = hd - p.rope_dim;
+    const float pos = float(win * m);
+    const uint obase = win * hd;
+    for (uint d = lane; d < hd; d += BLOCK_SIZE) {
+        s_pooled[d] = s_pooled[d] * inv * knorm[d];
+    }
+    barrier();
+    // RoPE pairs (2j,2j+1) within the rope region; freq j = ifreq[(d-nope)/2].
+    for (uint d = lane; d < hd; d += BLOCK_SIZE) {
+        if (d < nope) {
+            outc[obase + d] = s_pooled[d];
+        } else {
+            const uint r = d - nope;          // index within rope region
+            const uint j = r / 2u;            // freq index
+            const float ang = pos * ifreq[j];
+            const float c = cos(ang), sn = sin(ang);
+            const uint pairbase = nope + (j * 2u);
+            const float x1 = s_pooled[pairbase];      // even
+            const float x2 = s_pooled[pairbase + 1u]; // odd
+            outc[obase + d] = ((r & 1u) == 0u) ? (x1 * c - x2 * sn)
+                                               : (x2 * c + x1 * sn);
+        }
+    }
+}

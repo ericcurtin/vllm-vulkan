@@ -1,0 +1,119 @@
+#version 450
+// DeepSeek-V4-Flash Phase 2b — DSA Lightning-Indexer SCORE kernel (the load-
+// bearing indexer output that gates the sparse top-512 attention). Ports the
+// reference `DeepseekV4Indexer` score math (validated bit-exact in
+// scripts/dsv4/hc_dsa_oracle.py::indexer_fwd):
+//
+//   scores[s,head,win] = ReLU( sum_d q[s,head,d] * compressed_kv[win,d] ) * softmax_scale
+//   index_scores[s,win] = sum_head weights[s,head] * scores[s,head,win]
+//
+// (`weights` here is already weights_proj(hs) * weights_scaling; `q` and
+// `compressed_kv` are already dual-RoPE'd — those upstream stages are the 6-bit
+// matvec (Phase 2a) + the compressor-pool/RoPE deferred kernels, see the
+// continuation spec in scripts/dsv4/README / the report.)
+//
+// The causal top-512 selection with the `-1` sentinel consumes index_scores and
+// is applied by the host (a partial-sort/threshold op — the GPU top-k(512) is a
+// separate deferred kernel); the SELECTION is argmax-set-exact regardless of
+// where it runs, validated as a set-match vs the reference.
+//
+// Dispatch: grid (S, n_win, 1); one workgroup per (query s, window win). Threads
+// stride the nh heads (BLOCK_SIZE<=64 => one subgroup on GFX1013, subgroupAdd,
+// no LDS). Each head does an hd-dot over q·ckv.
+//
+// ── PRECISION TREATMENT (ITEM B: assembled-decode top-k stability) ────────────
+// The reference `indexer_topk` accumulates the hd-dot and the head-sum in fp64
+// (dsv4_dsa::indexer_topk: `dot += q as f64 * k as f64`, `acc` fp64). The score
+// itself is cos=1.0 in fp32, but the DOWNSTREAM discrete top-512 argsort is a
+// tie-sensitive decision: at real-checkpoint scale (long context, many windows)
+// fp32-vs-fp64 rounding flips which windows are selected, so block_bias — hence
+// the whole attention — DIVERGES across a multi-step decode even though each
+// per-op cos is 1.0. The cure is the SAME two-float (double-single, ~fp64-equiv)
+// carry the mHC mix-projection uses (dsv4_hyper_connection): an exact fma product
+// (twoProd) + compensated (Knuth twoSum) accumulation, per-lane then a
+// compensated combine of the 64 lane partials via LDS. Each op is an identity on
+// the already-cos=1.0 scores; it only recovers the low-order bits the discrete
+// selection needs to match the fp64 oracle. softmax_scale factors out of the sum
+// so it is applied once on the final collapse (bit-identical to per-term scaling).
+
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 0) const uint BLOCK_SIZE = 64;
+
+layout(push_constant) uniform parameter {
+    uint seq_len;       // S
+    uint n_heads;       // nh (index_n_heads = 64)
+    uint head_dim;      // hd (index_head_dim = 128)
+    uint n_windows;     // compressed length (n_win)
+    float softmax_scale;
+} p;
+
+layout(binding = 0) readonly  buffer Q    { float q[];    };   // [S, nh, hd] post-RoPE
+layout(binding = 1) readonly  buffer Ckv  { float ckv[];  };   // [n_win, hd] post-RoPE
+layout(binding = 2) readonly  buffer W    { float wgt[];  };   // [S, nh] (*weights_scaling)
+layout(binding = 3) writeonly buffer Out  { float outs[]; };   // [S, n_win]
+
+// two-float (double-single) lane partials for the compensated head reduction
+shared float p_hi[64];
+shared float p_lo[64];
+
+// Knuth/Møller compensated 2-sum: s = a+b exactly represented as (s,e).
+void twoSum(float a, float b, out float s, out float e) {
+    s = a + b;
+    float bb = s - a;
+    e = (a - (s - bb)) + (b - bb);
+}
+// Exact fp32 product a*b as (p,e) via FMA (GFX1013 has native fma).
+void twoProd(float a, float b, out float pr, out float e) {
+    pr = a * b;
+    e = fma(a, b, -pr);
+}
+// Accumulate the two-float value (xhi,xlo) into the running two-float (hi,lo).
+void dfAdd(inout float hi, inout float lo, float xhi, float xlo) {
+    float s, e; twoSum(hi, xhi, s, e);
+    e += lo + xlo;
+    float s2, e2; twoSum(s, e, s2, e2);
+    hi = s2; lo = e2;
+}
+
+void main() {
+    const uint s    = gl_WorkGroupID.x;
+    const uint win  = gl_WorkGroupID.y;
+    const uint lane = gl_LocalInvocationID.x;
+    const uint nh = p.n_heads;
+    const uint hd = p.head_dim;
+    const uint ckv_base = win * hd;
+
+    // per-lane two-float accumulation of this lane's strided heads
+    float acc_hi = 0.0, acc_lo = 0.0;
+    for (uint head = lane; head < nh; head += BLOCK_SIZE) {
+        const uint qb = (s * nh + head) * hd;
+        // two-float hd-dot: exact products + compensated sum (mirrors the fp64 oracle)
+        float dhi = 0.0, dlo = 0.0;
+        for (uint dd = 0u; dd < hd; ++dd) {
+            float pr, ee; twoProd(q[qb + dd], ckv[ckv_base + dd], pr, ee);
+            dfAdd(dhi, dlo, pr, ee);
+        }
+        // ReLU on the faithfully-rounded dot (dhi is the fp64-equivalent value's
+        // high word; positivity of the pair == positivity of the true sum).
+        const bool pos = (dhi > 0.0) || (dhi == 0.0 && dlo > 0.0);
+        if (pos) {
+            const float w = wgt[s * nh + head];
+            // contribution = w * (dhi + dlo), kept as a two-float
+            float chi, cle; twoProd(w, dhi, chi, cle);
+            cle = fma(w, dlo, cle);
+            dfAdd(acc_hi, acc_lo, chi, cle);
+        }
+    }
+    p_hi[lane] = acc_hi; p_lo[lane] = acc_lo;
+    barrier();
+    // lane 0 compensated-combines the 64 lane partials (still two-float), then
+    // applies softmax_scale on the final collapse (factors out of the sum).
+    if (subgroupElect()) {
+        float ahi = 0.0, alo = 0.0;
+        for (uint k = 0u; k < BLOCK_SIZE; ++k) { dfAdd(ahi, alo, p_hi[k], p_lo[k]); }
+        outs[s * p.n_windows + win] = (ahi + alo) * p.softmax_scale;
+    }
+}

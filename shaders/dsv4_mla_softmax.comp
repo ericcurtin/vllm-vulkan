@@ -1,0 +1,134 @@
+#version 450
+// DeepSeek-V4-Flash M2b — resident single-token MLA eager-attention softmax.
+//
+// The GPU twin of the decode eager-attention core in
+// `dsv4_gpu::attention_layer_decode` (the argmax-11111 oracle), for ONE query at
+// absolute position `pos` (seq=1 decode). Reproduces, per attention head:
+//   * per-head attn SINK (a virtual key whose logit == sinks[hh], value == 0,
+//     participating in the softmax max/denominator but not the output),
+//   * SLIDING-window causal mask over the S sliding KV rows
+//     (visible iff qpos - ti < sliding_window),
+//   * the concatenated COMPRESSED KV rows (CSA/HCA) with an additive
+//     `block_bias` (0 visible / -inf hidden),
+//   * K==V single-shared-head broadcast to all query heads,
+//   * the trailing output-rope CONJUGATE (-sin) on the `rope_dim` channels.
+//
+// q/kv are already RMSNorm'd + q/kv-rope'd host-side (the on-node-validated
+// resident RMSNorm/RoPE recorders feed these); this kernel is ONLY the
+// softmax+weighted-V+output-rope block, exactly what stays host today.
+//
+// ONE WORKGROUP PER HEAD (grid.x = num_heads). local_size_x = 64 => one wave64
+// subgroup on GFX1013, so the hd-dot is a subgroupAdd with no LDS tree. Online
+// (flash-style) softmax so no per-key logit storage is needed (the sliding + the
+// compressed key counts both grow with context).
+
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+const uint BLOCK = 64u;
+const uint HDMAX = 512u; // head_dim cap (real = 512)
+
+layout(push_constant) uniform parameter {
+    uint num_heads;       // nh
+    uint head_dim;        // hd
+    uint t1;              // sliding KV rows (== pos+1)
+    uint t_comp;          // compressed KV rows (0 for sliding layers)
+    uint sliding_window;  // sw
+    uint rope_dim;        // rotated trailing channels (== 2*half)
+    float scaling;        // (hd)^-0.5
+} p;
+
+layout(binding = 0) readonly  buffer Q     { float q[]; };      // [nh*hd] post q-rope
+layout(binding = 1) readonly  buffer KVs   { float kvs[]; };    // [t1*hd] sliding K==V
+layout(binding = 2) readonly  buffer CKV   { float ckv[]; };    // [t_comp*hd] compressed K==V
+layout(binding = 3) readonly  buffer BB    { float bb[]; };     // [t_comp] additive block_bias
+layout(binding = 4) readonly  buffer Sinks { float sinks[]; };  // [nh]
+layout(binding = 5) readonly  buffer CosB  { float cosb[]; };   // [rope_dim/2]
+layout(binding = 6) readonly  buffer SinB  { float sinb[]; };   // [rope_dim/2]
+layout(binding = 7) writeonly buffer Out   { float ao[]; };     // [nh*hd] attn out (post o-rope)
+
+shared float sao[HDMAX];
+
+void main() {
+    const uint hh   = gl_WorkGroupID.x;
+    const uint lane = gl_LocalInvocationID.x;
+    const uint hd   = p.head_dim;
+    const uint t1   = p.t1;
+    const uint tc   = p.t_comp;
+    const uint total = t1 + tc;
+    const uint qpos = t1 - 1u;
+    const uint qbase = hh * hd;
+
+    // Online softmax with the sink as the initial virtual key (logit=sink, val=0).
+    float run_max = sinks[hh];
+    float run_den = 1.0;               // exp(sink - run_max) == 1
+    float acc[HDMAX / BLOCK];          // per-lane d-slice accumulator (hd/64 entries)
+    const uint slots = (hd + BLOCK - 1u) / BLOCK;
+    for (uint s = 0u; s < slots; ++s) acc[s] = 0.0;
+
+    for (uint ti = 0u; ti < total; ++ti) {
+        // additive mask m (skip when hidden).
+        bool visible;
+        float m;
+        if (ti < t1) {
+            // sliding causal: visible iff qpos - ti < sw.
+            visible = (qpos - ti) < p.sliding_window;
+            m = 0.0;
+        } else {
+            float b = bb[ti - t1];
+            visible = b > -1.0e30;      // -inf encodes hidden
+            m = 0.0;                    // visible block_bias is exactly 0.0
+        }
+        if (!visible) continue;
+
+        // hd-dot(q_head, k_ti) via subgroup reduction (k in the sliding or compressed plane).
+        float part = 0.0;
+        for (uint d = lane; d < hd; d += BLOCK) {
+            float kv = (ti < t1) ? kvs[ti * hd + d] : ckv[(ti - t1) * hd + d];
+            part += q[qbase + d] * kv;
+        }
+        float dot = subgroupAdd(part);
+        float l = dot * p.scaling + m;
+
+        // online update (uniform run_max/run_den across the subgroup).
+        float new_max = max(run_max, l);
+        float corr = exp(run_max - new_max);
+        float w = exp(l - new_max);
+        run_den = run_den * corr + w;
+        for (uint s = 0u; s < slots; ++s) {
+            uint d = lane + s * BLOCK;
+            if (d < hd) {
+                float v = (ti < t1) ? kvs[ti * hd + d] : ckv[(ti - t1) * hd + d];
+                acc[s] = acc[s] * corr + w * v;
+            }
+        }
+        run_max = new_max;
+    }
+
+    // normalise + stage into shared for the output-rope pass.
+    float invden = 1.0 / run_den;
+    for (uint s = 0u; s < slots; ++s) {
+        uint d = lane + s * BLOCK;
+        if (d < hd) sao[d] = acc[s] * invden;
+    }
+    barrier();
+
+    // output-rope conjugate (-sin) on the trailing rope_dim channels, interleaved
+    // pairs (nope+2i, nope+2i+1). Single position => cos/sin index by pair i.
+    const uint nhalf = p.rope_dim / 2u;
+    const uint nope = hd - p.rope_dim;
+    for (uint i = lane; i < nhalf; i += BLOCK) {
+        float c = cosb[i];
+        float sn = -sinb[i];            // conjugate
+        float a = sao[nope + 2u * i];
+        float b = sao[nope + 2u * i + 1u];
+        sao[nope + 2u * i]      = a * c - b * sn;
+        sao[nope + 2u * i + 1u] = b * c + a * sn;
+    }
+    barrier();
+
+    for (uint d = lane; d < hd; d += BLOCK) {
+        ao[qbase + d] = sao[d];
+    }
+}
