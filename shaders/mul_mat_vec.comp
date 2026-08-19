@@ -7,7 +7,13 @@
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
-#if !defined(DATA_A_F32) && !defined(DATA_A_F16) && !defined(DATA_A_BF16)
+// The K_PER_ITER==8 path calls dequantize4() (vec4) + folds d/min via get_dm().
+// The K-quant types (Q2_K..Q6_K) in dequant_funcs.glsl only provide the vec2
+// dequantize() that already returns fully-scaled weights (get_dm()==vec2(1,0)),
+// so they must use the K_PER_ITER==2 path. F32/F16/BF16 also use ==2.
+#if !defined(DATA_A_F32) && !defined(DATA_A_F16) && !defined(DATA_A_BF16) && \
+    !defined(DATA_A_Q2_K) && !defined(DATA_A_Q3_K) && !defined(DATA_A_Q4_K) && \
+    !defined(DATA_A_Q5_K) && !defined(DATA_A_Q6_K)
 #define K_PER_ITER 8
 #else
 #define K_PER_ITER 2
@@ -16,71 +22,155 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 uint a_offset, b_offset, d_offset, y_offset;
 
+// Column-batched dequant matvec (Design C flip primitive).
+//
+// The loop nest is ROW-outer / COLUMN-inner so each weight block is READ +
+// DEQUANTIZED **once per output row** and then MAC'd across all NUM_COLS
+// token-columns. `col`/`iqs`/`iybs` and the weight `ib`/dequant depend only on
+// (row, k), never on the column j, so the original column-outer nest recomputed
+// the dequant NUM_COLS times (the ALU redundancy §3 of the review). Hoisting it
+// out of j is BIT-NEUTRAL: every temp[j][n] still receives the identical
+// dot/fma/scale operations in the identical accumulation order across the outer
+// `i` iterations — only the dequant is computed once and shared. NUM_COLS==1
+// (the decode path) collapses to a single-iteration inner loop, byte-identical
+// to the pre-reorder decode kernel. The B (activation) values, which DO depend
+// on j, are prefetched into a per-column register array first.
 void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint tid, const uint i, bool lastiter)
 {
-    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-        const uint col = i*BLOCK_SIZE + K_PER_ITER*tid;
-        const uint iqs = (col%QUANT_K)/QUANT_R; // quant index
-        const uint iybs = col - col%QUANT_K; // y block start index
+    const uint col = i*BLOCK_SIZE + K_PER_ITER*tid;
+    const uint iqs = (col%QUANT_K)/QUANT_R; // quant index
+    const uint iybs = col - col%QUANT_K; // y block start index
 
 #if K_PER_ITER == 8
+    // Prefetch the B vec4 pairs for every token-column into a register array,
+    // but ONLY for NUM_COLS <= 4 (the COLS4_PREFETCH register gate). NUM_COLS is
+    // a SPECIALIZATION constant (constant_id=2, mul_mat_vec_base.glsl), NOT a
+    // preprocessor macro, so this MUST be a spec-constant runtime guard, not a
+    // `#if NUM_COLS <= 4` — the preprocessor would see NUM_COLS as undefined (0)
+    // and the `#if` would be inert (always true), gating nothing. Because the
+    // guard is a spec constant, ACO resolves it at pipeline-compile time (folds
+    // the branch, DCEs the untaken side), and the arrays are sized by a
+    // spec-constant expression: for NUM_COLS>4 they collapse to length 1 and are
+    // never filled/read, so cols 5-8 pay ZERO extra VGPRs for them (the length-
+    // NUM_COLS array pushes VGPRs 44->84 at cols=8, halving waves/SIMD). At
+    // NUM_COLS>4 B is read inline in the inner loop instead. The dequant-once
+    // hoist is preserved for ALL column counts; only the B-fetch strategy is
+    // gated. Bit-identical either way: same dot() operands, same accumulation
+    // order. NUM_COLS==1 (decode) keeps the length-1 prefetch path unchanged.
+    vec4 bv0[NUM_COLS <= 4 ? NUM_COLS : 1];
+    vec4 bv1[NUM_COLS <= 4 ? NUM_COLS : 1];
+    if (NUM_COLS <= 4) {
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
 #if QUANT_R == 2
-        const vec4 bv02 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4]);
-        const vec4 bv13 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs + y_offset) / 4]);
-        const vec4 bv0 = vec4(bv02.x, bv13.x, bv02.y, bv13.y);
-        const vec4 bv1 = vec4(bv02.z, bv13.z, bv02.w, bv13.w);
+            const vec4 bv02 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4]);
+            const vec4 bv13 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs + y_offset) / 4]);
+            bv0[j] = vec4(bv02.x, bv13.x, bv02.y, bv13.y);
+            bv1[j] = vec4(bv02.z, bv13.z, bv02.w, bv13.w);
 #else
-        const vec4 bv0 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4]);
-        const vec4 bv1 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4 + 1]);
+            bv0[j] = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4]);
+            bv1[j] = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4 + 1]);
 #endif
-#else
-        // Check if the second of the pair of elements is OOB, and don't fetch B or
-        // accumulate it. We still fetch a pair of elements for A, which is fine for
-        // quantized formats since they'll be within the same block. We should
-        // probably skip fetching the second element for F16/F32, but as of now we
-        // still do.
-        const bool OOB = lastiter && (iybs + iqs + y_offset >= p.ncols);
-
-        FLOAT_TYPE b0 = 0, b1 = 0;
-        b0 = FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs]);
-        if (!OOB) {
-            b1 = FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs + y_offset]);
         }
+    }
+
+    uint ibi = first_row*p.ncols;
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        const uint ib = (ibi + col)/QUANT_K; // block index
+        ibi += p.ncols;
+
+        // Dequantize this weight row ONCE; reuse across all NUM_COLS columns.
+        vec4 v = dequantize4(ib, iqs, a_offset);
+        vec4 v2 = dequantize4(ib, iqs+(4/QUANT_R), a_offset);
+
+        const vec2 dm = get_dm(ib, a_offset);
+        if (dm.y != 0) { // quant has min component
+            v = v * dm.x + dm.y;
+            v2 = v2 * dm.x + dm.y;
+        }
+
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            // B is prefetched (cols<=4) or read inline (cols>4, register gate);
+            // the vec4 operands are identical either way -> bit-exact.
+            vec4 lbv0, lbv1;
+            if (NUM_COLS <= 4) {
+                lbv0 = bv0[j];
+                lbv1 = bv1[j];
+            } else {
+#if QUANT_R == 2
+                const vec4 bv02 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4]);
+                const vec4 bv13 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs + y_offset) / 4]);
+                lbv0 = vec4(bv02.x, bv13.x, bv02.y, bv13.y);
+                lbv1 = vec4(bv02.z, bv13.z, bv02.w, bv13.w);
+#else
+                lbv0 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4]);
+                lbv1 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4 + 1]);
 #endif
-        uint ibi = first_row*p.ncols;
-        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
-            const uint ib = (ibi + col)/QUANT_K; // block index
-            ibi += p.ncols;
-
-#if K_PER_ITER == 8
-            vec4 v = dequantize4(ib, iqs, a_offset);
-            vec4 v2 = dequantize4(ib, iqs+(4/QUANT_R), a_offset);
-
-            const vec2 dm = get_dm(ib, a_offset);
-            if (dm.y != 0) { // quant has min component
-                v = v * dm.x + dm.y;
-                v2 = v2 * dm.x + dm.y;
             }
-
             // matrix multiplication
-            FLOAT_TYPE rowtmp = dot(bv0, v);
-            rowtmp += dot(bv1, v2);
+            FLOAT_TYPE rowtmp = dot(lbv0, v);
+            rowtmp += dot(lbv1, v2);
 
             if (dm.y == 0)
                 rowtmp *= dm.x;
 
             temp[j][n] += rowtmp;
-#else
-            const vec2 v = dequantize(ib, iqs, a_offset);
-
-            // matrix multiplication
-            temp[j][n] = fma(FLOAT_TYPE(v.x), b0, temp[j][n]);
-            if (!OOB) {
-                temp[j][n] = fma(FLOAT_TYPE(v.y), b1, temp[j][n]);
-            }
-#endif
         }
     }
+#else
+    // Check if the second of the pair of elements is OOB, and don't fetch B or
+    // accumulate it. We still fetch a pair of elements for A, which is fine for
+    // quantized formats since they'll be within the same block. We should
+    // probably skip fetching the second element for F16/F32, but as of now we
+    // still do. (OOB depends only on col, so it is shared across all columns.)
+    const bool OOB = lastiter && (iybs + iqs + y_offset >= p.ncols);
+
+    // Prefetch the B scalar pair for every token-column, gated on NUM_COLS <= 4
+    // (see the COLS4_PREFETCH register-gate note on the K_PER_ITER==8 path
+    // above: NUM_COLS is a spec constant, so this is a folded runtime guard with
+    // a spec-const-sized array, NOT a preprocessor `#if`). The live f16 batched
+    // verify (mul_mat_vec_f16_f32_f32) is a K_PER_ITER==2 shader, so cols=8 hits
+    // THIS path too. cols>4 reads B inline below; bit-identical either way.
+    FLOAT_TYPE b0[NUM_COLS <= 4 ? NUM_COLS : 1];
+    FLOAT_TYPE b1[NUM_COLS <= 4 ? NUM_COLS : 1];
+    if (NUM_COLS <= 4) {
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            b0[j] = FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs]);
+            b1[j] = FLOAT_TYPE(0);
+            if (!OOB) {
+                b1[j] = FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs + y_offset]);
+            }
+        }
+    }
+
+    uint ibi = first_row*p.ncols;
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        const uint ib = (ibi + col)/QUANT_K; // block index
+        ibi += p.ncols;
+
+        // Dequantize this weight pair ONCE; reuse across all NUM_COLS columns.
+        const vec2 v = dequantize(ib, iqs, a_offset);
+
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            // B is prefetched (cols<=4) or read inline (cols>4); identical values.
+            FLOAT_TYPE lb0, lb1;
+            if (NUM_COLS <= 4) {
+                lb0 = b0[j];
+                lb1 = b1[j];
+            } else {
+                lb0 = FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs]);
+                lb1 = FLOAT_TYPE(0);
+                if (!OOB) {
+                    lb1 = FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs + y_offset]);
+                }
+            }
+            // matrix multiplication
+            temp[j][n] = fma(FLOAT_TYPE(v.x), lb0, temp[j][n]);
+            if (!OOB) {
+                temp[j][n] = fma(FLOAT_TYPE(v.y), lb1, temp[j][n]);
+            }
+        }
+    }
+#endif
 }
 
 void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {

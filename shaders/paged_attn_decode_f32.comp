@@ -28,14 +28,24 @@ layout(push_constant) uniform parameter {
     uint plane_elements_per_block;
     uint block_elements;
     float scale;
+    uint window_start;   // first token_idx to attend (sliding window; 0 = full causal)
+    uint ring_capacity;  // 0 = absolute block-table addressing (legacy, byte-identical);
+                         // >0 = window-sized RING plane, slot = token_idx % ring_capacity
 } p;
 
 uint kv_base_for_token(uint token_idx, uint kv_head) {
+    const uint elements_per_token = p.num_kv_heads * p.head_size;
+    // Ring plane for sliding-window layers (see paged_attn_decode_f32_sg.comp).
+    if (p.ring_capacity != 0u) {
+        const uint slot = token_idx % p.ring_capacity;
+        return p.layer_base_elements +
+            slot * elements_per_token +
+            kv_head * p.head_size;
+    }
     const uint logical_block_id = token_idx / p.block_size;
     const uint token_offset_in_block =
         token_idx - logical_block_id * p.block_size;
     const uint physical_block_id = blocks[logical_block_id];
-    const uint elements_per_token = p.num_kv_heads * p.head_size;
     return p.layer_base_elements +
         physical_block_id * p.block_elements +
         token_offset_in_block * elements_per_token +
@@ -60,7 +70,7 @@ void main() {
     float running_max = -3.402823466e+38;
     float denom = 0.0;
     float acc = 0.0;
-    for (uint token_idx = 0; token_idx < p.seq_len; token_idx++) {
+    for (uint token_idx = p.window_start; token_idx < p.seq_len; token_idx++) {
         const uint kv_base = kv_base_for_token(token_idx, kv_head);
         float dot = 0.0;
         for (uint d = 0; d < p.head_size; d++) {

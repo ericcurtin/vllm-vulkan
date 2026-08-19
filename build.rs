@@ -15,7 +15,21 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=shaders/");
+    println!("cargo:rerun-if-changed=scripts/compile_shaders.sh");
+    // Watch only shader SOURCES, not the spirv/ output subdir (watching the
+    // whole shaders/ dir would self-trigger rebuilds from the compiled output).
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+    if let Ok(entries) = fs::read_dir(Path::new(&manifest_dir).join("shaders")) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            match p.extension().and_then(|e| e.to_str()) {
+                Some("comp") | Some("glsl") => {
+                    println!("cargo:rerun-if-changed={}", p.display());
+                }
+                _ => {}
+            }
+        }
+    }
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
@@ -38,7 +52,6 @@ fn main() {
 fn compile_shaders() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let out_dir = env::var("OUT_DIR").unwrap();
-    let spirv_src = Path::new(&manifest_dir).join("shaders").join("spirv");
     let out_spirv = Path::new(&out_dir).join("spirv");
 
     fs::create_dir_all(&out_spirv).expect("failed to create OUT_DIR/spirv");
@@ -85,18 +98,133 @@ fn compile_shaders() {
         }
     }
 
-    // Also copy to shaders/spirv/ so they're available for subsequent builds
-    // without re-running the shader compiler.
-    fs::create_dir_all(&spirv_src).ok();
-    for entry in fs::read_dir(&out_spirv).unwrap().flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("spv") {
-            let dst = spirv_src.join(path.file_name().unwrap());
-            if !dst.exists() {
-                fs::copy(&path, &dst).ok();
-            }
-        }
+    stamp_glslang_version(&out_spirv);
+    generate_registry(&out_spirv);
+}
+
+// ─── Shader registry generation (H5) ──────────────────────────────────────────
+//
+// Single source of truth for (a) which shaders are registered, (b) their
+// bytes, and (c) their pipeline class. Consumed by `src/lib.rs`
+// (`include_all_shaders`) and `src/pipeline.rs` (`PipelineCache::new`) via
+// `include!(concat!(env!("OUT_DIR"), "/shader_registry.rs"))`.
+
+/// Compiled-but-intentionally-unregistered shaders (present in
+/// `scripts/compile_shaders.sh` output, but never referenced from `src/`).
+const SKIP: &[&str] = &[
+    "div_f32_f32_f32",
+    "sub_f32_f32_f32",
+    // Design A quant tiled-GEMM (PREFILL/M6) — compiled + verified but not yet
+    // registered: they need BK=32 (spec constant_id 3) + a quant-aware prefill
+    // dispatch, not the f16 MulMm class's BK=16 compile. See
+    // scripts/compile_shaders.sh (Design A block) + quant-batched-matmul-impl.md.
+    "matmul_q8_0_f32_fp32",
+    "matmul_q4_k_f32_fp32",
+    "matmul_q6_k_f32_fp32",
+];
+
+/// Registered alias name -> source `.spv` stem whose bytes it reuses.
+/// (Gemma4 head_dim variants share the same flash_attn_f32_f16_f32 SPIR-V;
+/// registered under distinct names so PipelineCache::new's flash_attn_ prefix
+/// routing picks HSK/HSV=256/512 from the "_hs256"/"_hs512" suffix.)
+const ALIASES: &[(&str, &str)] = &[
+    ("flash_attn_f32_f16_f32_hs256", "flash_attn_f32_f16_f32"),
+    ("flash_attn_f32_f16_f32_hs512", "flash_attn_f32_f16_f32"),
+];
+
+/// Mirrors `PipelineCache::new`'s name-based routing in src/pipeline.rs
+/// EXACTLY (same order, same predicates) so the generated class always
+/// matches what the runtime dispatch would have picked.
+fn class_of(name: &str) -> &'static str {
+    if name == "rms_norm_f32" {
+        "RmsNorm"
+    } else if name.ends_with("_subgroup") {
+        "MatvecSubgroup"
+    } else if name.starts_with("mul_mat_vec_") {
+        "Matvec"
+    } else if name.starts_with("matmul_") {
+        "MulMm"
+    } else if name.starts_with("flash_attn_") {
+        "Flash"
+    } else {
+        "Plain"
     }
+}
+
+fn generate_registry(out_spirv: &Path) {
+    let out_dir = env::var("OUT_DIR").unwrap();
+
+    let mut stems: Vec<String> = fs::read_dir(out_spirv)
+        .expect("read_dir OUT_DIR/spirv")
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("spv") {
+                path.file_stem().map(|s| s.to_string_lossy().into_owned())
+            } else {
+                None
+            }
+        })
+        .filter(|stem| !SKIP.contains(&stem.as_str()))
+        .collect();
+    stems.sort(); // deterministic generated output
+
+    let mut out = String::new();
+    out.push_str(
+        "pub static SHADER_REGISTRY: &[(&str, crate::pipeline::ShaderClass, &[u8])] = &[\n",
+    );
+    for stem in &stems {
+        let class = class_of(stem);
+        let spv_path = out_spirv.join(format!("{stem}.spv"));
+        out.push_str(&format!(
+            "    (\"{stem}\", crate::pipeline::ShaderClass::{class}, include_bytes!(r\"{}\")),\n",
+            spv_path.display()
+        ));
+    }
+    for (alias, source) in ALIASES {
+        assert!(
+            stems.iter().any(|s| s == source),
+            "H5 registry: alias '{alias}' source stem '{source}' not among compiled shaders"
+        );
+        // Aliases route through the same class rule as their own name (the
+        // "_hsNNN" suffix still matches the flash_attn_ prefix).
+        let class = class_of(alias);
+        let spv_path = out_spirv.join(format!("{source}.spv"));
+        out.push_str(&format!(
+            "    (\"{alias}\", crate::pipeline::ShaderClass::{class}, include_bytes!(r\"{}\")),\n",
+            spv_path.display()
+        ));
+    }
+    out.push_str("];\n");
+
+    fs::write(Path::new(&out_dir).join("shader_registry.rs"), out)
+        .expect("write OUT_DIR/shader_registry.rs");
+}
+
+// Version stamp + warning is the pragmatic first step; a fully pinned shaderc
+// build-dep is future hardening (H5-full territory).
+const EXPECTED_GLSLANG: &str = "11:16.3.0"; // pin: update deliberately
+
+fn stamp_glslang_version(out_spirv: &Path) {
+    let ver = Command::new("glslangValidator")
+        .arg("--version")
+        .output()
+        .ok()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string()
+        })
+        .unwrap_or_default();
+    if !ver.contains(EXPECTED_GLSLANG) {
+        println!(
+            "cargo:warning=vllm-vulkan: glslangValidator '{ver}' != pinned '{EXPECTED_GLSLANG}'; \
+             embedded SPIR-V may differ across hosts"
+        );
+    }
+    fs::write(out_spirv.join("GLSLANG_VERSION.txt"), ver).ok();
 }
 
 // ─── macOS ────────────────────────────────────────────────────────────────────

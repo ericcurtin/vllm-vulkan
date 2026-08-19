@@ -12,8 +12,63 @@ build = "build.rs"
 name = "_rs"
 crate-type = ["cdylib"]
 
+# -----------------------------------------------------------------------------
+# FOUNDATION BRANCH — PR1 of the vllm-vulkan upstreaming stack.
+#
+# This branch is the model-free Vulkan compute engine + shared runtime. `default`
+# therefore builds WITHOUT any model — it is exactly the same slice as
+# `cargo build --no-default-features --features "multiple-pymethods"`.
+#
+# The per-model feature flags below are declared as stack scaffolding; each
+# model's module(s) + shaders land in that model's own follow-up PR, which
+# enables the corresponding feature. Enabling a model feature on THIS branch
+# alone fails by design (its module is absent). Feature dependency edges:
+#   * mtp     -> qwen35   (the qwen3.5 MTP/spec draft head builds on qwen35)
+#   * laguna  -> nemotron (reuses nemotron's MoE router + quant types)
+#   * kimi / ling are independent of each other.
+# -----------------------------------------------------------------------------
+[features]
+default = ["multiple-pymethods"]
+
+# `multiple-pymethods` is exposed as a CRATE feature (forwarding to pyo3's own
+# `multiple-pymethods`) so the minimal foundation build can request it
+# explicitly via `--features "multiple-pymethods"`. It splits the many
+# `#[pymethods]` blocks across per-model files (the Phase A pyseam refactor).
+multiple-pymethods = ["pyo3/multiple-pymethods"]
+
+# `debug-api` gates src/debug_api.rs (the internal oracle/parity validators) so
+# the foundation builds WITHOUT it — a prerequisite for an upstream carve that
+# omits debug_api.rs. Default-on locally so the full test suite still runs.
+# NOTE: debug_api.rs exercises every model's reference forward, so it is only
+# ever built under `default` (where all models are present). Combining
+# `debug-api` with a strict model SUBSET is not a supported configuration.
+debug-api = []
+
+# Per-model slices. Each gates its model's module(s), its `VulkanModel` field,
+# its `new()` arch-dispatch arm, its pyclass/pyseam registration, and every
+# model-specific item that lives in an otherwise-foundation file
+# (model.rs / tp.rs / unified_layer.rs / batched_forward.rs / moe.rs).
+gemma = []
+qwen35 = []
+nemotron = []
+# laguna reuses nemotron's MoE `router_forward`/`RouterDims` + `NemGpuWeight`/
+# `NemQuant` quant types (laguna.rs / laguna_gpu.rs / laguna_loader.rs).
+laguna = ["nemotron"]
+ling = []
+kimi = []
+step3p7 = []
+dsv4 = []
+mtp = ["qwen35"]
+
 [dependencies]
-pyo3 = { version = "0.21", features = ["extension-module"] }
+# extension-module is applied at wheel-build time via [tool.maturin] features
+# in pyproject.toml. Leaving it OFF here lets `cargo test` link libpython, so
+# Rust-native tests may reach #[pymethods]-adjacent code paths (e.g. the GIL
+# helpers behind ComputeEngine submits) without undefined Python symbols.
+# `multiple-pymethods` is NOT enabled inline here — it is forwarded through the
+# crate feature of the same name (see [features]), which `default` turns on. A
+# plain build therefore still gets pyo3/multiple-pymethods exactly as before.
+pyo3 = { version = "0.21" }
 parking_lot = "0.12"
 thiserror = "2.0"
 log = "0.4"
@@ -24,12 +79,22 @@ ash = { version = "0.38", features = ["loaded"] }
 bytemuck = { version = "1.14", features = ["derive"] }
 # SafeTensors weight loading
 safetensors = "0.4"
+# JSON parsing for model config.json (architecture detection)
+serde_json = "1.0"
 # Memory-mapped file I/O (zero-copy weight loading)
 memmap2 = "0.9"
 # Half-precision float support (bfloat16)
 half = { version = "2.3", features = ["num-traits"] }
+# mlock(2) to pin host-coherent GPU weight pages against reclaim/swap on the
+# UMA APU (silent GTT-corruption fix; already a transitive dep, pinned here).
+libc = "0.2"
 # SIMD-optimized matrix multiplication (uses NEON on ARM)
 matrixmultiply = "0.3"
+# Data-parallel iterators (GatedDeltaNet per-head recurrence across CPU cores)
+rayon = "1.10"
+# Runtime dlopen of libvccl.so for the native collective FFI (mirrors ash's
+# libvulkan dlopen — no link-time dep, so the Mac cross-build needs no libvccl)
+libloading = "0.8"
 
 [build-dependencies]
 # No additional build deps needed; build.rs uses std::process::Command
