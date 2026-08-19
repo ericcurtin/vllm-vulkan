@@ -1,0 +1,65 @@
+#version 450
+
+// Qwen3.6 MoE PREFILL tail, BATCHED over all T tokens and a runtime top_k:
+// score-weighted routed-expert combine + sigmoid-gated shared-expert add, in
+// ONE dispatch (plan-epilogue-fused-moe-gemm.md Phase 3 / §5 "down-combine").
+//
+// Replaces the host rayon combine at the tail of
+// `qwen35_moe_mlp_prefill_gpu_grouped` so the grouped MoE prefill produces
+// out[T,h] entirely on-GPU: the [T,top_k,h] `down_out` never leaves VRAM (host
+// readback drops 16384 -> 2048 f/token) and the O(T*top_k*h) host reduction is
+// gone. This is a GATHER-reduce (each out[ti,m] is written by exactly ONE
+// thread, reducing over that token's top_k contiguous `down_out` rows) — NO
+// scatter-add, so it needs NO float atomics (unverified on RADV GFX1013) and
+// is deterministic: the slot-0..top_k reduction order is fixed, bit-for-bit
+// the same accumulation the host loop did, so cos == 1.0 vs the Phase 1+2
+// (host-combine) path holds. Uses NO shared memory (LDS = 0 B).
+//
+// Distinct from `q35_moe_accum.comp` (the WS3 DECODE tail): that one is a
+// single-token, top_k==8-hardcoded kernel with 8 separate d0..d7 bindings and
+// a fused residual add; this one is batched over T with a runtime top_k, reads
+// the contiguous [T,top_k,h] down buffer the grouped GEMM scattered, and does
+// NOT add the residual (the prefill grouped path adds it at the caller).
+//
+// Layouts (all f32, row-major):
+//   down_out [T, top_k, h]   (ti*top_k + slot)*h + m
+//   scores   [T, top_k]      ti*top_k + slot
+//   shared   [T, h]          ti*h + m
+//   logits   [T]             ti
+//   out      [T, h]          ti*h + m
+// The only non-bit-exact op vs libm is exp() in the sigmoid (last ulp) — the
+// SAME op the host `1/(1+exp(-logit))` and `q35_moe_accum.comp` use.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint n_out;   // total output elements = T*h (thread bound)
+    uint h;       // hidden size (row stride of out/shared)
+    uint top_k;   // routed experts per token
+};
+
+layout(binding = 0) readonly  buffer DOWN   { float down_out[]; }; // [T,top_k,h]
+layout(binding = 1) readonly  buffer SCORES { float scores[]; };   // [T,top_k]
+layout(binding = 2) readonly  buffer SHARED { float shared_out[]; };// [T,h]
+layout(binding = 3) readonly  buffer LOGITS { float logits[]; };   // [T]
+layout(binding = 4) writeonly buffer OUTB   { float outb[]; };     // [T,h]
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= n_out) {
+        return;
+    }
+    const uint ti = i / h;
+    const uint m  = i - ti * h;
+
+    const uint sc_base   = ti * top_k;
+    const uint down_base = sc_base * h + m;   // (ti*top_k + 0)*h + m
+
+    float acc = 0.0;
+    // Fixed slot-ascending reduction order == the host loop's order -> cos=1.0.
+    for (uint slot = 0u; slot < top_k; slot++) {
+        acc += scores[sc_base + slot] * down_out[down_base + slot * h];
+    }
+    acc += (1.0 / (1.0 + exp(-logits[ti]))) * shared_out[i];
+    outb[i] = acc;
+}

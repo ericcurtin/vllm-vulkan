@@ -1,0 +1,43 @@
+#version 450
+
+// Qwen3.6 GatedDeltaNet decode-step depthwise causal conv1d + SiLU (WS1b).
+//
+// One thread per channel `c` of conv_dim. Mirrors the CPU reference in
+// `Qwen35Model::delta_net` / `qwen35_delta_net_gpu` EXACTLY (same multiply/add
+// order per channel), including the sliding-window state shift:
+//   acc = sum_{t<win} conv_state[c,t] * w[c,t] + qkv[c] * w[c,win]
+//   conv_out[c] = silu(acc)
+//   conv_state[c, 0..win-1] = conv_state[c, 1..win]; conv_state[c, win-1] = qkv[c]
+// (win = kern-1; the only non-bit-exact op vs libm is exp() in the SiLU.)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint conv_dim;
+    uint kern;
+};
+
+layout(binding = 0) readonly buffer WBuf { float conv_w[]; };     // [conv_dim, kern]
+layout(binding = 1) readonly buffer XBuf { float qkv[]; };        // [conv_dim]
+layout(binding = 2) buffer SBuf { float conv_state[]; };          // [conv_dim, kern-1]
+layout(binding = 3) writeonly buffer OBuf { float conv_out[]; };  // [conv_dim]
+
+void main() {
+    const uint c = gl_GlobalInvocationID.x;
+    if (c >= conv_dim) {
+        return;
+    }
+    const uint win = kern - 1u;
+    float acc = 0.0;
+    for (uint t = 0u; t < win; t++) {
+        acc += conv_state[c * win + t] * conv_w[c * kern + t];
+    }
+    acc += qkv[c] * conv_w[c * kern + win];
+    conv_out[c] = acc / (1.0 + exp(-acc)); // silu
+    if (win > 0u) {
+        for (uint t = 0u; t + 1u < win; t++) {
+            conv_state[c * win + t] = conv_state[c * win + t + 1u];
+        }
+        conv_state[c * win + win - 1u] = qkv[c];
+    }
+}

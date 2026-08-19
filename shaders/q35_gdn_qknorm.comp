@@ -1,0 +1,54 @@
+#version 450
+
+// Qwen3.6 GatedDeltaNet per-head Q/K RMSNorm(no-weight) + inv-scale (WS1b).
+//
+// Dispatch (2*nk, 1, 1) workgroups: wg [0,nk) normalizes q head `wg`, wg
+// [nk,2*nk) normalizes k head `wg-nk`. Thread 0 computes the sum-of-squares
+// SEQUENTIALLY over kd (bit-identical accumulation order vs
+// `model::cpu_rms_norm_no_weight`), then all threads apply the scale:
+//   q[hi*kd+j] = (row[j]*scale) * inv * inv    (two successive multiplies,
+//   k[hi*kd+j] = (row[j]*scale) * inv           matching the CPU expression)
+// q rows live at conv_out[0..key_dim), k rows at conv_out[key_dim..2*key_dim).
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint nk;
+    uint kd;
+    uint key_dim;
+    float eps;
+    float inv;
+};
+
+layout(binding = 0) readonly buffer ABuf { float conv_out[]; };  // [conv_dim]
+layout(binding = 1) writeonly buffer QBuf { float q_out[]; };    // [key_dim]
+layout(binding = 2) writeonly buffer KBuf { float k_out[]; };    // [key_dim]
+
+shared float s_scale;
+
+void main() {
+    const uint wg = gl_WorkGroupID.x;
+    const bool is_k = wg >= nk;
+    const uint head = is_k ? (wg - nk) : wg;
+    const uint base = (is_k ? key_dim : 0u) + head * kd;
+
+    if (gl_LocalInvocationID.x == 0u) {
+        float ss = 0.0;
+        for (uint i = 0u; i < kd; i++) {
+            const float v = conv_out[base + i];
+            ss += v * v;
+        }
+        s_scale = 1.0 / sqrt(ss / float(kd) + eps);
+    }
+    barrier();
+
+    const float scale = s_scale;
+    for (uint i = gl_LocalInvocationID.x; i < kd; i += 128u) {
+        const float n = conv_out[base + i] * scale;
+        if (is_k) {
+            k_out[head * kd + i] = n * inv;
+        } else {
+            q_out[head * kd + i] = (n * inv) * inv;
+        }
+    }
+}
