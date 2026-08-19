@@ -1,0 +1,45 @@
+#version 450
+
+// Ling-3.0-flash (BailingMoeV3) KDA per-key-channel decay precompute — the
+// safe_gate NEW-MATH variant for the fused 1-CB KDA decode path.
+//
+// Ling's decay is DISTINCT from Kimi's `kda_decay.comp`
+// (`exp(-exp(A_log)·softplus(·))`): with `kda_safe_gate=true` and
+// `kda_lower_bound=-5.0`, the log-decay is
+//   g = lower_bound · sigmoid(exp(A_log[h]) · (f_proj[i] + dt_bias[i]))
+//   decay[i] = exp(g)
+// (matches `ling::LingKdaWeights::decode_step` / `decay_log`; reusing Kimi's
+// softplus form silently corrupts the recurrence — the ~8.6× drift trap).
+//
+// One thread per key-channel `i` of nh*kd (== proj == key_dim). Ling has
+// `no_kda_lora` (full-rank f_proj), so binding 0 is the DIRECT f_proj(x)
+// output — no low-rank `f_b(f_a(x))` tail. Accumulation is trivial
+// (elementwise); the ONLY divergence vs the CPU reference is the last-ulp of
+// the GPU exp() intrinsic vs libm — the documented argmax-exact / cos>=0.99999
+// decode tolerance.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint  nh;           // number of key heads (Ling KDA: 32)
+    uint  kd;           // key head dim        (Ling KDA: 128)
+    float lower_bound;  // -5.0
+};
+
+layout(binding = 0) readonly buffer FInBuf    { float f_in[]; };    // [nh*kd] = f_proj(x)
+layout(binding = 1) readonly buffer DtBiasBuf { float dt_bias[]; }; // [nh*kd]
+layout(binding = 2) readonly buffer AlogBuf   { float a_log[]; };   // [nh] (per-head)
+layout(binding = 3) writeonly buffer OutBuf   { float decay[]; };   // [nh*kd]
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    const uint total = nh * kd;
+    if (i >= total) {
+        return;
+    }
+    const uint h = i / kd;
+    const float fb = f_in[i] + dt_bias[i];
+    // sigmoid(exp(A_log[h]) * fb)
+    const float s = 1.0 / (1.0 + exp(-(exp(a_log[h]) * fb)));
+    decay[i] = exp(lower_bound * s);
+}

@@ -1,0 +1,129 @@
+#version 450
+
+// Ling-3.0-flash MoE ROUTER — grouped-topk scoring + selection over PRE-COMPUTED
+// router logits. GPU port of the selection half of `ling::grouped_topk_route`
+// (the `BailingMoeV3Gate` noaux_tc router). The router matvec itself
+// (`router_gate[e,h] . hidden[h]`) is done by the FAST coalesced `mul_mat_vec`
+// kernel BEFORE this dispatch — folding it into this single-workgroup shader was
+// a ~100x-slower uncoalesced single-CU matvec (measured 4.5ms/layer). Only the
+// tiny top-k (top_k indices + top_k weights) is emitted — the Phase-1 GPU-router
+// lever (`VLLM_VULKAN_LING_MOE_INDIRECT`).
+//
+// Ling's router is GROUPED-topk (unlike Laguna's plain top-k / n_group=1):
+//   logits  = router_gate[e,h] . hidden[h]                (SEPARATE matvec)
+//   scores  = sigmoid(logits)                             (RAW combine scores)
+//   biased  = scores + expert_bias                        (SELECTION scores)
+//   groups  = ne / n_group contiguous experts each
+//   gscore  = sum of the TOP-2 biased scores in the group
+//   keep    = the topk_group highest-scoring groups (ties -> LOWEST group idx)
+//   idx     = top_k experts by `biased` over the SURVIVING groups
+//               (ties -> LOWEST expert idx)
+//   weights = scores[idx] (RAW, NOT biased); if norm_topk_prob && top_k>1:
+//               weights /= (sum(weights) + 1e-20)
+//             weights *= routed_scaling_factor
+// Byte-for-byte the same math/order as `grouped_topk_route`. The per-expert dot
+// accumulates in ascending `j` with a `precise` accumulator; the host router
+// matvec is `matrixmultiply::sgemm` (a different reduction order), so the logits
+// differ by ~1 ULP — the on-node gate (`debug_ling_gpu_router`) confirms this
+// does NOT flip the selected top-k SET (the argmax-exact contract).
+//
+// One workgroup, one thread per expert (ne <= 512 — Ling has num_experts=512,
+// n_group=8 => 64 experts/group). Thread 0 does the serial grouped-topk (n_group
+// top-2 scans + topk_group group-argmax + top_k expert-argmax — all negligible
+// vs the matvec).
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint ne;              // number of routed experts (<= 512)
+    uint top_k;           // experts to select (== 8 for Ling)
+    uint n_group;         // expert groups (== 8)
+    uint topk_group;      // groups to keep (== 4)
+    float routed_scaling; // routed_scaling_factor (2.5)
+    uint norm_topk;       // norm_topk_prob (1 = renormalize weights)
+};
+
+layout(binding = 0) readonly buffer Logits { float logits[]; }; // [ne] router matvec output
+layout(binding = 1) readonly buffer Bias   { float bias[]; };   // [ne]
+layout(binding = 2) buffer Out { float outb[]; };   // [2*top_k]: idx0..k-1, w0..k-1
+
+const uint MAX_E = 512u;
+const uint MAX_G = 64u;
+shared float s_score[MAX_E];   // RAW sigmoid scores
+shared float s_choice[MAX_E];  // biased selection score (mutated by thread 0)
+
+void main() {
+    const uint e = gl_LocalInvocationID.x;
+    if (e < ne) {
+        float sc = 1.0 / (1.0 + exp(-logits[e]));   // sigmoid
+        s_score[e] = sc;
+        s_choice[e] = sc + bias[e];
+    }
+    barrier();
+
+    if (e == 0u) {
+        const uint per_group = ne / max(n_group, 1u);
+
+        // group score = sum of the top-2 biased scores in the group.
+        float gscore[MAX_G];
+        for (uint g = 0u; g < n_group; ++g) {
+            float m1 = -1.0 / 0.0;
+            float m2 = -1.0 / 0.0;
+            const uint gbase = g * per_group;
+            for (uint t = 0u; t < per_group; ++t) {
+                float v = s_choice[gbase + t];
+                if (v > m1) { m2 = m1; m1 = v; }
+                else if (v > m2) { m2 = v; }
+            }
+            gscore[g] = m1 + m2;
+        }
+
+        // keep the topk_group highest groups (strict `>` argmax -> LOWEST group
+        // idx on tie, matching the host stable sort `.then(a.cmp(&b))`); mask
+        // s_choice of experts in NON-kept groups to -inf.
+        bool keep[MAX_G];
+        for (uint g = 0u; g < n_group; ++g) keep[g] = false;
+        for (uint kg = 0u; kg < topk_group; ++kg) {
+            int bestg = -1;
+            float bv = -1.0 / 0.0;
+            for (uint g = 0u; g < n_group; ++g) {
+                if (!keep[g] && gscore[g] > bv) { bv = gscore[g]; bestg = int(g); }
+            }
+            if (bestg >= 0) keep[uint(bestg)] = true;
+        }
+        for (uint g = 0u; g < n_group; ++g) {
+            if (!keep[g]) {
+                const uint gbase = g * per_group;
+                for (uint t = 0u; t < per_group; ++t) s_choice[gbase + t] = -1.0 / 0.0;
+            }
+        }
+
+        // top_k experts by biased score over surviving groups.
+        float denom = 0.0;
+        for (uint k = 0u; k < top_k; ++k) {
+            int best = -1;
+            float bestval = -1.0 / 0.0;
+            for (uint e2 = 0u; e2 < ne; ++e2) {
+                float v = s_choice[e2];
+                if (v > bestval) { bestval = v; best = int(e2); }
+            }
+            float raw = s_score[best];
+            outb[k] = float(best);
+            outb[top_k + k] = raw;
+            denom += raw;
+            s_choice[best] = -1.0 / 0.0;   // mask so not re-selected
+        }
+
+        // norm_topk_prob (renorm to sum 1) then routed_scaling — per-element
+        // divide by (denom + 1e-20) to match the host rounding.
+        float d = denom + 1e-20;
+        for (uint k = 0u; k < top_k; ++k) {
+            precise float w = outb[top_k + k];
+            if (norm_topk != 0u && top_k > 1u) {
+                w = w / d;
+            }
+            w = w * routed_scaling;
+            outb[top_k + k] = w;
+        }
+    }
+}

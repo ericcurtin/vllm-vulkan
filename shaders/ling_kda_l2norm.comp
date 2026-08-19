@@ -1,0 +1,63 @@
+#version 450
+
+// Ling-3.0-flash (BailingMoeV3) KDA per-head Q/K L2-norm + q-only scale — the
+// NEW-MATH qknorm variant for the fused 1-CB KDA decode path.
+//
+// Ling uses L2 normalization (`use_qk_l2norm_in_kernel`), DISTINCT from the RMS
+// form `q35_gdn_qknorm.comp` implements: the reciprocal is `1/sqrt(sum(v^2)+eps)`
+// with NO division by kd (RMS divides by kd), and the head_dim^-0.5 `scale` is
+// applied to q ONLY (k unscaled). Matches `ling::LingKdaWeights::decode_step`:
+//   qn = 1/sqrt(sum(q^2)+eps);  q[i] *= qn * scale
+//   kn = 1/sqrt(sum(k^2)+eps);  k[i] *= kn
+//
+// Dispatch (2*nk, 1, 1): wg [0,nk) normalizes q head `wg`, wg [nk,2*nk)
+// normalizes k head `wg-nk`. Thread 0 computes the sum-of-squares SEQUENTIALLY
+// over kd (bit-identical accumulation order vs the CPU `.iter().map(|z|z*z).sum()`),
+// then all threads apply the scale. q rows live at conv_out[0..key_dim), k rows
+// at conv_out[key_dim..2*key_dim) (the combined b_conv layout the fused KDA CB
+// writes). Only the sqrt is a GPU-intrinsic-vs-libm last-ulp difference →
+// argmax-exact / cos>=0.99999.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint  nk;       // number of key heads
+    uint  kd;       // key head dim
+    uint  key_dim;  // nk*kd (offset of k rows in conv_out)
+    float eps;      // head-norm epsilon (Ling: rms_norm_eps = 1e-6)
+    float scale;    // head_dim^-0.5, applied to q ONLY
+};
+
+layout(binding = 0) readonly buffer ABuf { float conv_out[]; }; // [conv_dim]
+layout(binding = 1) writeonly buffer QBuf { float q_out[]; };   // [key_dim]
+layout(binding = 2) writeonly buffer KBuf { float k_out[]; };   // [key_dim]
+
+shared float s_inv;
+
+void main() {
+    const uint wg = gl_WorkGroupID.x;
+    const bool is_k = wg >= nk;
+    const uint head = is_k ? (wg - nk) : wg;
+    const uint base = (is_k ? key_dim : 0u) + head * kd;
+
+    if (gl_LocalInvocationID.x == 0u) {
+        float ss = 0.0;
+        for (uint i = 0u; i < kd; i++) {
+            const float v = conv_out[base + i];
+            ss += v * v;
+        }
+        // L2 norm: 1/sqrt(sum_sq + eps)  (NO /kd, unlike RMS)
+        s_inv = 1.0 / sqrt(ss + eps);
+    }
+    barrier();
+
+    const float inv = s_inv;
+    for (uint i = gl_LocalInvocationID.x; i < kd; i += 128u) {
+        const float n = conv_out[base + i] * inv;
+        if (is_k) {
+            k_out[head * kd + i] = n;          // k unscaled
+        } else {
+            q_out[head * kd + i] = n * scale;  // q scaled by head_dim^-0.5
+        }
+    }
+}

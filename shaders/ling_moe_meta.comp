@@ -1,0 +1,56 @@
+#version 450
+
+// Ling MoE GPU META-builder — consumes the `ling_moe_router` top-k output and
+// writes the per-expert gather descriptors (`meta[]`, uvec4 per expert) for the
+// three batched expert matvecs (gate/up/down) PLUS the routed combine `scores[]`
+// — entirely on the GPU, so the host never learns which experts were selected.
+// The route->meta->gather-matvec chain then records into ONE command buffer (no
+// index readback, no extra submit/fence). Phase-1 `VLLM_VULKAN_LING_MOE_INDIRECT`.
+//
+// The workgroup count of the downstream batched matvec is DATA-INDEPENDENT
+// (grid = (ceil(out/r), top_k, 1), top_k fixed = 8), so no vkCmdDispatchIndirect
+// is needed — only the meta CONTENTS are GPU-computed. Precondition: every
+// selected expert is resident (host-gated `SwitchR::fully_resident`), so slot >= 0.
+//
+// meta[e] (uvec4, matching `expert_meta_bytes`):
+//   .x = slot * pack_stride   (packed I32 words offset)   pack_stride = out*(inn/8)
+//   .y = slot * sb_stride     (scale/bias element offset)  sb_stride  = out*(inn/GS)
+//   .z = e   * x_stride        (activation float offset)    0 for gate/up, inn for down
+//   .w = e   * out             (dst float offset)
+// where slot = slot_map[expert_idx].
+
+layout(local_size_x = 8, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint top_k;
+    // gate/up share the same shape (out_gu, inn_gu); down is (out_dn, inn_dn).
+    uint out_gu; uint packstride_gu; uint sbstride_gu;   // x_stride = 0 (gate/up)
+    uint out_dn; uint packstride_dn; uint sbstride_dn; uint xstride_dn;
+};
+
+layout(binding = 0) readonly  buffer Router   { float router[]; };   // [2*top_k]: idx.., w..
+layout(binding = 1) readonly  buffer SlotG    { int slot_g[]; };     // [e]
+layout(binding = 2) readonly  buffer SlotU    { int slot_u[]; };     // [e]
+layout(binding = 3) readonly  buffer SlotD    { int slot_d[]; };     // [e]
+layout(binding = 4) writeonly buffer MetaG    { uvec4 meta_g[]; };
+layout(binding = 5) writeonly buffer MetaU    { uvec4 meta_u[]; };
+layout(binding = 6) writeonly buffer MetaD    { uvec4 meta_d[]; };
+layout(binding = 7) writeonly buffer Scores   { float scores[]; };
+
+void main() {
+    const uint e = gl_LocalInvocationID.x;
+    if (e >= top_k) return;
+
+    const uint ei = uint(router[e]);          // selected expert index
+    const uint sg = uint(max(slot_g[ei], 0)); // resident (host-gated >= 0)
+    const uint su = uint(max(slot_u[ei], 0));
+    const uint sd = uint(max(slot_d[ei], 0));
+
+    // gate / up: x_stride = 0 (all experts read the same activation), dst = e*out.
+    meta_g[e] = uvec4(sg * packstride_gu, sg * sbstride_gu, 0u,             e * out_gu);
+    meta_u[e] = uvec4(su * packstride_gu, su * sbstride_gu, 0u,             e * out_gu);
+    // down: x_stride = inn_dn (each expert reads its own [inter]-wide row).
+    meta_d[e] = uvec4(sd * packstride_dn, sd * sbstride_dn, e * xstride_dn, e * out_dn);
+
+    scores[e] = router[top_k + e];            // routed combine weight
+}
