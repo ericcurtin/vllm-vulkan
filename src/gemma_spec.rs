@@ -1,0 +1,547 @@
+//! EAGLE spec-decode DRIVER logic (INC-5a, spec §"EAGLE spec-decode driver").
+//!
+//! This is the CPU accept/reject/rollback BOOKKEEPING only — it drives
+//! `Gemma4Model::forward_verify_core` / `verify_rollback` (INC-4) with a
+//! caller-supplied drafter, but does no drafting, GPU dispatch, or TP/cluster
+//! plumbing itself. The real EAGLE 0.5B-drafter-to-31B-target coupling (KV
+//! borrow, hidden-state hookup) is INC-5b, a separate follow-up; here the
+//! drafter is injected as a plain closure so the SAME loop drives both a CPU
+//! stub (this file's gate) and, later, the real drafter / cluster TP path
+//! without any change to the accept/reject math.
+//!
+//! Design-A loop (plan pseudocode, `GEMMA31B_SPEC_PLAN.md` §INC-5):
+//! ```text
+//! loop over generation:
+//!   draft[0..K]  = drafter.draft_block(bonus, target_hidden, shared_kv_snapshot, pos)
+//!   logits[0..K] = forward_verify_core([bonus, draft[0..K-1]], R)   # target, batched
+//!   accept_len   = longest prefix where argmax(logits[i]) == draft[i]
+//!   new_bonus    = argmax(logits[accept_len])
+//!   verify_rollback(R, K, accept_len)                                # KV rewind
+//!   emit committed tokens; R += accept_len + 1
+//! ```
+//! `K` here is the number of DRAFTED tokens per block (block size = K+1,
+//! counting the bonus token); `forward_verify_core` is called with exactly
+//! `K+1` tokens (bonus + K drafts), matching its existing `[T][vocab]`
+//! contract (INC-4).
+
+use crate::model::{argmax, Gemma4Model};
+
+/// Per-block driver config: `k` drafted tokens per block, generate until at
+/// least `max_new_tokens` tokens have been committed (a block may commit
+/// between 1 and `k+1` tokens, so the final block can overshoot slightly —
+/// callers that need an exact count should truncate the returned vec).
+#[derive(Debug, Clone, Copy)]
+pub struct SpecConfig {
+    pub k: usize,
+    pub max_new_tokens: usize,
+}
+
+/// Outcome of one draft -> batched-verify -> accept/rollback block.
+#[derive(Debug, Clone)]
+pub struct SpecStepResult {
+    /// Number of drafted tokens accepted (0..=k).
+    pub accept_len: usize,
+    /// Tokens actually committed this block: `bonus` followed by
+    /// `draft[0..accept_len]` (length `accept_len + 1`).
+    pub committed: Vec<u32>,
+    /// Greedy-argmax continuation token to feed as next block's bonus.
+    pub new_bonus: u32,
+}
+
+/// Runs ONE draft/verify/accept/rollback block starting from `bonus` at
+/// position `pos`. `draft_fn(bonus, pos, k)` must return exactly `k` drafted
+/// token ids — it is the abstracted drafter (stub in the CPU gate below,
+/// EAGLE 0.5B model in INC-5b).
+///
+/// Mirrors the plan pseudocode exactly: batched-verify over
+/// `[bonus, draft[0..k-1]]` (T = k+1 tokens fed at `pos..pos+k`), longest
+/// matching prefix -> `accept_len`, `new_bonus` read off `logits[accept_len]`
+/// (valid since `forward_verify_core` returns `k+1` rows, indices `0..=k`),
+/// then `verify_rollback` rewinds every layer's KV frontier to
+/// `pos + accept_len + 1` (a no-op on full accept, since `accept_len < k+1 =
+/// t` always holds — see `verify_rollback`'s own assert/no-op contract).
+pub fn spec_step<F>(
+    model: &mut Gemma4Model,
+    mut draft_fn: F,
+    bonus: u32,
+    pos: usize,
+    k: usize,
+) -> SpecStepResult
+where
+    F: FnMut(u32, usize, usize) -> Vec<u32>,
+{
+    let draft = draft_fn(bonus, pos, k);
+    assert_eq!(draft.len(), k, "draft_fn must return exactly k={k} draft ids");
+
+    let mut tokens = Vec::with_capacity(k + 1);
+    tokens.push(bonus);
+    tokens.extend_from_slice(&draft);
+    let t = tokens.len(); // k + 1
+
+    let logits = model.forward_verify_core(&tokens, pos);
+    assert_eq!(logits.len(), t, "forward_verify_core must return t={t} rows");
+
+    // Longest prefix where the target's own greedy argmax at row i agrees
+    // with the drafted token at position i+1 (row i predicts tokens[i+1]).
+    let mut accept_len = 0usize;
+    while accept_len < k && argmax(&logits[accept_len]) as u32 == draft[accept_len] {
+        accept_len += 1;
+    }
+    let new_bonus = argmax(&logits[accept_len]) as u32;
+
+    // KV-counter rewind to the accepted frontier (no-op on full accept).
+    model.verify_rollback(pos, t, accept_len);
+
+    let mut committed = Vec::with_capacity(accept_len + 1);
+    committed.push(bonus);
+    committed.extend_from_slice(&draft[..accept_len]);
+
+    SpecStepResult { accept_len, committed, new_bonus }
+}
+
+/// Runs the full accept/reject generation loop, block after block, until at
+/// least `cfg.max_new_tokens` tokens have been committed. Returns the
+/// concatenated committed token stream (bonus + accepted drafts of every
+/// block) — this is what should equal a SPEC-off greedy run's token stream
+/// when the drafter always drafts the target's own argmax (the identity
+/// gate), and it still must equal that same greedy stream when the drafter
+/// mis-drafts a suffix of a block (the partial-accept gate), since the
+/// committed prefix is by construction the same tokens the greedy baseline
+/// would have produced.
+pub fn run_spec_decode<F>(
+    model: &mut Gemma4Model,
+    mut draft_fn: F,
+    start_bonus: u32,
+    start_pos: usize,
+    cfg: &SpecConfig,
+) -> Vec<u32>
+where
+    F: FnMut(u32, usize, usize) -> Vec<u32>,
+{
+    let mut pos = start_pos;
+    let mut bonus = start_bonus;
+    let mut emitted = Vec::new();
+    while emitted.len() < cfg.max_new_tokens {
+        let step = spec_step(model, &mut draft_fn, bonus, pos, cfg.k);
+        pos += step.committed.len();
+        emitted.extend(step.committed);
+        bonus = step.new_bonus;
+    }
+    emitted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{load_gemma_mlx_affine, tiny_synthetic_gemma, Gemma4Config, Gemma4Weights, KvCache, SimpleTensor};
+
+    fn cosine(a: &[f32], b: &[f32]) -> f32 {
+        let dot: f32 = a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum();
+        let na: f32 = a.iter().map(|&x| x * x).sum::<f32>().sqrt();
+        let nb: f32 = b.iter().map(|&x| x * x).sum::<f32>().sqrt();
+        if na == 0.0 || nb == 0.0 { return 0.0; }
+        dot / (na * nb)
+    }
+
+    /// Loads the real gemma-4-12B checkpoint as a proxy for the g31b target
+    /// (same forward primitives; see `model.rs`'s
+    /// `load_gemma12b_for_verify_gate` for the INC-4 precedent this mirrors).
+    /// The 12B's own last-layer KV dims don't line up with the 0.5B EAGLE
+    /// drafter's borrowed-KV expectation (that coupling is INC-5b), so this
+    /// gate exercises the driver with a STUB drafter instead of the real one,
+    /// per the plan.
+    ///   GEMMA12B_DIR=<checkpoint dir>
+    fn load_gemma12b(max_seq: usize) -> Option<Gemma4Model> {
+        let dir = match std::env::var("GEMMA12B_DIR") {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("SKIP gemma_spec driver gate: set GEMMA12B_DIR");
+                return None;
+            }
+        };
+        let cfg = Gemma4Config::g12b();
+        let tensors = load_gemma_mlx_affine(std::path::Path::new(&dir)).expect("load checkpoint");
+        let weights = Gemma4Weights {
+            tensors: tensors
+                .into_iter()
+                .map(|(k, v)| (k, SimpleTensor { shape: vec![v.len()], data: v }))
+                .collect(),
+        };
+        let kv_caches = (0..cfg.num_hidden_layers)
+            .map(|l| KvCache::new(max_seq, cfg.layer_num_kv_heads(l), cfg.layer_head_dim(l)))
+            .collect();
+        Some(Gemma4Model { config: cfg, weights, kv_caches })
+    }
+
+    fn reset_kv_caches(model: &mut Gemma4Model, max_seq: usize) {
+        let cfg = &model.config;
+        model.kv_caches = (0..cfg.num_hidden_layers)
+            .map(|l| KvCache::new(max_seq, cfg.layer_num_kv_heads(l), cfg.layer_head_dim(l)))
+            .collect();
+    }
+
+    /// Precomputes a SPEC-off serial greedy baseline of `n` tokens starting
+    /// from `start_bonus` at `start_pos`, driving the model with plain
+    /// `forward` calls only (no verify/rollback machinery at all) — this is
+    /// the ground truth both gates below compare the spec-decode driver
+    /// against.
+    fn greedy_baseline(model: &mut Gemma4Model, start_bonus: u32, start_pos: usize, n: usize) -> Vec<u32> {
+        let mut ids = Vec::with_capacity(n);
+        let mut tok = start_bonus;
+        let mut pos = start_pos;
+        for _ in 0..n {
+            ids.push(tok);
+            let logits = model.forward(tok, pos);
+            tok = argmax(&logits) as u32;
+            pos += 1;
+        }
+        ids
+    }
+
+    /// INC-5a gate 1 ("identity gate"): a STUB drafter that always drafts
+    /// exactly what the greedy baseline would have produced next (forced ==
+    /// target argmax) must make the spec-decode driver's committed token
+    /// stream identical to the SPEC-off greedy stream over >=32 tokens, with
+    /// every block's `accept_len` maximal (== k, full acceptance).
+    ///
+    /// ONE checkpoint load only (the ~44GB host-f32 dequant of the 12B
+    /// checkpoint dominates wall time — see `load_gemma_mlx_affine`'s doc
+    /// comment on `load_gemma_resident_weights` — so, exactly like the INC-4
+    /// gates, the greedy baseline is computed on the SAME loaded model, then
+    /// the KV state is reset and the short prompt prefix replayed before
+    /// driving the spec-decode loop from a clean, comparable starting point.
+    ///
+    /// Real-checkpoint variant of the synthetic gate below (~30 min/run on the
+    /// full gemma-4-12B f32 checkpoint) — kept for optional real-weight
+    /// confidence, `#[ignore]`d by default so `cargo test` stays fast.
+    #[test]
+    #[ignore]
+    fn gemma31b_spec_driver_identity_matches_greedy_real12b() {
+        let max_seq = 64usize;
+        let k = 4usize;
+        let n = 32usize; // >= 32 committed tokens required by the gate
+        let mut model = match load_gemma12b(max_seq) { Some(m) => m, None => return };
+
+        let prefix = [2u32, 1024, 2048];
+        let r0 = prefix.len();
+        for (pos, &tok) in prefix.iter().enumerate() {
+            model.forward(tok, pos);
+        }
+        // `bonus` is a NEW token that has not yet been forwarded (its KV gets
+        // appended by the first `forward_verify_core` call, at `start_pos`) —
+        // it plays the same role `verify_tokens[0]` plays in the INC-4 gate,
+        // distinct from the already-forwarded `prefix`.
+        let start_bonus = 4096u32;
+        let start_pos = r0;
+
+        // Ground truth: greedy baseline over a small margin beyond `n` (the
+        // stub drafter reads ahead by up to `k` tokens per block, and blocks
+        // can overshoot `n` by up to `k`, so one block's worth of slack is
+        // enough). Computed on `model` directly — no second checkpoint load.
+        let baseline = greedy_baseline(&mut model, start_bonus, start_pos, n + k + 2);
+
+        // Reset KV state and replay the same short prefix so the spec-decode
+        // driver starts from the identical clean state the baseline did.
+        reset_kv_caches(&mut model, max_seq);
+        for (pos, &tok) in prefix.iter().enumerate() {
+            model.forward(tok, pos);
+        }
+
+        // Stub drafter: forces draft[i] = baseline[pos_offset+1+i], i.e.
+        // exactly the greedy continuation of whatever bonus token led into
+        // this block. `baseline` is indexed relative to `start_pos`.
+        let draft_fn = |_bonus: u32, pos: usize, k: usize| -> Vec<u32> {
+            let off = pos - start_pos;
+            (0..k).map(|i| baseline[off + 1 + i]).collect()
+        };
+
+        let cfg = SpecConfig { k, max_new_tokens: n };
+        let committed = run_spec_decode(&mut model, draft_fn, start_bonus, start_pos, &cfg);
+
+        assert!(committed.len() >= n, "expected >= {n} committed tokens, got {}", committed.len());
+        for i in 0..n {
+            assert_eq!(committed[i], baseline[i], "token {i}: spec-on {} != greedy baseline {}", committed[i], baseline[i]);
+        }
+        eprintln!("identity gate: {} tokens matched greedy baseline exactly", n);
+    }
+
+    /// INC-5a gate 1, synthetic: identical to
+    /// `gemma31b_spec_driver_identity_matches_greedy_real12b` above but driven
+    /// on `tiny_synthetic_gemma` — an in-memory, deterministic-weight model
+    /// (see `model.rs`) that exercises the same `forward_verify_core` /
+    /// `verify_rollback` code paths without a checkpoint load. A short 8-token
+    /// run is plenty to exercise 2 full spec blocks (k=4) end to end; this is
+    /// the DEFAULT gate, the real-checkpoint version is `#[ignore]`d for
+    /// optional confidence only.
+    #[test]
+    fn gemma31b_spec_driver_identity_matches_greedy() {
+        let max_seq = 32usize;
+        let k = 4usize;
+        let n = 8usize; // 8-12 generated tokens is plenty to prove the logic
+        let mut model = tiny_synthetic_gemma(max_seq);
+
+        let prefix = [2u32, 10, 20];
+        let r0 = prefix.len();
+        for (pos, &tok) in prefix.iter().enumerate() {
+            model.forward(tok, pos);
+        }
+        // `bonus` is a NEW token that has not yet been forwarded (see the
+        // real-checkpoint gate's doc comment above for why).
+        let start_bonus = 30u32;
+        let start_pos = r0;
+
+        // Ground truth: greedy baseline over a small margin beyond `n` (the
+        // stub drafter reads ahead by up to `k` tokens per block, and blocks
+        // can overshoot `n` by up to `k`, so one block's worth of slack is
+        // enough).
+        let baseline = greedy_baseline(&mut model, start_bonus, start_pos, n + k + 2);
+
+        // Reset KV state and replay the same short prefix so the spec-decode
+        // driver starts from the identical clean state the baseline did.
+        reset_kv_caches(&mut model, max_seq);
+        for (pos, &tok) in prefix.iter().enumerate() {
+            model.forward(tok, pos);
+        }
+
+        // Stub drafter: forces draft[i] = baseline[pos_offset+1+i], i.e.
+        // exactly the greedy continuation of whatever bonus token led into
+        // this block. `baseline` is indexed relative to `start_pos`.
+        let draft_fn = |_bonus: u32, pos: usize, k: usize| -> Vec<u32> {
+            let off = pos - start_pos;
+            (0..k).map(|i| baseline[off + 1 + i]).collect()
+        };
+
+        let cfg = SpecConfig { k, max_new_tokens: n };
+        let committed = run_spec_decode(&mut model, draft_fn, start_bonus, start_pos, &cfg);
+
+        assert!(committed.len() >= n, "expected >= {n} committed tokens, got {}", committed.len());
+        for i in 0..n {
+            assert_eq!(committed[i], baseline[i], "token {i}: spec-on {} != greedy baseline {}", committed[i], baseline[i]);
+        }
+        eprintln!("identity gate (synthetic): {} tokens matched greedy baseline exactly", n);
+    }
+
+    /// INC-5a gate 2 ("partial-accept + rollback correctness"): a STUB
+    /// drafter that drafts a correct prefix then a deliberately WRONG token
+    /// (and arbitrary garbage after it, never reachable) must produce
+    /// `accept_len` == the correct-prefix length on the mismatching block,
+    /// the driver's emitted ids must still equal the greedy baseline (the
+    /// wrong drafted suffix is never committed), and the KV frontier after
+    /// `verify_rollback` must match a clean baseline run that never executed
+    /// the rejected suffix at all (reusing the INC-4
+    /// `gemma31b_verify_rollback_frontier_matches_clean_baseline` idea,
+    /// driven through the driver instead of calling verify/rollback by hand).
+    ///
+    /// ONE checkpoint load only (see the identity gate's doc comment above
+    /// for why) — the greedy continuation used to derive the "correct
+    /// prefix" and the clean-baseline replay are both driven off the SAME
+    /// loaded model, with KV resets/prefix replays in between.
+    ///
+    /// Real-checkpoint variant of the synthetic gate below (~30 min/run on the
+    /// full gemma-4-12B f32 checkpoint) — kept for optional real-weight
+    /// confidence, `#[ignore]`d by default so `cargo test` stays fast.
+    #[test]
+    #[ignore]
+    fn gemma31b_spec_driver_partial_accept_rollback_matches_baseline_real12b() {
+        let max_seq = 32usize;
+        let k = 4usize;
+        let mut model = match load_gemma12b(max_seq) { Some(m) => m, None => return };
+
+        let prefix = [2u32, 1024, 2048];
+        let r0 = prefix.len();
+        for (pos, &tok) in prefix.iter().enumerate() {
+            model.forward(tok, pos);
+        }
+        // `bonus` is a NEW token not yet forwarded (see identity gate above
+        // for why it must be distinct from `prefix`).
+        let start_bonus = 4096u32;
+        let start_pos = r0;
+
+        // Ground truth greedy continuation (only need k+1 tokens: bonus + k
+        // true next tokens) to know the correct prefix and the "wrong" id.
+        // Computed on `model` directly, then KV is reset and the prefix
+        // replayed so the driver call below starts from the same clean state.
+        let baseline = greedy_baseline(&mut model, start_bonus, start_pos, k + 2);
+        reset_kv_caches(&mut model, max_seq);
+        for (pos, &tok) in prefix.iter().enumerate() {
+            model.forward(tok, pos);
+        }
+
+        // Force a mismatch after 2 correct drafts (assumes k >= 3 so there's
+        // a rejected remainder to exercise rollback on).
+        let forced_correct = 2usize;
+        assert!(forced_correct < k, "test needs k > forced_correct to exercise a rejection");
+        // A token id guaranteed different from the true next token: bump by
+        // 1 mod vocab (vocab is large; wrap is astronomically unlikely to
+        // coincide, and even if it did the test would just be less strict,
+        // never wrong — accept_len is checked via argmax equality by the
+        // driver itself, not id equality).
+        let true_next = baseline[forced_correct + 1];
+        let vocab = model.config.vocab_size as u32; // usize -> u32, vocab_size (262144) fits
+        let wrong_tok = (true_next + 1) % vocab;
+
+        let baseline_for_draft = baseline.clone();
+        let draft = move |_bonus: u32, pos: usize, kk: usize| -> Vec<u32> {
+            assert_eq!(pos, start_pos, "single-block test: only the first block should draft");
+            let mut d = Vec::with_capacity(kk);
+            for i in 0..kk {
+                if i < forced_correct {
+                    d.push(baseline_for_draft[i + 1]);
+                } else if i == forced_correct {
+                    d.push(wrong_tok);
+                } else {
+                    d.push(999_999_999u32 % vocab); // unreachable garbage
+                }
+            }
+            d
+        };
+
+        let step = spec_step(&mut model, draft, start_bonus, start_pos, k);
+
+        assert_eq!(step.accept_len, forced_correct, "accept_len should equal the correct-prefix length");
+        let expected_committed: Vec<u32> = std::iter::once(start_bonus)
+            .chain(baseline[1..1 + forced_correct].iter().copied())
+            .collect();
+        assert_eq!(step.committed, expected_committed, "committed ids must equal the greedy baseline prefix");
+
+        // Frontier check: every layer's KV counter must sit at
+        // start_pos + accept_len + 1, matching the INC-4 rollback contract.
+        let expected_frontier = start_pos + step.accept_len + 1;
+        for (li, cache) in model.kv_caches.iter().enumerate() {
+            assert_eq!(cache.seq_len, expected_frontier, "layer {li}: KV frontier {} != expected {expected_frontier}", cache.seq_len);
+        }
+
+        // Clean baseline: never runs the rejected suffix at all — prefix,
+        // then only the accepted `accept_len+1` tokens, then a shared
+        // continuation token, must be bit-exact vs. the driver's post-
+        // rollback state continuing with the same token.
+        let continuation_tok = wrong_tok; // arbitrary; just needs to match on both sides
+        let logits_after_rollback = model.forward(continuation_tok, expected_frontier);
+
+        reset_kv_caches(&mut model, max_seq);
+        for (pos, &tok) in prefix.iter().enumerate() {
+            model.forward(tok, pos);
+        }
+        for (i, &tok) in expected_committed.iter().enumerate() {
+            model.forward(tok, start_pos + i);
+        }
+        let logits_baseline = model.forward(continuation_tok, expected_frontier);
+
+        let maxdiff = logits_after_rollback
+            .iter()
+            .zip(logits_baseline.iter())
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let cos = cosine(&logits_after_rollback, &logits_baseline);
+        eprintln!(
+            "partial-accept gate: accept_len={} frontier={expected_frontier} maxdiff={maxdiff:.8} cos={cos:.6}",
+            step.accept_len
+        );
+        assert_eq!(maxdiff, 0.0, "post-rollback forward diverges from clean baseline (maxdiff {maxdiff})");
+        assert_eq!(cos, 1.0, "cos {cos} != 1.0");
+    }
+
+    /// INC-5a gate 2, synthetic: identical to
+    /// `gemma31b_spec_driver_partial_accept_rollback_matches_baseline_real12b`
+    /// above but driven on `tiny_synthetic_gemma`. This is the DEFAULT gate;
+    /// the real-checkpoint version is `#[ignore]`d for optional confidence
+    /// only.
+    #[test]
+    fn gemma31b_spec_driver_partial_accept_rollback_matches_baseline() {
+        let max_seq = 32usize;
+        let k = 4usize;
+        let mut model = tiny_synthetic_gemma(max_seq);
+
+        let prefix = [2u32, 10, 20];
+        let r0 = prefix.len();
+        for (pos, &tok) in prefix.iter().enumerate() {
+            model.forward(tok, pos);
+        }
+        // `bonus` is a NEW token not yet forwarded (see identity gate above
+        // for why it must be distinct from `prefix`).
+        let start_bonus = 30u32;
+        let start_pos = r0;
+
+        // Ground truth greedy continuation (only need k+1 tokens: bonus + k
+        // true next tokens) to know the correct prefix and the "wrong" id.
+        // Computed on `model` directly, then KV is reset and the prefix
+        // replayed so the driver call below starts from the same clean state.
+        let baseline = greedy_baseline(&mut model, start_bonus, start_pos, k + 2);
+        reset_kv_caches(&mut model, max_seq);
+        for (pos, &tok) in prefix.iter().enumerate() {
+            model.forward(tok, pos);
+        }
+
+        // Force a mismatch after 2 correct drafts (assumes k >= 3 so there's
+        // a rejected remainder to exercise rollback on).
+        let forced_correct = 2usize;
+        assert!(forced_correct < k, "test needs k > forced_correct to exercise a rejection");
+        // A token id guaranteed different from the true next token: bump by
+        // 1 mod vocab. accept_len is checked via argmax equality by the
+        // driver itself, not id equality, so this is never wrong even in the
+        // (astronomically unlikely, and harmless if it happened) case of wrap.
+        let true_next = baseline[forced_correct + 1];
+        let vocab = model.config.vocab_size as u32; // tiny synthetic vocab (512)
+        let wrong_tok = (true_next + 1) % vocab;
+
+        let baseline_for_draft = baseline.clone();
+        let draft = move |_bonus: u32, pos: usize, kk: usize| -> Vec<u32> {
+            assert_eq!(pos, start_pos, "single-block test: only the first block should draft");
+            let mut d = Vec::with_capacity(kk);
+            for i in 0..kk {
+                if i < forced_correct {
+                    d.push(baseline_for_draft[i + 1]);
+                } else if i == forced_correct {
+                    d.push(wrong_tok);
+                } else {
+                    d.push(999_999_999u32 % vocab); // unreachable garbage
+                }
+            }
+            d
+        };
+
+        let step = spec_step(&mut model, draft, start_bonus, start_pos, k);
+
+        assert_eq!(step.accept_len, forced_correct, "accept_len should equal the correct-prefix length");
+        let expected_committed: Vec<u32> = std::iter::once(start_bonus)
+            .chain(baseline[1..1 + forced_correct].iter().copied())
+            .collect();
+        assert_eq!(step.committed, expected_committed, "committed ids must equal the greedy baseline prefix");
+
+        // Frontier check: every layer's KV counter must sit at
+        // start_pos + accept_len + 1, matching the INC-4 rollback contract.
+        let expected_frontier = start_pos + step.accept_len + 1;
+        for (li, cache) in model.kv_caches.iter().enumerate() {
+            assert_eq!(cache.seq_len, expected_frontier, "layer {li}: KV frontier {} != expected {expected_frontier}", cache.seq_len);
+        }
+
+        // Clean baseline: never runs the rejected suffix at all — prefix,
+        // then only the accepted `accept_len+1` tokens, then a shared
+        // continuation token, must be bit-exact vs. the driver's post-
+        // rollback state continuing with the same token.
+        let continuation_tok = wrong_tok; // arbitrary; just needs to match on both sides
+        let logits_after_rollback = model.forward(continuation_tok, expected_frontier);
+
+        reset_kv_caches(&mut model, max_seq);
+        for (pos, &tok) in prefix.iter().enumerate() {
+            model.forward(tok, pos);
+        }
+        for (i, &tok) in expected_committed.iter().enumerate() {
+            model.forward(tok, start_pos + i);
+        }
+        let logits_baseline = model.forward(continuation_tok, expected_frontier);
+
+        let maxdiff = logits_after_rollback
+            .iter()
+            .zip(logits_baseline.iter())
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let cos = cosine(&logits_after_rollback, &logits_baseline);
+        eprintln!(
+            "partial-accept gate (synthetic): accept_len={} frontier={expected_frontier} maxdiff={maxdiff:.8} cos={cos:.6}",
+            step.accept_len
+        );
+        assert_eq!(maxdiff, 0.0, "post-rollback forward diverges from clean baseline (maxdiff {maxdiff})");
+        assert_eq!(cos, 1.0, "cos {cos} != 1.0");
+    }
+}
