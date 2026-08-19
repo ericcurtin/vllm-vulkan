@@ -1,0 +1,40 @@
+#version 450
+
+// Laguna per-head scalar softplus ATTENTION GATE (PIECE 3 of the GPU-resident
+// span fold). Replaces the host softplus loop in `LagunaGpuModel::attn_cached_1cb`:
+// computes the per-head gate `softplus(g[h])` and broadcast-multiplies it into
+// the attention output over `head_dim`, IN PLACE, before o_proj.
+//
+//   softplus(x) = ln(1 + e^x)
+// evaluated in the numerically-stable form used by the CPU oracle
+// (`laguna::softplus` / `laguna_gpu::softplus`:
+//   x.max(0.0) + (-x.abs()).exp().ln_1p()  ==  max(x,0) + log(1 + e^-|x|)),
+// which collapses to `x` for large positive x and to `e^x` for large negative x,
+// so it never overflows. Being elementwise, the GPU result differs from the host
+// libm result only in the last ulp of exp/log.
+//
+// Dispatch ((nq*hd + 255)/256, 1, 1).
+//   binding 0 = g[nq]      (gate projection g_proj(h), read-only)
+//   binding 1 = attn[nq*hd] (attention output, scaled in place)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint nq;   // number of query heads (48 full / 72 sliding)
+    uint hd;   // head_dim (128)
+};
+
+layout(binding = 0) readonly buffer GBuf { float g[]; };    // [nq]
+layout(binding = 1) buffer ABuf { float attn[]; };          // [nq*hd] in/out
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    const uint total = nq * hd;
+    if (idx >= total) {
+        return;
+    }
+    const uint h = idx / hd;                 // head index for this element
+    const float x = g[h];
+    const float sp = max(x, 0.0) + log(1.0 + exp(-abs(x)));
+    attn[idx] *= sp;
+}

@@ -1,0 +1,58 @@
+#version 450
+
+// Laguna-S-2.1 MoE tail: top-10 score-weighted routed-expert accumulate +
+// UNGATED shared-expert add, in ONE dispatch. Replaces the HOST accumulate in
+// `LagunaGpuModel::moe_token_1cb` so the folded MoE command buffer reads back
+// only ONE [hidden] vector instead of the 10 routed `down` + shared `down`.
+//
+// DIFFERS from `q35_moe_accum` (which is FIXED top-8 with a SIGMOID-GATED
+// shared expert and a trailing residual add): Laguna is top-10 and the shared
+// expert is UNGATED (a plain add, NO sigmoid), and there is NO residual add
+// here (the layer residual is applied by the caller). Math matches the host
+// loop EXACTLY (same accumulation order):
+//   acc  = sum_{slot 0..9} w[slot] * d[slot][i]     (slot order)
+//   out[i] = acc + sh[i]                             (ungated shared, weight 1)
+// The router weights `w0..w9` already carry `norm_topk_prob` (renorm to sum 1)
+// and `moe_routed_scaling_factor` (×2.5), baked on the host by `router_forward`.
+//
+// Fixed top_k = 10 (the Laguna `num_experts_per_tok`); the Rust side falls back
+// to the host accumulate when top_k != 10.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint n;      // hidden size
+    float w0; float w1; float w2; float w3; float w4;
+    float w5; float w6; float w7; float w8; float w9;   // routed weights, slot order
+};
+
+layout(binding = 0)  readonly buffer D0 { float d0[]; };   // [n] routed slot 0 down
+layout(binding = 1)  readonly buffer D1 { float d1[]; };
+layout(binding = 2)  readonly buffer D2 { float d2[]; };
+layout(binding = 3)  readonly buffer D3 { float d3[]; };
+layout(binding = 4)  readonly buffer D4 { float d4[]; };
+layout(binding = 5)  readonly buffer D5 { float d5[]; };
+layout(binding = 6)  readonly buffer D6 { float d6[]; };
+layout(binding = 7)  readonly buffer D7 { float d7[]; };
+layout(binding = 8)  readonly buffer D8 { float d8[]; };
+layout(binding = 9)  readonly buffer D9 { float d9[]; };
+layout(binding = 10) readonly buffer SH { float sh[]; };   // [n] ungated shared down
+layout(binding = 11) writeonly buffer OUTB { float outb[]; }; // [n] moe out
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= n) {
+        return;
+    }
+    float acc = w0 * d0[i];
+    acc += w1 * d1[i];
+    acc += w2 * d2[i];
+    acc += w3 * d3[i];
+    acc += w4 * d4[i];
+    acc += w5 * d5[i];
+    acc += w6 * d6[i];
+    acc += w7 * d7[i];
+    acc += w8 * d8[i];
+    acc += w9 * d9[i];
+    outb[i] = acc + sh[i];   // ungated shared expert (plain add)
+}

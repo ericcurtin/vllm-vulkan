@@ -1,0 +1,98 @@
+#version 450
+
+// Laguna-S-2.1 MoE ROUTER scoring + top-k selection, in ONE dispatch. Moves the
+// per-layer sigmoid-router off the HOST (`nemotron::router_forward`, called by
+// `LagunaGpuModel::moe_token_1cb`) onto the GPU so the decode critical path no
+// longer reads the [num_experts, hidden] gate weight back to host for a host
+// matvec every MoE layer. Only the tiny top-k (10 indices + 10 weights) is read
+// back (approach (a) of the span-fold "readback only the router top-k" plan).
+//
+// Laguna's router is a PLAIN top-k over all experts (n_group = 1, so the
+// nemotron group mask is a no-op — see `LagunaConfig::router_dims`):
+//   logits  = gate_weight[ne,hs] . hidden[hs]           (per-expert dot)
+//   scores  = sigmoid(logits)                            (RAW scores)
+//   choice  = scores + e_score_correction_bias           (selection scores)
+//   idx     = top_k experts by `choice`, ties -> LOWEST index
+//   weights = scores[idx]  (RAW, NOT choice); if norm_topk_prob:
+//               weights /= (sum(weights) + 1e-20)
+//             weights *= routed_scaling_factor
+// This is byte-for-byte the same math/order as `nemotron::router_forward`
+// (masking group == a no-op single group). The matvec accumulates in ascending
+// `j` order with a `precise` accumulator to match the host's non-fused
+// `acc += a[j]*row[j]` (`model::cpu_matvec_par`); the only residual divergence
+// vs host is the transcendental `exp` in sigmoid (~1 ULP of a 0..1 score), which
+// the single-node gate (`debug_laguna_gpu_router`) confirms does NOT flip the
+// selected top-k set.
+//
+// One workgroup, one thread per expert (ne <= 256). Thread 0 does the serial
+// top_k argmax (top_k * ne comparisons, negligible vs the matvec).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint ne;              // number of routed experts (<= 256)
+    uint hs;              // hidden size (dot length)
+    uint top_k;           // experts to select (== 10 for Laguna)
+    float routed_scaling; // moe_routed_scaling_factor (2.5)
+    uint norm_topk;       // norm_topk_prob (1 = renormalize weights)
+};
+
+layout(binding = 0) readonly buffer Gate   { float gate[]; };    // [ne*hs] row-major [ne,hs]
+layout(binding = 1) readonly buffer Bias   { float bias[]; };    // [ne]
+layout(binding = 2) readonly buffer Hidden { float hid[]; };     // [hs]
+layout(binding = 3) buffer Out { float outb[]; };    // [2*top_k]: idx0..k-1, w0..k-1 (read+write by thread 0)
+
+shared float s_score[256];   // RAW sigmoid scores
+shared float s_choice[256];  // score + bias (selection score; mutated by thread 0)
+
+void main() {
+    const uint e = gl_LocalInvocationID.x;
+    if (e < ne) {
+        // Per-expert dot in ascending j order, precise (non-fused) to match the
+        // host `acc += hid[j]*row[j]` rounding.
+        precise float acc = 0.0;
+        const uint base = e * hs;
+        for (uint j = 0u; j < hs; ++j) {
+            acc += hid[j] * gate[base + j];
+        }
+        float sc = 1.0 / (1.0 + exp(-acc));   // sigmoid
+        s_score[e] = sc;
+        s_choice[e] = sc + bias[e];
+    }
+    barrier();
+
+    if (e == 0u) {
+        float denom = 0.0;
+        for (uint k = 0u; k < top_k; ++k) {
+            // argmax over choice; strict `>` keeps the LOWEST index on a tie
+            // (first-seen wins) == host `partial_cmp(...).then(a.cmp(&b))`.
+            int best = -1;
+            float bestval = -1.0 / 0.0;   // -inf
+            for (uint e2 = 0u; e2 < ne; ++e2) {
+                float v = s_choice[e2];
+                if (v > bestval) {
+                    bestval = v;
+                    best = int(e2);
+                }
+            }
+            float raw = s_score[best];
+            outb[k] = float(best);        // selected expert index (exact for <2^24)
+            outb[top_k + k] = raw;        // RAW score (pre-norm weight)
+            denom += raw;
+            s_choice[best] = -1.0 / 0.0;  // mask so it is not re-selected
+        }
+        // norm_topk_prob (renorm to sum 1) then routed_scaling, matching
+        // router_forward's weight post-processing exactly (division by
+        // `denom + 1e-20` per element, NOT a shared reciprocal, to match host
+        // rounding).
+        float d = denom + 1e-20;
+        for (uint k = 0u; k < top_k; ++k) {
+            precise float w = outb[top_k + k];
+            if (norm_topk != 0u) {
+                w = w / d;
+            }
+            w = w * routed_scaling;
+            outb[top_k + k] = w;
+        }
+    }
+}

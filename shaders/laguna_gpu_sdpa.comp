@@ -1,0 +1,131 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// Laguna GPU decode-SDPA over the DEVICE-RESIDENT K/V planes (span-fold final
+// piece). ONE wave64 subgroup per q_head computes single-query attention against
+// the resident post-rope K/V planes with NO host readback: q(1 token) . Kᵀ over
+// the cached prefix -> * scale -> online softmax -> . V.
+//
+// Adapted from paged_attn_decode_f32_sg (same subgroup/online-softmax algorithm,
+// cos=1.0 vs host) for Laguna's storage:
+//   * NO paged block table — the planes are CONTIGUOUS `[seq, nkv, hd]` f32,
+//     row stride nkv*hd, so token t's kv_head kvh lives at (t*nkv + kvh)*hd.
+//   * K and V are SEPARATE buffers (the ResidentKvPlane `k`/`v` planes), not one
+//     interleaved cache — so V reads its own binding, not kv_base+plane_stride.
+//   * window_start replicates cpu_sdpa's absolute-position READ clamp exactly:
+//     full-attn layers pass 0 (attend [0, seq_len)); sliding layers pass
+//     seq_len - min(seq_len, sliding_window) (attend the last `window`). The
+//     plane stores FULL length; the window is a read clamp, never a ring buffer.
+//
+// GQA: kv_head = q_head / (num_q_heads / num_kv_heads). Full layers 48Q/8KV
+// (ratio 6), sliding layers 72Q/8KV (ratio 9); num_kv_heads is uniformly 8.
+//
+// Q here is ALREADY qk-normed (pre-rope) + roped, and the plane stores POST-rope
+// K/V — no norm/rope happens inside SDPA.
+//
+// Dispatch num_q_heads workgroups of 64 threads (one wave64 subgroup each on
+// RADV GFX1013). Subgroup ops on GFX1013 are correct ONLY at native 64-lane
+// width (see paged_attn_decode_f32_sg) — pipeline.rs skips this shader on any
+// non-64 device.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer QInput {
+    float q[];
+};
+
+layout(binding = 1) readonly buffer KPlane {
+    float kplane[];
+};
+
+layout(binding = 2) readonly buffer VPlane {
+    float vplane[];
+};
+
+layout(binding = 3) writeonly buffer Output {
+    float output_data[];
+};
+
+layout(push_constant) uniform parameter {
+    uint seq_len;       // valid tokens in the plane (causal read bound for THIS query)
+    uint num_q_heads;
+    uint num_kv_heads;
+    uint head_size;
+    float scale;        // 1/sqrt(head_dim)
+    uint window_start;  // first token_idx to attend (sliding clamp; 0 = full causal)
+    uint ring_capacity; // 0 = full absolute plane (legacy, byte-identical: slot == token_idx);
+                        // >0 = window-sized RING plane, slot = token_idx % ring_capacity
+} p;
+
+// 64 lanes * 8 dims/lane = up to head_size 512 (Laguna head_dim is 128 => 2).
+const uint MAX_DIMS_PER_LANE = 8u;
+
+void main() {
+    const uint q_head = gl_WorkGroupID.x;
+    if (q_head >= p.num_q_heads) {
+        return;
+    }
+    const uint lane = gl_LocalInvocationID.x;          // 0..63
+    const uint D = p.head_size;
+    const uint dpl = (D + 63u) / 64u;                  // output dims this lane owns
+    const uint gqa_ratio = p.num_q_heads / p.num_kv_heads;
+    const uint kv_head = q_head / gqa_ratio;
+    const uint q_base = q_head * D;
+    const uint row_stride = p.num_kv_heads * D;        // elements per token row
+
+    // Cache this lane's q dims; init the online-softmax accumulators.
+    float qreg[MAX_DIMS_PER_LANE];
+    float acc[MAX_DIMS_PER_LANE];
+    for (uint i = 0u; i < dpl; i++) {
+        const uint d = lane + i * 64u;
+        qreg[i] = d < D ? q[q_base + d] : 0.0;
+        acc[i] = 0.0;
+    }
+
+    float running_max = -3.402823466e+38;
+    float denom = 0.0;
+
+    for (uint token_idx = p.window_start; token_idx < p.seq_len; token_idx++) {
+        // Per-layer-sized KV: a sliding-window layer's resident plane is a ring
+        // of `ring_capacity` (= window) slots, so absolute position `token_idx`
+        // lives at slot `token_idx % ring_capacity`. `ring_capacity == 0` is the
+        // legacy full absolute plane (slot == token_idx) → full/YaRN layers are
+        // byte-for-byte unchanged. Mirrors paged_attn_decode_f32_sg's ring branch.
+        const uint slot = (p.ring_capacity != 0u) ? (token_idx % p.ring_capacity) : token_idx;
+        const uint kv_base = slot * row_stride + kv_head * D;
+
+        // QK: each lane sums its dims, subgroupAdd reduces to the full dot
+        // (broadcast to all lanes — no shared memory, no barrier).
+        float partial = 0.0;
+        for (uint i = 0u; i < dpl; i++) {
+            const uint d = lane + i * 64u;
+            if (d < D) {
+                partial += qreg[i] * kplane[kv_base + d];
+            }
+        }
+        const float logit = subgroupAdd(partial) * p.scale;
+
+        const float new_max = max(running_max, logit);
+        const float old_scale = exp(running_max - new_max);
+        const float weight = exp(logit - new_max);
+        denom = denom * old_scale + weight;
+
+        // V accumulate: each lane updates only the dims it owns.
+        for (uint i = 0u; i < dpl; i++) {
+            const uint d = lane + i * 64u;
+            if (d < D) {
+                acc[i] = acc[i] * old_scale + weight * vplane[kv_base + d];
+            }
+        }
+        running_max = new_max;
+    }
+
+    const float inv = denom > 0.0 ? 1.0 / denom : 0.0;
+    for (uint i = 0u; i < dpl; i++) {
+        const uint d = lane + i * 64u;
+        if (d < D) {
+            output_data[q_base + d] = acc[i] * inv;
+        }
+    }
+}
