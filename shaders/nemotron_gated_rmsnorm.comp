@@ -1,0 +1,54 @@
+#version 450
+
+// Nemotron-H Mamba2 gated RMSNorm (R2 GPU SSD scan), the second half of
+// `mamba2_recurrence_and_norm`'s gated-RMSNorm loop (src/nemotron.rs): the
+// gate (`* silu(gate)`) was already applied by `nemotron_ssd_scan`, so this
+// shader only does the per-group RMS scale + weight multiply:
+//   ssq  = sum_{i<group_size} gated[gi*group_size + i]^2
+//   rstd = 1 / sqrt(ssq / group_size + eps)
+//   scan[gi*group_size + i] = gated[gi*group_size + i] * rstd * norm_w[gi*group_size + i]
+// One workgroup per group `gi` (dispatch (n_groups,1,1)); local_size_x=256,
+// each thread strides group_size/256 elements. The sum-of-squares reduction
+// mirrors `q35_gdn_step.comp`'s thread-0 sequential reduction (bit-order
+// matches the CPU's sequential `for j in 0..gs` loop) rather than a
+// parallel tree, so no subgroup ops / no reordered float sum.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint group_size;
+    float eps;
+    uint n_groups;
+};
+
+layout(binding = 0) readonly buffer GatedBuf { float gated[]; };   // [n_groups * group_size]
+layout(binding = 1) readonly buffer NormWBuf { float norm_w[]; };  // [n_groups * group_size]
+layout(binding = 2) writeonly buffer ScanBuf { float scan[]; };    // [n_groups * group_size]
+
+shared float sh_gated[1024];
+shared float sh_scale;
+
+void main() {
+    const uint gi = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint base = gi * group_size;
+
+    for (uint i = tid; i < group_size; i += 256u) {
+        sh_gated[i] = gated[base + i];
+    }
+    barrier();
+
+    if (tid == 0u) {
+        float ss = 0.0;
+        for (uint i = 0u; i < group_size; i++) {
+            const float v = sh_gated[i];
+            ss += v * v;
+        }
+        sh_scale = 1.0 / sqrt(ss / float(group_size) + eps);
+    }
+    barrier();
+
+    for (uint i = tid; i < group_size; i += 256u) {
+        scan[base + i] = sh_gated[i] * sh_scale * norm_w[base + i];
+    }
+}

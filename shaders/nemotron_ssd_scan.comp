@@ -1,0 +1,75 @@
+#version 450
+
+// Nemotron-H Mamba2 SSD per-head recurrence + gate (pre-norm) (R2 GPU SSD
+// scan). One workgroup per head `h` (dispatch (num_heads,1,1)); one thread
+// per head-dim column `di` (hd <= 64). Each thread owns its FULL ssm row
+// (`ssm_state[h, di, 0..ss)`), so no shared-mem/reduction is needed — this
+// only ports the per-(h,di) closure of `mamba2_recurrence_and_norm`
+// (src/nemotron.rs) EXACTLY, same accumulation order over `n`:
+//   a     = -exp(A_log[h]); dt = max(softplus(dt_raw[h]+dt_bias[h]), time_step_min)
+//   da    = exp(dt * a)
+//   g     = h / heads_per_group  (group-shared B/C)
+//   x     = conv_out[h*hd + di]
+//   for n in 0..ss: s = ssm[n]*da + dt*B[g,n]*x; ssm[n] = s; acc += s*C[g,n]
+//   y     = acc + x * D[h]
+//   gated = y * silu(gate[h*hd + di])   (pre-norm output; the gated RMSNorm
+//                                        itself is `nemotron_gated_rmsnorm`)
+// exp/log use GPU intrinsics (last-ulp vs libm, same tolerance posture as
+// the qwen3.6 GDN decode kernel).
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint nh;
+    uint hd;
+    uint ss;
+    uint heads_per_group;
+    uint inter;
+    uint conv_dim;
+    uint ng_ss; // n_groups * ss (C's group-block offset into conv_out)
+    float time_step_min;
+};
+
+layout(binding = 0) readonly buffer PBuf { float proj[]; };       // [in_proj_out]; gate = proj[0..inter], dt_raw at proj[inter+conv_dim+h]
+layout(binding = 1) readonly buffer CoBuf { float conv_out[]; };  // [conv_dim]; x=[0..inter), B=[inter..inter+ng_ss), C=[inter+ng_ss..)
+layout(binding = 2) readonly buffer ParBuf { float params[]; };   // [a_log(nh) | D(nh) | dt_bias(nh)]
+layout(binding = 3) buffer SBuf { float ssm_state[]; };           // [nh, hd, ss]
+layout(binding = 4) writeonly buffer GBuf { float gated[]; };     // [inter]
+
+void main() {
+    const uint h = gl_WorkGroupID.x;
+    const uint di = gl_LocalInvocationID.x;
+    if (di >= hd) {
+        return;
+    }
+
+    const float a_log = params[h];
+    const float d_skip = params[nh + h];
+    const float dt_bias = params[2u * nh + h];
+
+    const float dt_raw = proj[inter + conv_dim + h];
+    const float xx = dt_raw + dt_bias;
+    const float sp = xx > 0.0 ? xx + log(1.0 + exp(-xx)) : log(1.0 + exp(xx));
+    float dt_h = sp;
+    if (dt_h < time_step_min) {
+        dt_h = time_step_min;
+    }
+    const float a = -exp(a_log);
+    const float da = exp(dt_h * a);
+
+    const uint g = h / heads_per_group;
+    const float x = conv_out[h * hd + di];
+    const uint base = h * hd * ss + di * ss;
+    const uint b_off = inter + g * ss;
+    const uint c_off = inter + ng_ss + g * ss;
+
+    float acc = 0.0;
+    for (uint n = 0u; n < ss; n++) {
+        const float s = ssm_state[base + n] * da + dt_h * conv_out[b_off + n] * x;
+        ssm_state[base + n] = s;
+        acc += s * conv_out[c_off + n];
+    }
+    const float y = acc + x * d_skip;
+    const float gate = proj[h * hd + di];
+    gated[h * hd + di] = y * (gate / (1.0 + exp(-gate))); // * silu(gate)
+}
