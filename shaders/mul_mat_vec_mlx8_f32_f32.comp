@@ -1,0 +1,128 @@
+#version 450
+// MLX-affine 8-bit gs64 matvec — DeepSeek-V4-Flash shared_experts / embed_tokens
+// / lm_head (the "8-bit gs64" bucket). The thin twin of
+// mul_mat_vec_mlx2repack_f32_f32.comp for the aligned 8-bit width. NOTE: the
+// existing `mul_mat_vec_mlx4_w8` is a MISNAMED 4-bit kernel (w8 = 8 nibbles/word,
+// still 4-bit codes); this is the FIRST real 8-bit MLX-affine matvec.
+//
+// LAYOUT (MLX affine, aligned): 4 codes per u32, little-bits-first
+//   q_j = (word >> (8*(j%4))) & 0xFF
+// 8 divides 32 so a code NEVER crosses a u32 boundary — this is the aligned
+// `dequantize_mlx_affine` layout (per_word=4), byte-identical packed bytes, ZERO
+// loader change. Confirmed vs the Phase-0 oracle model::dequantize_mlx_affine_bits
+// (bits=8 path == aligned dequantize_mlx_affine).
+//
+//  (1) DWORDX4: one uvec4 load (128b) = 4 words = 16 codes; packed address
+//      amortized over 16 elements. Across a wave the uvec4 chunks are contiguous
+//      -> coalesced. Packed layout unchanged (row-major), loader permutation = id.
+//  (2) SCALE/BIAS ONCE PER CHUNK + fused affine: DSV4 8-bit tensors are gs=64, so
+//      chunks_per_group = 64/16 = 4 and each 16-elem chunk lies wholly within one
+//      affine group. affine factored exactly like the 2/4/6-bit repack:
+//        temp += scale*sum(q_j*x_j) + bias*sum(x_j)     (one fma per chunk)
+//      Algebraically == v1's per-element (scale*q_j+bias)*x_j; f32 rounding differs
+//      (fma + subgroup reassoc) -> gate ARGMAX-EXACT + max_abs_err ~ULP.
+//  (3) SUBGROUP REDUCTION: per-row subgroupAdd (wave64 GFX1013, BLOCK_SIZE<=64 =
+//      one subgroup -> no LDS, no barrier); tiny LDS combine only if BLOCK_SIZE
+//      spans >1 subgroup.
+//
+// REQUIRES k % 16 == 0 (chunks_per_row = k/16) AND packed base 16B-aligned:
+// packed_off and words_per_row (=k/4) both multiples of 4 => k % 16 == 0.
+// True for DSV4: hidden_size=4096 (k/16=256), moe/shared intermediate, vocab head
+// row length k=hidden=4096. Bindings / push-constants IDENTICAL to
+// mul_mat_vec_mlx4.comp (5 buffers, 5 uints) -> same matvec_mlx4_pc / record_to.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 64;
+layout(constant_id = 1) const uint NUM_ROWS = 2;
+
+layout(push_constant) uniform parameter {
+    uint ncols;       // k = in_features (contraction)
+    uint nrows;       // n = out_features
+    uint group_size;  // affine group size (64 for DSV4 8-bit tensors)
+    uint packed_off;  // WORD offset into packed[] for this weight (0 for dense 2D)
+    uint sb_off;      // ELEMENT offset into scales[]/biases[]  (0 for dense 2D)
+} p;
+
+layout(binding = 0) readonly buffer Packed { uvec4 packed4[]; }; // 4 words / uvec4 = 16 codes
+layout(binding = 1) readonly buffer Scales { float scales[]; };
+layout(binding = 2) readonly buffer Biases { float biases[]; };
+layout(binding = 3) readonly buffer Activ  { vec4  x4[];     };  // k/4 vec4s
+layout(binding = 4) writeonly buffer Dst   { float dst[];    };
+
+shared float part[NUM_ROWS][16];
+
+// Unpack the 4 8-bit codes of `w` into one vec4 (codes j,j+1,j+2,j+3).
+#define Q4_8(w) vec4(float(((w) >>  0u) & 0xFFu), float(((w) >>  8u) & 0xFFu), \
+                     float(((w) >> 16u) & 0xFFu), float(((w) >> 24u) & 0xFFu))
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint first_row = NUM_ROWS * gl_WorkGroupID.x;
+
+    const uint k = p.ncols;
+    const uint groups = k / p.group_size;
+    const uint words_per_row = k >> 2u;               // k/4 (4 codes/word)
+    const uint chunks_per_row = k >> 4u;              // k/16 (4 words = 16 codes each)
+    const uint chunks_per_group = p.group_size >> 4u; // gs/16 = 4 for gs=64
+
+    float temp[NUM_ROWS];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) { temp[n] = 0.0; }
+
+    for (uint c = tid; c < chunks_per_row; c += BLOCK_SIZE) {
+        const uint g = c / chunks_per_group;   // affine group of this 16-elem chunk
+        const uint xb = c << 2u;               // 4*c (vec4 index base for 16 acts)
+        const vec4 x0 = x4[xb + 0u];
+        const vec4 x1 = x4[xb + 1u];
+        const vec4 x2 = x4[xb + 2u];
+        const vec4 x3 = x4[xb + 3u];
+        const float xsum = dot(x0 + x1 + x2 + x3, vec4(1.0));
+
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint r = first_row + n;
+            if (r >= p.nrows) { continue; }
+            const uint base4 = ((p.packed_off + r * words_per_row) >> 2u) + c;
+            const uvec4 pw = packed4[base4];   // ONE dwordx4 = 16 codes
+            const float qx = dot(Q4_8(pw.x), x0) + dot(Q4_8(pw.y), x1)
+                           + dot(Q4_8(pw.z), x2) + dot(Q4_8(pw.w), x3);
+            const uint sb = p.sb_off + r * groups + g;
+            temp[n] = fma(scales[sb], qx, fma(biases[sb], xsum, temp[n]));
+        }
+    }
+
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        temp[n] = subgroupAdd(temp[n]);
+    }
+
+    if (gl_NumSubgroups == 1u) {
+        if (subgroupElect()) {
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                const uint r = first_row + n;
+                if (r < p.nrows) { dst[r] = temp[n]; }
+            }
+        }
+        return;
+    }
+
+    if (subgroupElect()) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            part[n][gl_SubgroupID] = temp[n];
+        }
+    }
+    barrier();
+    if (gl_SubgroupID == 0u) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            float acc = 0.0;
+            for (uint s = gl_SubgroupInvocationID; s < gl_NumSubgroups; s += gl_SubgroupSize) {
+                acc += part[n][s];
+            }
+            acc = subgroupAdd(acc);
+            const uint r = first_row + n;
+            if (subgroupElect() && r < p.nrows) { dst[r] = acc; }
+        }
+    }
+}

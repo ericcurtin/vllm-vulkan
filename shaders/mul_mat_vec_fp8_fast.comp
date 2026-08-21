@@ -1,0 +1,110 @@
+#version 450
+
+// FP8 (OCP E4M3 / modelopt W8A16) matrix-vector kernel for vllm-vulkan — FAST
+// variant (VLLM_VULKAN_FP8_FAST): arithmetic decode + vec4 loads instead of
+// the 256-entry const-LUT gather + scalar byte loads in mul_mat_vec_fp8.comp.
+//
+// Computes, for each output row r in [0, n):
+//   out[r] = sum_{j=0..k} ( e4m3_decode( byte(w, r, j) ) * scale ) * x[j]
+// exactly mirroring model::dequantize_fp8. The weight is UNPACKED FP8-E4M3,
+// 1 byte per element, row-major [out, in]. `scale` is per-tensor (scalar,
+// broadcast) or per-output-row; selected by push-constant `scale_per_row`.
+//
+// Absolute-byte addressing: bi = r*k + j; word = bi>>2; shift = (bi&3)*8;
+// code = (word>>shift)&0xFF. Requires k%4==0 (each row word-aligned), asserted
+// host-side by matvec_fp8_pc. Reinterpret-as-uint mirrors mlx4/nvfp4 (no 8-bit
+// storage extension needed).
+//
+// This variant additionally requires packed_off%4==0 (word-aligned row start,
+// true for every real dispatch since packed_off is always 0 for dense fp8
+// matvecs — matvec_fp8_pc hardcodes it) so the hot loop can address whole
+// uint words (4 codes) and vec4-load 4 activations per iteration with no
+// tail/OOB handling.
+//
+// Bindings (auto-numbered 0.. by record_to in buffer order):
+//   0 = packed weight  (uint[], FP8 bytes, 4 per u32)
+//   1 = scale          (float[], length 1 per-tensor OR n per-row)
+//   2 = activation x   (float[], length k) — aliased as vec4[] (ActivV4)
+//   3 = output         (float[], length n)
+// Push constants: { uint ncols(=k); uint nrows(=n); uint scale_per_row(0|1);
+//                   uint packed_off; uint sb_off; }
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 512;
+layout(constant_id = 1) const uint NUM_ROWS = 1;
+
+layout(push_constant) uniform parameter {
+    uint ncols;         // k = in_features
+    uint nrows;         // n = out_features
+    uint scale_per_row; // 0 = per-tensor scalar (scale[sb_off]); 1 = per-row (scale[sb_off+r])
+    uint packed_off;    // base BYTE offset into the weight for this slice (0 for dense)
+    uint sb_off;        // base ELEMENT offset into scale[] (0 for dense)
+} p;
+
+layout(binding = 0) readonly buffer Packed { uint   packed[]; };
+layout(binding = 1) readonly buffer Scales { float  scale[];  };
+layout(binding = 2) readonly buffer Activ   { float x[];   };
+layout(binding = 2) readonly buffer ActivV4 { vec4  xv4[]; };
+layout(binding = 3) writeonly buffer Dst   { float  dst[];    };
+
+shared float tmpsh[NUM_ROWS][BLOCK_SIZE];
+
+// E4M3 (1 sign / 4 exp bias-7 / 3 mant) -> f32, bit-exact vs model::e4m3_to_f32.
+float e4m3_decode(uint code) {
+    uint s = (code >> 7) & 1u;
+    uint e = (code >> 3) & 0xFu;
+    uint m =  code       & 0x7u;
+    float mag;
+    if (e == 0u) {
+        mag = float(m) * (1.0 / 512.0);          // subnormal (m==0 -> +0.0)
+    } else if (e == 0xFu && m == 7u) {
+        mag = 0.0;                                // NaN code -> 0 (ref parity)
+    } else {
+        mag = uintBitsToFloat(((e + 120u) << 23) | (m << 20));
+    }
+    return uintBitsToFloat(floatBitsToUint(mag) | (s << 31u));
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint first_row = NUM_ROWS * gl_WorkGroupID.x;
+    const uint k = p.ncols;
+
+    float temp[NUM_ROWS];
+    [[unroll]] for (uint m = 0; m < NUM_ROWS; ++m) { temp[m] = 0.0; }
+
+    const uint kw = k >> 2u;                 // words per row; k%4==0
+    for (uint wi = tid; wi < kw; wi += BLOCK_SIZE) {
+        const vec4 xv = xv4[wi];
+        [[unroll]] for (uint mrow = 0; mrow < NUM_ROWS; ++mrow) {
+            const uint r = first_row + mrow;
+            if (r >= p.nrows) { continue; }
+            const uint bi = p.packed_off + r * k + (wi << 2u);
+            const uint w  = packed[bi >> 2u];
+            const vec4 wv = vec4(e4m3_decode( w        & 0xFFu),
+                                 e4m3_decode((w >>  8u) & 0xFFu),
+                                 e4m3_decode((w >> 16u) & 0xFFu),
+                                 e4m3_decode((w >> 24u) & 0xFFu));
+            const uint sidx = p.sb_off + (p.scale_per_row != 0u ? r : 0u);
+            temp[mrow] += scale[sidx] * dot(wv, xv);
+        }
+    }
+
+    [[unroll]] for (uint m = 0; m < NUM_ROWS; ++m) { tmpsh[m][tid] = temp[m]; }
+    barrier();
+    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            [[unroll]] for (uint m = 0; m < NUM_ROWS; ++m) { tmpsh[m][tid] += tmpsh[m][tid + s]; }
+        }
+        barrier();
+    }
+    if (tid == 0) {
+        [[unroll]] for (uint m = 0; m < NUM_ROWS; ++m) {
+            const uint r = first_row + m;
+            if (r < p.nrows) { dst[r] = tmpsh[m][0]; }
+        }
+    }
+}

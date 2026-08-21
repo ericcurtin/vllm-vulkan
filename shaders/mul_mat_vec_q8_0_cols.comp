@@ -1,0 +1,106 @@
+#version 450
+
+// Q8_0 batched multi-column matrix-vector kernel (spec-decode "batched verify"
+// primitive). Computes, for each output row r in [0,n) and token-column c in
+// [0,NUM_COLS):  dst[c,r] = sum_{j=0..k} (qs[r,j] * d[r,blk(j)]) * x[c,j].
+//
+// Like mul_mat_vec_f16_cols / mul_mat_vec_nvfp4, each thread DEQUANTIZES each
+// weight element (int8 * f16 block scale) EXACTLY ONCE and reuses it across all
+// NUM_COLS token columns (columns are the INNER loop) -- the genuine
+// stream-weight-once amortization the generic mul_mat_vec.comp base.glsl path
+// does NOT achieve (it re-dequantizes the weight per column -> ~linear T).
+//
+// Weight is the standard ggml q8_0 block layout (matches model::quantize_q8_0 /
+// dequant_q8_0_to_f32): row-major [n, k/32] blocks, each block = { f16 d; int8
+// qs[32] }. Block for (r,j) = data_a[r*(k/32) + j/32]; qs index = j%32.
+// Activation [NUM_COLS,k] row-major (x[c*k+j], f32); output [NUM_COLS,n]
+// row-major (dst[c*n+r], f32). 2D workgroup grid -> n may exceed 65535.
+//
+// Bindings: 0 = weight (q8_0 blocks), 1 = activation x (f32), 2 = output (f32).
+// Push constants: { uint ncols(=k); uint nrows(=n); }. k must be a multiple of
+// 32. NUM_ROWS*NUM_COLS<=8 keeps LDS (rows*cols*BLOCK_SIZE*4) <= 16 KB.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 512;
+layout(constant_id = 1) const uint NUM_ROWS = 1;
+layout(constant_id = 2) const uint NUM_COLS = 1;
+
+layout(push_constant) uniform parameter {
+    uint ncols;  // k = in_features (contraction dim), multiple of 32
+    uint nrows;  // n = out_features
+} p;
+
+struct block_q8_0 {
+    float16_t d;
+    int8_t qs[32];
+};
+
+layout(binding = 0) readonly buffer W    { block_q8_0 data_a[]; };
+layout(binding = 1) readonly buffer Activ { float x[];         };
+layout(binding = 2) writeonly buffer Dst { float dst[];        };
+
+shared float tmpsh[NUM_ROWS][NUM_COLS][BLOCK_SIZE];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint wg_lin = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    const uint first_row = NUM_ROWS * wg_lin;
+    const uint k = p.ncols;
+    const uint blocks_per_row = k >> 5;   // k / 32
+
+    float temp[NUM_ROWS][NUM_COLS];
+    [[unroll]] for (uint nr = 0; nr < NUM_ROWS; ++nr) {
+        [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+            temp[nr][c] = 0.0;
+        }
+    }
+
+    for (uint j = tid; j < k; j += BLOCK_SIZE) {
+        const uint blk_in_row = j >> 5;    // j / 32
+        const uint qi = j & 31u;           // j % 32
+        [[unroll]] for (uint nr = 0; nr < NUM_ROWS; ++nr) {
+            const uint r = first_row + nr;
+            if (r >= p.nrows) { continue; }
+            const uint b = r * blocks_per_row + blk_in_row;
+            // Dequantize the weight element ONCE (int8 * f16 scale).
+            const float wv = float(int(data_a[b].qs[qi])) * float(data_a[b].d);
+            [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+                temp[nr][c] += wv * x[c * k + j];
+            }
+        }
+    }
+
+    [[unroll]] for (uint nr = 0; nr < NUM_ROWS; ++nr) {
+        [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+            tmpsh[nr][c][tid] = temp[nr][c];
+        }
+    }
+    barrier();
+    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            [[unroll]] for (uint nr = 0; nr < NUM_ROWS; ++nr) {
+                [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+                    tmpsh[nr][c][tid] += tmpsh[nr][c][tid + s];
+                }
+            }
+        }
+        barrier();
+    }
+    if (tid == 0) {
+        [[unroll]] for (uint nr = 0; nr < NUM_ROWS; ++nr) {
+            const uint r = first_row + nr;
+            if (r < p.nrows) {
+                [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+                    dst[c * p.nrows + r] = tmpsh[nr][c][0];
+                }
+            }
+        }
+    }
+}

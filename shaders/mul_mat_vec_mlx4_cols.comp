@@ -1,0 +1,156 @@
+#version 450
+
+// MLX-affine 4-bit batched multi-column matrix-vector kernel (spec-decode
+// "batched verify" primitive). The 4-bit DEQUANT-cols twin of the q8_0 winner
+// shaders/mul_mat_vec_q8_0_cols.comp, targeting the fleet's REAL weight format
+// (mlx4 affine 4-bit), NOT the q8_0 debug format.
+//
+// Computes, for each output row r in [0,n) and token-column c in [0,NUM_COLS):
+//   dst[c,r] = sum_{j=0..k} ( nibble(w,r,j) * scale[r,g] + bias[r,g] ) * x[c,j]
+// where g = j / group_size, exactly mirroring the validated CPU reference
+// `model::dequantize_mlx_affine` (bits=4) and the single-column
+// shaders/mul_mat_vec_mlx4.comp:
+//
+//   words_per_row = k / 8              (8 nibbles per u32 word, LSB-first)
+//   q  = (packed[r*words_per_row + j/8] >> ((j%8)*4)) & 0xF
+//   w  = scales[r*groups + g] * q + biases[r*groups + g]
+//
+// ─── DESIGN: minimal live state (avoid the repack VGPR trap) ──────────────────
+// Like mul_mat_vec_q8_0_cols / mul_mat_vec_nvfp4 (cols), each thread UNPACKS +
+// DEQUANTIZES each weight element EXACTLY ONCE (nibble unpack + affine
+// scale*q+bias) and reuses that single scalar `w` across all NUM_COLS token
+// columns (columns are the INNER loop). The ONLY column-scaled live state is the
+// accumulator array temp[NUM_ROWS][NUM_COLS]; the decoded weight `w`, the packed
+// `word`, `q`, and the per-group scale/bias are TRANSIENT scalars consumed
+// immediately. This is the crucial contrast with the DEAD mlx4 REPACK-cols
+// design (on-node refuted 2026-07-26, 0.19–0.38×): repack decoded a whole block
+// of 8 weights (w0..w7) and held that vector LIVE across the T columns, pushing
+// VGPR 56→96 → occupancy collapse. Here nothing but the T accumulators lives
+// across the column loop, so the kernel stays in the q8-like LDS-bound regime
+// (VGPR ~ base + T) rather than the repack VGPR-bound regime.
+//
+// Since the fleet 4-bit matvec is DEQUANT-ALU-bound at ~263 GB/s (not at the
+// ~380 GB/s BW roof like q8) [[gfx1013-4bit-decode-bw-ceiling]], the cols reuse
+// amortizes BOTH the weight read AND the nibble-unpack+affine ALU across T — a
+// potentially BIGGER win than q8, contingent on occupancy holding (the whole
+// point of the spike). The heavier per-element VALU (shift/mask + mul+add vs
+// q8's single int8*scale) can pull the T-plateau IN vs q8's T≈8 — the sweep
+// measures where.
+//
+// Activation x is laid out [NUM_COLS,k] row-major (x[c*k+j], f32); output
+// [NUM_COLS,n] row-major (dst[c*n+r], f32) — the same [T,k]->[T,n] convention as
+// q8_0_cols / nvfp4-cols. 2D workgroup grid so n may exceed 65535.
+//
+// Bindings (auto-numbered 0.. by record_to in buffer order, matching
+// mul_mat_vec_mlx4.comp):
+//   0 = packed weight  (uint[],  4-bit nibbles, 8 per u32)
+//   1 = scales         (float[], one per output-row x group)
+//   2 = biases         (float[], one per output-row x group)
+//   3 = activation x   (float[], [NUM_COLS,k] row-major)
+//   4 = output         (float[], [NUM_COLS,n] row-major)
+//
+// Push constants: { uint ncols(=k); uint nrows(=n); uint group_size;
+//                   uint packed_off; uint sb_off; } — identical to
+// mul_mat_vec_mlx4.comp, so the single-column dispatch path is reused verbatim.
+//
+// NUM_COLS (spec constant 2, default 1) is the batch width. NUM_COLS=1 is
+// byte-identical to mul_mat_vec_mlx4.comp by construction (the inner column loop
+// collapses to the original single MAC and the [c*..] indices collapse to [..]).
+// LDS = NUM_ROWS*NUM_COLS*BLOCK_SIZE*4; callers keep NUM_ROWS*NUM_COLS<=8 so LDS
+// <= 16 KB (BLOCK_SIZE=512). Wave64 on GFX1013; NUM_ROWS<=8.
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 512;
+layout(constant_id = 1) const uint NUM_ROWS = 1;
+layout(constant_id = 2) const uint NUM_COLS = 1;
+
+layout(push_constant) uniform parameter {
+    uint ncols;       // k = in_features (contraction dim)
+    uint nrows;       // n = out_features
+    uint group_size;  // affine group size along k (typically 64)
+    uint packed_off;  // base WORD offset into packed[] for this expert's slice
+    uint sb_off;      // base ELEMENT offset into scales[]/biases[] for this expert
+} p;
+
+layout(binding = 0) readonly buffer Packed { uint   packed[]; };
+layout(binding = 1) readonly buffer Scales { float  scales[]; };
+layout(binding = 2) readonly buffer Biases { float  biases[]; };
+layout(binding = 3) readonly buffer Activ  { float  x[];      };
+layout(binding = 4) writeonly buffer Dst   { float  dst[];    };
+
+shared float tmpsh[NUM_ROWS][NUM_COLS][BLOCK_SIZE];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint wg_lin = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    const uint first_row = NUM_ROWS * wg_lin;
+
+    const uint k = p.ncols;
+    const uint gs = p.group_size;
+    const uint groups = k / gs;
+    const uint words_per_row = k >> 3u;   // k / 8
+
+    // Per-(row,col) running partial sums for this thread's strided slice of k.
+    // This is the ONLY column-scaled live state (NUM_ROWS*NUM_COLS f32).
+    float temp[NUM_ROWS][NUM_COLS];
+    [[unroll]] for (uint nr = 0; nr < NUM_ROWS; ++nr) {
+        [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+            temp[nr][c] = 0.0;
+        }
+    }
+
+    // Each thread walks columns j = tid, tid+BLOCK_SIZE, ... The weight element
+    // at (r,j) is unpacked + affine-dequantized ONCE into the scalar `w` and
+    // reused across all NUM_COLS token columns (x is [NUM_COLS,k] row-major).
+    for (uint j = tid; j < k; j += BLOCK_SIZE) {
+        const uint widx  = j >> 3u;         // j / 8   word index within a row
+        const uint shift = (j & 7u) * 4u;   // (j % 8) * 4  nibble bit offset
+        const uint g = j / gs;              // affine group index
+
+        [[unroll]] for (uint nr = 0; nr < NUM_ROWS; ++nr) {
+            const uint r = first_row + nr;
+            if (r >= p.nrows) { continue; }
+            const uint word = packed[p.packed_off + r * words_per_row + widx];
+            const float q = float((word >> shift) & 0xFu);
+            // Dequantize ONCE: affine scale*q + bias (transient scalar, not held
+            // across columns -- the anti-repack-trap invariant).
+            const float w = scales[p.sb_off + r * groups + g] * q
+                          + biases[p.sb_off + r * groups + g];
+            [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+                temp[nr][c] += w * x[c * k + j];
+            }
+        }
+    }
+
+    // Reduce partial sums across the workgroup via shared memory (same order as
+    // mul_mat_vec_mlx4.comp / q8_0_cols).
+    [[unroll]] for (uint nr = 0; nr < NUM_ROWS; ++nr) {
+        [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+            tmpsh[nr][c][tid] = temp[nr][c];
+        }
+    }
+    barrier();
+    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            [[unroll]] for (uint nr = 0; nr < NUM_ROWS; ++nr) {
+                [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+                    tmpsh[nr][c][tid] += tmpsh[nr][c][tid + s];
+                }
+            }
+        }
+        barrier();
+    }
+    if (tid == 0) {
+        [[unroll]] for (uint nr = 0; nr < NUM_ROWS; ++nr) {
+            const uint r = first_row + nr;
+            if (r < p.nrows) {
+                [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+                    dst[c * p.nrows + r] = tmpsh[nr][c][0];
+                }
+            }
+        }
+    }
+}

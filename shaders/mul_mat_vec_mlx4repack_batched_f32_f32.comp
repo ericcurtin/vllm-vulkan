@@ -1,0 +1,150 @@
+#version 450
+// MLX-affine 4-bit EXPERT-BATCHED matvec — the Ling MoE decode dispatch-collapse
+// lever (VLLM_VULKAN_LING_MOE_BATCH). Computes the SAME gate/up/down projection
+// over ALL top_k routed experts in ONE dispatch, each expert's slice processed
+// through the EXACT per-byte repack inner loop of
+// mul_mat_vec_mlx4repack_f32_f32.comp (dwordx4 word-granular load + fma-factored
+// affine + subgroupAdd reduction, at the ~62us weight-read BW floor).
+//
+// ★ THE GUARDRAIL (why Laguna's cbbatch was a 2x REGRESSION): batching MUST go
+// THROUGH the repack kernel, NOT the v1 LDS tree-reduce. This kernel's per-(row,
+// chunk) body is BYTE-FOR-BYTE the repack body; the ONLY additions are a per-
+// expert base lookup from `meta[gl_WorkGroupID.y]` and a per-expert activation/
+// output base offset. So per-expert throughput is IDENTICAL to the single-expert
+// repack (VGPR/LDS/occupancy unchanged — single token, no live-weight-across-cols
+// blowup) while the DISPATCH count collapses 24->3 per MoE layer and the 8 experts'
+// workgroups fill the CUs concurrently.
+//
+// Dispatch grid: (ceil(n / NUM_ROWS), num_experts, 1). gl_WorkGroupID.y = expert
+// slot in [0, num_experts). meta[e] = (packed_off, sb_off, x_off, dst_off):
+//   packed_off  WORD offset into packed[]  for expert e's weight  (= slot[e]*n*(k/8))
+//   sb_off      ELEMENT offset into scales[]/biases[] for expert e (= slot[e]*n*(k/gs))
+//   x_off       FLOAT offset into the activation buffer for expert e
+//               (0 for gate/up: all experts share x; e*k for down: per-expert mid)
+//   dst_off     FLOAT offset into dst[] for expert e (= e*n)
+// x_off is a multiple of 4 (k%4==0) so the vec4 activation index is exact.
+//
+// REQUIRES (same as the single-expert repack, guaranteed by k%32==0 for every Ling
+// MoE shape): chunks_per_row = k/32, packed base 16B-aligned (packed_off and
+// words_per_row = k/8 both multiples of 4). group_size generic (chunks_per_group =
+// gs/32; Ling routed experts are gs=32 -> 1 chunk/group).
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 64;
+layout(constant_id = 1) const uint NUM_ROWS = 2;
+
+layout(push_constant) uniform parameter {
+    uint ncols;       // k = in_features (contraction)
+    uint nrows;       // n = out_features
+    uint group_size;  // affine group size (32 for Ling routed experts)
+    uint packed_off;  // UNUSED here (per-expert offset comes from meta[]); kept so
+    uint sb_off;      // matvec_mlx4_pc's 5-uint layout is reused verbatim.
+} p;
+
+layout(binding = 0) readonly buffer Packed { uvec4 packed4[]; }; // 4 words / uvec4 = 32 nibbles
+layout(binding = 1) readonly buffer Scales { float scales[]; };
+layout(binding = 2) readonly buffer Biases { float biases[]; };
+layout(binding = 3) readonly buffer Activ  { vec4  x4[];     };  // (num_experts*)k/4 vec4s
+layout(binding = 4) writeonly buffer Dst   { float dst[];    };  // num_experts*n floats
+layout(binding = 5) readonly buffer Meta   { uvec4 meta[];   };  // per-expert bases
+
+// Cross-subgroup combine scratch (only touched when BLOCK_SIZE > subgroup size).
+shared float part[NUM_ROWS][16];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint first_row = NUM_ROWS * gl_WorkGroupID.x;
+    const uint e = gl_WorkGroupID.y;              // expert slot
+
+    const uvec4 md = meta[e];
+    const uint packed_off = md.x;
+    const uint sb_off     = md.y;
+    const uint x_base4    = md.z >> 2u;           // FLOAT x_off -> vec4 index base
+    const uint dst_off    = md.w;
+
+    const uint k = p.ncols;
+    const uint groups = k / p.group_size;
+    const uint words_per_row = k >> 3u;               // k/8
+    const uint chunks_per_row = k >> 5u;              // k/32 (4 words each)
+    const uint chunks_per_group = p.group_size >> 5u; // gs/32
+
+    float temp[NUM_ROWS];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) { temp[n] = 0.0; }
+
+    for (uint c = tid; c < chunks_per_row; c += BLOCK_SIZE) {
+        const uint g = c / chunks_per_group;   // affine group of this 32-elem chunk
+        const uint xb = x_base4 + (c << 3u);   // 8 vec4 of activations for j in [32c,32c+32)
+        const vec4 x0 = x4[xb + 0u];
+        const vec4 x1 = x4[xb + 1u];
+        const vec4 x2 = x4[xb + 2u];
+        const vec4 x3 = x4[xb + 3u];
+        const vec4 x4v = x4[xb + 4u];
+        const vec4 x5 = x4[xb + 5u];
+        const vec4 x6 = x4[xb + 6u];
+        const vec4 x7 = x4[xb + 7u];
+        const float xsum = dot(x0 + x1 + x2 + x3 + x4v + x5 + x6 + x7, vec4(1.0));
+
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint r = first_row + n;
+            if (r >= p.nrows) { continue; }
+            const uint base4 = ((packed_off + r * words_per_row) >> 2u) + c;
+            const uvec4 pw = packed4[base4];   // ONE dwordx4 = 32 nibbles (words 4c..4c+3)
+            float qx = dot(vec4(float( pw.x        & 0xFu), float((pw.x >>  4u) & 0xFu),
+                                float((pw.x >>  8u) & 0xFu), float((pw.x >> 12u) & 0xFu)), x0)
+                     + dot(vec4(float((pw.x >> 16u) & 0xFu), float((pw.x >> 20u) & 0xFu),
+                                float((pw.x >> 24u) & 0xFu), float((pw.x >> 28u) & 0xFu)), x1)
+                     + dot(vec4(float( pw.y        & 0xFu), float((pw.y >>  4u) & 0xFu),
+                                float((pw.y >>  8u) & 0xFu), float((pw.y >> 12u) & 0xFu)), x2)
+                     + dot(vec4(float((pw.y >> 16u) & 0xFu), float((pw.y >> 20u) & 0xFu),
+                                float((pw.y >> 24u) & 0xFu), float((pw.y >> 28u) & 0xFu)), x3)
+                     + dot(vec4(float( pw.z        & 0xFu), float((pw.z >>  4u) & 0xFu),
+                                float((pw.z >>  8u) & 0xFu), float((pw.z >> 12u) & 0xFu)), x4v)
+                     + dot(vec4(float((pw.z >> 16u) & 0xFu), float((pw.z >> 20u) & 0xFu),
+                                float((pw.z >> 24u) & 0xFu), float((pw.z >> 28u) & 0xFu)), x5)
+                     + dot(vec4(float( pw.w        & 0xFu), float((pw.w >>  4u) & 0xFu),
+                                float((pw.w >>  8u) & 0xFu), float((pw.w >> 12u) & 0xFu)), x6)
+                     + dot(vec4(float((pw.w >> 16u) & 0xFu), float((pw.w >> 20u) & 0xFu),
+                                float((pw.w >> 24u) & 0xFu), float((pw.w >> 28u) & 0xFu)), x7);
+            const uint sb = sb_off + r * groups + g;
+            temp[n] = fma(scales[sb], qx, fma(biases[sb], xsum, temp[n]));
+        }
+    }
+
+    // Reduce each row across the subgroup.
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        temp[n] = subgroupAdd(temp[n]);
+    }
+
+    if (gl_NumSubgroups == 1u) {
+        if (subgroupElect()) {
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                const uint r = first_row + n;
+                if (r < p.nrows) { dst[dst_off + r] = temp[n]; }
+            }
+        }
+        return;
+    }
+
+    if (subgroupElect()) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            part[n][gl_SubgroupID] = temp[n];
+        }
+    }
+    barrier();
+    if (gl_SubgroupID == 0u) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            float acc = 0.0;
+            for (uint s = gl_SubgroupInvocationID; s < gl_NumSubgroups; s += gl_SubgroupSize) {
+                acc += part[n][s];
+            }
+            acc = subgroupAdd(acc);
+            const uint r = first_row + n;
+            if (subgroupElect() && r < p.nrows) { dst[dst_off + r] = acc; }
+        }
+    }
+}

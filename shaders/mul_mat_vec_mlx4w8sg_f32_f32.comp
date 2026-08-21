@@ -1,0 +1,115 @@
+#version 450
+// MLX-affine 4-bit matvec — word-granular load/dequant (identical to
+// mul_mat_vec_mlx4w8) but the log2(BLOCK_SIZE) LDS tree reduction is replaced
+// by a per-row subgroupAdd, with a tiny LDS combine ONLY when the workgroup
+// spans more than one subgroup.
+//
+// Motivation: the down (k=512,n=2048) MoE dispatch launches 2048 tiny
+// workgroups; a wave-cost decomposition of the w8 sweep attributes ~30% of its
+// 27.3 µs to the barrier-separated shared-memory reduction (paid once per
+// workgroup, i.e. 2048x). On wave64 GFX1013 a workgroup of BLOCK_SIZE<=64 is a
+// SINGLE subgroup, so subgroupAdd collapses the entire reduction to one op with
+// no barrier and no LDS round-trip. Load/dequant math is bit-identical to w8;
+// only the reduction summation order differs (f32) -> cos gate.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 128;
+layout(constant_id = 1) const uint NUM_ROWS = 2;
+
+layout(push_constant) uniform parameter {
+    uint ncols;       // k
+    uint nrows;       // n
+    uint group_size;  // 64
+    uint packed_off;  // WORD offset (expert slice)
+    uint sb_off;      // ELEMENT offset (expert slice)
+} p;
+
+layout(binding = 0) readonly buffer Packed { uint  packed[]; };
+layout(binding = 1) readonly buffer Scales { float scales[]; };
+layout(binding = 2) readonly buffer Biases { float biases[]; };
+layout(binding = 3) readonly buffer Activ  { vec4  x4[];     };  // k/4 vec4s
+layout(binding = 4) writeonly buffer Dst   { float dst[];    };
+
+// Cross-subgroup combine scratch. Max subgroups per workgroup =
+// BLOCK_SIZE(<=512) / min subgroup size(32) = 16. Only touched when
+// gl_NumSubgroups > 1 (BLOCK_SIZE > subgroup size), never on the target bs<=64.
+shared float part[NUM_ROWS][16];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint first_row = NUM_ROWS * gl_WorkGroupID.x;
+
+    const uint k = p.ncols;
+    const uint groups = k / p.group_size;
+    const uint words_per_row = k >> 3u;               // k/8
+    const uint words_per_group = p.group_size >> 3u;  // 8 for gs=64
+
+    float temp[NUM_ROWS];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) { temp[n] = 0.0; }
+
+    for (uint w = tid; w < words_per_row; w += BLOCK_SIZE) {
+        const uint g = w / words_per_group;
+        const vec4 xa = x4[2u * w];
+        const vec4 xb = x4[2u * w + 1u];
+        const float xsum = dot(xa + xb, vec4(1.0));
+
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint r = first_row + n;
+            if (r >= p.nrows) { continue; }
+            const uint word = packed[p.packed_off + r * words_per_row + w];
+            const vec4 qa = vec4(float( word         & 0xFu),
+                                 float((word >>  4u) & 0xFu),
+                                 float((word >>  8u) & 0xFu),
+                                 float((word >> 12u) & 0xFu));
+            const vec4 qb = vec4(float((word >> 16u) & 0xFu),
+                                 float((word >> 20u) & 0xFu),
+                                 float((word >> 24u) & 0xFu),
+                                 float((word >> 28u) & 0xFu));
+            const float qx = dot(qa, xa) + dot(qb, xb);
+            const uint sb = p.sb_off + r * groups + g;
+            temp[n] = fma(scales[sb], qx, fma(biases[sb], xsum, temp[n]));
+        }
+    }
+
+    // Reduce each row across the subgroup.
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        temp[n] = subgroupAdd(temp[n]);
+    }
+
+    // Single-subgroup workgroup (the target geometry): lane 0 writes directly.
+    // gl_NumSubgroups is workgroup-uniform, so this branch never splits barrier
+    // reachability.
+    if (gl_NumSubgroups == 1u) {
+        if (subgroupElect()) {
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                const uint r = first_row + n;
+                if (r < p.nrows) { dst[r] = temp[n]; }
+            }
+        }
+        return;
+    }
+
+    // Multi-subgroup: each subgroup stashes its partial, subgroup 0 combines.
+    if (subgroupElect()) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            part[n][gl_SubgroupID] = temp[n];
+        }
+    }
+    barrier();
+    if (gl_SubgroupID == 0u) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            float acc = 0.0;
+            for (uint s = gl_SubgroupInvocationID; s < gl_NumSubgroups; s += gl_SubgroupSize) {
+                acc += part[n][s];
+            }
+            acc = subgroupAdd(acc);
+            const uint r = first_row + n;
+            if (subgroupElect() && r < p.nrows) { dst[r] = acc; }
+        }
+    }
+}
