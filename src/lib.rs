@@ -75,6 +75,9 @@ mod direct_kernels;
 #[cfg(feature = "debug-api")]
 use debug_api::*;
 mod vulkan_ctx;
+// GPU numerical conformance harness (test-only; no-ops without a Vulkan ICD).
+#[cfg(test)]
+mod device_conformance;
 use vulkan_ctx::{VulkanContext, GpuTensor};
 mod tp;
 #[cfg(feature = "qwen35")]
@@ -8880,7 +8883,7 @@ mod registry_tests {
     /// shader never breaks it, losing one always does. Each name below is a
     /// kernel some model path dispatches by name; if one is absent the dispatch
     /// would fail at runtime on the GPU, which CI has no way to reach.
-    const REQUIRED_QUANT_KERNELS: &[&str] = &[
+    pub(crate) const REQUIRED_QUANT_KERNELS: &[&str] = &[
         // mlx4 (4-bit) family
         "mul_mat_vec_mlx4_f32_f32",
         "mul_mat_vec_mlx4_cols",
