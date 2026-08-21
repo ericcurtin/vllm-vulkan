@@ -66,6 +66,7 @@ use flags::{Flags, QuantFormat};
 mod gpu_error;
 mod push_constants;
 use push_constants::*;
+#[cfg(test)] mod spirv_reflect_tests;
 #[cfg(feature = "debug-api")]
 mod debug_api;
 
