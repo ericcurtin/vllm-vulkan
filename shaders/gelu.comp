@@ -5,15 +5,19 @@
 
 #extension GL_EXT_control_flow_attributes : enable
 
-// local_size_x=128 (not the more common 512): measured on this hardware
-// (marginal per-dispatch cost within a batched submit, averaged over
-// hundreds of iterations), 128 is a clear, reproducible ~1.3-1.4x win at
-// ple_dim (256 elements — a single 512-wide workgroup here leaves 3/4 of
-// its lanes idle) and is tied with 512 at the much larger ffn_inter
-// sizes (6144/12288), so this is a pure win with no regression at any
-// real Gemma4-E2B shape. See gelu_tests::gpu_gelu_matches_cpu_reference
-// in src/lib.rs for a correctness check of this exact configuration.
-layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+// local_size_x=512 — MUST stay in lockstep with every dispatch site's
+// workgroup math. All production call sites compute wg = ceil(n/512)
+// (gemma fused-FFN + resident layer in gemma_forward.rs, unified_layer's
+// Activation::Gelu arm), same convention as silu.comp/gelu_quick.comp.
+// A 2026-07 retune to 128 (a per-dispatch micro-win at E2B's ple_dim=256,
+// which no call site ever dispatched) silently under-covered every
+// ceil(n/512) dispatch by 4x: gelu ran on only the first n/4 elements and
+// the mlp's gated activation tail stayed stale/zero — the gemma-31B
+// GPU-vs-CPU per-layer divergence (Gate-1 incoherence, second root cause).
+// The i >= p.KX guard makes OVER-dispatch safe; UNDER-dispatch is silent
+// corruption. If retuning again, derive the wg count from the shader
+// width at the call sites first.
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
 
 layout (binding = 0) readonly buffer X {A_TYPE data_a[];};
 layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
@@ -21,14 +25,12 @@ layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
 void main() {
     const float GELU_COEF_A    = 0.044715f;
     const float SQRT_2_OVER_PI = 0.79788456080286535587989211986876f;
-    // Strides here must track local_size_x (128): every production call
-    // site currently dispatches with (wgX, 1, 1) only, so
-    // GlobalInvocationID.y/z are always 0 and these strides are inert
-    // today — but keeping them mismatched with local_size_x would be a
-    // silent correctness trap for any future multi-dimensional dispatch
-    // of this shader (128*512 = 65536, matching the same "512 groups
-    // before rolling over" convention as the original 512*512 = 262144).
-    const uint i = gl_GlobalInvocationID.z * 65536 + gl_GlobalInvocationID.y * 128 + gl_GlobalInvocationID.x;
+    // Strides track local_size_x (512): every production call site
+    // dispatches (wgX, 1, 1) only, so GlobalInvocationID.y/z are always 0
+    // and these strides are inert today — kept consistent (512*512 =
+    // 262144 "512 groups before rolling over" convention) for any future
+    // multi-dimensional dispatch.
+    const uint i = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
 
     if (i >= p.KX) {
         return;

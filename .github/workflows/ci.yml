@@ -17,7 +17,7 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
       with:
         submodules: recursive
 
@@ -35,7 +35,7 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
       with:
         submodules: recursive
 
@@ -48,3 +48,37 @@ jobs:
     - name: Test
       run: |
         scripts/test.sh
+
+  # Type-check the crate (including its #[cfg(test)] modules) under the model-free
+  # foundation feature slice. scripts/test.sh only runs pytest, so cargo never
+  # exercised the Rust test code in CI — which let #[cfg(test)] modules that
+  # reference model-gated symbols break `cargo test
+  # --no-default-features --features multiple-pymethods` invisibly. Running the
+  # foundation-slice unit tests here catches that (and any other) Rust-test
+  # regression. The slice is deterministic on CI: no GPU (those tests are
+  # #[ignore]) and no env-sensitive tests (they are gated to model features).
+  rust-test-foundation:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v6
+      with:
+        submodules: recursive
+
+    - name: Install build + link deps
+      run: |
+        # glslang: build.rs runs scripts/compile_shaders.sh (ensure_vulkan is the
+        # project's own installer, same path scripts/test.sh uses).
+        # libvulkan-dev: the linker needs libvulkan.so (build.rs links -lvulkan).
+        # libpython3.12-dev: pyo3 links -lpython3.12 for the test binary.
+        source scripts/lib.sh
+        ensure_vulkan
+        sudo apt-get install -y libvulkan-dev libpython3.12-dev
+
+    - name: Run foundation-slice Rust tests
+      run: |
+        # The test binary embeds the interpreter; point it at the system Python.
+        export PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
+        cargo test --no-default-features --features "multiple-pymethods" --lib

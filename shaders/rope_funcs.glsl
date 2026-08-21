@@ -92,12 +92,21 @@ void rope_neox(const uint i0, const uint i1, const uint i2, const uint i3, rope_
         return;
     }
 
-    const float theta_base = rope_data_pos[i2] * pow(p.theta_scale, i0/2.0f);
-
-    const float freq_factor = p.has_ff != 0 ? rope_data_ff[i0/2] : 1.0f;
-
     float cos_theta, sin_theta;
-    rope_yarn(theta_base / freq_factor, i0, cos_theta, sin_theta, p);
+    if (p.yarn_direct != 0) {
+        // Laguna full-attn transformers-YaRN: rope_data_ff holds the precomputed
+        // per-pair inv_freq table (length n_dims/2). angle = pos*inv_freq[j] is a
+        // single multiply, byte-for-byte the same op sequence as
+        // laguna::cpu_rope_yarn; attn_factor is the full_attention_factor mscale
+        // applied to BOTH cos and sin (transformers multiplies both).
+        const float theta = float(rope_data_pos[i2]) * rope_data_ff[i0/2];
+        cos_theta = cos(theta) * p.attn_factor;
+        sin_theta = sin(theta) * p.attn_factor;
+    } else {
+        const float theta_base = rope_data_pos[i2] * pow(p.theta_scale, i0/2.0f);
+        const float freq_factor = p.has_ff != 0 ? rope_data_ff[i0/2] : 1.0f;
+        rope_yarn(theta_base / freq_factor, i0, cos_theta, sin_theta, p);
+    }
 
     const float x0 = float(rope_data_a[ix + 0]);
     const float x1 = float(rope_data_a[ix + p.n_dims/2]);

@@ -26,6 +26,13 @@ struct rope_params {
     uint nb11;
     uint nb12;
     uint nb13;
+
+    // Laguna full-attn YaRN direct path (piece 2 of the GPU-resident span fold).
+    // When != 0, rope_neox reads the precomputed transformers-YaRN inv_freq table
+    // from rope_data_ff and forms the angle as pos*inv_freq[j] (a single multiply,
+    // matching laguna::cpu_rope_yarn exactly), scaling cos/sin by attn_factor
+    // (== full_attention_factor mscale). 0 preserves the existing plain/NTK path.
+    uint yarn_direct;
 };
 
 #endif // !defined(GGML_ROPE_PARAMS)

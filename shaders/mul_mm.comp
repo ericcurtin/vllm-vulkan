@@ -3,7 +3,17 @@
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_16bit_storage : require
 
-#ifdef FLOAT16
+// GEMM campaign Phase 0 fix: A_TYPE/B_TYPE become f16vec4/f16mat2x4 whenever
+// the STORAGE type is f16 (DATA_A_F16/DATA_B_F16) and LOAD_VEC_A/B>=4 -- this
+// is independent of FLOAT16 (the ARITHMETIC mode, MM_F16). Gating the
+// extension request on FLOAT16 alone left the f32-arith ALIGNED+LOAD_VEC=8
+// combo (A stored f16, arithmetic f32) using f16mat2x4 without ever
+// requesting the extension that type needs -- "unexpected IDENTIFIER" at the
+// `buffer A {A_TYPE data_a[];}` declaration. (Undefined LOAD_VEC_A/B evaluate
+// to 0 in the preprocessor, so this is safe when unset.)
+#if defined(FLOAT16) \
+    || (defined(DATA_A_F16) && LOAD_VEC_A >= 4) \
+    || (defined(DATA_B_F16) && LOAD_VEC_B >= 4)
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #endif
 #if defined(DATA_A_IQ1_M)
@@ -71,6 +81,37 @@ layout (binding = 3) readonly buffer IDS {int data_ids[];};
 layout (binding = 4) readonly buffer Counts {int data_expert_count[];};
 #endif
 
+// Phase A quant-batched-GEMM: MLX-affine 4-bit dense weights carry their
+// scale/bias as two SEPARATE device buffers (no inline per-block scale like
+// Q8_0/Q4_0/etc.), mirroring mul_mat_vec_mlx4.comp's binding layout. Bindings
+// 3/4 are free here because MUL_MAT_ID (which uses them for IDS/Counts) is
+// not defined for the Phase A dense dispatch -- Phase B (MUL_MAT_ID + MLX4)
+// will need different binding numbers, deferred to that later change.
+#if defined(DATA_A_MLX4) && !defined(MUL_MAT_ID)
+layout (binding = 3) readonly buffer Scales { float mlx4_scales[]; };
+layout (binding = 4) readonly buffer Biases { float mlx4_biases[]; };
+#endif
+
+// Phase B (MUL_MAT_ID + MLX4) grouped-expert GEMM: bindings 3/4 are taken by
+// IDS/Counts under MUL_MAT_ID, so the mlx4 Scales/Biases move to 5/6 here. The
+// buffer variable names (`mlx4_scales`/`mlx4_biases`) are kept identical to the
+// dense case above so the shared DATA_A_MLX4 dequant head body is unchanged.
+#if defined(DATA_A_MLX4) && defined(MUL_MAT_ID)
+layout (binding = 5) readonly buffer ScalesId { float mlx4_scales[]; };
+layout (binding = 6) readonly buffer BiasesId { float mlx4_biases[]; };
+#endif
+
+// Epilogue-fused grouped MoE GEMM (plan-epilogue-fused-moe-gemm.md §2.1):
+// gate+up fused into ONE dispatch via a SECOND A-binding (the up weight) +
+// its own scales/biases, sharing the gate's B (token) binding. Bindings
+// 7/8/9 -- 0-6 are already taken by gate-A/B/D/IDS/Counts/gate-Scales/
+// gate-Biases (MAX_BINDINGS=12, plenty of headroom).
+#if defined(MLX4_ID_GATEUP)
+layout (binding = 7) readonly buffer A_UP { uint data_a_up[]; };
+layout (binding = 8) readonly buffer ScalesUpId { float mlx4_scales_up[]; };
+layout (binding = 9) readonly buffer BiasesUpId { float mlx4_biases_up[]; };
+#endif
+
 layout (push_constant) uniform parameter
 {
     uint M;
@@ -89,6 +130,25 @@ layout (push_constant) uniform parameter
     uint nei1;
     uint nbi1;
     uint ne11;
+#if defined(DATA_A_MLX4)
+    // Phase B grouped-expert MLX-affine 4-bit: affine group size along K plus
+    // the PER-EXPERT strides into the packed/scale-bias buffers. The base
+    // offset for this workgroup's expert is derived as
+    // `gl_WorkGroupID.z * mlx4_pack_stride` (resp. sb_stride) in the head,
+    // replacing the per-tensor scalar offsets the dense (non-id) arm carries.
+    uint mlx4_group_size;
+    uint mlx4_pack_stride;   // words per expert       = M*(K/8)
+    uint mlx4_sb_stride;     // scales/biases per expert = M*(K/group_size)
+#if defined(MLX4_ID_GATEUP)
+    // Epilogue-fused gate+up (§2.1): the UP weight's own per-expert strides.
+    // group_size is shared with gate (same weight format), so no separate
+    // up_group_size field. This is a NEW 18-u32 push-constant layout for
+    // THIS variant only (gemm_pc_mlx4_id_gateup) -- do not conflate with the
+    // 16-u32 gemm_pc_mlx4_id contract the plain matmul_mlx4_id_f32_fp32 uses.
+    uint up_pack_stride;
+    uint up_sb_stride;
+#endif
+#endif
 #else
     uint base_work_group_z;
     uint num_batches;
@@ -97,6 +157,15 @@ layout (push_constant) uniform parameter
     uint ne12;
     uint broadcast2;
     uint broadcast3;
+#if defined(DATA_A_MLX4)
+    // MLX-affine 4-bit dense: affine group size along K (typically 64), plus
+    // per-tensor base offsets into the packed/scale/bias buffers (0 for a
+    // plain 2D dense weight; nonzero would be needed for a future per-expert
+    // MUL_MAT_ID variant, out of scope here).
+    uint mlx4_group_size;
+    uint mlx4_packed_off;
+    uint mlx4_sb_off;
+#endif
 #endif
 } p;
 
@@ -249,7 +318,21 @@ void main() {
     uint pos_b = (batch_idx * p.batch_stride_b + ic * BN * p.stride_b + start_k) / LOAD_VEC_B;
 #endif
 
-#ifdef COOPMAT
+#if defined(MLX4_ID_GATEUP)
+    // TWO register accumulators (gate, up) instead of one -- 32 f32/thread
+    // vs 16, VGPRs not LDS (plan §4). ONE `buf_a`/`cache_a` reused
+    // sequentially for gate then up (sequential-K reuse, see the K-loop
+    // below) -- no second LDS tile.
+    ACC_TYPEV2 sums_gate[WMITER * TM * WNITER * TN/2];
+    ACC_TYPEV2 sums_up[WMITER * TM * WNITER * TN/2];
+    FLOAT_TYPEV2 cache_a[WMITER * TM];
+    FLOAT_TYPEV2 cache_b;
+
+    [[unroll]] for (uint i = 0; i < WMITER*TM*WNITER*TN/2; i++) {
+        sums_gate[i] = ACC_TYPEV2(0.0f, 0.0f);
+        sums_up[i] = ACC_TYPEV2(0.0f, 0.0f);
+    }
+#elif defined(COOPMAT)
     coopmat<FLOAT_TYPE, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> cache_a;
     coopmat<FLOAT_TYPE, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> cache_b;
     coopmat<ACC_TYPE, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> sums[cms_per_row * cms_per_col];
@@ -272,6 +355,82 @@ void main() {
     }
 #endif
 
+#if defined(MLX4_ID_GATEUP)
+    // Epilogue-fused gate+up K-loop (plan §2.1): ONE workgroup computes BOTH
+    // projections for its BM x BN (out-feature x token-slot) block via
+    // sequential-K reuse of a SINGLE buf_a tile -- gate loads+FMAs first,
+    // THEN (after a barrier) up overwrites the SAME buf_a and FMAs again.
+    // buf_b (the shared token activations) is loaded ONCE per block and read
+    // twice (both gate and up project the same x) -- no LDS growth vs the
+    // plain matmul_mlx4_id_f32_fp32 kernel (still ~17 KB, see plan §4).
+    for (uint block = start_k; block < end_k; block += BK) {
+        // ---- Gate half: load gate-A + shared B into buf_a/buf_b. ----
+        [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) {
+            load_a_to_shmem(pos_a, loadr_a, loadc_a + l, ir * BM + loadc_a + l, block, end_k);
+        }
+        [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) {
+            load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic, _ne1, block, end_k);
+        }
+        barrier();
+
+        pos_a += BK / LOAD_VEC_A;
+        pos_b += BK / LOAD_VEC_B;
+
+        [[unroll]] for (uint i = 0; i < BK / BK_STEP; i++) {
+            [[unroll]] for (uint wsir = 0; wsir < WMITER; wsir++) {
+                [[unroll]] for (uint j = 0; j < TM; j++) {
+                    cache_a[wsir * TM + j] = buf_a[(warp_r * WM + wsir * WSUBM + tiwr * TM + j) * SHMEM_STRIDE + i];
+                }
+            }
+            [[unroll]] for (uint wsic = 0; wsic < WNITER; wsic++) {
+                [[unroll]] for (uint cc = 0; cc < TN; cc++) {
+                    cache_b = buf_b[(warp_c * WN + wsic * WSUBN + tiwc * TN + cc) * SHMEM_STRIDE + i];
+                    [[unroll]] for (uint wsir = 0; wsir < WMITER; wsir++) {
+                        [[unroll]] for (uint cr = 0; cr < TM / 2; cr++) {
+                            const uint sums_idx = (wsic * TN + cc) * WMITER * (TM / 2) + wsir * (TM / 2) + cr;
+                            sums_gate[sums_idx].x = fma(ACC_TYPE(cache_a[wsir * TM + 2 * cr    ].x), ACC_TYPE(cache_b.x), fma(ACC_TYPE(cache_a[wsir * TM + 2 * cr    ].y), ACC_TYPE(cache_b.y), sums_gate[sums_idx].x));
+                            sums_gate[sums_idx].y = fma(ACC_TYPE(cache_a[wsir * TM + 2 * cr + 1].x), ACC_TYPE(cache_b.x), fma(ACC_TYPE(cache_a[wsir * TM + 2 * cr + 1].y), ACC_TYPE(cache_b.y), sums_gate[sums_idx].y));
+                        }
+                    }
+                }
+            }
+        }
+
+        // buf_a's gate contents are fully consumed above -- safe to overwrite.
+        barrier();
+
+        // ---- Up half: SAME buf_a tile, sequential-K reuse (no extra LDS).
+        // buf_b (tokens) is untouched -- no reload, gate and up share it. ----
+        [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) {
+            load_a_up_to_shmem(pos_a, loadr_a, loadc_a + l, ir * BM + loadc_a + l, block, end_k);
+        }
+        barrier();
+
+        [[unroll]] for (uint i = 0; i < BK / BK_STEP; i++) {
+            [[unroll]] for (uint wsir = 0; wsir < WMITER; wsir++) {
+                [[unroll]] for (uint j = 0; j < TM; j++) {
+                    cache_a[wsir * TM + j] = buf_a[(warp_r * WM + wsir * WSUBM + tiwr * TM + j) * SHMEM_STRIDE + i];
+                }
+            }
+            [[unroll]] for (uint wsic = 0; wsic < WNITER; wsic++) {
+                [[unroll]] for (uint cc = 0; cc < TN; cc++) {
+                    cache_b = buf_b[(warp_c * WN + wsic * WSUBN + tiwc * TN + cc) * SHMEM_STRIDE + i];
+                    [[unroll]] for (uint wsir = 0; wsir < WMITER; wsir++) {
+                        [[unroll]] for (uint cr = 0; cr < TM / 2; cr++) {
+                            const uint sums_idx = (wsic * TN + cc) * WMITER * (TM / 2) + wsir * (TM / 2) + cr;
+                            sums_up[sums_idx].x = fma(ACC_TYPE(cache_a[wsir * TM + 2 * cr    ].x), ACC_TYPE(cache_b.x), fma(ACC_TYPE(cache_a[wsir * TM + 2 * cr    ].y), ACC_TYPE(cache_b.y), sums_up[sums_idx].x));
+                            sums_up[sums_idx].y = fma(ACC_TYPE(cache_a[wsir * TM + 2 * cr + 1].x), ACC_TYPE(cache_b.x), fma(ACC_TYPE(cache_a[wsir * TM + 2 * cr + 1].y), ACC_TYPE(cache_b.y), sums_up[sums_idx].y));
+                        }
+                    }
+                }
+            }
+        }
+
+        // buf_a's up contents are fully consumed above -- safe for the NEXT
+        // block's gate load to overwrite.
+        barrier();
+    }
+#else
     for (uint block = start_k; block < end_k; block += BK) {
         [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) {
             load_a_to_shmem(pos_a, loadr_a, loadc_a + l, ir * BM + loadc_a + l, block, end_k);
@@ -348,6 +507,7 @@ void main() {
 
         barrier();
     }
+#endif // MLX4_ID_GATEUP
 
 #if defined(ACC_TYPE_MAX)
 #ifdef COOPMAT
@@ -442,12 +602,36 @@ void main() {
                 [[unroll]] for (uint cr = 0; cr < TM / 2; cr++) {
                     const uint sums_idx = (wsic * TN + cc) * WMITER * (TM / 2) + wsir * (TM / 2) + cr;
 #ifdef MUL_MAT_ID
+#if defined(MLX4_ID_GATEUP)
+                    // Store epilogue = the fusion point (plan §2.1): compute
+                    // mid = silu(gate)*up PER ELEMENT right here, in-register,
+                    // instead of writing gu_gate/gu_up and running separate
+                    // silu_f32 + mul_f32_f32_f32 dispatches. Bit-for-bit the
+                    // same silu(x)=x/(1+exp(-x)) formula as shaders/silu.comp
+                    // and the same elementwise product as mul.comp -- no
+                    // reordering of the ops this replaces, so cos==1.0 holds
+                    // (only non-bit-exact op is exp(), last-ulp identical
+                    // either way).
+                    if (dr_warp + 2 * cr < p.M) {
+                        const float g0 = float(sums_gate[sums_idx].x);
+                        const float u0 = float(sums_up[sums_idx].x);
+                        const float mid0 = (g0 / (1.0f + exp(-g0))) * u0;
+                        data_d[row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr_warp + 2 * cr] = D_TYPE(mid0);
+                    }
+                    if (dr_warp + 2 * cr + 1 < p.M) {
+                        const float g1 = float(sums_gate[sums_idx].y);
+                        const float u1 = float(sums_up[sums_idx].y);
+                        const float mid1 = (g1 / (1.0f + exp(-g1))) * u1;
+                        data_d[row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr_warp + 2 * cr + 1] = D_TYPE(mid1);
+                    }
+#else
                     if (dr_warp + 2 * cr < p.M) {
                         data_d[row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr_warp + 2 * cr] = D_TYPE(sums[sums_idx].x);
                     }
                     if (dr_warp + 2 * cr + 1 < p.M) {
                         data_d[row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr_warp + 2 * cr + 1] = D_TYPE(sums[sums_idx].y);
                     }
+#endif // MLX4_ID_GATEUP
 #else
                     if (dr_warp + 2 * cr < p.M && dc_warp + cc < p.N) {
                         data_d[offsets + (dc_warp + cc) * p.stride_d + dr_warp + 2 * cr] = D_TYPE(sums[sums_idx].x);

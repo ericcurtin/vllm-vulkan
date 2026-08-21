@@ -503,6 +503,57 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
                                               kvalues_mxfp4[vui2 & 0xF] * d);
             buf_a[buf_idx + 8] = FLOAT_TYPEV2(kvalues_mxfp4[vui  >>  4] * d,
                                               kvalues_mxfp4[vui2 >>  4] * d);
+#elif defined(DATA_A_MLX4)
+            // MLX-affine 4-bit dense dequant, reusing mul_mat_vec_mlx4.comp's
+            // formula VERBATIM: w = q*scale + bias, g = k/group_size,
+            // word = packed[row*words_per_row + k/8], q = (word>>((k%8)*4))&0xF
+            // (LSB-first nibbles). LOAD_VEC_A=4 (compile-time, see
+            // scripts/compile_shaders.sh) makes `row` (the `row` arg here)
+            // range over BK/LOAD_VEC_A = 8 values per BK=32 K-slab, each
+            // covering 4 consecutive raw K-elements -- so `block + row*4 + e`
+            // (e in 0..3) is the absolute K position directly, no per-block
+            // struct indexing needed (unlike Q8_0/Q4_0/etc, mlx4 has no inline
+            // per-block scale to address via ib/iqs). idx_m is already the
+            // absolute weight row (out_features index) passed in by the
+            // caller. Dequant lands in buf_a (LDS) exactly like every other
+            // quant head -- amortized across BN token columns, same footprint
+            // as the proven f16 mul_mm (see the campaign plan's LDS-
+            // amortization argument).
+            const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 2;
+            const uint m_row = idx_m;
+            const uint words_per_row = p.K / 8u;
+            const uint groups = p.K / p.mlx4_group_size;
+
+            // Per-tensor scalar base (dense, non-id) vs per-EXPERT base derived
+            // from the grouped-GEMM expert index (Phase B). gl_WorkGroupID.z is
+            // a stage built-in readable from any function (no signature change),
+            // and equals `expert_idx` in mul_mm.comp's MUL_MAT_ID main().
+#if defined(MUL_MAT_ID)
+            const uint packed_off = gl_WorkGroupID.z * p.mlx4_pack_stride;
+            const uint sb_off     = gl_WorkGroupID.z * p.mlx4_sb_stride;
+#else
+            const uint packed_off = p.mlx4_packed_off;
+            const uint sb_off     = p.mlx4_sb_off;
+#endif
+
+            vec4 v = vec4(0.0);
+            if (m_row < p.M) {
+                [[unroll]] for (uint e = 0; e < 4; e++) {
+                    const uint k = block + row * 4 + e;
+                    if (k < end_k) {
+                        const uint widx = k >> 3u;
+                        const uint shift = (k & 7u) * 4u;
+                        const uint word = data_a[packed_off + m_row * words_per_row + widx];
+                        const float q = float((word >> shift) & 0xFu);
+                        const uint g = k / p.mlx4_group_size;
+                        const float s = mlx4_scales[sb_off + m_row * groups + g];
+                        const float b = mlx4_biases[sb_off + m_row * groups + g];
+                        v[e] = q * s + b;
+                    }
+                }
+            }
+            buf_a[buf_idx    ] = FLOAT_TYPEV2(v.xy);
+            buf_a[buf_idx + 1] = FLOAT_TYPEV2(v.zw);
 #elif defined(DATA_A_NVFP4)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
             // lo and hi nibbles are 8 elements apart, which doesn't quite line up with
@@ -522,6 +573,48 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
                                               kvalues_mxfp4[vui2 >>  4] * d);
 #endif
 }
+
+#if defined(MLX4_ID_GATEUP)
+// Epilogue-fused grouped MoE GEMM (plan-epilogue-fused-moe-gemm.md §2.1):
+// the UP-projection weight's dequant head, duplicated from the DATA_A_MLX4
+// branch above VERBATIM except for which buffers it reads (`data_a_up`/
+// `mlx4_scales_up`/`mlx4_biases_up`, bindings 7/8/9) and which per-expert
+// strides it uses (`p.up_pack_stride`/`p.up_sb_stride`). `group_size` is
+// shared with gate (same weight format/geometry), so `p.mlx4_group_size` is
+// reused unchanged. Writes into the SAME `buf_a` LDS tile as
+// `load_a_to_shmem` -- the caller (mul_mm.comp's MLX4_ID_GATEUP K-loop)
+// calls this AFTER the gate FMA has consumed `buf_a` and a barrier has run,
+// so there is no extra LDS allocation (sequential-K reuse, the design this
+// whole variant hinges on -- see the plan's §4 LDS feasibility argument).
+void load_a_up_to_shmem(const uint pos_a, const uint row, const uint col, const uint idx_m, const uint block, const uint end_k) {
+    const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 2;
+    const uint m_row = idx_m;
+    const uint words_per_row = p.K / 8u;
+    const uint groups = p.K / p.mlx4_group_size;
+
+    const uint packed_off = gl_WorkGroupID.z * p.up_pack_stride;
+    const uint sb_off     = gl_WorkGroupID.z * p.up_sb_stride;
+
+    vec4 v = vec4(0.0);
+    if (m_row < p.M) {
+        [[unroll]] for (uint e = 0; e < 4; e++) {
+            const uint k = block + row * 4 + e;
+            if (k < end_k) {
+                const uint widx = k >> 3u;
+                const uint shift = (k & 7u) * 4u;
+                const uint word = data_a_up[packed_off + m_row * words_per_row + widx];
+                const float q = float((word >> shift) & 0xFu);
+                const uint g = k / p.mlx4_group_size;
+                const float s = mlx4_scales_up[sb_off + m_row * groups + g];
+                const float b = mlx4_biases_up[sb_off + m_row * groups + g];
+                v[e] = q * s + b;
+            }
+        }
+    }
+    buf_a[buf_idx    ] = FLOAT_TYPEV2(v.xy);
+    buf_a[buf_idx + 1] = FLOAT_TYPEV2(v.zw);
+}
+#endif
 
 #if !defined(MUL_MAT_ID)
 void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uint idx_n, const uint block, const uint end_k) {
