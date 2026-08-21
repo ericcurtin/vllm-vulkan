@@ -591,6 +591,7 @@ def test_select_decode_shader_prefers_block_size_matching_head_size():
     assert wg_512 == 512
 
 
+@pytest.mark.slow  # wall-clock comparison; unreliable on shared CI runners
 def test_cached_available_shaders_matches_uncached_reference_and_is_faster():
     """`kv_ops._cached_available_shaders` must return the exact same set
     of shader names as calling `ctx.available_shaders()` directly, just
@@ -797,6 +798,7 @@ def test_paged_attn_decode_pc_matches_old_layout_based_reference():
     assert new_pc == old_pc
 
 
+@pytest.mark.slow  # wall-clock comparison; unreliable on shared CI runners
 def test_paged_attn_decode_pc_resolved_spec_is_faster_than_relayout_lookup():
     """Measures the actual speedup: passing an already-resolved `spec`/
     `layer_base_offset` directly should be faster than re-deriving them
@@ -900,6 +902,7 @@ def test_block_table_to_u32_skips_dtype_conversion_for_already_int64_input(
     np.testing.assert_array_equal(result, np.array([2, 0, 3], dtype=np.uint32))
 
 
+@pytest.mark.slow  # wall-clock comparison; unreliable on shared CI runners
 def test_block_table_whole_batch_int64_conversion_is_faster_than_per_row():
     """Measures the actual speedup: converting a whole (B, blocks_per_row)
     int32 block table to int64 once, before splitting into per-row
