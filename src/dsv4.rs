@@ -1137,3 +1137,80 @@ mod mla_tests {
         assert_eq!(c.mlp_layer_types, vec![MlpType::HashMoe, MlpType::Moe, MlpType::Moe]);
     }
 }
+
+#[cfg(test)]
+mod shader_guard {
+    //! Registry guard for the DeepSeek-V4-specific compute kernels.
+    //!
+    //! `scripts/compile_shaders.sh` SKIPS a `compile` entry whose `.comp`
+    //! source is absent, rather than failing. That is deliberate — one script
+    //! drives every per-feature slice, compiling the shaders present in the
+    //! tree and ignoring the rest — but it means a renamed file, a typo'd
+    //! compile entry, or a bad carve no longer breaks the build: the entry
+    //! compiles nothing, the script exits 0, and the kernel simply vanishes
+    //! from the registry.
+    //!
+    //! A count or self-consistency check cannot catch that: when an entry
+    //! disappears, the generated registry and the runtime shader map shrink
+    //! together and stay 1:1. So this test NAMES the kernels instead of
+    //! counting them — adding a shader never breaks it, losing one always
+    //! does. Every name below is dispatched by name from this model's GPU
+    //! path, so its absence would be a runtime failure on device, which CI
+    //! has no way to reach.
+
+    /// DeepSeek-V4-Flash (MLA + DSA sparse indexer + hyper-connections)
+    /// kernels this model owns.
+    const REQUIRED_DSV4_KERNELS: &[&str] = &[
+        // MLA decode attention + clamped SwiGLU MLP
+        "dsv4_mla_softmax",
+        "dsv4_swiglu_clamp",
+        // hyper-connection mix / residual recombine
+        "dsv4_hyper_connection",
+        "dsv4_hc_residual_mix",
+        // DSA (sparse attention) indexer pipeline
+        "dsv4_dsa_compress",
+        "dsv4_dsa_index_score",
+        "dsv4_dsa_topk",
+    ];
+
+    #[test]
+    fn dsv4_kernels_are_registered() {
+        let map = crate::include_all_shaders();
+        let missing: Vec<&str> = REQUIRED_DSV4_KERNELS
+            .iter()
+            .copied()
+            .filter(|n| !map.contains_key(*n))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{} DeepSeek-V4 shader(s) missing from the registry: {:?}\n\
+             The SPIR-V for these was not produced, so any dispatch of them would \
+             fail on device. Check that the .comp source exists under shaders/ and \
+             that scripts/compile_shaders.sh still has a compile entry for it \
+             (a missing source is SKIPPED, not an error, by design).",
+            missing.len(),
+            missing,
+        );
+    }
+
+    /// The SPIR-V behind each required kernel must be non-empty and well-formed
+    /// enough to be a SPIR-V module: correct magic number and a 5-word header.
+    /// Catches a truncated or empty `.spv` surviving into the registry.
+    #[test]
+    fn dsv4_kernel_spirv_is_wellformed() {
+        let map = crate::include_all_shaders();
+        for name in REQUIRED_DSV4_KERNELS {
+            let Some(bytes) = map.get(*name) else { continue };
+            assert!(
+                bytes.len() >= 20 && bytes.len() % 4 == 0,
+                "{name}: SPIR-V is {} bytes — too short or not word-aligned",
+                bytes.len()
+            );
+            let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            assert_eq!(
+                magic, 0x0723_0203,
+                "{name}: bad SPIR-V magic 0x{magic:08x} (expected 0x07230203)"
+            );
+        }
+    }
+}
