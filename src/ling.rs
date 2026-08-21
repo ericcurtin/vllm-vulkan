@@ -3021,3 +3021,79 @@ mod tests {
         eprintln!("[ling PP-decompose] [0,3)+[3,6) == [0,6) decode bit-identical");
     }
 }
+
+#[cfg(test)]
+mod shader_guard {
+    //! Registry guard for the Ling-specific compute kernels.
+    //!
+    //! `scripts/compile_shaders.sh` SKIPS a `compile` entry whose `.comp`
+    //! source is absent, rather than failing. That is deliberate — one script
+    //! drives every per-feature slice, compiling the shaders present in the
+    //! tree and ignoring the rest — but it means a renamed file, a typo'd
+    //! compile entry, or a bad carve no longer breaks the build: the entry
+    //! compiles nothing, the script exits 0, and the kernel simply vanishes
+    //! from the registry.
+    //!
+    //! A count or self-consistency check cannot catch that: when an entry
+    //! disappears, the generated registry and the runtime shader map shrink
+    //! together and stay 1:1. So this test NAMES the kernels instead of
+    //! counting them — adding a shader never breaks it, losing one always
+    //! does. Every name below is a kernel this slice ships and its GPU path
+    //! dispatches by name, so its absence would be a runtime failure on
+    //! device, which CI has no way to reach.
+
+    /// Ling (KDA linear attention + MoE) kernels this model owns.
+    const REQUIRED_LING_KERNELS: &[&str] = &[
+        // KDA (Kimi Delta Attention) recurrence step, shared with the Kimi
+        // slice; `kda_decay` is the per-key-channel decay twin.
+        "kda_gdn_step",
+        "kda_decay",
+        // Ling's own fused-KDA decay + L2 norm
+        "ling_kda_decay",
+        "ling_kda_l2norm",
+        // MoE grouped router + its expert-metadata pass
+        "ling_moe_router",
+        "ling_moe_meta",
+    ];
+
+    #[test]
+    fn ling_kernels_are_registered() {
+        let map = crate::include_all_shaders();
+        let missing: Vec<&str> = REQUIRED_LING_KERNELS
+            .iter()
+            .copied()
+            .filter(|n| !map.contains_key(*n))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{} Ling shader(s) missing from the registry: {:?}\n\
+             The SPIR-V for these was not produced, so any dispatch of them would \
+             fail on device. Check that the .comp source exists under shaders/ and \
+             that scripts/compile_shaders.sh still has a compile entry for it \
+             (a missing source is SKIPPED, not an error, by design).",
+            missing.len(),
+            missing,
+        );
+    }
+
+    /// The SPIR-V behind each required kernel must be non-empty and well-formed
+    /// enough to be a SPIR-V module: correct magic number and a 5-word header.
+    /// Catches a truncated or empty `.spv` surviving into the registry.
+    #[test]
+    fn ling_kernel_spirv_is_wellformed() {
+        let map = crate::include_all_shaders();
+        for name in REQUIRED_LING_KERNELS {
+            let Some(bytes) = map.get(*name) else { continue };
+            assert!(
+                bytes.len() >= 20 && bytes.len() % 4 == 0,
+                "{name}: SPIR-V is {} bytes — too short or not word-aligned",
+                bytes.len()
+            );
+            let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            assert_eq!(
+                magic, 0x0723_0203,
+                "{name}: bad SPIR-V magic 0x{magic:08x} (expected 0x07230203)"
+            );
+        }
+    }
+}
