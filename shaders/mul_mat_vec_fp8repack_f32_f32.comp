@@ -1,0 +1,129 @@
+#version 450
+
+// FP8 (OCP E4M3 / modelopt W8A16) matvec — VALU-refactor twin of
+// mul_mat_vec_fp8_fast.comp. Gated by VLLM_VULKAN_FP8_REPACK.
+//
+// UNLIKE the mlx4/nvfp4 repack twins, there is NO load repack here: the fp8
+// weight is 1 byte/element and the fast kernel ALREADY reads a whole uint word
+// (4 codes) per iteration, so its address-gen is already ~4x amortized (the
+// s4rig ISA rig confirms fp8_v1 addr_gen/unpack = 1.76, NOT address-gen-bound,
+// vs mlx4_v1's 20.11). The ONLY fp8 lever is the REDUCTION EPILOGUE: fp8_fast
+// still reduces through a shared[NUM_ROWS][BLOCK_SIZE] LDS log2(BLOCK) barrier
+// tree (~148-instr class epilogue + a 16KB-LDS-class occupancy cap at BLOCK=512).
+// This twin replaces it with the same per-row subgroupAdd reduction the mlx4/
+// nvfp4 repack twins use (no LDS + no barrier for BLOCK_SIZE<=64 = one wave64
+// subgroup on GFX1013; a tiny LDS combine only when BLOCK_SIZE spans >1 wave).
+// Estimate ~1.2-1.4x/op on the compute-bound nemotron FP8 attn matvecs (the
+// win scales with the epilogue's share, i.e. larger at small k / BLOCK=512).
+//
+// The hot loop (e4m3 arithmetic decode + uint-word load + dot4) is byte-for-byte
+// fp8_fast — same math, same accumulation order → cosine-invisible vs the fast
+// kernel (only the reduction reassociates across the subgroup, ~ULP; re-gate
+// argmax-exact on-node exactly as the mlx4/nvfp4 twins were).
+//
+// Bindings + push constants: identical to mul_mat_vec_fp8_fast.comp.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_vote : enable
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 64;
+layout(constant_id = 1) const uint NUM_ROWS = 1;
+
+layout(push_constant) uniform parameter {
+    uint ncols;         // k = in_features
+    uint nrows;         // n = out_features
+    uint scale_per_row; // 0 = per-tensor scalar (scale[sb_off]); 1 = per-row (scale[sb_off+r])
+    uint packed_off;    // base BYTE offset into the weight for this slice (0 for dense)
+    uint sb_off;        // base ELEMENT offset into scale[] (0 for dense)
+} p;
+
+layout(binding = 0) readonly buffer Packed { uint   packed[]; };
+layout(binding = 1) readonly buffer Scales { float  scale[];  };
+layout(binding = 2) readonly buffer Activ   { float x[];   };
+layout(binding = 2) readonly buffer ActivV4 { vec4  xv4[]; };
+layout(binding = 3) writeonly buffer Dst   { float  dst[];    };
+
+// Cross-subgroup combine scratch (only touched when BLOCK_SIZE > subgroup size).
+shared float part[NUM_ROWS][16];
+
+// E4M3 (1 sign / 4 exp bias-7 / 3 mant) -> f32, bit-exact vs model::e4m3_to_f32
+// and mul_mat_vec_fp8_fast.comp::e4m3_decode.
+float e4m3_decode(uint code) {
+    uint s = (code >> 7) & 1u;
+    uint e = (code >> 3) & 0xFu;
+    uint m =  code       & 0x7u;
+    float mag;
+    if (e == 0u) {
+        mag = float(m) * (1.0 / 512.0);          // subnormal (m==0 -> +0.0)
+    } else if (e == 0xFu && m == 7u) {
+        mag = 0.0;                                // NaN code -> 0 (ref parity)
+    } else {
+        mag = uintBitsToFloat(((e + 120u) << 23) | (m << 20));
+    }
+    return uintBitsToFloat(floatBitsToUint(mag) | (s << 31u));
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint first_row = NUM_ROWS * gl_WorkGroupID.x;
+    const uint k = p.ncols;
+
+    float temp[NUM_ROWS];
+    [[unroll]] for (uint m = 0; m < NUM_ROWS; ++m) { temp[m] = 0.0; }
+
+    const uint kw = k >> 2u;                 // words per row; k%4==0
+    for (uint wi = tid; wi < kw; wi += BLOCK_SIZE) {
+        const vec4 xv = xv4[wi];
+        [[unroll]] for (uint mrow = 0; mrow < NUM_ROWS; ++mrow) {
+            const uint r = first_row + mrow;
+            if (r >= p.nrows) { continue; }
+            const uint bi = p.packed_off + r * k + (wi << 2u);
+            const uint w  = packed[bi >> 2u];
+            const vec4 wv = vec4(e4m3_decode( w        & 0xFFu),
+                                 e4m3_decode((w >>  8u) & 0xFFu),
+                                 e4m3_decode((w >> 16u) & 0xFFu),
+                                 e4m3_decode((w >> 24u) & 0xFFu));
+            const uint sidx = p.sb_off + (p.scale_per_row != 0u ? r : 0u);
+            temp[mrow] += scale[sidx] * dot(wv, xv);
+        }
+    }
+
+    // Reduce each row across the subgroup (replaces fp8_fast's LDS barrier tree).
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        temp[n] = subgroupAdd(temp[n]);
+    }
+
+    // Single-subgroup workgroup (BLOCK_SIZE<=64, the target): lane 0 writes.
+    if (gl_NumSubgroups == 1u) {
+        if (subgroupElect()) {
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                const uint r = first_row + n;
+                if (r < p.nrows) { dst[r] = temp[n]; }
+            }
+        }
+        return;
+    }
+
+    // Multi-subgroup: each subgroup stashes its partial, subgroup 0 combines.
+    if (subgroupElect()) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            part[n][gl_SubgroupID] = temp[n];
+        }
+    }
+    barrier();
+    if (gl_SubgroupID == 0u) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            float acc = 0.0;
+            for (uint s = gl_SubgroupInvocationID; s < gl_NumSubgroups; s += gl_SubgroupSize) {
+                acc += part[n][s];
+            }
+            acc = subgroupAdd(acc);
+            const uint r = first_row + n;
+            if (subgroupElect() && r < p.nrows) { dst[r] = acc; }
+        }
+    }
+}

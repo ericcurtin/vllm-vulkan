@@ -1,0 +1,180 @@
+#version 450
+// MLX-affine 4-bit matvec — VALU-bound repack refactor (VLLM_VULKAN_MLX4_REPACK).
+//
+// Tunnels through the mlx4 4-bit matvec roofline identified by the zero-hazard
+// probe: the v1 kernel (mul_mat_vec_mlx4.comp, bs512/r8) is VALU-bound with ~90%
+// of the VALU spent on ADDRESS GENERATION for uncoalesced per-element loads
+// (~190 addr VALU vs 16 unpack, gfx1013 ISA). This kernel cuts the address-gen:
+//
+//  (1) DWORDX4 word-granular processing: each thread walks a CONTIGUOUS run of
+//      4 packed words (= 32 nibbles = 32 output-contraction elements) via ONE
+//      uvec4 load (global_load_dwordx4, 128b). One packed address amortizes over
+//      32 elements (v1 recomputed a full 64-bit address PER element). Across a
+//      wave the 4-word chunks are contiguous -> coalesced. NOTE: the packed
+//      layout is UNCHANGED — for a contiguous-4-word-per-thread mapping the
+//      "repacked" (coalescing-friendly) order IS the existing row-major order,
+//      so the loader-side permutation is the identity (bytes bit-identical to
+//      mul_mat_vec_mlx4.comp's packed buffer). See push_constants::
+//      matvec_mlx4_variant_k / geom_combos_for.
+//
+//  (2) SCALE/BIAS ONCE PER CHUNK + fused affine: gs=64 = 2 chunks, so each 32-
+//      element chunk lies wholly within one affine group -> scale/bias loaded
+//      ONCE per chunk (v1 loaded them per element). The affine is factored
+//      exactly like mul_mat_vec_mlx4w8sg (the shipped MoE-down kernel):
+//        temp += scale*sum(q_j*x_j) + bias*sum(x_j)     (one fma per chunk)
+//      This is algebraically == v1's per-element (scale*q_j + bias)*x_j but the
+//      f32 rounding differs (fma + reassociation) -> re-gate ARGMAX-EXACT +
+//      max_abs_err, NOT byte-identity (the w8sg factoring is already argmax-
+//      validated on real 4-bit weights).
+//
+//  (3) SUBGROUP REDUCTION: the 16KB-LDS log2(BLOCK) barrier tree of v1 is
+//      replaced by a per-row subgroupAdd (wave64 GFX1013: BLOCK_SIZE<=64 is one
+//      subgroup -> no LDS, no barrier), with a tiny LDS combine only when
+//      BLOCK_SIZE spans >1 subgroup. Removes the ~148-instr epilogue and raises
+//      occupancy above the LDS-4-wg/CU cap.
+//
+// REQUIRES k % 32 == 0 (chunks_per_row = k/32) AND packed base 16B-aligned:
+// packed_off and words_per_row (=k/8) both multiples of 4 — true for the dense
+// (packed_off=0, k%32==0) decode shapes this kernel is gated to. Bindings /
+// push-constants are IDENTICAL to mul_mat_vec_mlx4.comp (5 buffers, 5 uints), so
+// it drops into the same dispatch (matvec_mlx4_pc / record_to).
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// f16-resident scales/biases variant (VLLM_VULKAN_MOE_F16_SCALES): the MoE
+// routed-expert affine scales+biases are stored f16 in the resident buffer (half
+// the GTT of f32, the fit-enabler for 122B PP-8). f16 has 10 mantissa bits vs
+// bf16's 7, so every in-range bf16-sourced scale is EXACT -> the f16 loads add no
+// error beyond the f32-repack twin's fma/subgroup reassociation. This is the
+// SCALE_F16 sibling of mul_mat_vec_mlx4.comp's f16scale variant, routed by
+// push_constants::matvec_mlx4_moe_variant_k so the address-gen-bound v1 f16scale
+// kernel (mul_mat_vec_mlx4_f16scale_f32_f32) no longer runs the 122B experts.
+#ifdef SCALE_F16
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 64;
+layout(constant_id = 1) const uint NUM_ROWS = 2;
+
+layout(push_constant) uniform parameter {
+    uint ncols;       // k = in_features (contraction)
+    uint nrows;       // n = out_features
+    uint group_size;  // affine group size (64)
+    uint packed_off;  // WORD offset into packed[] for this weight (0 for dense 2D)
+    uint sb_off;      // ELEMENT offset into scales[]/biases[]  (0 for dense 2D)
+} p;
+
+layout(binding = 0) readonly buffer Packed { uvec4 packed4[]; }; // 4 words / uvec4 = 32 nibbles
+#ifdef SCALE_F16
+layout(binding = 1) readonly buffer Scales { float16_t scales[]; };
+layout(binding = 2) readonly buffer Biases { float16_t biases[]; };
+#else
+layout(binding = 1) readonly buffer Scales { float scales[]; };
+layout(binding = 2) readonly buffer Biases { float biases[]; };
+#endif
+layout(binding = 3) readonly buffer Activ  { vec4  x4[];     };  // k/4 vec4s
+layout(binding = 4) writeonly buffer Dst   { float dst[];    };
+
+// Cross-subgroup combine scratch (only touched when BLOCK_SIZE > subgroup size).
+shared float part[NUM_ROWS][16];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint first_row = NUM_ROWS * gl_WorkGroupID.x;
+
+    const uint k = p.ncols;
+    const uint groups = k / p.group_size;
+    const uint words_per_row = k >> 3u;               // k/8
+    const uint chunks_per_row = k >> 5u;              // k/32 (4 words each)
+    const uint chunks_per_group = p.group_size >> 5u; // gs/32 = 2 for gs=64
+    // packed4 element base for a row: (packed_off + r*words_per_row)/4.
+    const uint row_words4 = words_per_row >> 2u;      // uvec4s per row = (k/8)/4 = k/32
+
+    float temp[NUM_ROWS];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) { temp[n] = 0.0; }
+
+    for (uint c = tid; c < chunks_per_row; c += BLOCK_SIZE) {
+        const uint g = c / chunks_per_group;   // affine group of this 32-elem chunk
+        // 8 vec4 of activations covering j in [32c, 32c+32).
+        const uint xb = c << 3u;               // 8*c  (vec4 index base)
+        const vec4 x0 = x4[xb + 0u];
+        const vec4 x1 = x4[xb + 1u];
+        const vec4 x2 = x4[xb + 2u];
+        const vec4 x3 = x4[xb + 3u];
+        const vec4 x4v = x4[xb + 4u];
+        const vec4 x5 = x4[xb + 5u];
+        const vec4 x6 = x4[xb + 6u];
+        const vec4 x7 = x4[xb + 7u];
+        const float xsum = dot(x0 + x1 + x2 + x3 + x4v + x5 + x6 + x7, vec4(1.0));
+
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint r = first_row + n;
+            if (r >= p.nrows) { continue; }
+            const uint base4 = ((p.packed_off + r * words_per_row) >> 2u) + c;
+            const uvec4 pw = packed4[base4];   // ONE dwordx4 = 32 nibbles (words 4c..4c+3)
+            // word pw.x -> j[32c .. 32c+8) -> x0(lo 4), x1(hi 4); pw.y -> x2,x3; ...
+            float qx = dot(vec4(float( pw.x        & 0xFu), float((pw.x >>  4u) & 0xFu),
+                                float((pw.x >>  8u) & 0xFu), float((pw.x >> 12u) & 0xFu)), x0)
+                     + dot(vec4(float((pw.x >> 16u) & 0xFu), float((pw.x >> 20u) & 0xFu),
+                                float((pw.x >> 24u) & 0xFu), float((pw.x >> 28u) & 0xFu)), x1)
+                     + dot(vec4(float( pw.y        & 0xFu), float((pw.y >>  4u) & 0xFu),
+                                float((pw.y >>  8u) & 0xFu), float((pw.y >> 12u) & 0xFu)), x2)
+                     + dot(vec4(float((pw.y >> 16u) & 0xFu), float((pw.y >> 20u) & 0xFu),
+                                float((pw.y >> 24u) & 0xFu), float((pw.y >> 28u) & 0xFu)), x3)
+                     + dot(vec4(float( pw.z        & 0xFu), float((pw.z >>  4u) & 0xFu),
+                                float((pw.z >>  8u) & 0xFu), float((pw.z >> 12u) & 0xFu)), x4v)
+                     + dot(vec4(float((pw.z >> 16u) & 0xFu), float((pw.z >> 20u) & 0xFu),
+                                float((pw.z >> 24u) & 0xFu), float((pw.z >> 28u) & 0xFu)), x5)
+                     + dot(vec4(float( pw.w        & 0xFu), float((pw.w >>  4u) & 0xFu),
+                                float((pw.w >>  8u) & 0xFu), float((pw.w >> 12u) & 0xFu)), x6)
+                     + dot(vec4(float((pw.w >> 16u) & 0xFu), float((pw.w >> 20u) & 0xFu),
+                                float((pw.w >> 24u) & 0xFu), float((pw.w >> 28u) & 0xFu)), x7);
+            const uint sb = p.sb_off + r * groups + g;
+            // float() casts are no-ops for the f32 buffer; for SCALE_F16 they
+            // widen the f16 scale/bias to f32 BEFORE the fma (the affine math and
+            // the accumulator stay f32, identical to the f32 twin — only the
+            // stored scale precision differs, and f16 holds bf16 exactly in range).
+            temp[n] = fma(float(scales[sb]), qx, fma(float(biases[sb]), xsum, temp[n]));
+        }
+    }
+
+    // Reduce each row across the subgroup.
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        temp[n] = subgroupAdd(temp[n]);
+    }
+
+    // Single-subgroup workgroup (BLOCK_SIZE<=64, the target): lane 0 writes.
+    if (gl_NumSubgroups == 1u) {
+        if (subgroupElect()) {
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                const uint r = first_row + n;
+                if (r < p.nrows) { dst[r] = temp[n]; }
+            }
+        }
+        return;
+    }
+
+    // Multi-subgroup: each subgroup stashes its partial, subgroup 0 combines.
+    if (subgroupElect()) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            part[n][gl_SubgroupID] = temp[n];
+        }
+    }
+    barrier();
+    if (gl_SubgroupID == 0u) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            float acc = 0.0;
+            for (uint s = gl_SubgroupInvocationID; s < gl_NumSubgroups; s += gl_SubgroupSize) {
+                acc += part[n][s];
+            }
+            acc = subgroupAdd(acc);
+            const uint r = first_row + n;
+            if (subgroupElect() && r < p.nrows) { dst[r] = acc; }
+        }
+    }
+}

@@ -1,0 +1,123 @@
+#version 450
+
+// MLX-affine 4-bit matrix-vector kernel for vllm-vulkan.
+//
+// Computes, for each output row r in [0, n):
+//   out[r] = sum_{j=0..k} ( nibble(w, r, j) * scale[r, g] + bias[r, g] ) * x[j]
+// where g = j / group_size, exactly mirroring the validated CPU reference
+// `model::dequantize_mlx_affine` (bits=4):
+//
+//   per_word      = 32 / 4 = 8 nibbles per u32 word
+//   mask          = 0xF
+//   groups        = k / group_size
+//   words_per_row = k / 8
+//   word          = packed[r * words_per_row + j/8]
+//   q             = (word >> ((j % 8) * 4)) & 0xF          (LSB-first nibbles)
+//   scale/bias    = scales[r*groups + g] / biases[r*groups + g]
+//
+// Bindings (auto-numbered 0.. by record_to in buffer order):
+//   0 = packed weight  (uint[],  4-bit nibbles, 8 per u32)
+//   1 = scales         (float[], one per output-row x group)
+//   2 = biases         (float[], one per output-row x group)
+//   3 = activation x   (float[], length k)
+//   4 = output         (float[], length n)
+//
+// Push constants: { uint ncols(=k); uint nrows(=n); uint group_size; }
+//
+// One workgroup handles NUM_ROWS output rows. The BLOCK_SIZE threads of the
+// workgroup partition the k-dimension (strided by BLOCK_SIZE) and reduce their
+// partial dot products through shared memory. Wave64 on GFX1013; NUM_ROWS<=8
+// (r16/r32 hang pipeline creation on this driver — see compile_matvec).
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// f16-resident scales/biases variant (VLLM_VULKAN_MOE_F16_SCALES): the affine
+// scales+biases are stored f16 in the resident MoE buffer (half the GTT of f32,
+// the fit-enabler for 122B PP-6). f16 has 10 mantissa bits vs bf16's 7, so every
+// in-range bf16-sourced scale is represented EXACTLY -- bit-identical to f32,
+// verified by the exact round-trip guard on the host upload side.
+#ifdef SCALE_F16
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 512;
+layout(constant_id = 1) const uint NUM_ROWS = 1;
+
+layout(push_constant) uniform parameter {
+    uint ncols;       // k = in_features (contraction dim)
+    uint nrows;       // n = out_features
+    uint group_size;  // affine group size along k (typically 64)
+    uint packed_off;  // base WORD offset into packed[] for this expert's slice
+    uint sb_off;      // base ELEMENT offset into scales[]/biases[] for this expert
+} p;
+
+layout(binding = 0) readonly buffer Packed { uint   packed[]; };
+#ifdef SCALE_F16
+layout(binding = 1) readonly buffer Scales { float16_t scales[]; };
+layout(binding = 2) readonly buffer Biases { float16_t biases[]; };
+#else
+layout(binding = 1) readonly buffer Scales { float  scales[]; };
+layout(binding = 2) readonly buffer Biases { float  biases[]; };
+#endif
+layout(binding = 3) readonly buffer Activ  { float  x[];      };
+layout(binding = 4) writeonly buffer Dst   { float  dst[];    };
+
+shared float tmpsh[NUM_ROWS][BLOCK_SIZE];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint first_row = NUM_ROWS * gl_WorkGroupID.x;
+
+    const uint k = p.ncols;
+    const uint gs = p.group_size;
+    const uint groups = k / gs;
+    const uint words_per_row = k / 8u;
+
+    // Per-row running partial sums for this thread's strided slice of k.
+    float temp[NUM_ROWS];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        temp[n] = 0.0;
+    }
+
+    // Each thread walks columns j = tid, tid+BLOCK_SIZE, ...
+    for (uint j = tid; j < k; j += BLOCK_SIZE) {
+        const float xv = x[j];
+        const uint widx = j >> 3u;             // j / 8  word index within a row
+        const uint shift = (j & 7u) * 4u;      // (j % 8) * 4  nibble bit offset
+        const uint g = j / gs;                 // affine group index
+
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint r = first_row + n;
+            if (r >= p.nrows) { continue; }
+            const uint word = packed[p.packed_off + r * words_per_row + widx];
+            const float q = float((word >> shift) & 0xFu);
+            const float w = float(scales[p.sb_off + r * groups + g]) * q + float(biases[p.sb_off + r * groups + g]);
+            temp[n] += w * xv;
+        }
+    }
+
+    // Reduce partial sums across the workgroup via shared memory.
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        tmpsh[n][tid] = temp[n];
+    }
+    barrier();
+    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                tmpsh[n][tid] += tmpsh[n][tid + s];
+            }
+        }
+        barrier();
+    }
+    if (tid == 0) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint r = first_row + n;
+            if (r < p.nrows) {
+                dst[r] = tmpsh[n][0];
+            }
+        }
+    }
+}

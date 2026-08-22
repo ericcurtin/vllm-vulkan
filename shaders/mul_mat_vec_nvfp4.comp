@@ -1,0 +1,138 @@
+#version 450
+
+// NVFP4 (NVIDIA FP4 / modelopt W4A16) matrix-vector kernel for vllm-vulkan.
+//
+// Computes, for each output row r in [0, n):
+//   out[r] = sum_{j=0..k} ( E2M1[nibble(w, r, j)] * scale[r, g] ) * x[j]
+// where g = j / group_size, exactly mirroring the validated CPU reference
+// `model::dequantize_nvfp4` — EXCEPT the per-block e4m3 scale and the per-tensor
+// f32 global scale are PRE-FOLDED into `scale[r,g]` (f32) on the host at upload
+// time (`scale = e4m3(weight_scale[r,g]) * weight_scale_2`). So the shader needs
+// neither an e4m3 decode nor the global term: it just looks up the E2M1 value of
+// the 4-bit code and multiplies by the folded f32 block scale.
+//
+// The 4-bit codes are packed 2-per-byte, low nibble = even input index
+// (compressed-tensors `pack_fp4_to_uint8`). Four little-endian bytes per u32 word
+// yield the SAME bit layout as the mlx4 kernel's `shift=(j&7)*4` scheme, so the
+// nibble unpack is identical — only the value mapping (E2M1 LUT vs raw int) and
+// the absence of a bias term differ.
+//
+// Bindings (auto-numbered 0.. by record_to in buffer order):
+//   0 = packed weight  (uint[],  4-bit E2M1 codes, 8 per u32)
+//   1 = scale          (float[], folded e4m3*global, one per output-row x group)
+//   2 = activation x   (float[], length k)
+//   3 = output         (float[], length n)
+//
+// Push constants: { uint ncols(=k); uint nrows(=n); uint group_size(=16);
+//                   uint packed_off; uint sb_off; }
+// packed_off / sb_off are per-slice base offsets (0 for a plain dense weight;
+// reserved for a future per-expert MoE dispatch, mirroring mul_mat_vec_mlx4).
+//
+// One workgroup handles NUM_ROWS output rows; BLOCK_SIZE threads partition k and
+// reduce partials through shared memory. Wave64 on GFX1013; NUM_ROWS<=8.
+//
+// NUM_COLS (spec constant 2, default 1) is the batched multi-column extension
+// (spec-decode "batched verify" primitive, mirroring the f16/q8_0 base.glsl
+// `_r{rows}_c{cols}` variants). The activation is laid out [NUM_COLS, k]
+// row-major (x[col*k + j]) and the output [NUM_COLS, n] row-major
+// (dst[col*n + r]) — the same [T,k]->[T,n] convention matvec_pc13 encodes for
+// the f16/q8_0 multi-column matvec. Each thread DEQUANTIZES every weight code
+// exactly ONCE (kE2M1[code]*scale) and reuses it across all NUM_COLS token
+// columns, so the 4-bit unpack + LUT + scale ALU is amortized across the batch
+// — the whole point of the Phase-0 weight-amortization measurement. NUM_COLS=1
+// is byte-identical to the original single-column kernel by construction.
+// LDS = NUM_ROWS*NUM_COLS*BLOCK_SIZE*4; callers keep NUM_ROWS*NUM_COLS<=8.
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 512;
+layout(constant_id = 1) const uint NUM_ROWS = 1;
+layout(constant_id = 2) const uint NUM_COLS = 1;
+
+layout(push_constant) uniform parameter {
+    uint ncols;       // k = in_features (contraction dim)
+    uint nrows;       // n = out_features
+    uint group_size;  // NVFP4 block size along k (16)
+    uint packed_off;  // base WORD offset into packed[] for this slice
+    uint sb_off;      // base ELEMENT offset into scale[] for this slice
+} p;
+
+layout(binding = 0) readonly buffer Packed { uint   packed[]; };
+layout(binding = 1) readonly buffer Scales { float  scale[];  };
+layout(binding = 2) readonly buffer Activ  { float  x[];      };
+layout(binding = 3) writeonly buffer Dst   { float  dst[];    };
+
+shared float tmpsh[NUM_ROWS][NUM_COLS][BLOCK_SIZE];
+
+// E2M1 (FP4) code -> value. Magnitudes {0,.5,1,1.5,2,3,4,6}; sign in bit 3.
+const float kE2M1[16] = float[16](
+    0.0,  0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0,
+   -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0
+);
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint first_row = NUM_ROWS * gl_WorkGroupID.x;
+
+    const uint k = p.ncols;
+    const uint gs = p.group_size;
+    const uint groups = k / gs;
+    const uint words_per_row = k / 8u;
+
+    float temp[NUM_ROWS][NUM_COLS];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+            temp[n][c] = 0.0;
+        }
+    }
+
+    // Each thread walks columns j = tid, tid+BLOCK_SIZE, ... The weight code at
+    // (r,j) is unpacked + dequantized ONCE and reused across all NUM_COLS token
+    // columns (x is [NUM_COLS,k] row-major).
+    for (uint j = tid; j < k; j += BLOCK_SIZE) {
+        const uint widx = j >> 3u;             // j / 8  word index within a row
+        const uint shift = (j & 7u) * 4u;      // (j % 8) * 4  nibble bit offset
+        const uint g = j / gs;                 // block index
+
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint r = first_row + n;
+            if (r >= p.nrows) { continue; }
+            const uint word = packed[p.packed_off + r * words_per_row + widx];
+            const uint code = (word >> shift) & 0xFu;
+            const float w = kE2M1[code] * scale[p.sb_off + r * groups + g];
+            [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+                temp[n][c] += w * x[c * k + j];
+            }
+        }
+    }
+
+    // Reduce partial sums across the workgroup via shared memory.
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+            tmpsh[n][c][tid] = temp[n][c];
+        }
+    }
+    barrier();
+    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+                    tmpsh[n][c][tid] += tmpsh[n][c][tid + s];
+                }
+            }
+        }
+        barrier();
+    }
+    if (tid == 0) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint r = first_row + n;
+            if (r < p.nrows) {
+                [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+                    dst[c * p.nrows + r] = tmpsh[n][c][0];
+                }
+            }
+        }
+    }
+}

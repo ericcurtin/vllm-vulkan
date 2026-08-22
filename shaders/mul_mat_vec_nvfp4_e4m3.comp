@@ -1,0 +1,165 @@
+#version 450
+
+// NVFP4 (NVIDIA FP4 / modelopt W4A16) matrix-vector kernel — E4M3-RESIDENT scale
+// variant (VLLM_VULKAN_NVFP4_E4M3_SCALES=1). The footprint lever for the >=150B
+// NVFP4 tier: instead of the f32-folded per-(row,group) scale the default
+// `mul_mat_vec_nvfp4.comp` reads (32 bits / 16 elems = 2 bits/param), this kernel
+// keeps the RAW per-group e4m3 block scale resident (1 byte / 16 elems =
+// 0.5 bits/param) and re-adds the e4m3 decode + the per-tensor f32 global in the
+// inner loop. Net resident cost drops 6.0 -> 4.5 bits/param and the group=16
+// scale-buffer traffic drops 4x (1 byte vs 4). On the big BW-bound mlp/expert
+// shapes NVFP4 feeds, the extra ALU is hidden under bandwidth, so this is close
+// to a pure win (smaller + less scale traffic).
+//
+// Computes, for each output row r in [0, n):
+//   out[r] = sum_{j=0..k} ( E2M1[nibble(w,r,j)] * (E4M3[scale_byte(r,g)] * global) ) * x[j]
+// where g = j / group_size. This is the FAITHFUL two-level NVFP4 dequant of
+// `model::dequantize_nvfp4` (`E2M1[nib] * e4m3(block) * global`) with NOTHING
+// pre-folded: the raw e4m3 `.weight_scale` byte and the per-tensor
+// `.weight_scale_2` (`global`) are both applied here.
+//
+// BIT-EXACTNESS vs the f32-fold kernel: the f32-fold path stores
+// `folded = e4m3_to_f32(byte) * global` (host f32) and the shader does
+// `E2M1[code] * folded`. Here we compute `bscale = kE4M3[byte] * global` as a
+// SUBEXPRESSION (parenthesized) then `E2M1[code] * bscale`. kE4M3 is bit-equal to
+// `model::e4m3_to_f32` for all 256 codes (proven by fp8_shader_lut_matches_e4m3),
+// so `kE4M3[byte]*global` (GPU f32) == `e4m3_to_f32(byte)*global` (host f32) —
+// the same IEEE-754 single-precision multiply — and the outer `E2M1*bscale` then
+// matches the f32-fold kernel bit-for-bit. Do NOT rewrite as
+// `E2M1[code]*kE4M3[byte]*global` (left-assoc -> (E2M1*kE4M3)*global, a different
+// rounding order) — the parentheses are load-bearing for argmax-exactness.
+//
+// The e4m3 scale buffer is uploaded as raw bytes and read as uint[] with an
+// absolute-byte extract (word = sidx>>2; shift = (sidx&3)*8), exactly like the
+// fp8 kernel — no GL_EXT_shader_8bit_storage needed. The 4-bit weight nibbles are
+// unpacked identically to `mul_mat_vec_nvfp4.comp`.
+//
+// Bindings (auto-numbered 0.. by record_to in buffer order):
+//   0 = packed weight  (uint[],  4-bit E2M1 codes, 8 per u32)
+//   1 = scale          (uint[],  raw e4m3 block-scale bytes, 4 per u32)
+//   2 = activation x   (float[], length k)
+//   3 = output         (float[], length n)
+//
+// Push constants: { uint ncols(=k); uint nrows(=n); uint group_size(=16);
+//                   uint packed_off; uint sb_off; float global; }
+// packed_off is the base WORD offset into packed[] for this slice; sb_off the
+// base BYTE-ELEMENT offset into the e4m3 scale[] (both 0 for a plain dense
+// weight; reserved for a future per-expert MoE dispatch). global is the
+// per-tensor `.weight_scale_2` scalar.
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 512;
+layout(constant_id = 1) const uint NUM_ROWS = 1;
+
+layout(push_constant) uniform parameter {
+    uint  ncols;       // k = in_features (contraction dim)
+    uint  nrows;       // n = out_features
+    uint  group_size;  // NVFP4 block size along k (16)
+    uint  packed_off;  // base WORD offset into packed[] for this slice
+    uint  sb_off;      // base BYTE-ELEMENT offset into scale[] for this slice
+    float global;      // per-tensor weight_scale_2
+} p;
+
+layout(binding = 0) readonly buffer Packed { uint  packed[]; };
+layout(binding = 1) readonly buffer Scales { uint  scaleb[]; };
+layout(binding = 2) readonly buffer Activ  { float x[];      };
+layout(binding = 3) writeonly buffer Dst   { float dst[];    };
+
+shared float tmpsh[NUM_ROWS][BLOCK_SIZE];
+
+// E2M1 (FP4) code -> value. Magnitudes {0,.5,1,1.5,2,3,4,6}; sign in bit 3.
+const float kE2M1[16] = float[16](
+    0.0,  0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0,
+   -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0
+);
+
+// E4M3 (1 sign, 4 exp bias-7, 3 mantissa) code -> value, ARITHMETIC decode.
+// Was a 256-entry `const float kE4M3[256]` LUT indexed by the raw scale byte; on
+// GFX1013/ACO a DIVERGENT index into a 256-elem const array is NOT a memory load
+// — it lowers to a ~255-wide v_cndmask SELECT CASCADE (~16x the VALU of the dot's
+// kE2M1[16] lookup). Same address-gen-class pathology, and same cure, as the
+// nvfp4_e4m3repack twin (this is the verbatim kE4M3_decode from that kernel).
+// BIT-EXACT vs the old kE4M3[byte] for all 256 codes (fp8_arith_decode_matches_e4m3
+// + fp8_shader_lut_matches_e4m3 together prove decode == e4m3_to_f32 == LUT), so
+// `kE4M3_decode(byte)*global` is bit-identical to `kE4M3[byte]*global` ->
+// argmax-exactness (and the f32-fold parity below) preserved.
+float kE4M3_decode(uint b) {
+    const uint s = b & 0x80u;               // sign bit (in position 7)
+    const uint e = (b >> 3u) & 0xFu;        // 4-bit exponent (bias 7)
+    const uint m = b & 0x7u;                // 3-bit mantissa
+    float mag;
+    if (e == 0u) {
+        mag = float(m) * 0.001953125;       // subnormal: m * 2^-9 (exact)
+    } else if (e == 15u && m == 7u) {
+        mag = 0.0;                          // e4m3 nan-slot -> 0.0 (LUT contract)
+    } else {
+        mag = uintBitsToFloat(((e + 120u) << 23u) | (m << 20u));  // normal
+    }
+    return uintBitsToFloat(floatBitsToUint(mag) | (s << 24u));    // sign -> bit 31
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint first_row = NUM_ROWS * gl_WorkGroupID.x;
+
+    const uint k = p.ncols;
+    const uint gs = p.group_size;
+    const uint groups = k / gs;
+    const uint words_per_row = k / 8u;
+    const float global = p.global;
+
+    float temp[NUM_ROWS];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        temp[n] = 0.0;
+    }
+
+    // Each thread walks columns j = tid, tid+BLOCK_SIZE, ...
+    for (uint j = tid; j < k; j += BLOCK_SIZE) {
+        const float xv = x[j];
+        const uint widx = j >> 3u;             // j / 8  word index within a row
+        const uint shift = (j & 7u) * 4u;      // (j % 8) * 4  nibble bit offset
+        const uint g = j / gs;                 // block index
+
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint r = first_row + n;
+            if (r >= p.nrows) { continue; }
+            const uint word = packed[p.packed_off + r * words_per_row + widx];
+            const uint code = (word >> shift) & 0xFu;
+            // Absolute-byte extract of the raw e4m3 block scale (reinterpret the
+            // byte buffer as uint[], mirroring the fp8 kernel).
+            const uint sidx  = p.sb_off + r * groups + g;
+            const uint sword = scaleb[sidx >> 2u];
+            const uint sbyte = (sword >> ((sidx & 3u) * 8u)) & 0xFFu;
+            // Parentheses are load-bearing for bit-exactness vs the f32-fold
+            // kernel — see the header. bscale == the f32-fold `folded[r,g]`.
+            const float bscale = kE4M3_decode(sbyte) * global;
+            const float w = kE2M1[code] * bscale;
+            temp[n] += w * xv;
+        }
+    }
+
+    // Reduce partial sums across the workgroup via shared memory.
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        tmpsh[n][tid] = temp[n];
+    }
+    barrier();
+    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                tmpsh[n][tid] += tmpsh[n][tid + s];
+            }
+        }
+        barrier();
+    }
+    if (tid == 0) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint r = first_row + n;
+            if (r < p.nrows) {
+                dst[r] = tmpsh[n][0];
+            }
+        }
+    }
+}

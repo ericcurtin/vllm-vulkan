@@ -1,0 +1,134 @@
+#version 450
+// MLX-affine 6-bit CONTIGUOUS matvec — DeepSeek-V4-Flash attn/MLA/DSA
+// (indexer + compressor) tensors. The HARD width: 6-bit codes are packed as a
+// CONTIGUOUS little-endian bitstream that CROSSES u32 word boundaries (bits ∉
+// {2,4,8} => in*bits/32 packed cols, NOT in/(32/bits)). This is the layout the
+// Phase-0 oracle model::dequantize_mlx_affine_bits (6-bit path) handles; this
+// kernel ports the contiguous unpack to GLSL and is gated ARGMAX-EXACT/ULP
+// against it.
+//
+// SCHEME — "3 words per 16 codes" (16*6 = 96 bits = 3 u32 EXACTLY). Each thread
+// processes a chunk of 16 codes = 3 consecutive words (w0,w1,w2). Only codes 5
+// and 10 straddle a word boundary inside the 3-word block; every extract shift
+// is a COMPILE-TIME CONSTANT (fully unrolled), so wi/off never become dynamic
+// array indices — the 3 words stay register-resident, no scratch spill. Across a
+// wave the (3*chunk) word runs are contiguous -> coalesced global loads.
+//
+//   code i (i=0..15) at bit 6i in the 96-bit little-endian window w0|w1<<32|w2<<64:
+//     0: (w0>> 0)&63   1: (w0>> 6)&63   2: (w0>>12)&63   3: (w0>>18)&63
+//     4: (w0>>24)&63   5: ((w0>>30)|(w1<<2))&63          6: (w1>> 4)&63
+//     7: (w1>>10)&63   8: (w1>>16)&63   9: (w1>>22)&63  10: ((w1>>28)|(w2<<4))&63
+//    11: (w2>> 2)&63  12: (w2>> 8)&63  13: (w2>>14)&63  14: (w2>>20)&63  15: (w2>>26)&63
+//
+// AFFINE (gs=128 for every DSV4 6-bit tensor; chunks_per_group = 128/16 = 8, so a
+// 16-code chunk lies wholly within one group): factored exactly like the 2/4-bit
+// repack: temp += scale*sum(q_j*x_j) + bias*sum(x_j). subgroupAdd reduction.
+//
+// REQUIRES k % 16 == 0 (=> words_per_row = k*6/32 = 3*(k/16) integer;
+// chunks_per_row = k/16). packed[] bound as plain u32 (no dwordx4 alignment
+// needed — 3-word chunks are not 16B-multiples). Bindings/push-constants match
+// mul_mat_vec_mlx4.comp (5 buffers, 5 uints); dispatch via matvec_mlx4_pc.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 64;
+layout(constant_id = 1) const uint NUM_ROWS = 2;
+
+layout(push_constant) uniform parameter {
+    uint ncols;       // k = in_features (contraction)
+    uint nrows;       // n = out_features
+    uint group_size;  // affine group size (128 for DSV4 6-bit tensors)
+    uint packed_off;  // WORD offset into packed[] for this weight (0 for dense 2D)
+    uint sb_off;      // ELEMENT offset into scales[]/biases[]  (0 for dense 2D)
+} p;
+
+layout(binding = 0) readonly buffer Packed { uint  packed[]; };  // contiguous 6-bit stream
+layout(binding = 1) readonly buffer Scales { float scales[]; };
+layout(binding = 2) readonly buffer Biases { float biases[]; };
+layout(binding = 3) readonly buffer Activ  { vec4  x4[];     };  // k/4 vec4s
+layout(binding = 4) writeonly buffer Dst   { float dst[];    };
+
+shared float part[NUM_ROWS][16];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint first_row = NUM_ROWS * gl_WorkGroupID.x;
+
+    const uint k = p.ncols;
+    const uint groups = k / p.group_size;
+    const uint words_per_row = (k >> 4u) * 3u;        // k*6/32 = 3*(k/16)
+    const uint chunks_per_row = k >> 4u;              // k/16 (3 words = 16 codes each)
+    const uint chunks_per_group = p.group_size >> 4u; // gs/16 = 8 for gs=128
+
+    float temp[NUM_ROWS];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) { temp[n] = 0.0; }
+
+    for (uint c = tid; c < chunks_per_row; c += BLOCK_SIZE) {
+        const uint g = c / chunks_per_group;   // affine group of this 16-code chunk
+        const uint xb = c << 2u;               // 4*c (vec4 index base for 16 acts)
+        const vec4 x0 = x4[xb + 0u];
+        const vec4 x1 = x4[xb + 1u];
+        const vec4 x2 = x4[xb + 2u];
+        const vec4 x3 = x4[xb + 3u];
+        const float xsum = dot(x0 + x1 + x2 + x3, vec4(1.0));
+
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint r = first_row + n;
+            if (r >= p.nrows) { continue; }
+            const uint wbase = p.packed_off + r * words_per_row + c * 3u;
+            const uint w0 = packed[wbase + 0u];
+            const uint w1 = packed[wbase + 1u];
+            const uint w2 = packed[wbase + 2u];
+            // 16 contiguous 6-bit codes -> 4 vec4 (codes 5 and 10 cross a word).
+            const vec4 q0 = vec4(float((w0 >>  0u) & 0x3Fu), float((w0 >>  6u) & 0x3Fu),
+                                 float((w0 >> 12u) & 0x3Fu), float((w0 >> 18u) & 0x3Fu));
+            const vec4 q1 = vec4(float((w0 >> 24u) & 0x3Fu),
+                                 float(((w0 >> 30u) | (w1 << 2u)) & 0x3Fu),
+                                 float((w1 >>  4u) & 0x3Fu), float((w1 >> 10u) & 0x3Fu));
+            const vec4 q2 = vec4(float((w1 >> 16u) & 0x3Fu), float((w1 >> 22u) & 0x3Fu),
+                                 float(((w1 >> 28u) | (w2 << 4u)) & 0x3Fu),
+                                 float((w2 >>  2u) & 0x3Fu));
+            const vec4 q3 = vec4(float((w2 >>  8u) & 0x3Fu), float((w2 >> 14u) & 0x3Fu),
+                                 float((w2 >> 20u) & 0x3Fu), float((w2 >> 26u) & 0x3Fu));
+            const float qx = dot(q0, x0) + dot(q1, x1) + dot(q2, x2) + dot(q3, x3);
+            const uint sb = p.sb_off + r * groups + g;
+            temp[n] = fma(scales[sb], qx, fma(biases[sb], xsum, temp[n]));
+        }
+    }
+
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        temp[n] = subgroupAdd(temp[n]);
+    }
+
+    if (gl_NumSubgroups == 1u) {
+        if (subgroupElect()) {
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                const uint r = first_row + n;
+                if (r < p.nrows) { dst[r] = temp[n]; }
+            }
+        }
+        return;
+    }
+
+    if (subgroupElect()) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            part[n][gl_SubgroupID] = temp[n];
+        }
+    }
+    barrier();
+    if (gl_SubgroupID == 0u) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            float acc = 0.0;
+            for (uint s = gl_SubgroupInvocationID; s < gl_NumSubgroups; s += gl_SubgroupSize) {
+                acc += part[n][s];
+            }
+            acc = subgroupAdd(acc);
+            const uint r = first_row + n;
+            if (subgroupElect() && r < p.nrows) { dst[r] = acc; }
+        }
+    }
+}

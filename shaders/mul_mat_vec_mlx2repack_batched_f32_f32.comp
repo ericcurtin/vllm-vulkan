@@ -1,0 +1,135 @@
+#version 450
+// MLX-affine 2-bit EXPERT-BATCHED matvec — the DeepSeek-V4-Flash MoE decode
+// dispatch-collapse lever (top-k routed experts = the 84% bucket). Computes the
+// SAME gate/up/down projection over ALL top_k routed experts in ONE dispatch,
+// each expert's slice through the EXACT per-word repack inner loop of
+// mul_mat_vec_mlx2repack_f32_f32.comp (dwordx4 = 64 codes/load + fma-factored
+// affine + subgroupAdd reduction). The 2-bit twin of
+// mul_mat_vec_mlx4repack_batched_f32_f32.comp (the Ling primitive).
+//
+// ★ GUARDRAIL: batching MUST go THROUGH the repack body, NOT a v1 LDS tree —
+// per-expert VGPR/LDS/occupancy is IDENTICAL to the single-expert repack (single
+// token, no live-weight-across-cols blowup) while the DISPATCH count collapses
+// top_k -> 1 per projection and the experts' workgroups fill the CUs concurrently.
+//
+// Dispatch grid: (ceil(n / NUM_ROWS), num_experts, 1). gl_WorkGroupID.y = expert
+// slot. meta[e] = (packed_off, sb_off, x_off, dst_off):
+//   packed_off  WORD offset into packed[]  for expert e (= slot[e]*n*(k/16))
+//   sb_off      ELEMENT offset into scales[]/biases[] for expert e (= slot[e]*n*(k/gs))
+//   x_off       FLOAT offset into activations (0 for gate/up shared x; e*k for down)
+//   dst_off     FLOAT offset into dst[] (= e*n)
+//
+// REQUIRES k % 64 == 0 (chunks_per_row = k/64), packed base 16B-aligned
+// (packed_off and words_per_row = k/16 multiples of 4 — true for every DSV4
+// expert: gate/up k=4096 wpr=256, down k=2048 wpr=128; per-expert pack_stride =
+// n*wpr = 2048*256 / 4096*128 both mult 4). group_size generic (chunks_per_group
+// = gs/64; DSV4 routed experts gs=128 -> 2 chunks/group).
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 64;
+layout(constant_id = 1) const uint NUM_ROWS = 2;
+
+layout(push_constant) uniform parameter {
+    uint ncols;       // k = in_features (contraction)
+    uint nrows;       // n = out_features
+    uint group_size;  // affine group size (128 for DSV4 routed experts)
+    uint packed_off;  // UNUSED (per-expert offset from meta[]); kept for the 5-uint layout
+    uint sb_off;
+} p;
+
+layout(binding = 0) readonly buffer Packed { uvec4 packed4[]; }; // 4 words / uvec4 = 64 codes
+layout(binding = 1) readonly buffer Scales { float scales[]; };
+layout(binding = 2) readonly buffer Biases { float biases[]; };
+layout(binding = 3) readonly buffer Activ  { vec4  x4[];     };  // (num_experts*)k/4 vec4s
+layout(binding = 4) writeonly buffer Dst   { float dst[];    };  // num_experts*n floats
+layout(binding = 5) readonly buffer Meta   { uvec4 meta[];   };  // per-expert bases
+
+shared float part[NUM_ROWS][16];
+
+#define Q4(w, s) vec4(float(((w) >> (s + 0u)) & 0x3u), float(((w) >> (s + 2u)) & 0x3u), \
+                      float(((w) >> (s + 4u)) & 0x3u), float(((w) >> (s + 6u)) & 0x3u))
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint first_row = NUM_ROWS * gl_WorkGroupID.x;
+    const uint e = gl_WorkGroupID.y;
+
+    const uvec4 md = meta[e];
+    const uint packed_off = md.x;
+    const uint sb_off     = md.y;
+    const uint x_base4    = md.z >> 2u;
+    const uint dst_off    = md.w;
+
+    const uint k = p.ncols;
+    const uint groups = k / p.group_size;
+    const uint words_per_row = k >> 4u;               // k/16
+    const uint chunks_per_row = k >> 6u;              // k/64
+    const uint chunks_per_group = p.group_size >> 6u; // gs/64
+
+    float temp[NUM_ROWS];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) { temp[n] = 0.0; }
+
+    for (uint c = tid; c < chunks_per_row; c += BLOCK_SIZE) {
+        const uint g = c / chunks_per_group;
+        const uint xb = x_base4 + (c << 4u);
+        vec4 xv[16];
+        [[unroll]] for (uint j = 0; j < 16; ++j) { xv[j] = x4[xb + j]; }
+        vec4 xacc = vec4(0.0);
+        [[unroll]] for (uint j = 0; j < 16; ++j) { xacc += xv[j]; }
+        const float xsum = dot(xacc, vec4(1.0));
+
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint r = first_row + n;
+            if (r >= p.nrows) { continue; }
+            const uint base4 = ((packed_off + r * words_per_row) >> 2u) + c;
+            const uvec4 pw = packed4[base4];
+            float qx = dot(Q4(pw.x,  0u), xv[0])  + dot(Q4(pw.x, 8u), xv[1])
+                     + dot(Q4(pw.x, 16u), xv[2])  + dot(Q4(pw.x, 24u), xv[3])
+                     + dot(Q4(pw.y,  0u), xv[4])  + dot(Q4(pw.y, 8u), xv[5])
+                     + dot(Q4(pw.y, 16u), xv[6])  + dot(Q4(pw.y, 24u), xv[7])
+                     + dot(Q4(pw.z,  0u), xv[8])  + dot(Q4(pw.z, 8u), xv[9])
+                     + dot(Q4(pw.z, 16u), xv[10]) + dot(Q4(pw.z, 24u), xv[11])
+                     + dot(Q4(pw.w,  0u), xv[12]) + dot(Q4(pw.w, 8u), xv[13])
+                     + dot(Q4(pw.w, 16u), xv[14]) + dot(Q4(pw.w, 24u), xv[15]);
+            const uint sb = sb_off + r * groups + g;
+            temp[n] = fma(scales[sb], qx, fma(biases[sb], xsum, temp[n]));
+        }
+    }
+
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        temp[n] = subgroupAdd(temp[n]);
+    }
+
+    if (gl_NumSubgroups == 1u) {
+        if (subgroupElect()) {
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                const uint r = first_row + n;
+                if (r < p.nrows) { dst[dst_off + r] = temp[n]; }
+            }
+        }
+        return;
+    }
+
+    if (subgroupElect()) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            part[n][gl_SubgroupID] = temp[n];
+        }
+    }
+    barrier();
+    if (gl_SubgroupID == 0u) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            float acc = 0.0;
+            for (uint s = gl_SubgroupInvocationID; s < gl_NumSubgroups; s += gl_SubgroupSize) {
+                acc += part[n][s];
+            }
+            acc = subgroupAdd(acc);
+            const uint r = first_row + n;
+            if (subgroupElect() && r < p.nrows) { dst[dst_off + r] = acc; }
+        }
+    }
+}

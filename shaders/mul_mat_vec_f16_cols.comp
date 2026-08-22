@@ -1,0 +1,101 @@
+#version 450
+
+// F16 batched multi-column matrix-vector kernel (spec-decode "batched verify"
+// primitive). Computes, for each output row r in [0,n) and token-column c in
+// [0,NUM_COLS):  dst[c,r] = sum_{j=0..k} w[r,j] * x[c,j].
+//
+// The whole point vs the generic mul_mat_vec.comp (base.glsl) path: base.glsl's
+// iter() loops columns OUTER and loads/dequantizes the weight INSIDE that loop,
+// so the weight row is RE-STREAMED once per token-column -> ~linear T scaling,
+// zero amortization. Here each thread loads each weight element w[r,j] EXACTLY
+// ONCE and reuses it across all NUM_COLS columns (columns are the INNER loop),
+// so on BW-bound GFX1013 the extra verify tokens are nearly free. This is the
+// f16 sibling of mul_mat_vec_nvfp4.comp's multi-column path.
+//
+// Layout: weight [n,k] row-major (w[r*k+j], f16); activation [NUM_COLS,k]
+// row-major (x[c*k+j], f32); output [NUM_COLS,n] row-major (dst[c*n+r], f32) --
+// the same [T,k]->[T,n] convention as the nvfp4/q8_0 cols kernels.
+//
+// Rows are addressed via a LINEAR workgroup index across a 2D dispatch grid
+// (gl_WorkGroupID.x + gl_WorkGroupID.y*gl_NumWorkGroups.x) so n can exceed the
+// 65535 one-dimension workgroup limit (e.g. lm_head n=131072).
+//
+// Bindings: 0 = weight (f16), 1 = activation x (f32), 2 = output (f32).
+// Push constants: { uint ncols(=k); uint nrows(=n); }.
+// One workgroup handles NUM_ROWS rows; BLOCK_SIZE threads partition k.
+// NUM_ROWS*NUM_COLS<=8 keeps LDS (rows*cols*BLOCK_SIZE*4) <= 16 KB.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 512;
+layout(constant_id = 1) const uint NUM_ROWS = 1;
+layout(constant_id = 2) const uint NUM_COLS = 1;
+
+layout(push_constant) uniform parameter {
+    uint ncols;  // k = in_features (contraction dim)
+    uint nrows;  // n = out_features
+} p;
+
+layout(binding = 0) readonly buffer W    { float16_t w[]; };
+layout(binding = 1) readonly buffer Activ { float x[];    };
+layout(binding = 2) writeonly buffer Dst { float dst[];   };
+
+shared float tmpsh[NUM_ROWS][NUM_COLS][BLOCK_SIZE];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint wg_lin = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    const uint first_row = NUM_ROWS * wg_lin;
+    const uint k = p.ncols;
+
+    float temp[NUM_ROWS][NUM_COLS];
+    [[unroll]] for (uint nr = 0; nr < NUM_ROWS; ++nr) {
+        [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+            temp[nr][c] = 0.0;
+        }
+    }
+
+    // Each thread walks columns j = tid, tid+BLOCK_SIZE, ... The weight element
+    // w[r,j] is read ONCE and reused across all NUM_COLS token columns.
+    for (uint j = tid; j < k; j += BLOCK_SIZE) {
+        [[unroll]] for (uint nr = 0; nr < NUM_ROWS; ++nr) {
+            const uint r = first_row + nr;
+            if (r >= p.nrows) { continue; }
+            const float wv = float(w[r * k + j]);
+            [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+                temp[nr][c] += wv * x[c * k + j];
+            }
+        }
+    }
+
+    [[unroll]] for (uint nr = 0; nr < NUM_ROWS; ++nr) {
+        [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+            tmpsh[nr][c][tid] = temp[nr][c];
+        }
+    }
+    barrier();
+    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            [[unroll]] for (uint nr = 0; nr < NUM_ROWS; ++nr) {
+                [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+                    tmpsh[nr][c][tid] += tmpsh[nr][c][tid + s];
+                }
+            }
+        }
+        barrier();
+    }
+    if (tid == 0) {
+        [[unroll]] for (uint nr = 0; nr < NUM_ROWS; ++nr) {
+            const uint r = first_row + nr;
+            if (r < p.nrows) {
+                [[unroll]] for (uint c = 0; c < NUM_COLS; ++c) {
+                    dst[c * p.nrows + r] = tmpsh[nr][c][0];
+                }
+            }
+        }
+    }
+}

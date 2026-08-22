@@ -82,3 +82,59 @@ jobs:
         # The test binary embeds the interpreter; point it at the system Python.
         export PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
         cargo test --no-default-features --features "multiple-pymethods" --lib
+
+    # lavapipe is Mesa's CPU Vulkan driver. With it selected the kernel
+    # conformance tests stop no-op'ing and actually dispatch the compiled
+    # SPIR-V, checking each quantized matvec against a CPU reference. The
+    # device-less run above stays as-is: it is what proves the graceful-skip
+    # path still works.
+    - name: Install Mesa lavapipe (software Vulkan device)
+      run: |
+        sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
+        # The lavapipe ICD filename varies with Mesa packaging -- noble ships
+        # lvp_icd.x86_64.json while noble-updates ships lvp_icd.json -- and the
+        # directory differs across distros too. Discover it instead of pinning
+        # one spelling, and fail loudly (listing what IS installed) if absent,
+        # so this never degrades into a silently device-less run.
+        icd=$(find /usr/share/vulkan/icd.d /usr/lib/x86_64-linux-gnu/vulkan/icd.d \
+                -name 'lvp_icd*.json' 2>/dev/null | head -1)
+        if [ -z "$icd" ]; then
+          echo "::error::lavapipe ICD not found. Installed Vulkan ICDs:"
+          find /usr -name '*_icd*.json' 2>/dev/null | sed 's/^/  /'
+          exit 1
+        fi
+        echo "lavapipe ICD: $icd"
+        echo "VK_ICD_FILENAMES=$icd" >> "$GITHUB_ENV"
+        VK_ICD_FILENAMES="$icd" vulkaninfo --summary | head -40
+
+    - name: Run Rust tests against the software Vulkan device
+      env:
+        RUST_BACKTRACE: '1'
+      run: |
+        # VK_ICD_FILENAMES comes from the discovery step above via GITHUB_ENV.
+        export PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
+        cargo test --no-default-features --features "multiple-pymethods" --lib -- --nocapture
+
+    # Structural validation of every compiled module. Complements the Rust
+    # reflection gates: spirv-val checks the module against the SPIR-V spec,
+    # while the reflection tests check it against the Rust dispatch contract
+    # (bindings, push-constant sizes) -- which spirv-val does not look at.
+    # The target-env must track scripts/compile_shaders.sh's --target-env.
+    - name: Validate compiled SPIR-V modules
+      run: |
+        set -euo pipefail
+        sudo apt-get install -y spirv-tools
+        mapfile -t mods < <(find target -type d -name spirv -path '*/vllm-vulkan-*/out/*' -exec find {} -name '*.spv' \;)
+        if [ "${#mods[@]}" -eq 0 ]; then
+          echo "::error::no compiled .spv modules found - did the build step run?"
+          exit 1
+        fi
+        fail=0
+        for m in "${mods[@]}"; do
+          if ! out=$(spirv-val --target-env vulkan1.3 "$m" 2>&1); then
+            echo "::error file=$m::spirv-val failed: $out"
+            fail=$((fail + 1))
+          fi
+        done
+        echo "spirv-val: ${#mods[@]} module(s) checked, $fail failure(s)"
+        [ "$fail" -eq 0 ]

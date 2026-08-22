@@ -66,6 +66,7 @@ use flags::{Flags, QuantFormat};
 mod gpu_error;
 mod push_constants;
 use push_constants::*;
+#[cfg(test)] mod spirv_reflect_tests;
 #[cfg(feature = "debug-api")]
 mod debug_api;
 
@@ -75,6 +76,9 @@ mod direct_kernels;
 #[cfg(feature = "debug-api")]
 use debug_api::*;
 mod vulkan_ctx;
+// GPU numerical conformance harness (test-only; no-ops without a Vulkan ICD).
+#[cfg(test)]
+mod device_conformance;
 use vulkan_ctx::{VulkanContext, GpuTensor};
 mod tp;
 #[cfg(feature = "qwen35")]
@@ -8860,6 +8864,96 @@ mod registry_tests {
             ShaderClass::Flash
         } else {
             ShaderClass::Plain
+        }
+    }
+
+    /// Every quantized-matvec / subgroup-attention kernel this crate ships must
+    /// survive into the runtime shader map.
+    ///
+    /// This is the counterpart to `scripts/compile_shaders.sh`'s
+    /// skip-when-absent behaviour. That guard lets ONE compile script drive any
+    /// feature slice (it compiles the shaders present in the tree and skips the
+    /// rest), but it means a `.comp` that goes missing — a renamed file, a
+    /// typo'd entry in the compile script, a bad carve — no longer fails the
+    /// build. It compiles zero shaders for that entry, exits 0, and the kernel
+    /// simply vanishes from the registry.
+    ///
+    /// A length/self-consistency check cannot catch that: when an entry
+    /// disappears, the registry and the runtime map shrink together and stay
+    /// 1:1. So this test names the kernels instead of counting them — adding a
+    /// shader never breaks it, losing one always does. Each name below is a
+    /// kernel some model path dispatches by name; if one is absent the dispatch
+    /// would fail at runtime on the GPU, which CI has no way to reach.
+    pub(crate) const REQUIRED_QUANT_KERNELS: &[&str] = &[
+        // mlx4 (4-bit) family
+        "mul_mat_vec_mlx4_f32_f32",
+        "mul_mat_vec_mlx4_cols",
+        "mul_mat_vec_mlx4w8_f32_f32",
+        "mul_mat_vec_mlx4w16_f32_f32",
+        "mul_mat_vec_mlx4w8sg_f32_f32",
+        "mul_mat_vec_mlx4repack_f32_f32",
+        "mul_mat_vec_mlx4repack_batched_f32_f32",
+        // mlx2 / mlx6 / mlx8 repack variants
+        "mul_mat_vec_mlx2repack_f32_f32",
+        "mul_mat_vec_mlx2repack_batched_f32_f32",
+        "mul_mat_vec_mlx6_f32_f32",
+        "mul_mat_vec_mlx8_f32_f32",
+        // nvfp4 family
+        "mul_mat_vec_nvfp4_f32_f32",
+        "mul_mat_vec_nvfp4_e4m3_f32_f32",
+        "mul_mat_vec_nvfp4repack_f32_f32",
+        "mul_mat_vec_nvfp4_e4m3repack_f32_f32",
+        // fp8 family
+        "mul_mat_vec_fp8_f32_f32",
+        "mul_mat_vec_fp8fast_f32_f32",
+        "mul_mat_vec_fp8repack_f32_f32",
+        // column-batched dequant matvec
+        "mul_mat_vec_q8_0_cols",
+        "mul_mat_vec_f16_cols",
+        // subgroup paged decode attention
+        "paged_attn_decode_f32_sg",
+        "paged_attn_decode_f16_sg",
+        "relu2_f32",
+    ];
+
+    #[test]
+    fn quant_matvec_kernels_are_registered() {
+        let map = include_all_shaders();
+        let missing: Vec<&str> = REQUIRED_QUANT_KERNELS
+            .iter()
+            .copied()
+            .filter(|n| !map.contains_key(*n))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{} required shader(s) missing from the registry: {:?}\n\
+             The SPIR-V for these was not produced, so any dispatch of them would \
+             fail on device. Check that the .comp source exists under shaders/ and \
+             that scripts/compile_shaders.sh still has a compile entry for it \
+             (a missing source is SKIPPED, not an error, by design).",
+            missing.len(),
+            missing,
+        );
+    }
+
+    /// The SPIR-V behind each required kernel must be non-empty and well-formed
+    /// enough to be a SPIR-V module: correct magic number and a 5-word header.
+    /// Catches a truncated or empty .spv surviving into the registry.
+    #[test]
+    fn required_kernel_spirv_is_wellformed() {
+        let map = include_all_shaders();
+        for name in REQUIRED_QUANT_KERNELS {
+            let Some(bytes) = map.get(*name) else { continue };
+            assert!(
+                bytes.len() >= 20 && bytes.len() % 4 == 0,
+                "{name}: SPIR-V is {} bytes — too short or not word-aligned",
+                bytes.len()
+            );
+            let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            assert_eq!(
+                magic, 0x0723_0203,
+                "{name}: bad SPIR-V magic 0x{magic:08x} (expected 0x07230203)"
+            );
         }
     }
 

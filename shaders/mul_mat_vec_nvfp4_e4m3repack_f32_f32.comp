@@ -1,0 +1,191 @@
+#version 450
+// NVFP4 matvec — VALU-bound repack refactor, E4M3-RESIDENT scale variant
+// (VLLM_VULKAN_NVFP4_REPACK=1 AND VLLM_VULKAN_NVFP4_E4M3_SCALES=1). The e4m3-
+// resident twin of mul_mat_vec_nvfp4repack_f32_f32: same dwordx4 word-granular
+// load + subgroupAdd reduction + per-group (not per-element) scale, but the
+// per-group scale is the RAW e4m3 block byte (0.5 bits/param resident) decoded +
+// multiplied by the per-tensor f32 global IN the inner loop (hoisted ONCE per
+// chunk, not per element), instead of the pre-folded f32 scale the default
+// repack reads. So this stacks the >=150B footprint lever (e4m3-resident scales,
+// 4.5 bits/param) on top of the address-gen win. See mul_mat_vec_nvfp4_e4m3.comp
+// (the v1 kernel this refactors) for the layout/bit-exactness contract.
+//
+// Computes, for each output row r in [0, n):
+//   out[r] = sum_j ( E2M1[nibble(w,r,j)] * (E4M3[scale_byte(r,g)] * global) ) * x[j]
+// with g = j/16, factored per 16-elem group as scale*sum(E2M1*x) (two fma/chunk).
+//
+// BIT-EXACTNESS vs the f32-fold repack: bscale = kE4M3[byte] * global as a
+// PARENTHESIZED subexpression == the f32-fold path's stored folded scale
+// (e4m3_to_f32(byte)*global, same IEEE-754 single multiply), so the outer
+// scale*dot matches the f32-fold repack bit-for-bit -> both are argmax-exact vs
+// v1. Do NOT reassociate the global into the dot.
+//
+// The e4m3 scale buffer is uploaded as raw bytes, read as uint[] with an
+// absolute-byte extract (word = sidx>>2; shift = (sidx&3)*8) — exactly like
+// mul_mat_vec_nvfp4_e4m3.comp / the fp8 kernel; no 8-bit-storage extension.
+//
+// REQUIRES k % 32 == 0, group_size == 16, packed base 16B-aligned (see
+// mul_mat_vec_nvfp4repack_f32_f32.comp). Bindings / push-constants IDENTICAL to
+// mul_mat_vec_nvfp4_e4m3.comp (4 buffers, 5 uints + float global).
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 64;
+layout(constant_id = 1) const uint NUM_ROWS = 2;
+
+layout(push_constant) uniform parameter {
+    uint  ncols;       // k = in_features (contraction)
+    uint  nrows;       // n = out_features
+    uint  group_size;  // NVFP4 block size along k (16)
+    uint  packed_off;  // WORD offset into packed[] for this slice (0 for dense 2D)
+    uint  sb_off;      // BYTE-ELEMENT offset into scale[] for this slice
+    float global;      // per-tensor weight_scale_2
+} p;
+
+layout(binding = 0) readonly buffer Packed { uvec4 packed4[]; }; // 4 words / uvec4 = 32 nibbles
+layout(binding = 1) readonly buffer Scales { uint  scaleb[]; };  // raw e4m3 block bytes, 4/u32
+layout(binding = 2) readonly buffer Activ  { vec4  x4[];     };  // k/4 vec4s
+layout(binding = 3) writeonly buffer Dst   { float dst[];    };
+
+shared float part[NUM_ROWS][16];
+
+// E2M1 (FP4) code -> value. Magnitudes {0,.5,1,1.5,2,3,4,6}; sign in bit 3.
+const float kE2M1[16] = float[16](
+    0.0,  0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0,
+   -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0
+);
+
+// E4M3 (1 sign, 4 exp bias-7, 3 mantissa) code -> value, ARITHMETIC decode.
+//
+// PERF BUG FIX (was a 256-entry `const float kE4M3[256]` LUT indexed by the raw
+// scale byte): on GFX1013/ACO a DIVERGENT index into a 256-elem const array does
+// not become a memory load — it lowers to a ~255-wide v_cndmask SELECT CASCADE
+// (or a scratch-spilled indexable temp). In v1 that cost is hidden under the
+// uncoalesced per-element address-gen; but the repack KILLED the address-gen, so
+// the LUT cascade became the whole kernel (2 lookups/chunk, ~16x the VALU of the
+// dot's kE2M1[16] lookups) -> occupancy/latency-hiding collapse -> ~14.4ms/op
+// (0.08x). Decoding e4m3 with ~8 integer/bit ops instead removes the array
+// entirely and restores the f32-fold twin's address-gen profile.
+//
+// BIT-EXACTNESS: this returns the SAME f32 bit pattern as the old kE4M3[byte] for
+// all 256 codes (verified exhaustively, incl. subnormals, both signed zeros, and
+// the e4m3 nan-slot 0x7F/0xFF -> 0.0 the LUT encodes). Normals assemble the f32
+// bits directly (E=e+120, M=m<<20) so no v_exp_f32 rounding enters; subnormals use
+// float(m)*2^-9 (exact); sign is OR'd onto bit 31. So kE4M3_decode(b)*global is
+// bit-identical to the old kE4M3[b]*global -> argmax-exactness preserved.
+float kE4M3_decode(uint b) {
+    const uint s = b & 0x80u;               // sign bit (in position 7)
+    const uint e = (b >> 3u) & 0xFu;        // 4-bit exponent (bias 7)
+    const uint m = b & 0x7u;                // 3-bit mantissa
+    float mag;
+    if (e == 0u) {
+        mag = float(m) * 0.001953125;       // subnormal: m * 2^-9 (exact)
+    } else if (e == 15u && m == 7u) {
+        mag = 0.0;                          // e4m3 nan-slot -> 0.0 (LUT contract)
+    } else {
+        // normal: (1 + m/8) * 2^(e-7); assemble the f32 bits exactly.
+        mag = uintBitsToFloat(((e + 120u) << 23u) | (m << 20u));
+    }
+    return uintBitsToFloat(floatBitsToUint(mag) | (s << 24u));
+}
+
+// Decode the raw e4m3 block-scale byte at element index `sidx` and fold the
+// per-tensor global — parenthesized to match the f32-fold repack's stored scale.
+float block_scale(uint sidx, float global) {
+    const uint sword = scaleb[sidx >> 2u];
+    const uint sbyte = (sword >> ((sidx & 3u) * 8u)) & 0xFFu;
+    return kE4M3_decode(sbyte) * global;  // == e4m3_to_f32(byte) * global (host f32-fold)
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint first_row = NUM_ROWS * gl_WorkGroupID.x;
+
+    const uint k = p.ncols;
+    const uint groups = k / p.group_size;             // = k/16 = 2*chunks_per_row
+    const uint words_per_row = k >> 3u;               // k/8
+    const uint chunks_per_row = k >> 5u;              // k/32 (4 words = 32 nibbles each)
+    const float global = p.global;
+
+    float temp[NUM_ROWS];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) { temp[n] = 0.0; }
+
+    for (uint c = tid; c < chunks_per_row; c += BLOCK_SIZE) {
+        const uint g0 = c << 1u;               // group of first 16 elems (gs==16)
+        const uint g1 = g0 + 1u;               // group of next 16 elems
+        const uint xb = c << 3u;               // 8*c  (vec4 index base)
+        const vec4 x0 = x4[xb + 0u];
+        const vec4 x1 = x4[xb + 1u];
+        const vec4 x2 = x4[xb + 2u];
+        const vec4 x3 = x4[xb + 3u];
+        const vec4 x4v = x4[xb + 4u];
+        const vec4 x5 = x4[xb + 5u];
+        const vec4 x6 = x4[xb + 6u];
+        const vec4 x7 = x4[xb + 7u];
+
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint r = first_row + n;
+            if (r >= p.nrows) { continue; }
+            const uint base4 = ((p.packed_off + r * words_per_row) >> 2u) + c;
+            const uvec4 pw = packed4[base4];
+            const float qxA =
+                  dot(vec4(kE2M1[ pw.x        & 0xFu], kE2M1[(pw.x >>  4u) & 0xFu],
+                           kE2M1[(pw.x >>  8u) & 0xFu], kE2M1[(pw.x >> 12u) & 0xFu]), x0)
+                + dot(vec4(kE2M1[(pw.x >> 16u) & 0xFu], kE2M1[(pw.x >> 20u) & 0xFu],
+                           kE2M1[(pw.x >> 24u) & 0xFu], kE2M1[(pw.x >> 28u) & 0xFu]), x1)
+                + dot(vec4(kE2M1[ pw.y        & 0xFu], kE2M1[(pw.y >>  4u) & 0xFu],
+                           kE2M1[(pw.y >>  8u) & 0xFu], kE2M1[(pw.y >> 12u) & 0xFu]), x2)
+                + dot(vec4(kE2M1[(pw.y >> 16u) & 0xFu], kE2M1[(pw.y >> 20u) & 0xFu],
+                           kE2M1[(pw.y >> 24u) & 0xFu], kE2M1[(pw.y >> 28u) & 0xFu]), x3);
+            const float qxB =
+                  dot(vec4(kE2M1[ pw.z        & 0xFu], kE2M1[(pw.z >>  4u) & 0xFu],
+                           kE2M1[(pw.z >>  8u) & 0xFu], kE2M1[(pw.z >> 12u) & 0xFu]), x4v)
+                + dot(vec4(kE2M1[(pw.z >> 16u) & 0xFu], kE2M1[(pw.z >> 20u) & 0xFu],
+                           kE2M1[(pw.z >> 24u) & 0xFu], kE2M1[(pw.z >> 28u) & 0xFu]), x5)
+                + dot(vec4(kE2M1[ pw.w        & 0xFu], kE2M1[(pw.w >>  4u) & 0xFu],
+                           kE2M1[(pw.w >>  8u) & 0xFu], kE2M1[(pw.w >> 12u) & 0xFu]), x6)
+                + dot(vec4(kE2M1[(pw.w >> 16u) & 0xFu], kE2M1[(pw.w >> 20u) & 0xFu],
+                           kE2M1[(pw.w >> 24u) & 0xFu], kE2M1[(pw.w >> 28u) & 0xFu]), x7);
+            const uint sbase = p.sb_off + r * groups;
+            const float scaleA = block_scale(sbase + g0, global);
+            const float scaleB = block_scale(sbase + g1, global);
+            temp[n] = fma(scaleA, qxA, fma(scaleB, qxB, temp[n]));
+        }
+    }
+
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        temp[n] = subgroupAdd(temp[n]);
+    }
+
+    if (gl_NumSubgroups == 1u) {
+        if (subgroupElect()) {
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                const uint r = first_row + n;
+                if (r < p.nrows) { dst[r] = temp[n]; }
+            }
+        }
+        return;
+    }
+
+    if (subgroupElect()) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            part[n][gl_SubgroupID] = temp[n];
+        }
+    }
+    barrier();
+    if (gl_SubgroupID == 0u) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            float acc = 0.0;
+            for (uint s = gl_SubgroupInvocationID; s < gl_NumSubgroups; s += gl_SubgroupSize) {
+                acc += part[n][s];
+            }
+            acc = subgroupAdd(acc);
+            const uint r = first_row + n;
+            if (subgroupElect() && r < p.nrows) { dst[r] = acc; }
+        }
+    }
+}

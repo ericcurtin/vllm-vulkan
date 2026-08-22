@@ -1,0 +1,87 @@
+#version 450
+// MLX-affine 4-bit matvec, word-granular inner loop (v2).
+// Each thread owns whole u32 words (8 nibbles). Per 8 weights per row:
+//   1 word load + 1 scale load + 1 bias load  (was 8+8+8)
+// x is read as two vec4 per word, once per word, shared across NUM_ROWS
+//   (was 8 scalar loads per row).
+// Affine factoring per word: sum((q*s+b)*x) == s*dot(q,x) + b*sum(x).
+// Identical math over the reals; f32 rounding order differs from v1 -> cos gate.
+// group_size is a multiple of 8, so the 8 nibbles of one word never straddle
+// an affine group (gs=64 for every MLX-affine tensor we load; asserted host-side).
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 128;
+layout(constant_id = 1) const uint NUM_ROWS = 2;
+
+layout(push_constant) uniform parameter {
+    uint ncols;       // k
+    uint nrows;       // n
+    uint group_size;  // 64
+    uint packed_off;  // WORD offset (expert slice)
+    uint sb_off;      // ELEMENT offset (expert slice)
+} p;
+
+layout(binding = 0) readonly buffer Packed { uint  packed[]; };
+layout(binding = 1) readonly buffer Scales { float scales[]; };
+layout(binding = 2) readonly buffer Biases { float biases[]; };
+layout(binding = 3) readonly buffer Activ  { vec4  x4[];     };  // k/4 vec4s
+layout(binding = 4) writeonly buffer Dst   { float dst[];    };
+
+shared float tmpsh[NUM_ROWS][BLOCK_SIZE];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint first_row = NUM_ROWS * gl_WorkGroupID.x;
+
+    const uint k = p.ncols;
+    const uint groups = k / p.group_size;
+    const uint words_per_row = k >> 3u;          // k/8
+    const uint words_per_group = p.group_size >> 3u;  // 8 for gs=64
+
+    float temp[NUM_ROWS];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) { temp[n] = 0.0; }
+
+    for (uint w = tid; w < words_per_row; w += BLOCK_SIZE) {
+        const uint g = w / words_per_group;
+        const vec4 xa = x4[2u * w];
+        const vec4 xb = x4[2u * w + 1u];
+        const float xsum = dot(xa + xb, vec4(1.0));
+
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint r = first_row + n;
+            if (r >= p.nrows) { continue; }
+            const uint word = packed[p.packed_off + r * words_per_row + w];
+            const vec4 qa = vec4(float( word         & 0xFu),
+                                 float((word >>  4u) & 0xFu),
+                                 float((word >>  8u) & 0xFu),
+                                 float((word >> 12u) & 0xFu));
+            const vec4 qb = vec4(float((word >> 16u) & 0xFu),
+                                 float((word >> 20u) & 0xFu),
+                                 float((word >> 24u) & 0xFu),
+                                 float((word >> 28u) & 0xFu));
+            const float qx = dot(qa, xa) + dot(qb, xb);
+            const uint sb = p.sb_off + r * groups + g;
+            temp[n] = fma(scales[sb], qx, fma(biases[sb], xsum, temp[n]));
+        }
+    }
+
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) { tmpsh[n][tid] = temp[n]; }
+    barrier();
+    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                tmpsh[n][tid] += tmpsh[n][tid + s];
+            }
+        }
+        barrier();
+    }
+    if (tid == 0) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint r = first_row + n;
+            if (r < p.nrows) { dst[r] = tmpsh[n][0]; }
+        }
+    }
+}
