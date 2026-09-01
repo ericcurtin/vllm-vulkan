@@ -174,6 +174,19 @@ impl VulkanModel {
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let max_seq = self.max_seq_len;
 
+        // Bound the WHOLE appended span against the PHYSICAL resident plane
+        // before any offset is computed. `k_dst_off`/`v_dst_off` below are raw
+        // byte offsets into the gpu_kv plane, consumed by `vkCmdCopyBuffer`:
+        // an out-of-range `start_pos` writes `t*kv_dim*4` bytes past the end of
+        // the buffer (memory corruption, not a Rust panic). `start_pos` arrives
+        // straight from Python via `forward_batched`, so it is untrusted.
+        // Same precedent as `forward_prefill_gemma`.
+        if start_pos + t > max_seq {
+            return Err(format!(
+                "forward_batched: start_pos {start_pos} + t {t} exceeds max_seq_len {max_seq} — \
+                 construct VulkanModel with a larger max_seq_len").into());
+        }
+
         if !self.init_bres_bufs() {
             return Err("forward_batched: failed to allocate T-wide buffers".to_string().into());
         }
@@ -332,6 +345,12 @@ impl VulkanModel {
                         &rope_pc_k, (num_kv as u32, rope_wgy, 1))?;
                 }
 
+                // RoPE'd Q (SHADER_WRITE, COMPUTE) feeds the per-token SDPA
+                // dispatches below (SHADER_READ, COMPUTE). The
+                // COMPUTE→TRANSFER + TRANSFER→COMPUTE pair below covers only
+                // K/V: it makes TRANSFER_WRITEs visible to SHADER_READ, never
+                // the COMPUTE SHADER_WRITE of Q.
+                eng.record_barrier_to(cb);
                 // ── Resident-KV append: T positions are CONTIGUOUS -> ONE
                 // copy each for K and V (RoPE wrote them, COMPUTE; the copy
                 // reads them, TRANSFER).

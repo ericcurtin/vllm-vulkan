@@ -708,6 +708,167 @@ impl VulkanModel {
     }
 }
 
+// ── Column-batched prefill matvec — shared by the `gemma` and `qwen35`
+// model paths ──────────────────────────────────────────────────────────────
+//
+// These two helpers carry the `qwen35_` name for history (they were written for
+// the qwen3.6 batched-prefill work) but touch NO qwen3.5/3.6 state: they read
+// only `self.gpu_weights` and `self.engine`, both foundation-level. The gemma
+// prefill (`gemma_forward.rs`, `flags.gemma_prefill_cols`, default ON) calls
+// `qwen35_matvec_cols_tiled` directly. Keeping them inside the
+// `#[cfg(feature = "qwen35")]` impl block made that call site
+// `#[cfg(feature = "qwen35")]` too, so a `--features gemma` build WITHOUT
+// `qwen35` silently lost a default-ON lever and fell back to one
+// submit+fence+readback per token per projection. Gate on either feature
+// instead of making `gemma` depend on the whole qwen3.6 hybrid.
+#[cfg(any(feature = "gemma", feature = "qwen35"))]
+impl VulkanModel {
+    /// Batched GEMM `[T,n] = xs[T,k] @ W[n,k]^T` reading the qwen3_5 weight
+    /// store (`gpu_weights` f16, else host f32 from `self.qwen35`). Mirrors
+    /// `VulkanModel::gpu_gemm` exactly, just retargeted at the qwen3_5 weight
+    /// store/CPU-fallback (the Gemma `gpu_gemm`'s CPU fallback reads
+    /// `self.inner`, which is an empty placeholder on a qwen3_5 model — reusing
+    /// it here would silently read garbage, hence this qwen35-specific copy).
+    /// Design-A batched-verify projection primitive (MTP re-gate, spec §6):
+    /// dispatch the SINGLE-STREAM `mul_mat_vec_{f16,q8_0}_cols` kernel — each
+    /// weight element is read/dequantized ONCE and reused across all `t`
+    /// token-columns (the Phase-0-confirmed GFX1013 amortization, blended
+    /// T_verify(5)/T_verify(1)=1.3963 → GO), unlike `qwen35_gemm`'s
+    /// occupancy-starved decode-shape GEMM or its T-serial matvec fallback that
+    /// RE-streams the weight per column (the 0.951× Design-B failure). The
+    /// resident f16 / q8_0 weight buffers already match the cols kernels' layouts
+    /// exactly (f16 `[n,k]`, q8_0 ggml blocks `[n,k/32]`) — no repack.
+    ///
+    /// Returns `None` (caller falls back to `qwen35_gemm`) when: the resident
+    /// weight is not a plain f16/q8_0 buffer (mlx4/nvfp4/fp8 DENSE residency has
+    /// no cols dequantizing sibling — set `VLLM_VULKAN_DENSE_Q4_RESIDENT=0`, the
+    /// default, so mlx4 projections dequant→requant to q8_0/f16 and DO amortize);
+    /// `t` is outside `2..=8` (t==1 has no reuse and stays on the bit-exact serial
+    /// path; the `rows*t<=8` LDS envelope caps t); q8_0 with `k % 32 != 0`; or the
+    /// pre-registered `_r{rows}_c{t}` variant is missing. `x` = `[t,k]` row-major,
+    /// output `[t,n]` row-major (identical convention to `qwen35_gemm`).
+    pub(crate) fn qwen35_matvec_cols(&mut self, weight_name: &str, x: &[f32], t: usize, k: usize, n: usize) -> Option<Vec<f32>> {
+        // STEP-7 bisect kill-switch: `VLLM_VULKAN_SPEC_NO_COLS=1` forces the
+        // qwen35_gemm fallback (GEMM / T-serial matvec) so the harness can
+        // localize a garbage-verify to the cols kernel vs the batched mixers.
+        if std::env::var("VLLM_VULKAN_SPEC_NO_COLS").map(|v| v != "0").unwrap_or(false) {
+            return None;
+        }
+        if !(2..=8).contains(&t) { return None; }
+        // Per-format: base shader, push-constants, and (mlx4 only) the aux
+        // scale/bias buffers bound between the packed weight and the activation.
+        // All pointers are gathered from `self.gpu_weights` BEFORE
+        // `engine.as_mut()` so the immutable borrow ends before the mutable one
+        // (the same discipline as `qwen35_matvec`).
+        enum ColsAux { None, Mlx4(*const compute::Buffer, *const compute::Buffer) }
+        let (base, pc, aux, w_ptr) = {
+            let w = self.gpu_weights.get(weight_name)?;
+            match (&w.format, &w.aux) {
+                (crate::flags::QuantFormat::F16, None) => (
+                    "mul_mat_vec_f16_cols",
+                    crate::push_constants::matvec_cols_pc2(k, n),
+                    ColsAux::None,
+                    &w.buffer as *const compute::Buffer,
+                ),
+                (crate::flags::QuantFormat::Q8_0, None) if k % 32 == 0 => (
+                    "mul_mat_vec_q8_0_cols",
+                    crate::push_constants::matvec_cols_pc2(k, n),
+                    ColsAux::None,
+                    &w.buffer as *const compute::Buffer,
+                ),
+                // MLX-affine 4-bit (the fleet's REAL weight format): the packed
+                // nibbles live in `buffer`, the per-(row,group) scales/biases in
+                // the Mlx4 aux. Bindings [packed, scales, biases, x, out] + the
+                // 5-word matvec_mlx4 pc — identical to mul_mat_vec_mlx4.comp, so
+                // NUM_COLS=1 is byte-identical to the serial decode matvec and
+                // column c of NUM_COLS=t is that same single-column projection.
+                // Requires k%8==0 (nibble packing) and k%group_size==0 (affine
+                // groups); a shape violating either falls back to serial.
+                (crate::flags::QuantFormat::Mlx4, Some(QuantAux::Mlx4 { scales, biases, group_size }))
+                    if k % 8 == 0 && k % (*group_size as usize) == 0 => (
+                    "mul_mat_vec_mlx4_cols",
+                    matvec_mlx4_pc(k, n, *group_size as usize),
+                    ColsAux::Mlx4(scales as *const compute::Buffer, biases as *const compute::Buffer),
+                    &w.buffer as *const compute::Buffer,
+                ),
+                _ => return None,
+            }
+        };
+        let rows = (8 / t as u32).max(1);           // matches the registered set
+        let variant = format!("{base}_r{rows}_c{t}");
+        let eng = self.engine.as_mut()?;
+        if !eng.has_pipeline(&variant) { return None; }  // fall back to qwen35_gemm
+        let xb = f32_slice_to_bytes(x);
+        let inp = eng.alloc_host_coherent_storage((t * k * 4) as u64).ok()?;
+        inp.write(&xb).ok()?;
+        let out = eng.alloc_host_coherent_storage((t * n * 4) as u64).ok()?;
+        let inp_p = &inp as *const compute::Buffer;
+        let out_p = &out as *const compute::Buffer;
+        // 2D grid over ceil(n/rows) row-groups (n may exceed the 65535 limit).
+        let row_groups = (n as u32 + rows - 1) / rows;
+        let wg = if row_groups <= 65535 {
+            (row_groups, 1u32, 1u32)
+        } else {
+            let gx = 32768u32;
+            (gx, (row_groups + gx - 1) / gx, 1u32)
+        };
+        let cb = eng.begin_batch().ok()?;
+        unsafe {
+            // Binding order matches mul_mat_vec_mlx4.comp / the cols shaders:
+            // plain = [weight, x, out]; mlx4 = [packed, scales, biases, x, out].
+            match aux {
+                ColsAux::None =>
+                    eng.record_to(cb, &variant, &[&*w_ptr, &*inp_p, &*out_p], &pc, wg).ok()?,
+                ColsAux::Mlx4(s, b) =>
+                    eng.record_to(cb, &variant, &[&*w_ptr, &*s, &*b, &*inp_p, &*out_p], &pc, wg).ok()?,
+            }
+        }
+        eng.submit_batch(cb).ok()?;
+        let result = read_f32_buf(&out, t * n);
+        eng.return_to_pool(inp);
+        eng.return_to_pool(out);
+        Some(result)
+    }
+
+    /// Column-tiled `qwen35_matvec_cols`: process `t` activation columns in
+    /// tiles of at most `VLLM_VULKAN_QWEN35_COLS_TILE` (default 8 — the on-node
+    /// LDS/T sweet spot; mlx4-cols ACO gate n53) so a PREFILL projection of ANY
+    /// prompt length reuses the streamed weight across each <=8-token tile
+    /// instead of `t` serial per-token matvecs. Output columns are INDEPENDENT
+    /// (each is the exact single-column projection of its token), so
+    /// concatenating the per-tile `[tile,n]` blocks in column order rebuilds
+    /// `[t,n]` BIT-IDENTICALLY to one hypothetical t-wide dispatch — each column
+    /// equals the serial `qwen35_matvec` result up to f32 reduction order (the
+    /// on-node argmax/cos gate). Returns None (caller keeps the serial path) if
+    /// a tile declines (format/pipeline/geometry), so a run never MIXES cols and
+    /// serial projections for one weight. `t<=tile` collapses to a single
+    /// `qwen35_matvec_cols` dispatch (the pre-tiling spec-verify behaviour).
+    pub(crate) fn qwen35_matvec_cols_tiled(&mut self, weight_name: &str, x: &[f32], t: usize, k: usize, n: usize) -> Option<Vec<f32>> {
+        if t < 2 { return None; }
+        let tile = std::env::var("VLLM_VULKAN_QWEN35_COLS_TILE").ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| v.clamp(2, 8))
+            .unwrap_or(8);
+        if t <= tile {
+            return self.qwen35_matvec_cols(weight_name, x, t, k, n);
+        }
+        let mut out = vec![0.0f32; t * n];
+        // The (c0, ct) tiling — including the lone-trailing-column fold that
+        // keeps every tile >=2 — is `cols_tile_schedule` (host-tested, and
+        // reused by the gemma prefill cols path).
+        for (c0, ct) in cols_tile_schedule(t, tile) {
+            let xt = &x[c0 * k..(c0 + ct) * k];
+            // Any tile declining (weight/geometry ineligible, or a transient
+            // alloc failure) => uniform serial fallback: never emit a
+            // partially-cols result. Format/pipeline eligibility is
+            // tile-invariant, so the first tile decides for the whole weight.
+            let part = self.qwen35_matvec_cols(weight_name, xt, ct, k, n)?;
+            out[c0 * n..(c0 + ct) * n].copy_from_slice(&part);
+        }
+        Some(out)
+    }
+}
+
 // ── Qwen3.6 (qwen3_5) hybrid GPU path (`qwen35_*`) — the `qwen35` feature ────
 #[cfg(feature = "qwen35")]
 impl VulkanModel {
@@ -2276,150 +2437,6 @@ impl VulkanModel {
 
     // ── P1b/P2: qwen3.6 batched-prefill GPU helpers (plan-batched-prefill.md) ──
 
-    /// Batched GEMM `[T,n] = xs[T,k] @ W[n,k]^T` reading the qwen3_5 weight
-    /// store (`gpu_weights` f16, else host f32 from `self.qwen35`). Mirrors
-    /// `VulkanModel::gpu_gemm` exactly, just retargeted at the qwen3_5 weight
-    /// store/CPU-fallback (the Gemma `gpu_gemm`'s CPU fallback reads
-    /// `self.inner`, which is an empty placeholder on a qwen3_5 model — reusing
-    /// it here would silently read garbage, hence this qwen35-specific copy).
-    /// Design-A batched-verify projection primitive (MTP re-gate, spec §6):
-    /// dispatch the SINGLE-STREAM `mul_mat_vec_{f16,q8_0}_cols` kernel — each
-    /// weight element is read/dequantized ONCE and reused across all `t`
-    /// token-columns (the Phase-0-confirmed GFX1013 amortization, blended
-    /// T_verify(5)/T_verify(1)=1.3963 → GO), unlike `qwen35_gemm`'s
-    /// occupancy-starved decode-shape GEMM or its T-serial matvec fallback that
-    /// RE-streams the weight per column (the 0.951× Design-B failure). The
-    /// resident f16 / q8_0 weight buffers already match the cols kernels' layouts
-    /// exactly (f16 `[n,k]`, q8_0 ggml blocks `[n,k/32]`) — no repack.
-    ///
-    /// Returns `None` (caller falls back to `qwen35_gemm`) when: the resident
-    /// weight is not a plain f16/q8_0 buffer (mlx4/nvfp4/fp8 DENSE residency has
-    /// no cols dequantizing sibling — set `VLLM_VULKAN_DENSE_Q4_RESIDENT=0`, the
-    /// default, so mlx4 projections dequant→requant to q8_0/f16 and DO amortize);
-    /// `t` is outside `2..=8` (t==1 has no reuse and stays on the bit-exact serial
-    /// path; the `rows*t<=8` LDS envelope caps t); q8_0 with `k % 32 != 0`; or the
-    /// pre-registered `_r{rows}_c{t}` variant is missing. `x` = `[t,k]` row-major,
-    /// output `[t,n]` row-major (identical convention to `qwen35_gemm`).
-    pub(crate) fn qwen35_matvec_cols(&mut self, weight_name: &str, x: &[f32], t: usize, k: usize, n: usize) -> Option<Vec<f32>> {
-        // STEP-7 bisect kill-switch: `VLLM_VULKAN_SPEC_NO_COLS=1` forces the
-        // qwen35_gemm fallback (GEMM / T-serial matvec) so the harness can
-        // localize a garbage-verify to the cols kernel vs the batched mixers.
-        if std::env::var("VLLM_VULKAN_SPEC_NO_COLS").map(|v| v != "0").unwrap_or(false) {
-            return None;
-        }
-        if !(2..=8).contains(&t) { return None; }
-        // Per-format: base shader, push-constants, and (mlx4 only) the aux
-        // scale/bias buffers bound between the packed weight and the activation.
-        // All pointers are gathered from `self.gpu_weights` BEFORE
-        // `engine.as_mut()` so the immutable borrow ends before the mutable one
-        // (the same discipline as `qwen35_matvec`).
-        enum ColsAux { None, Mlx4(*const compute::Buffer, *const compute::Buffer) }
-        let (base, pc, aux, w_ptr) = {
-            let w = self.gpu_weights.get(weight_name)?;
-            match (&w.format, &w.aux) {
-                (crate::flags::QuantFormat::F16, None) => (
-                    "mul_mat_vec_f16_cols",
-                    crate::push_constants::matvec_cols_pc2(k, n),
-                    ColsAux::None,
-                    &w.buffer as *const compute::Buffer,
-                ),
-                (crate::flags::QuantFormat::Q8_0, None) if k % 32 == 0 => (
-                    "mul_mat_vec_q8_0_cols",
-                    crate::push_constants::matvec_cols_pc2(k, n),
-                    ColsAux::None,
-                    &w.buffer as *const compute::Buffer,
-                ),
-                // MLX-affine 4-bit (the fleet's REAL weight format): the packed
-                // nibbles live in `buffer`, the per-(row,group) scales/biases in
-                // the Mlx4 aux. Bindings [packed, scales, biases, x, out] + the
-                // 5-word matvec_mlx4 pc — identical to mul_mat_vec_mlx4.comp, so
-                // NUM_COLS=1 is byte-identical to the serial decode matvec and
-                // column c of NUM_COLS=t is that same single-column projection.
-                // Requires k%8==0 (nibble packing) and k%group_size==0 (affine
-                // groups); a shape violating either falls back to serial.
-                (crate::flags::QuantFormat::Mlx4, Some(QuantAux::Mlx4 { scales, biases, group_size }))
-                    if k % 8 == 0 && k % (*group_size as usize) == 0 => (
-                    "mul_mat_vec_mlx4_cols",
-                    matvec_mlx4_pc(k, n, *group_size as usize),
-                    ColsAux::Mlx4(scales as *const compute::Buffer, biases as *const compute::Buffer),
-                    &w.buffer as *const compute::Buffer,
-                ),
-                _ => return None,
-            }
-        };
-        let rows = (8 / t as u32).max(1);           // matches the registered set
-        let variant = format!("{base}_r{rows}_c{t}");
-        let eng = self.engine.as_mut()?;
-        if !eng.has_pipeline(&variant) { return None; }  // fall back to qwen35_gemm
-        let xb = f32_slice_to_bytes(x);
-        let inp = eng.alloc_host_coherent_storage((t * k * 4) as u64).ok()?;
-        inp.write(&xb).ok()?;
-        let out = eng.alloc_host_coherent_storage((t * n * 4) as u64).ok()?;
-        let inp_p = &inp as *const compute::Buffer;
-        let out_p = &out as *const compute::Buffer;
-        // 2D grid over ceil(n/rows) row-groups (n may exceed the 65535 limit).
-        let row_groups = (n as u32 + rows - 1) / rows;
-        let wg = if row_groups <= 65535 {
-            (row_groups, 1u32, 1u32)
-        } else {
-            let gx = 32768u32;
-            (gx, (row_groups + gx - 1) / gx, 1u32)
-        };
-        let cb = eng.begin_batch().ok()?;
-        unsafe {
-            // Binding order matches mul_mat_vec_mlx4.comp / the cols shaders:
-            // plain = [weight, x, out]; mlx4 = [packed, scales, biases, x, out].
-            match aux {
-                ColsAux::None =>
-                    eng.record_to(cb, &variant, &[&*w_ptr, &*inp_p, &*out_p], &pc, wg).ok()?,
-                ColsAux::Mlx4(s, b) =>
-                    eng.record_to(cb, &variant, &[&*w_ptr, &*s, &*b, &*inp_p, &*out_p], &pc, wg).ok()?,
-            }
-        }
-        eng.submit_batch(cb).ok()?;
-        let result = read_f32_buf(&out, t * n);
-        eng.return_to_pool(inp);
-        eng.return_to_pool(out);
-        Some(result)
-    }
-
-    /// Column-tiled `qwen35_matvec_cols`: process `t` activation columns in
-    /// tiles of at most `VLLM_VULKAN_QWEN35_COLS_TILE` (default 8 — the on-node
-    /// LDS/T sweet spot; mlx4-cols ACO gate n53) so a PREFILL projection of ANY
-    /// prompt length reuses the streamed weight across each <=8-token tile
-    /// instead of `t` serial per-token matvecs. Output columns are INDEPENDENT
-    /// (each is the exact single-column projection of its token), so
-    /// concatenating the per-tile `[tile,n]` blocks in column order rebuilds
-    /// `[t,n]` BIT-IDENTICALLY to one hypothetical t-wide dispatch — each column
-    /// equals the serial `qwen35_matvec` result up to f32 reduction order (the
-    /// on-node argmax/cos gate). Returns None (caller keeps the serial path) if
-    /// a tile declines (format/pipeline/geometry), so a run never MIXES cols and
-    /// serial projections for one weight. `t<=tile` collapses to a single
-    /// `qwen35_matvec_cols` dispatch (the pre-tiling spec-verify behaviour).
-    pub(crate) fn qwen35_matvec_cols_tiled(&mut self, weight_name: &str, x: &[f32], t: usize, k: usize, n: usize) -> Option<Vec<f32>> {
-        if t < 2 { return None; }
-        let tile = std::env::var("VLLM_VULKAN_QWEN35_COLS_TILE").ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .map(|v| v.clamp(2, 8))
-            .unwrap_or(8);
-        if t <= tile {
-            return self.qwen35_matvec_cols(weight_name, x, t, k, n);
-        }
-        let mut out = vec![0.0f32; t * n];
-        // The (c0, ct) tiling — including the lone-trailing-column fold that
-        // keeps every tile >=2 — is `cols_tile_schedule` (host-tested, and
-        // reused by the gemma prefill cols path).
-        for (c0, ct) in cols_tile_schedule(t, tile) {
-            let xt = &x[c0 * k..(c0 + ct) * k];
-            // Any tile declining (weight/geometry ineligible, or a transient
-            // alloc failure) => uniform serial fallback: never emit a
-            // partially-cols result. Format/pipeline eligibility is
-            // tile-invariant, so the first tile decides for the whole weight.
-            let part = self.qwen35_matvec_cols(weight_name, xt, ct, k, n)?;
-            out[c0 * n..(c0 + ct) * n].copy_from_slice(&part);
-        }
-        Some(out)
-    }
 
     pub(crate) fn qwen35_gemm(&mut self, weight_name: &str, x: &[f32], t: usize, k: usize, n: usize) -> Vec<f32> {
         // Design-A batched-verify projection swap (spec §6): during a verify pass

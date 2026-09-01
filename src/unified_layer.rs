@@ -101,6 +101,10 @@ pub(crate) struct LayerSpec {
     pub(crate) activation: Activation,
     // gemma per-layer PLE
     pub(crate) ple: Option<PleSpec>,
+    /// Value-less global (full-attention) gemma layers: no `v_proj` tensor on
+    /// disk at all; V is derived from the raw (pre-k_norm) K. Always false
+    /// for qwen. Mirrors `cfg.layer_uses_k_eq_v` / the base path.
+    pub(crate) uses_k_eq_v: bool,
 }
 
 impl LayerSpec {
@@ -129,6 +133,7 @@ impl LayerSpec {
             kv_shared: false,
             activation: Activation::Silu,
             ple: None,
+            uses_k_eq_v: false,
         }
     }
 
@@ -143,12 +148,21 @@ impl LayerSpec {
         } else {
             (10_000.0f32, head_dim)
         };
+        // Per-layer KV head count: global (full-attention) layers on g12b are
+        // value-less MQA(1), sliding layers are GQA(8) -- was hardcoded to
+        // `cfg.num_key_value_heads` (the sliding count), mis-sizing every
+        // global layer's K/V. Mirrors `forward_layer_gpu_matmuls`'s identical
+        // fix (gemma_forward.rs) and `cfg.layer_num_kv_heads`.
+        let num_kv = cfg.layer_num_kv_heads(layer_idx);
+        // Value-less global attention: no v_proj tensor on disk; V is derived
+        // from the raw (pre-k_norm) K via weightless rms-norm.
+        let uses_k_eq_v = cfg.layer_uses_k_eq_v(layer_idx);
         LayerSpec {
             is_qwen: false,
             hidden: cfg.hidden_size,
             head_dim,
             num_q: cfg.num_attention_heads,
-            num_kv: cfg.num_key_value_heads,
+            num_kv,
             inter: cfg.layer_intermediate_size(layer_idx),
             eps: cfg.rms_norm_eps,
             attn_scale: 1.0,   // gemma SDPA uses scale 1.0 (q already scaled)
@@ -164,11 +178,17 @@ impl LayerSpec {
             window: if is_full { None } else { Some(cfg.sliding_window) },
             kv_shared: is_kv_shared,
             activation: Activation::Gelu,
+            // `layer_scalar` applies on EVERY gemma layer (has_ple() or not
+            // -- see gemma_forward.rs's `hidden3 *= layer_scalar` after the
+            // `if cfg.has_ple() { ... }` PLE block), so PleSpec itself is
+            // still always populated; `unified_ple_tail` is the one that
+            // gates the PLE-specific tensor lookups on `ple_dim > 0`.
             ple: Some(PleSpec {
                 ple_dim: cfg.hidden_size_per_layer_input,
                 layer_ple,
                 layer_scalar,
             }),
+            uses_k_eq_v,
         }
     }
 }
@@ -277,8 +297,14 @@ impl VulkanModel {
     ///            "1-CB for the attention block" — its layer body is one submit.
     /// Returns false only if the resident-KV target buffer can't be guaranteed
     /// (defensive; in practice all gemma/qwen layer types are covered).
-    pub(crate) fn is_layer_1cb_eligible(&self, _spec: &LayerSpec, _layer_idx: usize) -> bool {
-        true
+    pub(crate) fn is_layer_1cb_eligible(&self, spec: &LayerSpec, _layer_idx: usize) -> bool {
+        // Value-less global gemma layers (`uses_k_eq_v`: no v_proj tensor, V
+        // derived from raw pre-k_norm K) aren't wired into the fused
+        // resident-KV append/SDPA path yet -- fall back to the (fully
+        // correct) 2-CB host-split path for those specific layers. All other
+        // gemma layer types (sliding, kv-shared) and all qwen layers stay on
+        // the 1-CB path.
+        !spec.uses_k_eq_v
     }
     /// Ensure the per-layer resident KV buffer exists (lazily, [K-plane][V-plane],
     /// each plane `capacity*num_kv*head_dim` f32). Returns the raw pointer (stable —
@@ -323,6 +349,19 @@ impl VulkanModel {
         let inter = spec.inter;
         let scale = spec.attn_scale;
         let max_seq = self.max_seq_len;
+
+        // Bound `pos` against the PHYSICAL resident plane BEFORE any offset is
+        // computed. `k_dst_off`/`v_dst_off` below are raw byte offsets into the
+        // gpu_kv plane, consumed by `vkCmdCopyBuffer` — an out-of-range `pos`
+        // is a device-side write past the end of the buffer (memory corruption,
+        // not a Rust panic). `pos` reaches here from the Python decode driver,
+        // so it is untrusted. Same precedent as `forward_prefill_gemma`
+        // (lib.rs: "prompt length {t} exceeds max_seq_len").
+        if pos >= max_seq {
+            return Err(format!(
+                "gpu_layer_1cb: position {pos} exceeds max_seq_len {max_seq} — \
+                 construct VulkanModel with a larger max_seq_len").into());
+        }
 
         // ── KV bookkeeping (no host data copy) ───────────────────────────────
         // Determine which resident KV buffer this layer's SDPA reads, the seq_len
@@ -402,16 +441,19 @@ impl VulkanModel {
         let uw = &self.gpu_weights[&ln("mlp.up_proj.weight")].buffer as *const compute::Buffer;
         let dw = &self.gpu_weights[&ln("mlp.down_proj.weight")].buffer as *const compute::Buffer;
 
-        let (qs, qrr) = matvec_variant(true, q_dim);
-        let (ks, krr) = matvec_variant(true, kv_dim);
-        let (os, orr) = matvec_variant(true, h);
-        let (gs, grr) = matvec_variant(true, inter);
-        let (ds, drr) = matvec_variant(true, h);
-        let mv_q = matvec_pc13(h, q_dim);
-        let mv_kv = matvec_pc13(h, kv_dim);
-        let mv_o = matvec_pc13(q_dim, h);
-        let mv_gu = matvec_pc13(h, inter);
-        let mv_d = matvec_pc13(inter, h);
+        // Per-weight-format dispatch (see the identical comment in
+        // `gpu_layer_2cb`): gemma4_unified's attn is Mlx4, MLP is Q8_0,
+        // unconditionally, regardless of the global `VLLM_VULKAN_QUANT` flag
+        // `matvec_variant` reads. `is_layer_1cb_eligible` keeps value-less
+        // (uses_k_eq_v) layers off this path entirely, so `v_proj` always
+        // exists here.
+        let (q_fmt, q_kind) = crate::gemma_forward::gemma_res_mv_kind(&self.gpu_weights[&ln("self_attn.q_proj.weight")]);
+        let (k_fmt, k_kind) = crate::gemma_forward::gemma_res_mv_kind(&self.gpu_weights[&ln("self_attn.k_proj.weight")]);
+        let (v_fmt, v_kind) = crate::gemma_forward::gemma_res_mv_kind(&self.gpu_weights[&ln("self_attn.v_proj.weight")]);
+        let (o_fmt, o_kind) = crate::gemma_forward::gemma_res_mv_kind(&self.gpu_weights[&ln("self_attn.o_proj.weight")]);
+        let (g_fmt, g_kind) = crate::gemma_forward::gemma_res_mv_kind(&self.gpu_weights[&ln("mlp.gate_proj.weight")]);
+        let (u_fmt, u_kind) = crate::gemma_forward::gemma_res_mv_kind(&self.gpu_weights[&ln("mlp.up_proj.weight")]);
+        let (d_fmt, d_kind) = crate::gemma_forward::gemma_res_mv_kind(&self.gpu_weights[&ln("mlp.down_proj.weight")]);
         let rms_h = rmsnorm_pc(h, eps);
         let rms_hd = rmsnorm_pc(head_dim, eps);
         let rms_h2 = rmsnorm_pc(h, eps);
@@ -449,9 +491,9 @@ impl VulkanModel {
             eng.record_to(cb, "rms_norm_f32_mul", &[&*ha, &*inln_p, &*xp], &rms_h, (1, 1, 1))?;
             eng.record_barrier_to(cb);
             // q/k/v proj
-            eng.record_to(cb, &qs, &[&*qw, &*xp, &*qp], &mv_q, ((q_dim as u32 + qrr - 1)/qrr, 1, 1))?;
-            eng.record_to(cb, &ks, &[&*kw, &*xp, &*kp], &mv_kv, ((kv_dim as u32 + krr - 1)/krr, 1, 1))?;
-            eng.record_to(cb, &ks, &[&*vw, &*xp, &*vp], &mv_kv, ((kv_dim as u32 + krr - 1)/krr, 1, 1))?;
+            crate::gemma_forward::record_gemma_mv(eng, cb, qw, q_fmt, q_kind, xp, qp, h, q_dim);
+            crate::gemma_forward::record_gemma_mv(eng, cb, kw, k_fmt, k_kind, xp, kp, h, kv_dim);
+            crate::gemma_forward::record_gemma_mv(eng, cb, vw, v_fmt, v_kind, xp, vp, h, kv_dim);
             eng.record_barrier_to(cb);
             // q/k/v norm
             eng.record_to(cb, "rms_norm_f32_mul", &[&*qp, &*qnorm_p, &*qp], &rms_hd, (num_q as u32, 1, 1))?;
@@ -469,6 +511,13 @@ impl VulkanModel {
             // ── Resident-KV append (recorded copy, no host readback) ─────────
             // An appending layer copies this token's RoPE'd K/V into its resident
             // plane. A KV-shared layer skips this (its SDPA reads the target's KV).
+            // RoPE'd Q (SHADER_WRITE, COMPUTE) feeds the SDPA dispatch below
+            // (SHADER_READ, COMPUTE). This barrier is needed on BOTH branches:
+            // the append branch's COMPUTE→TRANSFER + TRANSFER→COMPUTE pair
+            // covers only K/V (it makes TRANSFER_WRITEs visible to SHADER_READ,
+            // never the COMPUTE SHADER_WRITE of Q), so without it Q's write is
+            // never made visible to the SDPA read on the hot path.
+            eng.record_barrier_to(cb);
             if append {
                 // RoPE wrote UR_K/UR_V (COMPUTE) → the copy reads them (TRANSFER).
                 eng.record_compute_to_transfer_barrier(cb);
@@ -476,10 +525,6 @@ impl VulkanModel {
                 eng.record_copy_to(cb, &*vp, &*kv_ptr, 0, v_dst_off, kv_copy_sz);
                 // The copy wrote gpu_kv (TRANSFER) → SDPA reads it (COMPUTE).
                 eng.record_transfer_to_compute_barrier(cb);
-            } else {
-                // KV-shared: no copy, but RoPE'd Q (COMPUTE write) feeds SDPA
-                // (COMPUTE read) — a plain compute→compute barrier suffices.
-                eng.record_barrier_to(cb);
             }
 
             // ── Resident SDPA: Q (UR_Q) over gpu_kv[kv_layer] → UR_ATTN ───────
@@ -487,7 +532,7 @@ impl VulkanModel {
             eng.record_barrier_to(cb);
 
             // ── o_proj → residual → ffn_in_norm → FFN → residual2 ────────────
-            eng.record_to(cb, &os, &[&*ow, &*attnp, &*op], &mv_o, ((h as u32 + orr - 1)/orr, 1, 1))?;
+            crate::gemma_forward::record_gemma_mv(eng, cb, ow, o_fmt, o_kind, attnp, op, q_dim, h);
             eng.record_barrier_to(cb);
             if sandwich {
                 // Invariant: spec.sandwich implies spec.post_attn_norm is Some.
@@ -501,14 +546,14 @@ impl VulkanModel {
             eng.record_barrier_to(cb);
             eng.record_to(cb, "rms_norm_f32_mul", &[&*hb, &*inln_after, &*ffin], &rms_h2, (1, 1, 1))?;
             eng.record_barrier_to(cb);
-            eng.record_to(cb, &gs, &[&*gw, &*ffin, &*gate], &mv_gu, ((inter as u32 + grr - 1)/grr, 1, 1))?;
-            eng.record_to(cb, &gs, &[&*uw, &*ffin, &*up], &mv_gu, ((inter as u32 + grr - 1)/grr, 1, 1))?;
+            crate::gemma_forward::record_gemma_mv(eng, cb, gw, g_fmt, g_kind, ffin, gate, h, inter);
+            crate::gemma_forward::record_gemma_mv(eng, cb, uw, u_fmt, u_kind, ffin, up, h, inter);
             eng.record_barrier_to(cb);
             eng.record_to(cb, act_shader, &[&*gate, &*act], &act_pc, ((elem + 511)/512, 1, 1))?;
             eng.record_barrier_to(cb);
             eng.record_to(cb, "mul_f32_f32_f32", &[&*act, &*up, &*mid], &mul_pc, ((elem + 255)/256, 1, 1))?;
             eng.record_barrier_to(cb);
-            eng.record_to(cb, &ds, &[&*dw, &*mid, &*down], &mv_d, ((h as u32 + drr - 1)/drr, 1, 1))?;
+            crate::gemma_forward::record_gemma_mv(eng, cb, dw, d_fmt, d_kind, mid, down, inter, h);
             eng.record_barrier_to(cb);
             if sandwich {
                 // Invariant: spec.sandwich implies spec.post_ffn_norm is Some.
@@ -565,13 +610,26 @@ impl VulkanModel {
         let knorm_p = if spec.k_norm {
             Some(&self.unified_norm_w[&ln("self_attn.k_norm.weight")] as *const compute::Buffer)
         } else { None };
+        // Dispatch each matvec by the WEIGHT'S OWN recorded format (mirrors
+        // `gemma_res_mv_kind`/`record_gemma_mv` in gemma_forward.rs), not the
+        // blanket `matvec_variant` (which keys off the GLOBAL
+        // `VLLM_VULKAN_QUANT` snapshot). gemma4_unified uploads attn as Mlx4
+        // (4-bit affine) and MLP as Q8_0 UNCONDITIONALLY regardless of that
+        // flag -- `matvec_variant`'s shader choice silently mismatches the
+        // packed bytes (reads Mlx4-packed nibbles as if they were f16/q8_0
+        // blocks) and produces NaN. Qwen3's resident weights ARE uniformly
+        // the global format, so this is a no-op shader choice for it (same
+        // format either way) and stays argmax-exact.
+        let (q_fmt, q_kind) = crate::gemma_forward::gemma_res_mv_kind(&self.gpu_weights[&ln("self_attn.q_proj.weight")]);
+        let (k_fmt, k_kind) = crate::gemma_forward::gemma_res_mv_kind(&self.gpu_weights[&ln("self_attn.k_proj.weight")]);
+        let v_meta = if spec.uses_k_eq_v { None } else {
+            Some(crate::gemma_forward::gemma_res_mv_kind(&self.gpu_weights[&ln("self_attn.v_proj.weight")]))
+        };
         let qw = &self.gpu_weights[&ln("self_attn.q_proj.weight")].buffer as *const compute::Buffer;
         let kw = &self.gpu_weights[&ln("self_attn.k_proj.weight")].buffer as *const compute::Buffer;
-        let vw = &self.gpu_weights[&ln("self_attn.v_proj.weight")].buffer as *const compute::Buffer;
-        let (qs, qrr) = matvec_variant(true, q_dim);
-        let (ks, krr) = matvec_variant(true, kv_dim);
-        let mv_q = matvec_pc13(h, q_dim);
-        let mv_kv = matvec_pc13(h, kv_dim);
+        let vw = if spec.uses_k_eq_v { None } else {
+            Some(&self.gpu_weights[&ln("self_attn.v_proj.weight")].buffer as *const compute::Buffer)
+        };
         let rms_h = rmsnorm_pc(h, eps);
         let rms_hd = rmsnorm_pc(head_dim, eps);
 
@@ -580,19 +638,38 @@ impl VulkanModel {
         unsafe {
             eng.record_to(cb, "rms_norm_f32_mul", &[&*ha, &*inln_p, &*xp], &rms_h, (1, 1, 1))?;
             eng.record_barrier_to(cb);
-            eng.record_to(cb, &qs, &[&*qw, &*xp, &*qp], &mv_q, ((q_dim as u32 + qrr - 1)/qrr, 1, 1))?;
-            eng.record_to(cb, &ks, &[&*kw, &*xp, &*kp], &mv_kv, ((kv_dim as u32 + krr - 1)/krr, 1, 1))?;
-            eng.record_to(cb, &ks, &[&*vw, &*xp, &*vp], &mv_kv, ((kv_dim as u32 + krr - 1)/krr, 1, 1))?;
+            crate::gemma_forward::record_gemma_mv(eng, cb, qw, q_fmt, q_kind, xp, qp, h, q_dim);
+            crate::gemma_forward::record_gemma_mv(eng, cb, kw, k_fmt, k_kind, xp, kp, h, kv_dim);
+            // Value-less global (full-attention) gemma layers have NO v_proj
+            // tensor on disk at all (`cfg.layer_uses_k_eq_v`/`spec.uses_k_eq_v`);
+            // V is derived from the RAW (pre-k_norm) K below, mirroring the base
+            // path's `forward_layer_gpu_matmuls`/`gemma_resident_layer`.
+            if let (Some(vw), Some((v_fmt, v_kind))) = (vw, v_meta) {
+                crate::gemma_forward::record_gemma_mv(eng, cb, vw, v_fmt, v_kind, xp, vp, h, kv_dim);
+            }
             eng.record_barrier_to(cb);
             // q-norm (weighted, per head).
             eng.record_to(cb, "rms_norm_f32_mul", &[&*qp, &*qnorm_p, &*qp], &rms_hd, (num_q as u32, 1, 1))?;
-            if let Some(knp) = knorm_p {
-                eng.record_to(cb, "rms_norm_f32_mul", &[&*kp, &*knp, &*kp], &rms_hd, (num_kv as u32, 1, 1))?;
-            }
-            if spec.v_norm {
-                // v-norm is NO-WEIGHT: rms_norm_f32, output at binding 2 (binding 1
-                // is an ignored dummy for the do_multiply=false path).
-                eng.record_to(cb, "rms_norm_f32", &[&*vp, &*ffp, &*vp], &rms_hd, (num_kv as u32, 1, 1))?;
+            if spec.uses_k_eq_v {
+                // Value-less global: V = v_norm_no_weight(RAW k_proj), computed
+                // BEFORE k_norm mutates K in place (mirrors the CPU reference's
+                // `v_raw = k_raw.clone()` taken before k_norm). A barrier
+                // separates the two dispatches since both read/write the same
+                // K buffer and one of them (k_norm) then overwrites it.
+                eng.record_to(cb, "rms_norm_f32", &[&*kp, &*ffp, &*vp], &rms_hd, (num_kv as u32, 1, 1))?;
+                eng.record_barrier_to(cb);
+                if let Some(knp) = knorm_p {
+                    eng.record_to(cb, "rms_norm_f32_mul", &[&*kp, &*knp, &*kp], &rms_hd, (num_kv as u32, 1, 1))?;
+                }
+            } else {
+                if let Some(knp) = knorm_p {
+                    eng.record_to(cb, "rms_norm_f32_mul", &[&*kp, &*knp, &*kp], &rms_hd, (num_kv as u32, 1, 1))?;
+                }
+                if spec.v_norm {
+                    // v-norm is NO-WEIGHT: rms_norm_f32, output at binding 2
+                    // (binding 1 is an ignored dummy for the do_multiply=false path).
+                    eng.record_to(cb, "rms_norm_f32", &[&*vp, &*ffp, &*vp], &rms_hd, (num_kv as u32, 1, 1))?;
+                }
             }
             eng.record_barrier_to(cb);
             // NeoX RoPE in place (partial-rotary tail passes through; ne00=head_dim).
@@ -630,16 +707,14 @@ impl VulkanModel {
             .map(|n| &self.unified_norm_w[&ln(n)] as *const compute::Buffer);
         let postff_p = spec.post_ffn_norm.as_ref()
             .map(|n| &self.unified_norm_w[&ln(n)] as *const compute::Buffer);
+        let (o_fmt, o_kind) = crate::gemma_forward::gemma_res_mv_kind(&self.gpu_weights[&ln("self_attn.o_proj.weight")]);
+        let (g_fmt, g_kind) = crate::gemma_forward::gemma_res_mv_kind(&self.gpu_weights[&ln("mlp.gate_proj.weight")]);
+        let (u_fmt, u_kind) = crate::gemma_forward::gemma_res_mv_kind(&self.gpu_weights[&ln("mlp.up_proj.weight")]);
+        let (d_fmt, d_kind) = crate::gemma_forward::gemma_res_mv_kind(&self.gpu_weights[&ln("mlp.down_proj.weight")]);
         let ow = &self.gpu_weights[&ln("self_attn.o_proj.weight")].buffer as *const compute::Buffer;
         let gw = &self.gpu_weights[&ln("mlp.gate_proj.weight")].buffer as *const compute::Buffer;
         let uw = &self.gpu_weights[&ln("mlp.up_proj.weight")].buffer as *const compute::Buffer;
         let dw = &self.gpu_weights[&ln("mlp.down_proj.weight")].buffer as *const compute::Buffer;
-        let (os, orr) = matvec_variant(true, h);
-        let (gs, grr) = matvec_variant(true, inter);
-        let (ds, drr) = matvec_variant(true, h);
-        let mv_o = matvec_pc13(q_dim, h);
-        let mv_gu = matvec_pc13(h, inter);
-        let mv_d = matvec_pc13(inter, h);
         let add_pc = ew_mul_pc(h as u32);
         let act_pc = ew_unary_pc(inter as u32);
         let mul_pc = ew_mul_pc(inter as u32);
@@ -652,7 +727,7 @@ impl VulkanModel {
         let cb = eng.begin_batch()?;
         unsafe {
             // o_proj: ATTN → O
-            eng.record_to(cb, &os, &[&*ow, &*attnp, &*op], &mv_o, ((h as u32 + orr - 1)/orr, 1, 1))?;
+            crate::gemma_forward::record_gemma_mv(eng, cb, ow, o_fmt, o_kind, attnp, op, q_dim, h);
             eng.record_barrier_to(cb);
             // residual after attn. SANDWICH (gemma): post_attn_norm(O) → ON, then
             // HB = HA + ON. PRE-norm (qwen): HB = HA + O straight.
@@ -671,8 +746,8 @@ impl VulkanModel {
             eng.record_to(cb, "rms_norm_f32_mul", &[&*hb, &*inln_after, &*ffin], &rms_h2, (1, 1, 1))?;
             eng.record_barrier_to(cb);
             // gate/up (independent)
-            eng.record_to(cb, &gs, &[&*gw, &*ffin, &*gate], &mv_gu, ((inter as u32 + grr - 1)/grr, 1, 1))?;
-            eng.record_to(cb, &gs, &[&*uw, &*ffin, &*up], &mv_gu, ((inter as u32 + grr - 1)/grr, 1, 1))?;
+            crate::gemma_forward::record_gemma_mv(eng, cb, gw, g_fmt, g_kind, ffin, gate, h, inter);
+            crate::gemma_forward::record_gemma_mv(eng, cb, uw, u_fmt, u_kind, ffin, up, h, inter);
             eng.record_barrier_to(cb);
             // act(gate) → ACT; mid = ACT * up
             eng.record_to(cb, act_shader, &[&*gate, &*act], &act_pc, ((elem + 511)/512, 1, 1))?;
@@ -680,7 +755,7 @@ impl VulkanModel {
             eng.record_to(cb, "mul_f32_f32_f32", &[&*act, &*up, &*mid], &mul_pc, ((elem + 255)/256, 1, 1))?;
             eng.record_barrier_to(cb);
             // down_proj: MID → DOWN
-            eng.record_to(cb, &ds, &[&*dw, &*mid, &*down], &mv_d, ((h as u32 + drr - 1)/drr, 1, 1))?;
+            crate::gemma_forward::record_gemma_mv(eng, cb, dw, d_fmt, d_kind, mid, down, inter, h);
             eng.record_barrier_to(cb);
             // residual2. SANDWICH: post_ffn_norm(DOWN) → DOWNN, HA = HB + DOWNN.
             // PRE-norm: HA = HB + DOWN.
@@ -739,39 +814,48 @@ impl VulkanModel {
         let ple_dim = ple.ple_dim;
         let mut hidden3 = read_f32_buf(unsafe { &*self.ures_ptr(UR_HA) }, h);
 
-        let (ps, prr) = matvec_variant(true, ple_dim);
-        let mv_pg = matvec_pc13(h, ple_dim);
-        let pgw = &self.gpu_weights[&ln("per_layer_input_gate.weight")].buffer as *const compute::Buffer;
-        let ffin_p = self.ures_ptr(UR_FFIN);
-        let pg_p = self.ures_ptr(UR_PLE_G);
-        unsafe { (*self.ures_ptr_mut(UR_FFIN)).write(&f32_slice_to_bytes(&hidden3))?; }
-        let eng = self.engine.as_mut().expect("invariant: unified_ple_tail only called when self.engine is Some");
-        let cb = eng.begin_batch()?;
-        unsafe {
-            eng.record_to(cb, &ps, &[&*pgw, &*ffin_p, &*pg_p], &mv_pg, ((ple_dim as u32 + prr - 1)/prr, 1, 1))?;
-        }
-        eng.submit_batch(cb)?;
-        let gate_ple = read_f32_buf(unsafe { &*pg_p }, ple_dim);
-        let gate_ple_act = model::cpu_gelu(&gate_ple);
-        let gated: Vec<f32> = gate_ple_act.iter().zip(ple.layer_ple.iter()).map(|(&g, &p)| g * p).collect();
+        // PLE (per-layer-embedding) contribution: `per_layer_input_gate` /
+        // `per_layer_projection` / `post_per_layer_input_norm` only exist on
+        // has_ple() checkpoints (E2B, ple_dim>0). g12b/g31b carry NO
+        // per_layer* tensors on disk at all -- skip the whole contribution
+        // for them, exactly like the base path's `if cfg.has_ple() { ... }`
+        // gate in gemma_forward.rs (the `layer_scalar` multiply below still
+        // runs unconditionally on every gemma layer, has_ple() or not).
+        if ple_dim > 0 {
+            let (ps, prr) = matvec_variant(true, ple_dim);
+            let mv_pg = matvec_pc13(h, ple_dim);
+            let pgw = &self.gpu_weights[&ln("per_layer_input_gate.weight")].buffer as *const compute::Buffer;
+            let ffin_p = self.ures_ptr(UR_FFIN);
+            let pg_p = self.ures_ptr(UR_PLE_G);
+            unsafe { (*self.ures_ptr_mut(UR_FFIN)).write(&f32_slice_to_bytes(&hidden3))?; }
+            let eng = self.engine.as_mut().expect("invariant: unified_ple_tail only called when self.engine is Some");
+            let cb = eng.begin_batch()?;
+            unsafe {
+                eng.record_to(cb, &ps, &[&*pgw, &*ffin_p, &*pg_p], &mv_pg, ((ple_dim as u32 + prr - 1)/prr, 1, 1))?;
+            }
+            eng.submit_batch(cb)?;
+            let gate_ple = read_f32_buf(unsafe { &*pg_p }, ple_dim);
+            let gate_ple_act = model::cpu_gelu(&gate_ple);
+            let gated: Vec<f32> = gate_ple_act.iter().zip(ple.layer_ple.iter()).map(|(&g, &p)| g * p).collect();
 
-        let (pps, pprr) = matvec_variant(true, h);
-        let mv_pp = matvec_pc13(ple_dim, h);
-        let ppw = &self.gpu_weights[&ln("per_layer_projection.weight")].buffer as *const compute::Buffer;
-        let pg_in = self.ures_ptr(UR_PLE_G);
-        let pc_p = self.ures_ptr(UR_PLE_C);
-        unsafe { (*self.ures_ptr_mut(UR_PLE_G)).write(&f32_slice_to_bytes(&gated))?; }
-        let eng = self.engine.as_mut().expect("invariant: unified_ple_tail only called when self.engine is Some");
-        let cb = eng.begin_batch()?;
-        unsafe {
-            eng.record_to(cb, &pps, &[&*ppw, &*pg_in, &*pc_p], &mv_pp, ((h as u32 + pprr - 1)/pprr, 1, 1))?;
-        }
-        eng.submit_batch(cb)?;
-        let contrib = read_f32_buf(unsafe { &*pc_p }, h);
+            let (pps, pprr) = matvec_variant(true, h);
+            let mv_pp = matvec_pc13(ple_dim, h);
+            let ppw = &self.gpu_weights[&ln("per_layer_projection.weight")].buffer as *const compute::Buffer;
+            let pg_in = self.ures_ptr(UR_PLE_G);
+            let pc_p = self.ures_ptr(UR_PLE_C);
+            unsafe { (*self.ures_ptr_mut(UR_PLE_G)).write(&f32_slice_to_bytes(&gated))?; }
+            let eng = self.engine.as_mut().expect("invariant: unified_ple_tail only called when self.engine is Some");
+            let cb = eng.begin_batch()?;
+            unsafe {
+                eng.record_to(cb, &pps, &[&*ppw, &*pg_in, &*pc_p], &mv_pp, ((h as u32 + pprr - 1)/pprr, 1, 1))?;
+            }
+            eng.submit_batch(cb)?;
+            let contrib = read_f32_buf(unsafe { &*pc_p }, h);
 
-        let ple_norm_w = self.inner.weights.f32_slice(&ln("post_per_layer_input_norm.weight")).to_vec();
-        let contrib_normed = model::cpu_rms_norm(&contrib, &ple_norm_w, eps);
-        hidden3.iter_mut().zip(contrib_normed.iter()).for_each(|(hv, &c)| *hv += c);
+            let ple_norm_w = self.inner.weights.f32_slice(&ln("post_per_layer_input_norm.weight")).to_vec();
+            let contrib_normed = model::cpu_rms_norm(&contrib, &ple_norm_w, eps);
+            hidden3.iter_mut().zip(contrib_normed.iter()).for_each(|(hv, &c)| *hv += c);
+        }
         hidden3.iter_mut().for_each(|v| *v *= ple.layer_scalar);
         unsafe { (*self.ures_ptr_mut(UR_HA)).write(&f32_slice_to_bytes(&hidden3))?; }
         Ok(())

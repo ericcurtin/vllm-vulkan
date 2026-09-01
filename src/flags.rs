@@ -853,6 +853,17 @@ pub struct Flags {
     /// cols=projection-compute are orthogonal). Argmax-exact AND net-positive →
     /// DEFAULT-ON (like qwen35_prefill_cols); =0 reverts to serial prefill.
     pub gemma_prefill_cols: bool,
+
+    /// `VLLM_VULKAN_ASSISTANT_GPU` — GPU-resident matvecs for the Gemma4-31B
+    /// EAGLE drafter (`gemma_assistant.rs`), DEFAULT ON. `=0` selects the
+    /// bit-exact host-f32 A/B path, which is what the drafter's own golden
+    /// gate compares against. Read here, not with a bare `std::env::var` at
+    /// the call site, so every runtime knob stays in ONE snapshot: a bare read
+    /// is re-evaluated per call, invisible to the flag dump, and is exactly how
+    /// this project has repeatedly shipped silently-disengaged levers.
+    /// Engine-less builds fall back to host inside `AssistantGpu::build`
+    /// regardless of this flag.
+    pub assistant_gpu: bool,
 }
 
 impl Flags {
@@ -879,6 +890,7 @@ impl Flags {
             gemma_mlp_q4: b1("VLLM_VULKAN_GEMMA_MLP_Q4"), // default OFF; H1 (mlp 8->4bit requant); see field doc
             gemma_lmhead_q4: b1("VLLM_VULKAN_GEMMA_LMHEAD_Q4"), // default OFF; H2 (lm_head f16->4bit requant); see field doc
             gemma_prefill_cols: bdef1("VLLM_VULKAN_GEMMA_PREFILL_COLS"), // default ON (on-node GO n75 2026-08-03: argmax-exact + net-positive prefill, stacks w/ ring); =0 reverts to serial per-row prefill. See field doc.
+            assistant_gpu: bdef1("VLLM_VULKAN_ASSISTANT_GPU"), // default ON; =0 selects the bit-exact host-f32 drafter. See field doc.
             qwen35_gpu: b1("VLLM_VULKAN_QWEN35_GPU"),
             q35_gpu_attn: b1("VLLM_VULKAN_Q35_GPU_ATTN"), // default OFF; see field doc
             q35_kv_f16: b1("VLLM_VULKAN_Q35_KV_F16"), // default OFF; RESERVED, not yet wired — see field doc

@@ -23,6 +23,15 @@
 //! counting the bonus token); `forward_verify_core` is called with exactly
 //! `K+1` tokens (bonus + K drafts), matching its existing `[T][vocab]`
 //! contract (INC-4).
+//!
+//! NO IN-CRATE CALLER, DELIBERATELY. `spec_step` / `run_spec_decode` are the
+//! INC-5a half of a two-part increment: the accept/reject math, landed and
+//! gated on its own (the `#[cfg(test)]` module below drives it with a CPU stub
+//! drafter, covering the identity and partial-accept gates). The production
+//! caller is INC-5b, which wires the real EAGLE drafter
+//! (`gemma_assistant.rs`) into this loop. Until then these are `pub` API of the
+//! `gemma_spec` module exercised only by its own tests — which is why `cargo`
+//! raises no dead-code warning, and why they should not be read as orphaned.
 
 use crate::model::{argmax, Gemma4Model};
 

@@ -16,6 +16,7 @@ use crate::{
 use crate::{
     ACT_QKV_IN, ACT_Q_OUT, ACT_K_OUT, ACT_V_OUT, ACT_O_IN, ACT_O_OUT, ACT_FFIN,
     ACT_GATE, ACT_UP, ACT_MID, ACT_DOWN, ACT_GELU, ACT_PLE_G, ACT_PLE_C,
+    ACT_COUNT,
 };
 use crate::{MvKind, QuantAux};
 use crate::flags::QuantFormat;
@@ -29,7 +30,7 @@ use std::time::Instant;
 /// MLP projections both dispatch the matching kernel regardless of that env
 /// var — see `gemma4_unified`'s loader in lib.rs, which uploads attn as Mlx4
 /// and MLP as Q8_0 unconditionally.
-fn gemma_res_mv_kind(w: &crate::GpuWeight) -> (QuantFormat, MvKind) {
+pub(crate) fn gemma_res_mv_kind(w: &crate::GpuWeight) -> (QuantFormat, MvKind) {
     let kind = match &w.aux {
         None => MvKind::Plain,
         Some(QuantAux::Nvfp4 { scales, group_size, e4m3, global }) =>
@@ -45,7 +46,7 @@ fn gemma_res_mv_kind(w: &crate::GpuWeight) -> (QuantFormat, MvKind) {
 /// Record one resident-layer matvec dispatch into `cb`, branching on the
 /// weight's own format/aux (via `kind`/`format` from `gemma_res_mv_kind`)
 /// instead of the global quant snapshot.
-unsafe fn record_gemma_mv(
+pub(crate) unsafe fn record_gemma_mv(
     eng: &mut compute::ComputeEngine,
     cb: ash::vk::CommandBuffer,
     wptr: *const compute::Buffer,
@@ -228,7 +229,8 @@ impl VulkanModel {
     /// lever). For an f16 weight this is bit-identical to the tiled GEMM's math.
     pub(crate) fn gemma_prefill_matmul(&mut self, weight_name: &str, x: &[f32],
                             t: usize, k: usize, n: usize) -> Vec<f32> {
-        // VLLM_VULKAN_GEMMA_PREFILL_COLS (default OFF): stream the resident weight
+        // VLLM_VULKAN_GEMMA_PREFILL_COLS (default ON — see flags.rs; `=0`
+        // reverts to the serial per-row loop below): stream the resident weight
         // ONCE per <=8-column tile through the shared single-stream cols kernels
         // (`mul_mat_vec_{mlx4,q8_0,f16}_cols`) instead of the T per-row matvecs
         // below — the same validated primitive the qwen35 cols prefill uses
@@ -247,9 +249,12 @@ impl VulkanModel {
         // call on value-less globals, so this dispatch only ever sees real
         // projections. Independent of (and stacks with) the windowed-ring KV
         // prefill.
-        // The column-tiled prefill matvec lives in the qwen3_5 impl; the gemma
-        // prefill reuses it when that feature is compiled in.
-        #[cfg(feature = "qwen35")]
+        // The column-tiled prefill matvec now lives in a shared
+        // `#[cfg(any(feature = "gemma", feature = "qwen35"))]` impl block
+        // (qwen35_forward.rs), so this default-ON lever is compiled in for a
+        // `--features gemma` build that does NOT enable `qwen35`. It used to
+        // sit behind `#[cfg(feature = "qwen35")]` here, which silently
+        // disengaged it in exactly that configuration.
         if self.flags.gemma_prefill_cols {
             if let Some(out) = self.qwen35_matvec_cols_tiled(weight_name, x, t, k, n) {
                 return out;
@@ -1129,7 +1134,6 @@ impl VulkanModel {
             let layer_ple = &ple_inputs[layer_idx * ple_dim..(layer_idx + 1) * ple_dim];
             hidden = self.forward_layer_gpu_matmuls(layer_idx, &hidden, position, layer_ple);
         }
-
         self.gemma_final(&hidden)
     }
     /// Embedding + PLE preprocessing — runs on the PLE-owning (first) stage.
@@ -1213,17 +1217,27 @@ impl VulkanModel {
         ) {
             let normed_bytes = f32_slice_to_bytes(&normed);
             let logit_size = (vocab * 4) as u64;
-            let inp_p = self.act_ptr_mut(ACT_QKV_IN);
-            let logit_p: *const compute::Buffer = {
-                if !self.act_bufs.iter().any(|b| b.size == logit_size) {
-                    if let Ok(buf) = self.engine.as_mut().unwrap().alloc_host_coherent_storage(logit_size) {
-                        self.act_bufs.push(buf);
-                    }
+            // The logits buffer is APPENDED to `act_bufs` past the fixed
+            // ACT_* slots, so only look for it (and only create it) beyond
+            // `ACT_COUNT`. A plain `size == logit_size` scan over the whole Vec
+            // aliases a fixed slot whenever `ffn_inter == vocab` (ACT_GATE /
+            // ACT_UP / ACT_MID / ACT_GELU are all `ffn_inter*4` bytes) — the
+            // LM head would then write its logits over a live FFN activation.
+            if !self.act_bufs.iter().skip(ACT_COUNT).any(|b| b.size == logit_size) {
+                if let Ok(buf) = self.engine.as_mut().unwrap().alloc_host_coherent_storage(logit_size) {
+                    self.act_bufs.push(buf);
                 }
-                self.act_bufs.iter().find(|b| b.size == logit_size)
-                    .map(|b| b as *const compute::Buffer)
-                    .unwrap_or(std::ptr::null())
-            };
+            }
+            // Both pointers are taken AFTER the push above. `act_bufs` is a
+            // `Vec<Buffer>`: pushing can REALLOCATE its backing store and
+            // invalidate every previously-taken element pointer, so taking
+            // `inp_p` first (as this did) leaves it dangling on the call that
+            // actually allocates the logits buffer.
+            let inp_p = self.act_ptr_mut(ACT_QKV_IN);
+            let logit_p: *const compute::Buffer = self.act_bufs.iter().skip(ACT_COUNT)
+                .find(|b| b.size == logit_size)
+                .map(|b| b as *const compute::Buffer)
+                .unwrap_or(std::ptr::null());
             if logit_p.is_null() {
                 let lm_w = self.gemma_lm_head_host_f32();
                 model::cpu_matmul(&normed, &lm_w, 1, h, vocab)
@@ -2401,6 +2415,12 @@ impl VulkanModel {
             eng.record_to(cb, "rope_neox_f32_f32", &[&*qp, &*posp, &*ffp, &*qp, &*idxp], &rope_pc_q, (num_q as u32, rope_wgy, 1)).unwrap();
             eng.record_to(cb, "rope_neox_f32_f32", &[&*kp, &*posp, &*ffp, &*kp, &*idxp], &rope_pc_k, (num_kv as u32, rope_wgy, 1)).unwrap();
 
+            // RoPE'd Q (SHADER_WRITE, COMPUTE) feeds the SDPA dispatch below
+            // (SHADER_READ, COMPUTE). The COMPUTE→TRANSFER + TRANSFER→COMPUTE
+            // pair below covers only K/V: it makes TRANSFER_WRITEs visible to
+            // SHADER_READ, never the COMPUTE SHADER_WRITE of Q. Without this
+            // barrier Q's write is never made visible to the SDPA read.
+            eng.record_barrier_to(cb);
             // ── Resident-KV append: RoPE'd K/V (COMPUTE write) → buffer-copy
             //    into gpu_kv[layer] at absolute `pos` (TRANSFER read). ───────────
             eng.record_compute_to_transfer_barrier(cb);

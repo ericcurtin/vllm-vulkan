@@ -497,7 +497,7 @@ impl GemmaAssistant {
         // the single-threaded host `cpu_matmul` per draft step that made the
         // gate-3 spec arm drafter-overhead-bound. Engine-less builds (Mac) fall
         // back to host automatically inside `AssistantGpu::build`.
-        let want_gpu = std::env::var("VLLM_VULKAN_ASSISTANT_GPU").map(|v| v != "0").unwrap_or(true);
+        let want_gpu = crate::flags::flags_global().assistant_gpu;
         let gpu = if want_gpu { AssistantGpu::build(&cfg, &weights, device_idx) } else { None };
         Ok(Self { cfg, weights, gpu })
     }
@@ -539,13 +539,35 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
+    /// Checkpoint directory for the 939MB bf16 drafter, from the environment
+    /// ONLY — the same env-gated-skip discipline as `laguna_loader.rs`'s
+    /// `VLLM_TEST_LAGUNA_SHARD`. There is deliberately NO default path: the
+    /// previous `$HOME/repos/OminiX-MLX/models/...` fallback made these tests
+    /// real on exactly one developer machine and a silent no-op pass
+    /// everywhere else, including CI.
+    ///
+    ///   VLLM_TEST_GEMMA31B_ASSISTANT_DIR=<checkpoint dir> cargo test ... -- --nocapture
+    ///
+    /// `GEMMA31B_ASSISTANT_DIR` stays accepted for the existing scripts.
     fn assistant_dir() -> Option<std::path::PathBuf> {
-        if let Ok(d) = std::env::var("GEMMA31B_ASSISTANT_DIR") {
-            return Some(std::path::PathBuf::from(d));
+        for var in ["VLLM_TEST_GEMMA31B_ASSISTANT_DIR", "GEMMA31B_ASSISTANT_DIR"] {
+            if let Ok(d) = std::env::var(var) {
+                let p = std::path::PathBuf::from(d);
+                assert!(
+                    p.join("model.safetensors").exists(),
+                    "{var}={} does not contain model.safetensors — the checkpoint path is \
+                     wrong; refusing to silently skip a test that was explicitly requested",
+                    p.display());
+                return Some(p);
+            }
         }
-        let default = std::path::PathBuf::from(std::env::var("HOME").unwrap())
-            .join("repos/OminiX-MLX/models/gemma-4-31B-it-assistant");
-        if default.join("model.safetensors").exists() { Some(default) } else { None }
+        None
+    }
+
+    /// One place to print a SKIP so an un-run test is visible in the log
+    /// rather than an indistinguishable green `ok`.
+    fn skip(test: &str, why: &str) {
+        eprintln!("SKIP {test}: {why} — set VLLM_TEST_GEMMA31B_ASSISTANT_DIR to run it");
     }
 
     /// INC-2 gate: load the REAL 939MB bf16 drafter checkpoint and assert
@@ -556,7 +578,7 @@ mod tests {
     fn gemma31b_assistant_load_shapes() {
         let dir = match assistant_dir() {
             Some(d) => d,
-            None => { eprintln!("SKIP gemma31b_assistant_load_shapes: checkpoint not found (set GEMMA31B_ASSISTANT_DIR)"); return; }
+            None => { skip("gemma31b_assistant_load_shapes", "checkpoint dir not configured"); return; }
         };
         let weights = load_assistant_weights(&dir).expect("load assistant checkpoint");
         let cfg = AssistantConfig::g31b_pair();
@@ -581,11 +603,31 @@ mod tests {
         assert!(extra.is_empty(), "unexpected extra tensors in checkpoint: {extra:?}");
     }
 
+    /// Minimal .npy reader for the golden fixtures. Checks the dtype in the
+    /// header: the body is decoded as little-endian f32, so a fixture
+    /// regenerated as f64/f16/bf16 (or big-endian) would otherwise be read as
+    /// garbage and only show up as a mysterious cosine failure — or, worse,
+    /// pass by accident on a short array.
     fn read_npy_f32(path: &std::path::Path) -> Vec<f32> {
         let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        assert!(bytes.len() >= 10, "truncated .npy: {}", path.display());
         assert_eq!(&bytes[0..6], b"\x93NUMPY", "not a .npy: {}", path.display());
-        let header_len = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
-        let data = &bytes[10 + header_len..];
+        // v1.x: 2-byte little-endian header length at offset 8; v2.x: 4-byte.
+        let (header_len, body) = match bytes[6] {
+            1 => (u16::from_le_bytes([bytes[8], bytes[9]]) as usize, 10usize),
+            2 => (u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize, 12usize),
+            v => panic!("unsupported .npy major version {v}: {}", path.display()),
+        };
+        let header = std::str::from_utf8(&bytes[body..body + header_len])
+            .unwrap_or_else(|e| panic!("non-utf8 .npy header in {}: {e}", path.display()));
+        // '<f4' little-endian f32; '|'/'=' would be native-order, which on every
+        // target this builds for is also little-endian f32 for a 4-byte float.
+        assert!(header.contains("'descr': '<f4'") || header.contains("'descr': '=f4'"),
+            "{} is not little-endian float32 — header: {header}", path.display());
+        assert!(!header.contains("'fortran_order': True"),
+            "{} is Fortran-ordered; this reader assumes C order", path.display());
+        let data = &bytes[body + header_len..];
+        assert_eq!(data.len() % 4, 0, "{}: body is not a whole number of f32", path.display());
         data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
     }
 
@@ -616,9 +658,10 @@ mod tests {
     fn gemma31b_assistant_forward_cos_vs_golden() {
         let dir = match assistant_dir() {
             Some(d) => d,
-            None => { eprintln!("SKIP gemma31b_assistant_forward_cos_vs_golden: checkpoint not found"); return; }
+            None => { skip("gemma31b_assistant_forward_cos_vs_golden", "checkpoint dir not configured"); return; }
         };
-        let golden = if let Ok(d) = std::env::var("GEMMA31B_GOLDEN") {
+        let golden_explicit = std::env::var("GEMMA31B_GOLDEN").ok();
+        let golden = if let Some(d) = golden_explicit.as_ref() {
             std::path::PathBuf::from(d)
         } else {
             // In-repo fixture generated by scripts/gen_gemma31b_assistant_golden.py
@@ -627,7 +670,14 @@ mod tests {
                 .join("tests/fixtures/gemma31b_assistant_golden")
         };
         if !golden.join("logits.npy").exists() {
-            eprintln!("SKIP gemma31b_assistant_forward_cos_vs_golden: golden fixture not found at {}", golden.display());
+            // An EXPLICIT GEMMA31B_GOLDEN that does not resolve is a
+            // misconfiguration, not a reason to skip. The in-repo fixture
+            // (tests/fixtures/gemma31b_assistant_golden/) is committed, so the
+            // default branch reaching here means the checkout is incomplete.
+            assert!(golden_explicit.is_none(),
+                "GEMMA31B_GOLDEN={} has no logits.npy", golden.display());
+            skip("gemma31b_assistant_forward_cos_vs_golden",
+                 &format!("golden fixture not found at {}", golden.display()));
             return;
         }
 

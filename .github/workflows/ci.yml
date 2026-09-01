@@ -138,3 +138,52 @@ jobs:
         done
         echo "spirv-val: ${#mods[@]} module(s) checked, $fail failure(s)"
         [ "$fail" -eq 0 ]
+
+  # Run the Rust tests of the `gemma` model slice — the ~11.8k lines this
+  # branch adds. `rust-test-foundation` above runs
+  # `--no-default-features --features multiple-pymethods`, which compiles NONE
+  # of the gemma/qwen3-dense code, so every `#[cfg(test)]` module in
+  # gemma_forward / gemma_assistant / gemma_spec / unified_layer /
+  # batched_forward / pyseam_gemma was invisible to CI: green did not mean
+  # tested. On this branch the foundation slice runs 131 tests and the gemma
+  # slice runs 142 (11 tests CI never executed).
+  #
+  # This also builds the standalone configuration the PR advertises
+  # (`--features multiple-pymethods,gemma`, i.e. gemma WITHOUT qwen35), which
+  # is where a model feature that silently depends on a sibling feature shows
+  # up as a compile error instead of as a silently-disengaged runtime lever.
+  rust-test-gemma:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v6
+      with:
+        submodules: recursive
+
+    - name: Install build + link deps
+      run: |
+        # Same deps as rust-test-foundation: glslang via the project's own
+        # installer (build.rs runs scripts/compile_shaders.sh), libvulkan for
+        # the -lvulkan link, libpython for the pyo3 test binary.
+        source scripts/lib.sh
+        ensure_vulkan
+        sudo apt-get install -y libvulkan-dev libpython3.12-dev
+
+    - name: Build the standalone gemma slice
+      run: |
+        # The PR's own stated claim. Keeping it in CI is what stops `gemma`
+        # from quietly acquiring a `qwen35` dependency.
+        cargo build --no-default-features --features "multiple-pymethods,gemma"
+
+    - name: Run gemma-slice Rust tests
+      env:
+        RUST_BACKTRACE: '1'
+      run: |
+        # The test binary embeds the interpreter; point it at the system Python.
+        export PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
+        # Single-threaded: two GEMM-picker tests race on a process-global
+        # env/OnceLock snapshot under the parallel runner.
+        cargo test --no-default-features --features "multiple-pymethods,gemma" --lib \
+          -- --test-threads=1 --nocapture
