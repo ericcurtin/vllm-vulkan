@@ -1031,14 +1031,13 @@ impl VulkanModel {
         // pp_first / pp_last live on VulkanModel (the same fields `forward_pp_gemma`
         // reads), NOT on a per-arch model struct — Gemma IS `self.inner`.
         let (first, last) = (self.pp_first, self.pp_last);
-        if seq == 0 {
-            return Err(PyRuntimeError::new_err("forward_pp_gemma_prefill: empty prompt"));
-        }
-        if !first && hidden_in.len() != seq * msg_len {
-            return Err(PyRuntimeError::new_err(format!(
-                "forward_pp_gemma_prefill: hidden_in.len()={} != seq*msg_len={}",
-                hidden_in.len(), seq * msg_len)));
-        }
+        // Validate BOTH stage inputs against `seq` before the loop below indexes
+        // them. The first-stage `tokens[pos]` was previously unchecked: a short
+        // `tokens` panics (a pyo3 panic, not a Python exception), and a long one
+        // silently prefills only the first `seq` ids while the caller believes
+        // the whole prompt went in. See `pp_gemma_prefill_check`.
+        pp_gemma_prefill_check(first, tokens.len(), hidden_in.len(), seq, msg_len)
+            .map_err(PyRuntimeError::new_err)?;
         let mut out: Vec<f32> = if last { Vec::new() } else { Vec::with_capacity(seq * msg_len) };
         for pos in 0..seq {
             let step = if first {
@@ -1633,4 +1632,99 @@ impl VulkanModel {
     }
 
 
+}
+
+/// Argument validation for `forward_pp_gemma_prefill`, split out so it is
+/// unit-testable without a loaded Gemma model or a GPU.
+///
+/// The stage kind decides WHICH input carries the prompt, and each is indexed
+/// `seq` times by the caller's loop:
+///   - FIRST stage: `tokens[pos]` for `pos in 0..seq`  → needs `tokens_len == seq`
+///   - MID/LAST   : `hidden_in[pos*msg_len..(pos+1)*msg_len]` → `hidden_len == seq*msg_len`
+///
+/// EXACT equality both ways, not `>=`. A SHORT input panics on the index; a LONG
+/// one is worse than a panic — it prefills a silent prefix of the prompt and the
+/// KV/`seq_len` state then disagrees with what the caller thinks it sent.
+pub(crate) fn pp_gemma_prefill_check(
+    first: bool,
+    tokens_len: usize,
+    hidden_len: usize,
+    seq: usize,
+    msg_len: usize,
+) -> Result<(), String> {
+    if seq == 0 {
+        return Err("forward_pp_gemma_prefill: empty prompt".to_string());
+    }
+    if first {
+        if tokens_len != seq {
+            return Err(format!(
+                "forward_pp_gemma_prefill: tokens.len()={tokens_len} != seq={seq}"));
+        }
+    } else if hidden_len != seq * msg_len {
+        return Err(format!(
+            "forward_pp_gemma_prefill: hidden_in.len()={} != seq*msg_len={}",
+            hidden_len, seq * msg_len));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod pp_prefill_arg_tests {
+    use super::pp_gemma_prefill_check;
+
+    #[test]
+    fn empty_prompt_is_refused_first_and_mid() {
+        assert!(pp_gemma_prefill_check(true, 0, 0, 0, 16).is_err());
+        assert!(pp_gemma_prefill_check(false, 0, 0, 0, 16).is_err());
+    }
+
+    /// Exact-length inputs still pass, per stage kind. A first stage ignores
+    /// `hidden_in` entirely (the launcher passes an empty vec), and a mid stage
+    /// ignores `tokens` — neither may become a new requirement.
+    #[test]
+    fn exact_lengths_pass_and_the_unused_input_is_ignored() {
+        assert!(pp_gemma_prefill_check(true, 4, 0, 4, 16).is_ok());   // first: hidden_in empty
+        assert!(pp_gemma_prefill_check(false, 0, 64, 4, 16).is_ok()); // mid: tokens empty
+    }
+
+    /// THE REGRESSION GUARD (short side). `tokens.len() < seq` used to reach
+    /// `tokens[pos]` and panic out of pyo3.
+    #[test]
+    fn first_stage_short_tokens_is_refused() {
+        let e = pp_gemma_prefill_check(true, 3, 0, 4, 16).unwrap_err();
+        assert!(e.contains("tokens.len()=3 != seq=4"), "{e}");
+    }
+
+    /// THE REGRESSION GUARD (long side). `tokens.len() > seq` never panicked —
+    /// it silently prefilled the first `seq` ids and dropped the rest, leaving
+    /// the resident KV describing a DIFFERENT prompt than the caller sent. A
+    /// guard that only covers the short case leaves this alive.
+    #[test]
+    fn first_stage_long_tokens_is_refused() {
+        let e = pp_gemma_prefill_check(true, 9, 0, 4, 16).unwrap_err();
+        assert!(e.contains("tokens.len()=9 != seq=4"), "{e}");
+    }
+
+    /// The pre-existing mid/last-stage check keeps its exact message.
+    #[test]
+    fn mid_stage_hidden_mismatch_keeps_its_message() {
+        let e = pp_gemma_prefill_check(false, 0, 63, 4, 16).unwrap_err();
+        assert_eq!(e, "forward_pp_gemma_prefill: hidden_in.len()=63 != seq*msg_len=64");
+    }
+
+    /// Property: whenever a FIRST stage is accepted, every index the loop takes
+    /// (`tokens[0..seq]`) is in bounds AND no token is left unconsumed. This is
+    /// the invariant the loop relies on; it fails in both directions without the
+    /// exact-equality check.
+    #[test]
+    fn ok_implies_first_stage_consumes_exactly_the_prompt() {
+        for seq in 1..8usize {
+            for tokens_len in 0..12usize {
+                if pp_gemma_prefill_check(true, tokens_len, 0, seq, 16).is_ok() {
+                    assert!(seq <= tokens_len, "seq {seq} > tokens_len {tokens_len}: would panic");
+                    assert_eq!(tokens_len, seq, "tokens_len {tokens_len} != seq {seq}: silent drop");
+                }
+            }
+        }
+    }
 }
