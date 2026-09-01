@@ -5241,6 +5241,23 @@ fn synth_tensor_centered(name: &str, shape: Vec<usize>, center: f32, half_range:
     SimpleTensor { data, shape }
 }
 
+/// The `synth_tensor_centered` payload WITHOUT the `SimpleTensor` wrapper, so a
+/// fixture whose weights are not a `Gemma4Weights` map can share this ONE
+/// deterministic generator instead of near-copying its LCG.
+///
+/// The EAGLE drafter (`gemma_assistant.rs`) is that case: its weights are a
+/// plain `HashMap<String, Vec<f32>>` (the shape
+/// `model::load_weights_from_safetensors` returns), not `SimpleTensor`s. A
+/// second copy of the LCG there would be free to drift from this one — the
+/// exact near-copy failure mode `tiny_synthetic_gemma` exists to avoid — so the
+/// drafter fixture calls in here instead.
+/// Compiled only where it is used (the gemma slice's test build), so the
+/// foundation slice does not carry it as a dead-code warning.
+#[cfg(all(test, feature = "gemma"))]
+pub(crate) fn synth_vec(name: &str, len: usize, center: f32, half_range: f32) -> Vec<f32> {
+    synth_tensor_centered(name, vec![len], center, half_range).data
+}
+
 /// Parameterized synthetic Gemma4 for offline cross-model KV spikes and unit
 /// tests. Weights are deterministic from tensor names (+ optional name tag).
 #[derive(Clone, Debug)]

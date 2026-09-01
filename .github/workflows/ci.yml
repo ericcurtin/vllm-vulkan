@@ -157,8 +157,15 @@ jobs:
   # of the gemma/qwen3-dense code, so every `#[cfg(test)]` module in
   # gemma_forward / gemma_assistant / gemma_spec / unified_layer /
   # batched_forward / pyseam_gemma was invisible to CI: green did not mean
-  # tested. On this branch the foundation slice runs 131 tests and the gemma
-  # slice runs 142 (11 tests CI never executed).
+  # tested. As of this branch the foundation slice runs 134 tests and the gemma
+  # slice 178, so 44 tests run only here.
+  #
+  # Five of those are the checkpoint-free gemma_assistant gates. The EAGLE
+  # drafter's golden tests need a 939MB checkpoint via
+  # VLLM_TEST_GEMMA31B_ASSISTANT_DIR and print SKIP without it, which in CI is
+  # always -- so the whole drafter path was green-but-unrun. The synthetic
+  # fixture in `gemma_assistant.rs` is the unconditional twin; it must stay
+  # ungated by any env var or feature this job does not set.
   #
   # This also builds the standalone configuration the PR advertises
   # (`--features multiple-pymethods,gemma`, i.e. gemma WITHOUT qwen35), which
