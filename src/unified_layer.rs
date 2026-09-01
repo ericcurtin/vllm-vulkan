@@ -288,11 +288,11 @@ impl LayerSpec {
 ///  - q / k / o / gate / up / down: indexed unconditionally by both
 ///    `gpu_layer_1cb` and `gpu_layer_2cb`.
 ///  - v: NOT required when `spec.uses_k_eq_v`. Value-less global Gemma layers
-///    carry no `v_proj` tensor on disk AT ALL; `is_layer_1cb_eligible` routes
-///    them to `gpu_layer_2cb`, which reads `v_proj` only under
-///    `if spec.uses_k_eq_v { .. } else { .. }`. Demanding the key here would
-///    re-break the very layers an earlier fix un-broke, only from the other
-///    side (a spurious refusal instead of a panic).
+///    carry no `v_proj` tensor on disk AT ALL; BOTH recording paths now derive V
+///    from the raw pre-k_norm K instead (`layer_core::record_front`), and
+///    `layer_proj_weights` drops the key on exactly the same condition.
+///    Demanding it here would re-break the very layers an earlier fix un-broke,
+///    only from the other side (a spurious refusal instead of a panic).
 ///  - PLE gate/projection: required only when `ple.ple_dim > 0`.
 ///    `LayerSpec::gemma` populates `ple: Some(..)` on EVERY gemma layer (the
 ///    `layer_scalar` multiply is unconditional), so `ple.is_some()` is NOT the
@@ -571,21 +571,29 @@ impl VulkanModel {
     }
     /// Is this layer type eligible for the 1-CB resident-KV path?
     ///   qwen   : always (uniform full causal).
-    ///   gemma  : global (full causal), sliding (windowed), and KV-shared layers
-    ///            are all handled by gpu_layer_1cb. The PLE tail still runs as a
-    ///            small separate submit afterward (it is host-glued, not part of
-    ///            the attention split this work targets), so a PLE layer is still
-    ///            "1-CB for the attention block" — its layer body is one submit.
-    /// Returns false only if the resident-KV target buffer can't be guaranteed
-    /// (defensive; in practice all gemma/qwen layer types are covered).
-    pub(crate) fn is_layer_1cb_eligible(&self, spec: &LayerSpec, _layer_idx: usize) -> bool {
-        // Value-less global gemma layers (`uses_k_eq_v`: no v_proj tensor, V
-        // derived from raw pre-k_norm K) aren't wired into the fused
-        // resident-KV append/SDPA path yet -- fall back to the (fully
-        // correct) 2-CB host-split path for those specific layers. All other
-        // gemma layer types (sliding, kv-shared) and all qwen layers stay on
-        // the 1-CB path.
-        !spec.uses_k_eq_v
+    ///   gemma  : global (full causal), sliding (windowed), KV-shared AND
+    ///            value-less global (`uses_k_eq_v`) layers are all handled by
+    ///            `gpu_layer_1cb`. The PLE tail still runs as a small separate
+    ///            submit afterward (it is host-glued, not part of the attention
+    ///            split this work targets), so a PLE layer is still "1-CB for the
+    ///            attention block" — its layer body is one submit.
+    ///
+    /// This used to return `!spec.uses_k_eq_v`. That was a CAPABILITY GAP in the
+    /// 1-CB body, not a property of the resident-KV path: the old hand-written
+    /// 1-CB front indexed `v_proj` unconditionally, and value-less global gemma
+    /// layers carry no such tensor on disk at all, so routing them here panicked.
+    /// The shared `layer_core::record_front` derives V from the RAW (pre-k_norm)
+    /// K for those layers exactly as the 2-CB path always did, and everything
+    /// downstream is indifferent to how UR_V was filled — the append copies UR_V
+    /// into the resident V plane and the SDPA reads that plane, neither of them
+    /// caring whether a `v_proj` matvec or a weightless norm produced it. So the
+    /// exclusion no longer has anything to protect.
+    ///
+    /// Returns true unconditionally today; kept as a hook (rather than deleted
+    /// with its call site) so a future layer type that genuinely cannot be folded
+    /// has one place to say so.
+    pub(crate) fn is_layer_1cb_eligible(&self, _spec: &LayerSpec, _layer_idx: usize) -> bool {
+        true
     }
     /// Ensure the per-layer resident KV buffer exists (lazily, [K-plane][V-plane],
     /// each plane `capacity*num_kv*head_dim` f32). Returns the raw pointer (stable —

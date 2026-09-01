@@ -851,6 +851,34 @@ mod layer_body_equivalence {
         }
     }
 
+    /// Follow-up 3: value-less global layers are now 1-CB eligible.
+    ///
+    /// The old `is_layer_1cb_eligible` returned `!spec.uses_k_eq_v` because the
+    /// hand-written 1-CB front indexed `v_proj` unconditionally. Now that both
+    /// entry points record the SAME front, the value-less plan the 1-CB path gets
+    /// is exactly the plan the 2-CB path was already executing correctly — which
+    /// is what makes the exclusion unnecessary rather than merely inconvenient.
+    #[test]
+    fn valueless_layer_is_now_one_cb_eligible() {
+        let cfg = tiny_cfg();
+        let li = 2;
+        let spec = LayerSpec::gemma(&cfg, li, Vec::new(), 1.0);
+        assert!(spec.uses_k_eq_v, "layer {li} must be the value-less global layer");
+
+        // The plan the 1-CB path will now record for it...
+        let one_cb = plan_front(&spec.front_params(true));
+        // ...is the plan the 2-CB path was already recording for it.
+        let two_cb = plan_front(&gemma_front_params(&cfg, li, true, cfg.num_attention_heads));
+        assert_eq!(one_cb, two_cb,
+            "the 1-CB front must record what the 2-CB front recorded for a value-less layer");
+
+        // And it never asks for the tensor that is not on disk.
+        assert!(!one_cb.iter().any(|s| s.starts_with("mv V ")), "{one_cb:?}");
+        assert!(!crate::unified_layer::unified_layer_weight_keys(&spec, li)
+            .iter().any(|k| k.contains("v_proj")),
+            "the pre-flight must not demand v_proj for a value-less layer");
+    }
+
     /// The 1-CB and 2-CB unified entry points differ ONLY in where attention runs.
     /// They derive their front and tail from the same `LayerSpec`, so their bodies
     /// are the same plan — which is why `is_layer_1cb_eligible` no longer has to
