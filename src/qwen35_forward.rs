@@ -410,9 +410,18 @@ impl VulkanModel {
         // k
         self.rope_one(k, pos, num_kv, head_dim, rotary_dim, rotary_dim, theta);
     }
+    /// Stable raw pointer to one persistent fused-Qwen-layer activation buffer.
+    ///
+    /// Raw, not a reference, so the immutable borrow of `self.qres_bufs` ends
+    /// before `self.engine.as_mut()` takes its mutable borrow — one recording
+    /// needs both. Valid only while `qres_bufs` is not reallocated:
+    /// `init_qres_bufs` fills it once and never resizes it, so no dispatch may
+    /// allocate activation buffers mid-recording.
     pub(crate) fn qres_ptr(&self, slot: usize) -> *const compute::Buffer {
         &self.qres_bufs[slot] as *const compute::Buffer
     }
+    /// Mutable twin of `qres_ptr` for the slots written host-side before a
+    /// recording. Same non-reallocation requirement.
     pub(crate) fn qres_ptr_mut(&mut self, slot: usize) -> *mut compute::Buffer {
         &mut self.qres_bufs[slot] as *mut compute::Buffer
     }
@@ -1133,6 +1142,19 @@ impl VulkanModel {
             .collect()
     }
 
+    /// One qwen3_5-hybrid DECODE token on the GPU: embed, this stage's layers,
+    /// final norm, lm_head — returning full `[vocab]` logits.
+    ///
+    /// The layer span is `[pp_start, pp_end)`, this rank's PP stage, NOT the
+    /// whole network; a non-last stage's return value is not a logit vector any
+    /// caller may argmax.
+    ///
+    /// Two recordings can serve the span: the WS3 GPU-RESIDENT stage
+    /// (`VLLM_VULKAN_Q35_1CB`, whole span plus the lm_head tail in one command
+    /// buffer) when `q35res_probe` says the model qualifies, else the
+    /// per-block submit path. The two are numerically equivalent — the resident
+    /// stage only removes submit/fence boundaries — so a divergence between
+    /// them is a defect, not a tuning choice.
     pub(crate) fn forward_qwen35_gpu(&mut self, token_id: u32, pos: usize) -> Vec<f32> {
         let cfg = self.qwen35.as_ref().unwrap().config.clone();
         let h = cfg.hidden_size;
@@ -1662,6 +1684,11 @@ impl VulkanModel {
     /// host copy); full-attn layers hash `seq_len ++ live K ++ live V`. The
     /// P1 gate compares this across the restore for exact rollback.
     pub(crate) fn spec_state_fingerprint_impl(&self) -> Result<Vec<u64>, String> {
+        /// FNV-1a mixing step, folding `bytes` into `acc` in place.
+        ///
+        /// ORDER-SENSITIVE by design: the fingerprint must change if the same
+        /// state bytes are visited in a different order, which is what makes it
+        /// able to catch a mis-ordered restore and not just a missing one.
         fn fnv(acc: &mut u64, bytes: &[u8]) {
             for &b in bytes {
                 *acc ^= b as u64;
@@ -1872,6 +1899,19 @@ impl VulkanModel {
         Ok(())
     }
 
+    /// Lazily allocate this GatedDeltaNet layer's resident GPU state (conv
+    /// state + recurrent state), returning false when the layer cannot be
+    /// served on the GPU at all.
+    ///
+    /// Idempotent — an already-present layer returns true without touching the
+    /// existing buffers, because those buffers hold LIVE recurrent state that a
+    /// reallocation would silently zero mid-sequence.
+    ///
+    /// The shape guard is a kernel limit, not a preference: `q35_gdn_step` runs
+    /// one thread per value column in a 128-thread workgroup and stages the
+    /// output in a 128-slot shared array, so a `linear_value_head_dim > 128`
+    /// (or a zero conv kernel) has no valid dispatch and must fall back to the
+    /// host scan rather than launch a truncated one.
     pub(crate) fn ensure_dn_gpu_layer(&mut self, cfg: &qwen35::Qwen35Config, layer_idx: usize) -> bool {
         if self.dn_gpu.contains_key(&layer_idx) {
             return true;
@@ -2438,6 +2478,16 @@ impl VulkanModel {
     // ── P1b/P2: qwen3.6 batched-prefill GPU helpers (plan-batched-prefill.md) ──
 
 
+    /// `[t,k] x [n,k]^T -> [t,n]` projection for the qwen3_5 batched paths
+    /// (prefill and spec-verify), dispatching to the best available kernel and
+    /// falling back to the serial per-token matvec for any weight or geometry
+    /// the batched kernels cannot take.
+    ///
+    /// NUMERICS ARE THE CONTRACT: every route here computes each output column
+    /// with the same per-column reduction, so switching route must not change a
+    /// single bit of the result. The cols route is gated on
+    /// `self.spec_verify_cols`, which is set only around the verify mixers, so
+    /// decode and MoE keep their existing kernels and cannot drift.
     pub(crate) fn qwen35_gemm(&mut self, weight_name: &str, x: &[f32], t: usize, k: usize, n: usize) -> Vec<f32> {
         // Design-A batched-verify projection swap (spec §6): during a verify pass
         // (`spec_verify_cols`, set only around the attn/GDN mixers in
@@ -2915,15 +2965,19 @@ impl VulkanModel {
     }
 
     /// P2 GPU-resident path: MoE MLP for `t_count` tokens.
-    //
-    // Phase B (item-1-phase-3): when VLLM_VULKAN_MOE_GEMM=1 (default OFF) and
-    // this layer's experts are 4-bit-resident, the routed-expert matmuls are
-    // batched across ALL T tokens via the grouped MUL_MAT_ID GEMM
-    // (`qwen35_moe_mlp_prefill_gpu_grouped`) — one dispatch per gate/up/down
-    // over every routed (token,slot) pair instead of T*top_k per-token matvecs.
-    // Falls through to the per-token loop below when the flag is off, there is
-    // no engine, the layer isn't quant-resident, or the grouped path returns
-    // None (the unchanged A/B baseline).
+    ///
+    /// Phase B (item-1-phase-3): when VLLM_VULKAN_MOE_GEMM=1 (default OFF) and
+    /// this layer's experts are 4-bit-resident, the routed-expert matmuls are
+    /// batched across ALL T tokens via the grouped MUL_MAT_ID GEMM
+    /// (`qwen35_moe_mlp_prefill_gpu_grouped`) — one dispatch per gate/up/down
+    /// over every routed (token,slot) pair instead of T*top_k per-token matvecs.
+    /// Falls through to the per-token loop below when the flag is off, there is
+    /// no engine, the layer isn't quant-resident, or the grouped path returns
+    /// None (the unchanged A/B baseline).
+    ///
+    /// The fall-through is a NUMERIC no-op, not an approximation: both routes
+    /// run the same per-expert arithmetic, so an A/B that changes the argmax is
+    /// a defect in the grouped path.
     pub(crate) fn qwen35_moe_mlp_prefill_gpu(
         &mut self,
         cfg: &qwen35::Qwen35Config,
@@ -4236,9 +4290,18 @@ impl VulkanModel {
         Some(out)
     }
     // ── WS3: qwen3.6 resident stage (VLLM_VULKAN_Q35_1CB) ───────────────────
+    /// Stable raw pointer to one WS3 resident-stage activation buffer.
+    ///
+    /// Raw, not a reference, so the immutable borrow of `self.q35res_bufs` ends
+    /// before `self.engine.as_mut()` takes its mutable borrow. The resident
+    /// stage records the WHOLE PP span into ONE command buffer, so these
+    /// pointers must stay valid across every layer of that recording: nothing
+    /// may reallocate `q35res_bufs` until the batch is submitted.
     pub(crate) fn q35r_ptr(&self, slot: usize) -> *const compute::Buffer {
         &self.q35res_bufs[slot] as *const compute::Buffer
     }
+    /// Mutable twin of `q35r_ptr` for the slots written host-side before the
+    /// span recording begins. Same non-reallocation requirement.
     pub(crate) fn q35r_ptr_mut(&mut self, slot: usize) -> *mut compute::Buffer {
         &mut self.q35res_bufs[slot] as *mut compute::Buffer
     }
@@ -4405,6 +4468,18 @@ impl VulkanModel {
         self.q35res_ok = Some(ok);
         ok
     }
+    /// Decide ONCE whether the WS3 resident stage can serve this model's layer
+    /// span, checking every hard requirement the fused recording depends on.
+    ///
+    /// These are CAPABILITY checks, not preferences: the fused stage folds the
+    /// deltanet and MoE recordings, so both sub-paths must be enabled and
+    /// serviceable, and `q35_moe_accum` is a FIXED top-8 kernel — a model with
+    /// any other `num_experts_per_tok` has no valid dispatch here. Answering
+    /// yes for an unsupported model does not degrade performance, it produces
+    /// wrong logits.
+    ///
+    /// The caller memoises the answer in `q35res_ok`; this must therefore stay
+    /// a pure function of the loaded model and flags, never of per-token state.
     fn q35res_probe(&mut self, cfg: &qwen35::Qwen35Config) -> bool {
         if self.engine.is_none() || self.qwen35.is_none() {
             return false;

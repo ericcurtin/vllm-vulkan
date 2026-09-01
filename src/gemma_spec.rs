@@ -35,10 +35,14 @@
 
 use crate::model::{argmax, Gemma4Model};
 
-/// Per-block driver config: `k` drafted tokens per block, generate until at
-/// least `max_new_tokens` tokens have been committed (a block may commit
-/// between 1 and `k+1` tokens, so the final block can overshoot slightly —
-/// callers that need an exact count should truncate the returned vec).
+/// Per-block driver config: `k` drafted tokens per block, generate EXACTLY
+/// `max_new_tokens` committed tokens.
+///
+/// `max_new_tokens` is a hard cap, not a floor. A block commits between 1 and
+/// `k + 1` tokens (the bonus plus the accepted drafts), so a `k` that does not
+/// divide the budget would overshoot if the driver always drafted the full
+/// width — `run_spec_decode` narrows the last block's draft width instead. The
+/// returned stream never needs truncating by the caller.
 #[derive(Debug, Clone, Copy)]
 pub struct SpecConfig {
     pub k: usize,
@@ -69,6 +73,11 @@ pub struct SpecStepResult {
 /// then `verify_rollback` rewinds every layer's KV frontier to
 /// `pos + accept_len + 1` (a no-op on full accept, since `accept_len < k+1 =
 /// t` always holds — see `verify_rollback`'s own assert/no-op contract).
+///
+/// `k == 0` is LEGAL and is what `run_spec_decode` passes when only one token
+/// of budget is left: no drafts, `t == 1`, verify the bonus alone, commit it,
+/// and `verify_rollback(pos, 1, 0)` is its own no-op case. The block still
+/// makes one token of progress, so the driver loop cannot spin.
 pub fn spec_step<F>(
     model: &mut Gemma4Model,
     mut draft_fn: F,
@@ -108,8 +117,8 @@ where
     SpecStepResult { accept_len, committed, new_bonus }
 }
 
-/// Runs the full accept/reject generation loop, block after block, until at
-/// least `cfg.max_new_tokens` tokens have been committed. Returns the
+/// Runs the full accept/reject generation loop, block after block, until
+/// EXACTLY `cfg.max_new_tokens` tokens have been committed. Returns the
 /// concatenated committed token stream (bonus + accepted drafts of every
 /// block) — this is what should equal a SPEC-off greedy run's token stream
 /// when the drafter always drafts the target's own argmax (the identity
@@ -117,6 +126,19 @@ where
 /// mis-drafts a suffix of a block (the partial-accept gate), since the
 /// committed prefix is by construction the same tokens the greedy baseline
 /// would have produced.
+///
+/// THE BUDGET INVARIANT: a block commits `accept_len + 1` tokens, up to
+/// `k + 1` on a full accept — the drafted width plus the BONUS. So the draft
+/// width of each block is narrowed to `min(k, remaining - 1)`, one less than
+/// the remaining budget, and the loop cannot overshoot. Drafting `cfg.k`
+/// unconditionally returned up to `k` tokens too many (`k = 4`,
+/// `max_new_tokens = 8` gave 10), which for a real caller is generation past
+/// the requested length, not a harmless overshoot.
+///
+/// `remaining == 1` narrows to a width-0 block. That is a legal, PROGRESSING
+/// block, not a stall: `spec_step` still verifies the single bonus token,
+/// commits it, and the loop ends. `remaining` is >= 1 at the top of every
+/// iteration, so `remaining - 1` never underflows.
 pub fn run_spec_decode<F>(
     model: &mut Gemma4Model,
     mut draft_fn: F,
@@ -131,7 +153,13 @@ where
     let mut bonus = start_bonus;
     let mut emitted = Vec::new();
     while emitted.len() < cfg.max_new_tokens {
-        let step = spec_step(model, &mut draft_fn, bonus, pos, cfg.k);
+        let remaining = cfg.max_new_tokens - emitted.len(); // >= 1 here
+        // One less than the budget: the block also commits the bonus token.
+        let step_k = cfg.k.min(remaining - 1);
+        let step = spec_step(model, &mut draft_fn, bonus, pos, step_k);
+        debug_assert!(!step.committed.is_empty(), "every block must commit the bonus token");
+        debug_assert!(step.committed.len() <= remaining,
+                      "block committed {} > remaining budget {remaining}", step.committed.len());
         pos += step.committed.len();
         emitted.extend(step.committed);
         bonus = step.new_bonus;
@@ -144,6 +172,11 @@ mod tests {
     use super::*;
     use crate::model::{load_gemma_mlx_affine, tiny_synthetic_gemma, Gemma4Config, Gemma4Weights, KvCache, SimpleTensor};
 
+    /// Cosine similarity between two logit rows.
+    ///
+    /// Returns 0.0 — NOT NaN — when either vector has zero norm, so a
+    /// degenerate row reads as "no similarity" and fails a `>= threshold`
+    /// gate rather than propagating NaN through it.
     fn cosine(a: &[f32], b: &[f32]) -> f32 {
         let dot: f32 = a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum();
         let na: f32 = a.iter().map(|&x| x * x).sum::<f32>().sqrt();
@@ -160,6 +193,21 @@ mod tests {
     /// gate exercises the driver with a STUB drafter instead of the real one,
     /// per the plan.
     ///   GEMMA12B_DIR=<checkpoint dir>
+    ///
+    /// Two DIFFERENT outcomes, deliberately. No `GEMMA12B_DIR` at all means the
+    /// gate was not requested: print a visible SKIP and return `None`, so an
+    /// un-run test is distinguishable from a green `ok` in the log. But
+    /// `GEMMA12B_DIR` SET and pointing somewhere with no checkpoint means the
+    /// gate WAS requested and cannot run — that FAILS, loudly. Skipping there
+    /// would report success for a test nobody actually executed, which is the
+    /// same defect as a silent no-op pass, just wearing the skip's clothes.
+    /// Same rule as `gemma_assistant.rs`'s `assistant_dir`, but the presence
+    /// check is "any `*.safetensors` in the directory", NOT the literal
+    /// `model.safetensors` that helper looks for: the 12B is a SHARDED
+    /// checkpoint, and `load_gemma_mlx_affine` reaches it through
+    /// `discover_shards`, which globs every `*.safetensors` sibling and never
+    /// opens `model.safetensors` itself. Asserting on that one filename would
+    /// reject a perfectly good `model-0000N-of-...safetensors` checkpoint.
     fn load_gemma12b(max_seq: usize) -> Option<Gemma4Model> {
         let dir = match std::env::var("GEMMA12B_DIR") {
             Ok(d) => d,
@@ -168,6 +216,14 @@ mod tests {
                 return None;
             }
         };
+        let has_shard = std::fs::read_dir(&dir)
+            .map(|entries| entries.flatten().any(|e|
+                e.path().extension().and_then(|x| x.to_str()) == Some("safetensors")))
+            .unwrap_or(false);
+        assert!(
+            has_shard,
+            "GEMMA12B_DIR={dir} holds no *.safetensors shard — the checkpoint path is wrong; \
+             refusing to silently skip a test that was explicitly requested");
         let cfg = Gemma4Config::g12b();
         let tensors = load_gemma_mlx_affine(std::path::Path::new(&dir)).expect("load checkpoint");
         let weights = Gemma4Weights {
@@ -182,6 +238,15 @@ mod tests {
         Some(Gemma4Model { config: cfg, weights, kv_caches })
     }
 
+    /// Drop and REBUILD every layer's KV cache, so a gate can replay the same
+    /// prompt from a genuinely clean state.
+    ///
+    /// A rebuild, not `truncate(0)`: truncation only rewinds the counter and
+    /// leaves the old K/V bytes in place, which is correct for spec-decode
+    /// rollback but would let stale rows leak into a comparison run if any
+    /// path ever read past `seq_len`. Rebuilding also restores each layer's
+    /// own `layer_num_kv_heads`/`layer_head_dim` sizing, which differs between
+    /// sliding and full layers.
     fn reset_kv_caches(model: &mut Gemma4Model, max_seq: usize) {
         let cfg = &model.config;
         model.kv_caches = (0..cfg.num_hidden_layers)
@@ -328,6 +393,58 @@ mod tests {
             assert_eq!(committed[i], baseline[i], "token {i}: spec-on {} != greedy baseline {}", committed[i], baseline[i]);
         }
         eprintln!("identity gate (synthetic): {} tokens matched greedy baseline exactly", n);
+    }
+
+    /// `max_new_tokens` is a HARD CAP, not a floor.
+    ///
+    /// Every `k` here is chosen NOT to divide its budget, because a `k` that
+    /// divides it hides the defect: with `k + 1` committed per full-accept
+    /// block, `k = 3` / budget 8 lands on 4, 8 and looks correct even when the
+    /// last block drafts its full width. The cases below all need the last
+    /// block narrowed, and the pre-fix driver overshot each of them — `k = 4`
+    /// with a budget of 8 returned 10 tokens (the reviewer's own example, the
+    /// second case here).
+    ///
+    /// `budget = 1` is the boundary: the width narrows to 0, which must still
+    /// commit the bonus token and terminate rather than loop forever on a
+    /// zero-length block.
+    #[test]
+    fn spec_decode_respects_max_new_tokens_exactly() {
+        let max_seq = 64usize;
+        for (k, budget) in [(3usize, 7usize), (4, 8), (4, 5), (2, 9), (5, 1), (1, 1), (4, 3)] {
+            let mut model = tiny_synthetic_gemma(max_seq);
+            let prefix = [2u32, 10, 20];
+            for (pos, &tok) in prefix.iter().enumerate() {
+                model.forward(tok, pos);
+            }
+            let start_bonus = 30u32;
+            let start_pos = prefix.len();
+
+            // Full-accept drafter: drafts the target's own greedy continuation,
+            // so every block commits its maximum `width + 1` tokens. This is
+            // the WORST case for the cap — a partially-rejecting drafter
+            // commits fewer and could mask an over-wide draft.
+            let baseline = greedy_baseline(&mut model, start_bonus, start_pos, budget + k + 2);
+            reset_kv_caches(&mut model, max_seq);
+            for (pos, &tok) in prefix.iter().enumerate() {
+                model.forward(tok, pos);
+            }
+            let draft_fn = |_bonus: u32, pos: usize, width: usize| -> Vec<u32> {
+                let off = pos - start_pos;
+                (0..width).map(|i| baseline[off + 1 + i]).collect()
+            };
+
+            let cfg = SpecConfig { k, max_new_tokens: budget };
+            let committed = run_spec_decode(&mut model, draft_fn, start_bonus, start_pos, &cfg);
+
+            assert_eq!(committed.len(), budget,
+                       "k={k}, max_new_tokens={budget}: expected EXACTLY {budget} committed \
+                        tokens, got {}", committed.len());
+            // Capping must not change WHICH tokens come out, only how many.
+            assert_eq!(committed[..], baseline[..budget],
+                       "k={k}, max_new_tokens={budget}: capped stream must still equal the \
+                        greedy baseline prefix");
+        }
     }
 
     /// INC-5a gate 2 ("partial-accept + rollback correctness"): a STUB

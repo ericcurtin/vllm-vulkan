@@ -411,9 +411,27 @@ impl VulkanModel {
     /// via `vccl.Communicator.all_gather` (a python-level primitive — no new
     /// FFI needed) to reassemble the FULL kv-head set the Q-only drafter's
     /// cross-attention requires. Returns `(k_flat, v_flat, seq_len)`.
+    ///
+    /// ABSOLUTE-POSITION contract, so it REFUSES a wrapped ring. The returned
+    /// layout is `[seq_len, ...]` in ascending absolute order, which a
+    /// `capacity < seq_len` sliding ring simply no longer holds — it retains
+    /// only the last `capacity` positions, in slot order. `k_up_to_now()` would
+    /// slice `seq_len * stride` out of a `capacity * stride` buffer, so the
+    /// wrapped case is a raw index panic with no explanation; this names the
+    /// cause instead. (`windowed_view` is the ring-correct reader, but it
+    /// returns `window` rows, not `seq_len` — a different contract than the
+    /// drafter's all-gather expects, so widening it is INC-5b work, not a
+    /// silent substitution here.)
     fn gemma_kv_layer(&self, layer_idx: usize) -> PyResult<(Vec<f32>, Vec<f32>, usize)> {
         let cache = self.inner.kv_caches.get(layer_idx).ok_or_else(|| PyRuntimeError::new_err(
             format!("gemma_kv_layer: layer_idx {layer_idx} out of range ({} caches)", self.inner.kv_caches.len())))?;
+        if cache.has_wrapped() {
+            return Err(PyRuntimeError::new_err(format!(
+                "gemma_kv_layer: layer {layer_idx} KV ring has wrapped (seq_len {} > capacity {}); \
+                 the absolute-position [seq_len, kv_heads, head_dim] layout this returns no longer \
+                 exists. Set VLLM_VULKAN_KV_RING_DISABLE=1 to keep full-size caches.",
+                cache.seq_len, cache.capacity)));
+        }
         Ok((cache.k_up_to_now().to_vec(), cache.v_up_to_now().to_vec(), cache.seq_len))
     }
 
@@ -632,7 +650,12 @@ impl VulkanModel {
                 let l = tkv_lens[i];
                 let stride = cfg.layer_num_kv_heads(layer_idx) * cfg.layer_head_dim(layer_idx);
                 let cache = &self.inner.kv_caches[layer_idx];
-                let p = cache.seq_len - 1;
+                // RING SLOT, not the absolute position. A sliding layer's cache
+                // is a `capacity`-slot ring written at `pos % capacity`
+                // (`KvCache::append`), and `capacity < max_seq_len`, so the
+                // absolute `seq_len - 1` indexes off the end of `cache.k` the
+                // moment the ring wraps. See `crate::kv_last_slot`.
+                let p = crate::kv_last_slot(cache);
                 let o: usize = tkv_lens[..i].iter().map(|&x| 2 * x).sum();
                 tkv[o..o + l].copy_from_slice(&cache.k[p * stride..p * stride + l]);
                 tkv[o + l..o + 2 * l].copy_from_slice(&cache.v[p * stride..p * stride + l]);

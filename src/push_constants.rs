@@ -337,13 +337,25 @@ pub(crate) fn matvec_variant_by_format(fmt: QuantFormat, n: usize) -> (String, u
     matvec_variant_core(fmt, use_subgroup_flag(), f16, matvec_rows_override(), n)
 }
 
-/// Batched matvec variant for forward_batched: (shader, rows) for `t` columns.
-/// Reads the resident weight format (VLLM_VULKAN_QUANT) so a q8_0/q4-resident
-/// batched verify streams+dequantizes each weight ONCE across all T columns
-/// (Design C, the quantized batched-matmul flip) instead of T serial matvecs.
-/// See `matvec_cols_variant_core`.
-pub(crate) fn matvec_cols_variant(n: usize, t: usize) -> (String, u32) {
-    matvec_cols_variant_core(quant_format(), n, t)
+/// Batched matvec variant for `forward_batched`: (shader, rows) for `t`
+/// columns, keyed on THAT WEIGHT's own recorded format — never on the global
+/// `VLLM_VULKAN_QUANT` snapshot.
+///
+/// THE INVARIANT (the `matvec_variant_by_format` rule, applied to the
+/// multi-column family): a resident weight's format and the global flag are not
+/// the same thing even inside one loader. The dense loader keeps any tensor
+/// whose element count is not 32-aligned as `F16` while the flag still reads
+/// `q8_0`; a global-keyed selector then hands those f16 bytes to the q8_0
+/// dequant `_c{t}` kernel and returns garbage with no error. Callers must pass
+/// `GpuWeight::format`.
+///
+/// A q8_0/q4-resident batched verify streams+dequantizes each weight ONCE
+/// across all T columns (Design C, the quantized batched-matmul flip) instead
+/// of T serial matvecs. See `matvec_cols_variant_core` for the shader-name
+/// rules and the bit-exactness argument. Packed formats (Mlx4/Nvfp4/Fp8) have
+/// NO `_c{t}` sibling and must be rejected by the caller before this is called.
+pub(crate) fn matvec_cols_variant_by_format(fmt: QuantFormat, n: usize, t: usize) -> (String, u32) {
+    matvec_cols_variant_core(fmt, n, t)
 }
 
 /// Pure core of `matvec_cols_variant` (unit-testable, no GPU/env).

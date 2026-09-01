@@ -26,10 +26,12 @@ use crate::compute;
 use crate::gpu_error::GpuResult;
 use crate::VulkanModel;
 use crate::{
-    matvec_cols_variant, matvec_variant, matvec_pc13, rmsnorm_pc, rope_neox_pc, sdpa_pc,
+    matvec_cols_variant_by_format, matvec_pc13, rmsnorm_pc, rope_neox_pc, sdpa_pc,
     ew_unary_pc, ew_mul_pc, f32_slice_to_bytes, read_f32_buf,
 };
 use crate::{attn_decode_kernel, prof_add};
+use crate::flags::QuantFormat;
+use crate::gemma_forward::{gemma_res_mv_kind, record_gemma_mv_off};
 
 /// Max tokens a single `forward_batched` call may verify. Buffers are sized
 /// for this up front (`init_bres_bufs`) and reused across calls; a bigger `t`
@@ -63,6 +65,14 @@ const BR_LOGITS:usize = 19; // final lm_head output                  [T,vocab]
 const BR_COUNT: usize = 20;
 
 impl VulkanModel {
+    /// Stable raw pointer to one persistent `BR_*` activation buffer.
+    ///
+    /// Raw, not a reference, so the immutable borrow of `self.bres_bufs` ends
+    /// before `self.engine.as_mut()` takes its mutable borrow — the recording
+    /// loop needs both at once. Valid only while `bres_bufs` is not
+    /// reallocated, which `init_bres_bufs` does exactly once (it is idempotent
+    /// and never resizes afterwards), so no dispatch may allocate buffers
+    /// mid-recording.
     fn bres_ptr(&self, slot: usize) -> *const compute::Buffer {
         &self.bres_bufs[slot] as *const compute::Buffer
     }
@@ -127,6 +137,37 @@ impl VulkanModel {
         if let Some(qm) = self.qwen.as_mut() {
             for c in qm.kv_caches.iter_mut() { c.truncate(accepted); }
         }
+    }
+
+    /// Fetch one projection weight for the batched path as
+    /// `(buffer_ptr, its OWN recorded format)`.
+    ///
+    /// THE INVARIANT: the multi-column `_r*_c{t}` matvec kernel is chosen from
+    /// the returned format, NOT from the process-wide `VLLM_VULKAN_QUANT`
+    /// snapshot. The two are not interchangeable even inside a single loader —
+    /// the dense loader falls back to `F16` for any tensor whose element count
+    /// is not 32-aligned while the global flag still says `q8_0`, and the
+    /// global-keyed `matvec_cols_variant` would then hand those f16 bytes to
+    /// the q8_0 dequant kernel (garbage logits, no error). Same class of defect
+    /// `22ee4a9` fixed in the unified per-op path.
+    ///
+    /// PACKED formats are REFUSED rather than mis-dispatched: Mlx4/Nvfp4/Fp8
+    /// need extra scale/bias bindings and have NO compiled `_c{t}` sibling, so
+    /// there is no correct multi-column dispatch to select. Failing here is the
+    /// point — the alternative is a plain matvec reading 4-bit nibbles as f16.
+    fn bres_proj(&self, name: &str, layer_idx: usize)
+        -> GpuResult<(*const compute::Buffer, QuantFormat)>
+    {
+        let w = self.gpu_weights.get(name)
+            .ok_or_else(|| format!("forward_batched: missing {name} (layer {layer_idx})"))?;
+        if w.aux.is_some() {
+            return Err(format!(
+                "forward_batched: {name} (layer {layer_idx}) is packed-quantized ({:?}); the \
+                 batched multi-column matvec has no packed `_c{{t}}` kernel. Load this model \
+                 without the packed-weight lever, or verify one token at a time.",
+                w.format).into());
+        }
+        Ok((&w.buffer as *const compute::Buffer, w.format))
     }
 
     /// T-token batched forward for spec-decode verify (dense Qwen3-unified
@@ -249,20 +290,18 @@ impl VulkanModel {
         // reads B at j*batch_stride_b(=k) and writes D at j*batch_stride_d(=n),
         // exactly the row-major [T,k]->[T,n] layout of the BR_* buffers, and
         // matvec_pc13 already encodes those strides. Bit-exact per column vs the
-        // serial decode matvec (same kernel/accumulation order). lm_head stays on
-        // the bn8 GEMM below (occupancy-good at M=vocab; a matvec would exceed
-        // the 65535-workgroup limit).
-        let (mv_name, mv_rows) = matvec_cols_variant(h, t);
+        // serial decode matvec (same kernel/accumulation order). The LM head is
+        // NOT on this kernel — it is T single-column r8 matvecs, see the final
+        // block below.
+        //
+        // The shader is picked PER WEIGHT (`bres_proj` -> its own recorded
+        // format), not from the global `VLLM_VULKAN_QUANT` snapshot; see
+        // `bres_proj`'s doc comment for why those two diverge in practice.
         let mv_q = matvec_pc13(h, q_dim);
         let mv_kv = matvec_pc13(h, kv_dim);
         let mv_o = matvec_pc13(q_dim, h);
         let mv_gu = matvec_pc13(h, inter);
         let mv_d = matvec_pc13(inter, h);
-        let wg_q = ((q_dim as u32 + mv_rows - 1) / mv_rows, 1u32, 1u32);
-        let wg_kv = ((kv_dim as u32 + mv_rows - 1) / mv_rows, 1u32, 1u32);
-        let wg_o = ((h as u32 + mv_rows - 1) / mv_rows, 1u32, 1u32);
-        let wg_gu = ((inter as u32 + mv_rows - 1) / mv_rows, 1u32, 1u32);
-        let wg_d = ((h as u32 + mv_rows - 1) / mv_rows, 1u32, 1u32);
 
         for layer_idx in 0..cfg.num_hidden_layers {
             let ln = |s: &str| format!("model.layers.{layer_idx}.{s}");
@@ -290,20 +329,31 @@ impl VulkanModel {
             let qnorm_p = &self.unified_norm_w[&ln("self_attn.q_norm.weight")] as *const compute::Buffer;
             let knorm_p = &self.unified_norm_w[&ln("self_attn.k_norm.weight")] as *const compute::Buffer;
             let ffn_in_p = &self.unified_norm_w[&ln("post_attention_layernorm.weight")] as *const compute::Buffer;
-            let qw = &self.gpu_weights.get(&ln("self_attn.q_proj.weight"))
-                .ok_or_else(|| format!("forward_batched: missing q_proj weight layer {layer_idx}"))?.buffer as *const compute::Buffer;
-            let kw = &self.gpu_weights.get(&ln("self_attn.k_proj.weight"))
-                .ok_or_else(|| format!("forward_batched: missing k_proj weight layer {layer_idx}"))?.buffer as *const compute::Buffer;
-            let vw = &self.gpu_weights.get(&ln("self_attn.v_proj.weight"))
-                .ok_or_else(|| format!("forward_batched: missing v_proj weight layer {layer_idx}"))?.buffer as *const compute::Buffer;
-            let ow = &self.gpu_weights.get(&ln("self_attn.o_proj.weight"))
-                .ok_or_else(|| format!("forward_batched: missing o_proj weight layer {layer_idx}"))?.buffer as *const compute::Buffer;
-            let gw = &self.gpu_weights.get(&ln("mlp.gate_proj.weight"))
-                .ok_or_else(|| format!("forward_batched: missing gate_proj weight layer {layer_idx}"))?.buffer as *const compute::Buffer;
-            let uw = &self.gpu_weights.get(&ln("mlp.up_proj.weight"))
-                .ok_or_else(|| format!("forward_batched: missing up_proj weight layer {layer_idx}"))?.buffer as *const compute::Buffer;
-            let dw = &self.gpu_weights.get(&ln("mlp.down_proj.weight"))
-                .ok_or_else(|| format!("forward_batched: missing down_proj weight layer {layer_idx}"))?.buffer as *const compute::Buffer;
+            let (qw, q_fmt) = self.bres_proj(&ln("self_attn.q_proj.weight"), layer_idx)?;
+            let (kw, k_fmt) = self.bres_proj(&ln("self_attn.k_proj.weight"), layer_idx)?;
+            let (vw, v_fmt) = self.bres_proj(&ln("self_attn.v_proj.weight"), layer_idx)?;
+            let (ow, o_fmt) = self.bres_proj(&ln("self_attn.o_proj.weight"), layer_idx)?;
+            let (gw, g_fmt) = self.bres_proj(&ln("mlp.gate_proj.weight"), layer_idx)?;
+            let (uw, u_fmt) = self.bres_proj(&ln("mlp.up_proj.weight"), layer_idx)?;
+            let (dw, d_fmt) = self.bres_proj(&ln("mlp.down_proj.weight"), layer_idx)?;
+
+            // One (shader, rows) pair per projection, keyed on THAT weight's
+            // format. `rows` feeds the workgroup count, so it must come from
+            // the same call that chose the shader.
+            let (mv_n_q, r_q) = matvec_cols_variant_by_format(q_fmt, h, t);
+            let (mv_n_k, r_k) = matvec_cols_variant_by_format(k_fmt, h, t);
+            let (mv_n_v, r_v) = matvec_cols_variant_by_format(v_fmt, h, t);
+            let (mv_n_o, r_o) = matvec_cols_variant_by_format(o_fmt, h, t);
+            let (mv_n_g, r_g) = matvec_cols_variant_by_format(g_fmt, h, t);
+            let (mv_n_u, r_u) = matvec_cols_variant_by_format(u_fmt, h, t);
+            let (mv_n_d, r_d) = matvec_cols_variant_by_format(d_fmt, h, t);
+            let wg_q = ((q_dim as u32).div_ceil(r_q), 1u32, 1u32);
+            let wg_k = ((kv_dim as u32).div_ceil(r_k), 1u32, 1u32);
+            let wg_v = ((kv_dim as u32).div_ceil(r_v), 1u32, 1u32);
+            let wg_o = ((h as u32).div_ceil(r_o), 1u32, 1u32);
+            let wg_g = ((inter as u32).div_ceil(r_g), 1u32, 1u32);
+            let wg_u = ((inter as u32).div_ceil(r_u), 1u32, 1u32);
+            let wg_d = ((h as u32).div_ceil(r_d), 1u32, 1u32);
 
             let sdpa_wg = match sdpa_kernel {
                 "paged_attn_decode_f32_sg"   => (num_q as u32, 1u32, 1u32),
@@ -323,9 +373,9 @@ impl VulkanModel {
                 eng.record_barrier_to(cb);
                 // q/k/v projections — multi-column matvec, weight rows read
                 // ONCE per workgroup and reused across all T token-columns.
-                eng.record_to(cb, &mv_name, &[&*qw, &*xp, &*qp], &mv_q, wg_q)?;
-                eng.record_to(cb, &mv_name, &[&*kw, &*xp, &*kp], &mv_kv, wg_kv)?;
-                eng.record_to(cb, &mv_name, &[&*vw, &*xp, &*vp], &mv_kv, wg_kv)?;
+                eng.record_to(cb, &mv_n_q, &[&*qw, &*xp, &*qp], &mv_q, wg_q)?;
+                eng.record_to(cb, &mv_n_k, &[&*kw, &*xp, &*kp], &mv_kv, wg_k)?;
+                eng.record_to(cb, &mv_n_v, &[&*vw, &*xp, &*vp], &mv_kv, wg_v)?;
                 eng.record_barrier_to(cb);
                 // q/k-norm, row-batched over all heads x tokens (Q/K are
                 // row-major [T,num_*,head_dim] == contiguous [T*num_*,head_dim]).
@@ -372,20 +422,20 @@ impl VulkanModel {
                 eng.record_barrier_to(cb);
 
                 // o_proj matvec -> residual add -> ffn_in_norm -> FFN -> residual2.
-                eng.record_to(cb, &mv_name, &[&*ow, &*attnp, &*op], &mv_o, wg_o)?;
+                eng.record_to(cb, &mv_n_o, &[&*ow, &*attnp, &*op], &mv_o, wg_o)?;
                 eng.record_barrier_to(cb);
                 eng.record_to(cb, "add_f32_f32_f32", &[&*ha, &*op, &*hb, &*dummy], &add_pc_h, (add_wg_h, 1, 1))?;
                 eng.record_barrier_to(cb);
                 eng.record_to(cb, "rms_norm_f32_mul", &[&*hb, &*ffn_in_p, &*ffin], &rms_h, (t as u32, 1, 1))?;
                 eng.record_barrier_to(cb);
-                eng.record_to(cb, &mv_name, &[&*gw, &*ffin, &*gate], &mv_gu, wg_gu)?;
-                eng.record_to(cb, &mv_name, &[&*uw, &*ffin, &*up], &mv_gu, wg_gu)?;
+                eng.record_to(cb, &mv_n_g, &[&*gw, &*ffin, &*gate], &mv_gu, wg_g)?;
+                eng.record_to(cb, &mv_n_u, &[&*uw, &*ffin, &*up], &mv_gu, wg_u)?;
                 eng.record_barrier_to(cb);
                 eng.record_to(cb, "silu_f32", &[&*gate, &*act], &act_pc, (act_wg, 1, 1))?;
                 eng.record_barrier_to(cb);
                 eng.record_to(cb, "mul_f32_f32_f32", &[&*act, &*up, &*mid], &mul_pc, (mul_wg, 1, 1))?;
                 eng.record_barrier_to(cb);
-                eng.record_to(cb, &mv_name, &[&*dw, &*mid, &*down], &mv_d, wg_d)?;
+                eng.record_to(cb, &mv_n_d, &[&*dw, &*mid, &*down], &mv_d, wg_d)?;
                 eng.record_barrier_to(cb);
                 eng.record_to(cb, "add_f32_f32_f32", &[&*hb, &*down, &*ha, &*dummy], &add_pc_h, (add_wg_h, 1, 1))?;
             }
@@ -401,8 +451,24 @@ impl VulkanModel {
             return Err("forward_batched: missing model.norm.weight".to_string().into());
         }
         let lm_name = self.qwen.as_ref().unwrap().lm_head_name.clone();
-        let lm_w = &self.gpu_weights.get(&lm_name)
-            .ok_or_else(|| "forward_batched: missing lm_head weight".to_string())?.buffer as *const compute::Buffer;
+        // The LM head dispatch is keyed on the uploaded weight's OWN
+        // `format`/`aux`, exactly like the resident per-op path
+        // (`gemma_forward::gemma_res_mv_kind`, added by 22ee4a9). It used to
+        // call the global-quant-keyed `matvec_variant` and bind only
+        // (weight, input, output): for an Mlx4-packed head — which the
+        // gemma4_unified loader produces under VLLM_VULKAN_GEMMA_LMHEAD_Q4 —
+        // that picks a plain f16 matvec, leaves the mandatory `scales` and
+        // `biases` buffers unbound, and reads 4-bit nibbles as f16. NaN
+        // logits, no error.
+        let (lm_fmt, lm_kind, lm_w) = {
+            let lm_gw = self.gpu_weights.get(&lm_name)
+                .ok_or_else(|| "forward_batched: missing lm_head weight".to_string())?;
+            let (f, k) = gemma_res_mv_kind(lm_gw);
+            // Raw pointers into `gpu_weights`, which is not mutated between
+            // here and the record loop (same discipline as the per-layer
+            // projections above).
+            (f, k, &lm_gw.buffer as *const compute::Buffer)
+        };
         let norm_w_p = &self.unified_norm_w["model.norm.weight"] as *const compute::Buffer;
         let ha = self.bres_ptr(BR_HA);
         let normp = self.bres_ptr(BR_NORM);
@@ -415,13 +481,13 @@ impl VulkanModel {
         // the lm_head — rows*cols<=8 forces rows<8 for cols>1 (rows=2 at cols=3 →
         // 75968 wg > 65535). So loop T INDEPENDENT r8 dispatches, each slicing
         // token j's normed-hidden input row (j*h) and logits output row (j*vocab)
-        // via record_to_off. This reuses the EXACT decode lm_head kernel + pc, so
-        // every column is bit-identical to a serial decode by construction. The
-        // weight streams once per dispatch (T reads) but at the matvec family's
-        // ~185GB/s vs the GEMM's one read at its ~50GB/s occupancy ceiling.
-        let (lm_name_mv, lm_rows) = matvec_variant(true, vocab);
-        let mv_lm = matvec_pc13(h, vocab);
-        let wg_lm = ((vocab as u32 + lm_rows - 1) / lm_rows, 1u32, 1u32);
+        // via `record_gemma_mv_off`. This reuses the EXACT decode lm_head
+        // recorder (shader, bindings and push constants all chosen by
+        // `record_gemma_mv`'s own match), so every column is bit-identical to a
+        // serial decode by construction, for packed and plain heads alike.
+        // The weight streams once per dispatch (T reads) but at the matvec
+        // family's ~185GB/s vs the GEMM's one read at its ~50GB/s occupancy
+        // ceiling.
 
         let lmhead_submit_ts = std::time::Instant::now();
         let eng = self.engine.as_mut().expect("invariant: checked engine.is_some() above");
@@ -434,9 +500,8 @@ impl VulkanModel {
             for j in 0..t {
                 let in_off = (j * h * 4) as u64;
                 let out_off = (j * vocab * 4) as u64;
-                eng.record_to_off(cb, &lm_name_mv,
-                    &[(&*lm_w, 0), (&*normp, in_off), (&*logitsp, out_off)],
-                    &mv_lm, wg_lm)?;
+                record_gemma_mv_off(eng, cb, lm_w, lm_fmt, lm_kind,
+                    normp, in_off, logitsp, out_off, h, vocab);
             }
         }
         eng.submit_batch(cb)?;

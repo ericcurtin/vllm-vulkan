@@ -46,6 +46,17 @@ pub(crate) fn gemma_res_mv_kind(w: &crate::GpuWeight) -> (QuantFormat, MvKind) {
 /// Record one resident-layer matvec dispatch into `cb`, branching on the
 /// weight's own format/aux (via `kind`/`format` from `gemma_res_mv_kind`)
 /// instead of the global quant snapshot.
+///
+/// Whole-buffer form: the input and output are bound at offset 0. Callers that
+/// slice one token's row out of a T-wide activation buffer want
+/// `record_gemma_mv_off`.
+///
+/// Deliberately NOT a thin wrapper over `record_gemma_mv_off`. This is the
+/// GPU-resident DECODE hot path (7 projections x every layer, every token) and
+/// `record_to` binds through fixed-size stack arrays, while `record_to_off`
+/// heap-allocates two `Vec`s per dispatch — the exact allocation churn
+/// `record_to` was rewritten to remove. The offset form pays that only on the
+/// batched-verify LM head (T <= 8 dispatches per call).
 pub(crate) unsafe fn record_gemma_mv(
     eng: &mut compute::ComputeEngine,
     cb: ash::vk::CommandBuffer,
@@ -65,8 +76,6 @@ pub(crate) unsafe fn record_gemma_mv(
             eng.record_to(cb, &shader, &[&*wptr, &*s, &*b, &*inp, &*out], &pc, (wg, 1, 1)).unwrap();
         }
         MvKind::Nvfp4 { s, gs, e4m3, global } => {
-            // Flag-routed: e4m3-resident kernel or the f32-fold kernel (same 4
-            // bindings, differing only in shader name + push constants).
             let (shader, r, pc) = nvfp4_dispatch(k, n, gs, e4m3, global);
             let wg = (n as u32 + r - 1) / r;
             eng.record_to(cb, &shader, &[&*wptr, &*s, &*inp, &*out], &pc, (wg, 1, 1)).unwrap();
@@ -82,6 +91,74 @@ pub(crate) unsafe fn record_gemma_mv(
             let wg = (n as u32 + r - 1) / r;
             let pc = matvec_pc13(k, n);
             eng.record_to(cb, &shader, &[&*wptr, &*inp, &*out], &pc, (wg, 1, 1)).unwrap();
+        }
+    }
+}
+
+/// Byte-offset form of `record_gemma_mv`: identical dispatch selection, but the
+/// INPUT and OUTPUT buffers are bound at `in_off`/`out_off` instead of 0 (the
+/// weight and its scale/bias aux buffers are always whole-buffer).
+///
+/// THE INVARIANT this exists to hold: the shader and its BINDING COUNT come
+/// from the weight's OWN recorded `format`/`aux`, never from the process-wide
+/// `VLLM_VULKAN_QUANT` snapshot. The three packed formats each need extra
+/// buffers the plain matvec does not bind — Mlx4 needs `scales` AND `biases`
+/// (5 bindings), Nvfp4/Fp8 need `scales` (4) — so a global-keyed selector that
+/// picks a plain/f16 matvec for a packed weight reads 4-bit nibbles as f16 and
+/// yields NaN logits, not merely inaccurate ones. That was `22ee4a9`'s defect
+/// in the unified per-op path and (via `matvec_variant`/`matvec_cols_variant`)
+/// the same defect in `batched_forward`'s LM head.
+///
+/// `in_off`/`out_off` are BYTE offsets and must satisfy the device's
+/// `minStorageBufferOffsetAlignment`; a row stride of `dim * 4` bytes over the
+/// dims this path uses (multiples of 64) always does.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn record_gemma_mv_off(
+    eng: &mut compute::ComputeEngine,
+    cb: ash::vk::CommandBuffer,
+    wptr: *const compute::Buffer,
+    format: QuantFormat,
+    kind: MvKind,
+    inp: *const compute::Buffer,
+    in_off: u64,
+    out: *const compute::Buffer,
+    out_off: u64,
+    k: usize,
+    n: usize,
+) {
+    match kind {
+        MvKind::Mlx4 { s, b, gs } => {
+            let (shader, r) = matvec_mlx4_variant_k(k, n);
+            let wg = (n as u32 + r - 1) / r;
+            let pc = matvec_mlx4_pc(k, n, gs as usize);
+            eng.record_to_off(cb, &shader,
+                &[(&*wptr, 0), (&*s, 0), (&*b, 0), (&*inp, in_off), (&*out, out_off)],
+                &pc, (wg, 1, 1)).unwrap();
+        }
+        MvKind::Nvfp4 { s, gs, e4m3, global } => {
+            // Flag-routed: e4m3-resident kernel or the f32-fold kernel (same 4
+            // bindings, differing only in shader name + push constants).
+            let (shader, r, pc) = nvfp4_dispatch(k, n, gs, e4m3, global);
+            let wg = (n as u32 + r - 1) / r;
+            eng.record_to_off(cb, &shader,
+                &[(&*wptr, 0), (&*s, 0), (&*inp, in_off), (&*out, out_off)],
+                &pc, (wg, 1, 1)).unwrap();
+        }
+        MvKind::Fp8 { s, per_row } => {
+            let (shader, r) = matvec_fp8_variant(n);
+            let wg = (n as u32 + r - 1) / r;
+            let pc = matvec_fp8_pc(k, n, per_row);
+            eng.record_to_off(cb, &shader,
+                &[(&*wptr, 0), (&*s, 0), (&*inp, in_off), (&*out, out_off)],
+                &pc, (wg, 1, 1)).unwrap();
+        }
+        MvKind::Plain => {
+            let (shader, r) = matvec_variant_core(format, use_subgroup_flag(), true, matvec_rows_override(), n);
+            let wg = (n as u32 + r - 1) / r;
+            let pc = matvec_pc13(k, n);
+            eng.record_to_off(cb, &shader,
+                &[(&*wptr, 0), (&*inp, in_off), (&*out, out_off)],
+                &pc, (wg, 1, 1)).unwrap();
         }
     }
 }
@@ -1704,9 +1781,19 @@ impl VulkanModel {
         hidden3
     }
     // ─── Fused GPU-resident Gemma4 decode (roadmap P4) ──────────────────────
+    /// Stable raw pointer to one persistent `GR_*` activation buffer.
+    ///
+    /// Raw, not a reference, so the immutable borrow of `self.gres_bufs` ends
+    /// before `self.engine.as_mut()` takes its mutable borrow — one recording
+    /// needs both. Valid only while `gres_bufs` is not reallocated:
+    /// `init_gres_bufs` fills it once and never resizes it, so nothing may
+    /// allocate activation buffers part-way through a command buffer.
     pub(crate) fn gres_ptr(&self, slot: usize) -> *const compute::Buffer {
         &self.gres_bufs[slot] as *const compute::Buffer
     }
+    /// Mutable twin of `gres_ptr`, for the few slots a dispatch writes host-side
+    /// (rope position, dummies) before recording. Same non-reallocation
+    /// requirement, and the caller must not hold it across an `init_gres_bufs`.
     pub(crate) fn gres_ptr_mut(&mut self, slot: usize) -> *mut compute::Buffer {
         &mut self.gres_bufs[slot] as *mut compute::Buffer
     }
@@ -2503,8 +2590,13 @@ impl VulkanModel {
 mod gemma_prefill_cols_tests {
     use crate::qwen35_forward::cols_tile_schedule;
 
-    // Deterministic pseudo-random f32 in [-1, 1) from a 64-bit splitmix hash of
-    // (a, b) — no allocation, reproducible, no rand dep.
+    /// Deterministic pseudo-random f32 in [-1, 1) from a 64-bit splitmix hash of
+    /// (a, b) — no allocation, reproducible, no rand dep.
+    ///
+    /// It must stay a PURE function of (a, b): the oracle and the tiled
+    /// reconstruction below derive the same weight element independently, from
+    /// the same (row, col) pair, instead of sharing an n*k table. Any hidden
+    /// state here would make the two disagree for reasons unrelated to tiling.
     fn h32(a: u64, b: u64) -> f32 {
         let mut z = a.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ b.wrapping_add(0x1234_5678_9ABC_DEF0);
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -2514,12 +2606,18 @@ mod gemma_prefill_cols_tests {
         ((z >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
     }
 
-    // One output column's projection: out_row j = sum_i W[j*k+i] * xcol[i].
-    // `n_check` caps how many output rows we materialize (columns are fully
-    // independent, so a fixed slice per column suffices to catch any placement
-    // corruption while keeping the real `k` reduction length). `wseed` derives
-    // the weight so every shape gets a distinct deterministic W without storing
-    // an n*k table.
+    /// One output column's projection: out_row j = sum_i W[j*k+i] * xcol[i].
+    ///
+    /// `n_check` caps how many output rows we materialize (columns are fully
+    /// independent, so a fixed slice per column suffices to catch any placement
+    /// corruption while keeping the real `k` reduction length). `wseed` derives
+    /// the weight so every shape gets a distinct deterministic W without storing
+    /// an n*k table.
+    ///
+    /// The reduction order is fixed and COLUMN-INDEPENDENT. That is what makes
+    /// the bitwise comparison below meaningful: any difference between the
+    /// tiled and per-row results can then only come from tiling, never from a
+    /// reordered sum.
     fn project_col(wseed: u64, xcol: &[f32], k: usize, n_check: usize) -> Vec<f32> {
         let mut o = vec![0f32; n_check];
         for (j, oj) in o.iter_mut().enumerate() {
@@ -2532,7 +2630,9 @@ mod gemma_prefill_cols_tests {
         o
     }
 
-    // Per-row oracle == today's `gemma_prefill_matmul` loop (one column at a time).
+    /// Per-row oracle == today's `gemma_prefill_matmul` loop (one column at a
+    /// time). This is the reference the tiled reconstruction must match
+    /// BIT-for-bit, not merely approximately.
     fn oracle(wseed: u64, x: &[f32], t: usize, k: usize, n_check: usize) -> Vec<f32> {
         let mut out = vec![0f32; t * n_check];
         for ti in 0..t {
@@ -2542,9 +2642,13 @@ mod gemma_prefill_cols_tests {
         out
     }
 
-    // Cols-tiled reconstruction == `qwen35_matvec_cols_tiled`'s schedule (the
-    // live code path via `cols_tile_schedule`), each tile's columns projected
-    // independently and written at the tile's column offset.
+    /// Cols-tiled reconstruction == `qwen35_matvec_cols_tiled`'s schedule (the
+    /// live code path via `cols_tile_schedule`), each tile's columns projected
+    /// independently and written at the tile's column offset.
+    ///
+    /// The SCHEDULE is the live one, imported from the shipping code — only the
+    /// per-column arithmetic is modelled here. A local copy of the tiling rule
+    /// would gate the test against itself and pass through a schedule change.
     fn cols_tiled(wseed: u64, x: &[f32], t: usize, k: usize, n_check: usize, tile: usize) -> Vec<f32> {
         let mut out = vec![0f32; t * n_check];
         for (c0, ct) in cols_tile_schedule(t, tile) {
@@ -2557,6 +2661,9 @@ mod gemma_prefill_cols_tests {
         out
     }
 
+    /// First-maximum argmax (strict `>`, so ties keep the lowest index — the
+    /// driver's own tie-break). Used as a second, coarser check alongside the
+    /// bitwise one: it is the property a caller actually observes.
     fn argmax(row: &[f32]) -> usize {
         let mut best = 0usize;
         for j in 1..row.len() {
@@ -2589,9 +2696,15 @@ mod gemma_prefill_cols_tests {
         ("g31b.mlp.down",       21504, 5376),
     ];
 
-    // The schedule must (a) emit only 2..=tile-wide tiles, (b) cover [0,t)
-    // exactly once per column except the single idempotent lone-column overlap,
-    // and (c) never index past t. Pure index logic — exhaustive over the sweep.
+    /// The schedule must (a) emit only 2..=tile-wide tiles, (b) cover [0,t)
+    /// exactly once per column except the single idempotent lone-column
+    /// overlap, and (c) never index past t. Pure index logic — EXHAUSTIVE over
+    /// the sweep, not sampled, because the failure this guards is a single
+    /// awkward `t` that drops or double-writes one column.
+    ///
+    /// At most ONE column may be covered twice, and only by the trailing fold,
+    /// which recomputes it identically. Any further overlap means a column is
+    /// written by two different tiles and the last writer silently wins.
     #[test]
     fn schedule_covers_all_columns() {
         for t in 2..=260usize {
@@ -2612,7 +2725,18 @@ mod gemma_prefill_cols_tests {
         }
     }
 
-    // The load-bearing gate: cols-tiled projection == per-row oracle, bitwise.
+    /// The load-bearing gate: cols-tiled projection == per-row oracle, BITWISE
+    /// (`f32::to_bits`), over the real g12b/g31b projection shapes.
+    ///
+    /// Bitwise, not a tolerance: the tiled and per-row paths compute the same
+    /// per-column dot product in the same order, so ANY difference is a
+    /// placement defect (a dropped, duplicated or mis-offset column), never
+    /// accumulated rounding. A tolerance here would hide exactly the class of
+    /// bug the test exists for.
+    ///
+    /// The `t` sweep straddles the tile boundary on purpose — single-tile
+    /// (t <= 8), exact multiples, and remainders that trigger the lone-column
+    /// fold. A sweep that stayed under one tile would pass on an untiled path.
     #[test]
     fn cols_tiled_bit_exact_vs_per_row_oracle() {
         // Straddle the <=8 tile boundary: single-tile (t<=8), exact multiples,

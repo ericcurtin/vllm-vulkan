@@ -48,6 +48,10 @@ const UR_COUNT: usize = 23;
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Activation { Silu, Gelu }
 impl Activation {
+    /// SPIR-V entry point for this activation. The gemma/qwen split is exactly
+    /// one kernel wide — everything else in the unified layer is shared — so
+    /// picking the wrong one here silently swaps GELU for SiLU and shows up
+    /// only as drifted logits, never as an error.
     pub(crate) fn shader(self) -> &'static str {
         match self { Activation::Silu => "silu_f32", Activation::Gelu => "gelu_f32" }
     }
@@ -108,6 +112,14 @@ pub(crate) struct LayerSpec {
 }
 
 impl LayerSpec {
+    /// Build the unified layer descriptor for a Qwen3-dense layer.
+    ///
+    /// Every layer is identical, hence the ignored `_layer_idx` — kept in the
+    /// signature so the two constructors stay interchangeable at the call site.
+    /// The qwen shape is uniform in the ways gemma's is not: full rotary, one
+    /// RoPE theta, no sliding window, no PLE, no sandwich norms, PRE-norm
+    /// (`post_attention_layernorm` normalizes the FFN INPUT here, despite the
+    /// name).
     pub(crate) fn qwen(cfg: &model::Qwen3Config, _layer_idx: usize) -> Self {
         let head_dim = cfg.head_dim;
         LayerSpec {
@@ -137,6 +149,13 @@ impl LayerSpec {
         }
     }
 
+    /// Build the unified layer descriptor for a Gemma4 layer.
+    ///
+    /// STRONGLY per-layer, unlike the qwen twin: full (global) and sliding
+    /// layers differ in head dim, kv-head count, RoPE theta (1e6 vs 1e4),
+    /// rotary width (PARTIAL `head_dim/4` on global layers, full on sliding)
+    /// and window. Reading any of these off the model-level config instead of
+    /// `layer_idx` mis-shapes half the network.
     pub(crate) fn gemma(cfg: &model::Gemma4Config, layer_idx: usize,
              layer_ple: Vec<f32>, layer_scalar: f32) -> Self {
         let is_full = cfg.is_full_attention(layer_idx);
@@ -194,9 +213,18 @@ impl LayerSpec {
 }
 
 impl VulkanModel {
+    /// Stable raw pointer to one persistent `UR_*` unified activation buffer.
+    ///
+    /// Raw, not a reference, so the immutable borrow of `self.ures_bufs` ends
+    /// before `self.engine.as_mut()` takes its mutable borrow — one recording
+    /// needs both. Valid only while `ures_bufs` is not reallocated:
+    /// `init_ures_bufs` fills it once and never resizes it, so no dispatch may
+    /// allocate activation buffers mid-recording.
     pub(crate) fn ures_ptr(&self, slot: usize) -> *const compute::Buffer {
         &self.ures_bufs[slot] as *const compute::Buffer
     }
+    /// Mutable twin of `ures_ptr` for the slots written host-side before a
+    /// recording (rope position, dummies). Same non-reallocation requirement.
     pub(crate) fn ures_ptr_mut(&mut self, slot: usize) -> *mut compute::Buffer {
         &mut self.ures_bufs[slot] as *mut compute::Buffer
     }

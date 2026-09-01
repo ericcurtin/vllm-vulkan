@@ -963,6 +963,29 @@ fn gemma_pp_tkv_lens(cfg: &model::Gemma4Config, targets: &[usize]) -> Vec<usize>
     targets.iter().map(|&t| cfg.layer_num_kv_heads(t) * cfg.layer_head_dim(t)).collect()
 }
 
+/// RING SLOT of the most recently appended position in `cache` — the row index
+/// to use when reading `cache.k`/`cache.v` DIRECTLY.
+///
+/// THE INVARIANT: `KvCache::seq_len` is an ABSOLUTE token count, but `cache.k`
+/// and `cache.v` are indexed by RING SLOT `position % capacity` for every
+/// windowed (sliding) layer — that is `KvCache::append`'s own slot rule, and
+/// `capacity < max_seq_len` there. The two numbers agree ONLY while
+/// `seq_len <= capacity`. So `seq_len - 1` is a correct row index right up to
+/// the first wrap and then walks straight off the end of the ring; any test
+/// that stays under `capacity` passes on code that omits the `% capacity`.
+/// That is exactly the trap this helper exists to close — see
+/// `gemma_pp_last_kv_slot_wraps_the_ring`, which appends 7x the capacity.
+///
+/// `k_up_to_now()`/`v_up_to_now()` are NOT a substitute after a wrap: they
+/// slice `..seq_len * stride` out of a `capacity * stride` buffer and assume
+/// slot == absolute position (see their `debug_assert!(!has_wrapped())`).
+///
+/// Panics on an empty cache — there is no "last row" to name.
+fn kv_last_slot(cache: &model::KvCache) -> usize {
+    assert!(cache.seq_len > 0, "kv_last_slot: cache is empty (seq_len == 0)");
+    (cache.seq_len - 1) % cache.capacity
+}
+
 /// Strict GPU lm_head/embed upload policy (default ON).
 ///
 /// When a last-stage lm_head (or tied-embed) GPU upload is ATTEMPTED and FAILS
@@ -9988,8 +10011,56 @@ mod kv_cache_pymethod_tests {
 /// KV-share target sizing (the 4096-vs-512 g12b panic).
 #[cfg(test)]
 mod gemma_pp_kv_target_tests {
-    use super::{gemma_pp_kv_targets, gemma_pp_tkv_lens};
-    use crate::model::Gemma4Config;
+    use super::{gemma_pp_kv_targets, gemma_pp_tkv_lens, kv_last_slot};
+    use crate::model::{Gemma4Config, KvCache};
+
+    /// The carried-target-KV read in `forward_pp_gemma` copies "the row just
+    /// appended" straight out of `cache.k`/`cache.v`. That row is a RING SLOT
+    /// (`pos % capacity`), NOT the absolute `seq_len - 1`, for every windowed
+    /// sliding layer.
+    ///
+    /// This gate is only worth anything BECAUSE it wraps: it appends 7x the
+    /// capacity, and asserts up front that the pre-fix expression
+    /// `(seq_len - 1) * stride` is out of range of the ring (the old code's
+    /// panic), so an accidental revert cannot make this test pass. A
+    /// non-wrapping run — anything with `seq_len <= capacity` — agrees with the
+    /// broken expression at every step and proves nothing. Same lesson the
+    /// split-K `gpu_kv_append_cap` validator banked.
+    #[test]
+    fn gemma_pp_last_kv_slot_wraps_the_ring() {
+        let (num_kv, head_dim, window) = (2usize, 4usize, 8usize);
+        let stride = num_kv * head_dim;
+        let n = window * 7; // 7 full wraps of the ring
+        let mut cache = KvCache::new_windowed(1024, window, num_kv, head_dim);
+
+        for p in 0..n {
+            // Row value encodes the absolute position, so a wrong slot reads a
+            // detectably wrong token rather than plausible garbage.
+            let k: Vec<f32> = (0..stride).map(|j| (p * 1000 + j) as f32).collect();
+            let v: Vec<f32> = k.iter().map(|&x| -x).collect();
+            cache.append(&k, &v);
+
+            let slot = kv_last_slot(&cache);
+            assert_eq!(slot, p % window, "slot must be pos % capacity at pos {p}");
+            assert_eq!(cache.k[slot * stride..slot * stride + stride], k[..],
+                       "K row read back at pos {p} must be the row just appended");
+            assert_eq!(cache.v[slot * stride..slot * stride + stride], v[..],
+                       "V row read back at pos {p} must be the row just appended");
+        }
+
+        // Evidence this test genuinely exercises the wrap: the ring has
+        // wrapped, and the pre-fix ABSOLUTE index would now run past the end of
+        // the storage (the panic MAJOR-2 described).
+        assert!(cache.has_wrapped(), "ring must have wrapped (seq_len {} vs capacity {})",
+                cache.seq_len, cache.capacity);
+        assert_eq!(cache.seq_len, n);
+        let absolute = cache.seq_len - 1;
+        assert!(absolute * stride + stride > cache.k.len(),
+                "pre-fix absolute index {absolute} must be out of range of the {}-slot ring",
+                cache.capacity);
+        assert_ne!(absolute, kv_last_slot(&cache),
+                   "absolute position and ring slot must differ after a wrap");
+    }
 
     /// g12b has `num_kv_shared_layers == 0` (no cross-stage KV sharing at
     /// all) so `first_kv_shared_layer() == num_hidden_layers`. Targets, tkv

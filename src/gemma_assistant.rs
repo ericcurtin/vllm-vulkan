@@ -36,6 +36,10 @@ pub enum AssistantLayerKind {
 }
 
 impl AssistantLayerKind {
+    /// Map a checkpoint `layer_type` string to the kind. An unknown value is an
+    /// ERROR, never a default: sliding and full layers differ in head_dim,
+    /// kv-head count and RoPE theta, so guessing would produce a silently
+    /// mis-shaped drafter instead of a load failure.
     fn parse(s: &str) -> Result<Self, String> {
         match s {
             "sliding_attention" => Ok(Self::Sliding),
@@ -103,18 +107,33 @@ impl AssistantConfig {
         }
     }
 
+    /// True when this layer is FULL attention rather than sliding-window.
+    ///
+    /// This one predicate drives head_dim, kv-head count and RoPE theta below,
+    /// so a per-layer value must never be read from the model-level fields
+    /// directly — the two layer kinds do not share them.
     pub fn is_full(&self, layer_idx: usize) -> bool {
         matches!(self.layer_types[layer_idx], AssistantLayerKind::Full)
     }
 
+    /// Head dim FOR THIS LAYER. Full layers use `global_head_dim`, sliding
+    /// layers `head_dim`; the two differ, so KV-cache sizing and RoPE must both
+    /// go through here rather than the model-level `head_dim`.
     pub fn layer_head_dim(&self, layer_idx: usize) -> usize {
         if self.is_full(layer_idx) { self.global_head_dim } else { self.head_dim }
     }
 
+    /// KV-head count FOR THIS LAYER. Full layers can be MQA/low-GQA while
+    /// sliding layers are not, so a fixed `num_key_value_heads` mis-sizes the
+    /// full layers' cache — the exact shape mismatch behind the g12b
+    /// 4096-vs-512 KV panic.
     pub fn layer_num_kv_heads(&self, layer_idx: usize) -> usize {
         if self.is_full(layer_idx) { self.num_global_key_value_heads } else { self.num_key_value_heads }
     }
 
+    /// Q projection width FOR THIS LAYER. The query HEAD COUNT is uniform
+    /// across layers; only the head dim varies, so this is `num_attention_heads
+    /// * layer_head_dim` and NOT a per-layer head count times a fixed dim.
     pub fn layer_q_dim(&self, layer_idx: usize) -> usize {
         self.num_attention_heads * self.layer_head_dim(layer_idx)
     }
@@ -631,6 +650,13 @@ mod tests {
         data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
     }
 
+    /// Cosine similarity, accumulated in f64 so the gate's own reduction error
+    /// stays well under the tolerance it asserts on.
+    ///
+    /// Returns NaN on an all-zero input (0/0), and that is deliberate — a
+    /// silent 0.0 there would read as "totally dissimilar" for a degenerate
+    /// tensor, whereas NaN fails any `>= threshold` comparison loudly. Do not
+    /// "fix" it with a zero guard.
     fn cosine(a: &[f32], b: &[f32]) -> f32 {
         let mut dot = 0.0f64; let mut na = 0.0f64; let mut nb = 0.0f64;
         for i in 0..a.len() {
@@ -641,6 +667,10 @@ mod tests {
         (dot / (na.sqrt() * nb.sqrt())) as f32
     }
 
+    /// First-maximum argmax with a STRICT `>` comparison, so ties keep the
+    /// LOWEST index — the same tie-break the python driver and
+    /// `model::argmax` use. A `>=` here would pick the last of a tied run and
+    /// break token-for-token equality with the reference on flat logits.
     fn argmax(x: &[f32]) -> usize {
         x.iter().enumerate().fold((0, f32::MIN), |(bi, bv), (i, &v)| if v > bv { (i, v) } else { (bi, bv) }).0
     }
