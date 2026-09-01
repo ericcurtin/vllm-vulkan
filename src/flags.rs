@@ -17,6 +17,16 @@
 pub enum QuantFormat { F32, F16, Bf16, Q8_0, Q4_0, Q4_K, Mlx4, Nvfp4, Fp8 }
 
 impl QuantFormat {
+    /// Parse `VLLM_VULKAN_QUANT`. An UNRECOGNISED value silently becomes
+    /// `F16`, the default weight residency — a typo (`q8`, `Q8_0`, `q4k`) does
+    /// not fail the load, it quietly doubles the weight bytes and reads as a
+    /// mystery slowdown, so check the logged format when a run is unexpectedly
+    /// slow.
+    ///
+    /// Only the four global codecs appear here. `Mlx4`/`Nvfp4`/`Fp8` are PACKED
+    /// formats recorded PER WEIGHT at upload time and are deliberately not
+    /// selectable through this env var; dispatch for those must read
+    /// `GpuWeight::format`, never this snapshot.
     pub fn from_env_str(s: &str) -> Self {
         match s {
             "q8_0" => Self::Q8_0, "q4_0" => Self::Q4_0, "q4_k" => Self::Q4_K,
@@ -853,9 +863,28 @@ pub struct Flags {
     /// cols=projection-compute are orthogonal). Argmax-exact AND net-positive →
     /// DEFAULT-ON (like qwen35_prefill_cols); =0 reverts to serial prefill.
     pub gemma_prefill_cols: bool,
+
+    /// `VLLM_VULKAN_ASSISTANT_GPU` — GPU-resident matvecs for the Gemma4-31B
+    /// EAGLE drafter (`gemma_assistant.rs`), DEFAULT ON. `=0` selects the
+    /// bit-exact host-f32 A/B path, which is what the drafter's own golden
+    /// gate compares against. Read here, not with a bare `std::env::var` at
+    /// the call site, so every runtime knob stays in ONE snapshot: a bare read
+    /// is re-evaluated per call, invisible to the flag dump, and is exactly how
+    /// this project has repeatedly shipped silently-disengaged levers.
+    /// Engine-less builds fall back to host inside `AssistantGpu::build`
+    /// regardless of this flag.
+    pub assistant_gpu: bool,
 }
 
 impl Flags {
+    /// Snapshot every `VLLM_VULKAN_*` env var ONCE, at model construction.
+    ///
+    /// The snapshot is the point: reading the environment again mid-process
+    /// would let a lever change between the load that uploaded the weights and
+    /// the dispatch that consumes them, which is how a buffer ends up in one
+    /// format and its kernel chosen for another. `b1` is default-OFF (`1`/
+    /// `true` enables), `bdef1` is default-ON (only `0` disables) — read the
+    /// helper before assuming a flag's polarity.
     pub fn from_env() -> Self {
         let b1 = |k: &str| std::env::var(k).map(|v| v == "1" || v == "true").unwrap_or(false);
         let bdef1 = |k: &str| std::env::var(k).map(|v| v != "0").unwrap_or(true); // default-on
@@ -879,6 +908,7 @@ impl Flags {
             gemma_mlp_q4: b1("VLLM_VULKAN_GEMMA_MLP_Q4"), // default OFF; H1 (mlp 8->4bit requant); see field doc
             gemma_lmhead_q4: b1("VLLM_VULKAN_GEMMA_LMHEAD_Q4"), // default OFF; H2 (lm_head f16->4bit requant); see field doc
             gemma_prefill_cols: bdef1("VLLM_VULKAN_GEMMA_PREFILL_COLS"), // default ON (on-node GO n75 2026-08-03: argmax-exact + net-positive prefill, stacks w/ ring); =0 reverts to serial per-row prefill. See field doc.
+            assistant_gpu: bdef1("VLLM_VULKAN_ASSISTANT_GPU"), // default ON; =0 selects the bit-exact host-f32 drafter. See field doc.
             qwen35_gpu: b1("VLLM_VULKAN_QWEN35_GPU"),
             q35_gpu_attn: b1("VLLM_VULKAN_Q35_GPU_ATTN"), // default OFF; see field doc
             q35_kv_f16: b1("VLLM_VULKAN_Q35_KV_F16"), // default OFF; RESERVED, not yet wired — see field doc
@@ -986,6 +1016,9 @@ pub fn flags_global() -> &'static Flags {
 mod tests {
     use super::*;
 
+    /// Pins the parse table AND the silent `F16` fallback for both the empty
+    /// string and an unrecognised value — the fallback is a real behaviour
+    /// callers depend on, not an accident to be tightened away.
     #[test]
     fn quant_format_from_env_str() {
         assert_eq!(QuantFormat::from_env_str("q8_0"), QuantFormat::Q8_0);

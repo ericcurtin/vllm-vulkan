@@ -257,6 +257,16 @@ impl Gemma4Weights {
     pub fn f32_slice(&self, name: &str) -> &[f32] {
         &self.get(name).data
     }
+
+    /// Non-panicking presence probe.
+    ///
+    /// `get` / `f32_slice` PANIC on a miss, so a readiness check written on top
+    /// of them is not a check at all — it is the very crash it was meant to
+    /// prevent, moved a few lines earlier. Every host-weight pre-flight uses
+    /// this instead.
+    pub fn contains(&self, name: &str) -> bool {
+        self.tensors.contains_key(name)
+    }
 }
 
 /// Architecture-neutral alias for the host-memory weight map.  Both the Gemma4

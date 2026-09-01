@@ -259,10 +259,20 @@ impl PipelineCache {
         // given codec's base still runs the f16 verify; only the codecs actually
         // resident need their cols siblings. When present, a compile failure is
         // still fatal (a silently-missing pipeline would fault at dispatch).
+        //
+        // `mul_mat_vec_bf16_f32_f32` rides along here for a different reason: it
+        // is NOT a dequant kernel, it is the bf16 twin of MV_COLS_SRC (same
+        // mul_mat_vec.comp, DATA_A_BF16, the same K_PER_ITER==2 NUM_COLS-generic
+        // loop the f16 base uses). Without these siblings a bf16-resident
+        // forward_batched had nowhere correct to go and was silently dispatched
+        // on the f16 kernel — see `matvec_cols_variant_core`. Best-effort like
+        // the quant bases: a build whose shader set omits the bf16 base simply
+        // has no bf16 cols variants, and the dispatch fails loudly by name.
         for quant_src in [
             "mul_mat_vec_q8_0deq_f32_f32",
             "mul_mat_vec_q4_0deq_f32_f32",
             "mul_mat_vec_q4_kdeq_f32_f32",
+            "mul_mat_vec_bf16_f32_f32",
         ] {
             if let Some(&spv) = shader_spvs.get(quant_src) {
                 for (rows, cols) in MV_COLS_RC {
@@ -1006,8 +1016,16 @@ impl Drop for PipelineCache {
 ///
 /// Invariant the caller asserts: tmpsh LDS = `cols*rows*bs*4 <= 16 KB`.
 pub(crate) fn cols_block_size(name: &str, cols: u32) -> u32 {
-    let f16 = name.contains("f16");
-    match (f16, cols) {
+    // "narrow float" = the 2-byte non-dequant bases: `mul_mat_vec_f16_f32_f32`
+    // and `mul_mat_vec_bf16_f32_f32`. The substring test catches bf16 too
+    // ("bf16" contains "f16") and that is the INTENDED answer, not a lucky
+    // accident: bf16 is the same mul_mat_vec.comp kernel shape as f16 (2-byte
+    // weight, K_PER_ITER==2, dequant is a shift, no per-block scale), so it
+    // wants the f16 BLOCK_SIZE column and not the dequant-in-loop bs=64. Stated
+    // explicitly so a future rename cannot quietly move bf16 to the other row.
+    // (`cols_block_size_bf16_tracks_f16` pins this.)
+    let narrow_float = name.contains("f16") || name.contains("bf16");
+    match (narrow_float, cols) {
         (true, 2) => 256,  // flat vs bs512 (~+5-14%); 256 mid of the band
         (true, 4) => 128,  // robust across qwen(256-opt)/gemma(64-128-opt); flat region
         (true, 8) => 64,   // both models agree: +50-92% at bs512
@@ -1045,10 +1063,29 @@ mod tests {
         }
     }
 
+    /// bf16 is the 2-byte non-dequant twin of the f16 base (same
+    /// mul_mat_vec.comp shape), so it must take the f16 BLOCK_SIZE column, NOT
+    /// the dequant-in-loop bs=64 row. Today that holds because "bf16" contains
+    /// "f16"; this pins the behaviour against a rename of either.
+    #[test]
+    fn cols_block_size_bf16_tracks_f16() {
+        for c in 1u32..=8 {
+            assert_eq!(
+                cols_block_size("mul_mat_vec_bf16_f32_f32", c),
+                cols_block_size("mul_mat_vec_f16_f32_f32", c),
+                "bf16 must take the f16 BLOCK_SIZE column at cols={c}"
+            );
+        }
+    }
+
     /// A bad BLOCK_SIZE here is a GPU hang / LDS OOM, not just a perf bug.
     #[test]
     fn every_pick_respects_the_16kb_lds_bound() {
-        for name in ["mul_mat_vec_f16_f32_f32", "mul_mat_vec_q8_0deq_f32_f32"] {
+        for name in [
+            "mul_mat_vec_f16_f32_f32",
+            "mul_mat_vec_bf16_f32_f32",
+            "mul_mat_vec_q8_0deq_f32_f32",
+        ] {
             for cols in 1u32..=8 {
                 let rows = rows_for(cols);
                 if rows * cols > 8 {
