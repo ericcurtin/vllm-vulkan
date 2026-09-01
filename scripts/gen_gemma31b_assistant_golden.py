@@ -40,13 +40,12 @@ Writes flat little-endian float32 .npy files to <out_dir>:
   full_k.npy    [4,4,512]            full_v.npy    [4,4,512]
   logits.npy    [262144]             post_proj.npy [5376]
 """
+
 import os
 import sys
 
-import numpy as np
 import mlx.core as mx
-import mlx.nn as nn
-
+import numpy as np
 from mlx_vlm.models.gemma4.config import TextConfig
 from mlx_vlm.models.gemma4.language import DecoderLayer
 
@@ -55,9 +54,13 @@ from mlx_vlm.models.gemma4.language import DecoderLayer
 # here and the test that consumes it always point at one checkpoint. There is
 # deliberately no hard-coded default: a machine-specific absolute path is how
 # these fixtures became unreproducible in the first place.
-_DIR = os.environ.get("VLLM_TEST_GEMMA31B_ASSISTANT_DIR") or os.environ.get("GEMMA31B_ASSISTANT_DIR")
+_DIR = os.environ.get("VLLM_TEST_GEMMA31B_ASSISTANT_DIR") or os.environ.get(
+    "GEMMA31B_ASSISTANT_DIR"
+)
 if not _DIR:
-    sys.exit("set VLLM_TEST_GEMMA31B_ASSISTANT_DIR to the gemma-4-31B-it-assistant checkpoint directory")
+    sys.exit(
+        "set VLLM_TEST_GEMMA31B_ASSISTANT_DIR to the gemma-4-31B-it-assistant checkpoint directory"
+    )
 CKPT = os.path.join(_DIR, "model.safetensors")
 
 HIDDEN = 1024
@@ -73,7 +76,7 @@ def save_npy(path, arr: np.ndarray):
 
 
 def rng_array(rng, shape, scale=1.0):
-    return (rng.standard_normal(shape).astype(np.float32) * scale)
+    return rng.standard_normal(shape).astype(np.float32) * scale
 
 
 def main(out_dir: str):
@@ -100,7 +103,12 @@ def main(out_dir: str):
         final_logit_softcapping=None,
         use_double_wide_mlp=False,
         enable_moe_block=False,
-        layer_types=["sliding_attention", "sliding_attention", "sliding_attention", "full_attention"],
+        layer_types=[
+            "sliding_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "full_attention",
+        ],
         tie_word_embeddings=True,
         rope_parameters={
             "full_attention": {
@@ -120,9 +128,15 @@ def main(out_dir: str):
     for i, layer in enumerate(layers):
         p = f"model.layers.{i}"
         layer.input_layernorm.weight = weights[f"{p}.input_layernorm.weight"]
-        layer.post_attention_layernorm.weight = weights[f"{p}.post_attention_layernorm.weight"]
-        layer.pre_feedforward_layernorm.weight = weights[f"{p}.pre_feedforward_layernorm.weight"]
-        layer.post_feedforward_layernorm.weight = weights[f"{p}.post_feedforward_layernorm.weight"]
+        layer.post_attention_layernorm.weight = weights[
+            f"{p}.post_attention_layernorm.weight"
+        ]
+        layer.pre_feedforward_layernorm.weight = weights[
+            f"{p}.pre_feedforward_layernorm.weight"
+        ]
+        layer.post_feedforward_layernorm.weight = weights[
+            f"{p}.post_feedforward_layernorm.weight"
+        ]
         layer.layer_scalar = weights[f"{p}.layer_scalar"]
         layer.mlp.gate_proj.weight = weights[f"{p}.mlp.gate_proj.weight"]
         layer.mlp.up_proj.weight = weights[f"{p}.mlp.up_proj.weight"]
@@ -134,7 +148,7 @@ def main(out_dir: str):
 
     norm_w = weights["model.norm.weight"]
     embed_w = weights["model.embed_tokens.weight"]  # [VOCAB, HIDDEN], tied lm_head
-    pre_proj_w = weights["pre_projection.weight"]    # [HIDDEN, 2*BACKBONE]
+    pre_proj_w = weights["pre_projection.weight"]  # [HIDDEN, 2*BACKBONE]
     post_proj_w = weights["post_projection.weight"]  # [BACKBONE, HIDDEN]
 
     # ---- synthetic tiny fixed input (deterministic) ----
@@ -148,24 +162,40 @@ def main(out_dir: str):
 
     # ---- forward ----
     inputs_embeds = mx.concatenate(
-        [mx.array(prev_token_embed)[None, None, :], mx.array(recurrent_hidden)[None, None, :]],
+        [
+            mx.array(prev_token_embed)[None, None, :],
+            mx.array(recurrent_hidden)[None, None, :],
+        ],
         axis=-1,
     )  # [1,1,2*BACKBONE], embed FIRST
     h = inputs_embeds @ pre_proj_w.T  # pre_projection, bias=False
 
-    sk_full = mx.array(full_k)[None].transpose(0, 2, 1, 3)   # [1, n_kv, kv_len, hd] to match KVCache-style layer input
+    sk_full = mx.array(full_k)[None].transpose(
+        0, 2, 1, 3
+    )  # [1, n_kv, kv_len, hd] to match KVCache-style layer input
     sv_full = mx.array(full_v)[None].transpose(0, 2, 1, 3)
     sk_slide = mx.array(sliding_k)[None].transpose(0, 2, 1, 3)
     sv_slide = mx.array(sliding_v)[None].transpose(0, 2, 1, 3)
 
     offset = mx.array(POSITION_OFFSET)
     for layer in layers:
-        shared_kv = (sk_slide, sv_slide) if layer.layer_type == "sliding_attention" else (sk_full, sv_full)
-        h, _, _ = layer(h, mask=None, cache=None, per_layer_input=None, shared_kv=shared_kv, offset=offset)
+        shared_kv = (
+            (sk_slide, sv_slide)
+            if layer.layer_type == "sliding_attention"
+            else (sk_full, sv_full)
+        )
+        h, _, _ = layer(
+            h,
+            mask=None,
+            cache=None,
+            per_layer_input=None,
+            shared_kv=shared_kv,
+            offset=offset,
+        )
 
     inner = mx.fast.rms_norm(h, norm_w, cfg.rms_norm_eps)
-    post_proj_out = inner @ post_proj_w.T          # post_projection, bias=False
-    logits = inner @ embed_w.T                     # tied lm_head, NO softcap
+    post_proj_out = inner @ post_proj_w.T  # post_projection, bias=False
+    logits = inner @ embed_w.T  # tied lm_head, NO softcap
 
     mx.eval(logits, post_proj_out)
 
@@ -189,8 +219,12 @@ def main(out_dir: str):
 if __name__ == "__main__":
     # Default to the in-repo fixture directory the Rust test reads, so a bare
     # run regenerates exactly the committed fixtures.
-    default_out = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                               "tests", "fixtures", "gemma31b_assistant_golden")
+    default_out = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "tests",
+        "fixtures",
+        "gemma31b_assistant_golden",
+    )
     out = sys.argv[1] if len(sys.argv) > 1 else default_out
     os.makedirs(out, exist_ok=True)
     main(out)

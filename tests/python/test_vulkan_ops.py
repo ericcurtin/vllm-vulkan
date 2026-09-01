@@ -499,11 +499,63 @@ def test_rms_norm_pc_matches_uncached_reference():
         )
 
 
+def test_matvec_pc_repeated_calls_hit_the_lru_cache():
+    """Structural gate on the `@lru_cache` `_matvec_pc` carries: repeated
+    calls with the SAME (T, K, N) — the exact access pattern the real
+    decode loop exercises, one call per Linear-family module per decoder
+    layer per token — must be served from the cache, not recomputed, and
+    must still pack the correct bytes.
+
+    This asserts the property the timing test below only measures
+    indirectly. A cache hit is observable exactly (`cache_info().hits`)
+    and is deterministic on any machine, so this gate runs in CI while
+    the wall-clock comparison stays opt-in.
+    """
+    import struct as _struct
+
+    def matvec_pc_reference(t: int, k: int, n: int) -> bytes:
+        return _struct.pack("13I", k, k, k, n, k * n, k, n, 0, 0, 1, t, t, 1)
+
+    shape = (1, 1536, 6144)
+
+    # Correctness: the cached packer agrees with the independent reference.
+    assert vulkan_ops._matvec_pc(*shape) == matvec_pc_reference(*shape)
+
+    # Cache behaviour: after one warming call, every further call with the
+    # same key is a hit and no further miss is recorded.
+    vulkan_ops._matvec_pc(*shape)
+    before = vulkan_ops._matvec_pc.cache_info()
+    repeats = 8
+    first = vulkan_ops._matvec_pc(*shape)
+    for _ in range(repeats - 1):
+        # Identity, not just equality: a hit returns the very same object.
+        assert vulkan_ops._matvec_pc(*shape) is first
+    after = vulkan_ops._matvec_pc.cache_info()
+
+    assert after.hits - before.hits == repeats, (
+        f"expected {repeats} cache hits, got {after.hits - before.hits}"
+    )
+    assert after.misses == before.misses, (
+        f"a repeated same-shape call recomputed: misses "
+        f"{before.misses} -> {after.misses}"
+    )
+
+
+@pytest.mark.slow  # wall-clock comparison; unreliable on shared CI runners
 def test_matvec_pc_repeated_calls_faster_than_uncached_reference():
     """Measures the actual speedup `@lru_cache` gives `_matvec_pc` on a
     cache-hit path — the exact access pattern the real decode loop
     exercises (same module, same shape, called once per generated
-    token)."""
+    token).
+
+    Opt-in (`-m slow`). The two sides of this comparison land within ~10%
+    of each other, so on a shared CI runner the result is noise, not
+    signal — it failed CI with 0.0010s vs 0.0009s. The invariant it is
+    really about (a repeat call is a cache hit, not a recompute) is gated
+    exactly and deterministically by
+    `test_matvec_pc_repeated_calls_hit_the_lru_cache` above, which does
+    run in CI.
+    """
     import struct as _struct
     import time
 

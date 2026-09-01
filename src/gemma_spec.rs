@@ -440,14 +440,28 @@ mod tests {
             .iter()
             .zip(logits_baseline.iter())
             .map(|(&a, &b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+            // NOT `f32::max`: it returns the non-NaN operand, so a NaN pair
+            // would fold away to 0.0 and the assertion below would pass on
+            // garbage. Propagate NaN instead, so `maxdiff == 0.0` is a real
+            // proof of bit-identity — which is what lets the redundant
+            // cosine assertion go (see below).
+            .fold(0.0f32, |m, d| if d.is_nan() || d > m { d } else { m });
         let cos = cosine(&logits_after_rollback, &logits_baseline);
         eprintln!(
             "partial-accept gate: accept_len={} frontier={expected_frontier} maxdiff={maxdiff:.8} cos={cos:.6}",
             step.accept_len
         );
         assert_eq!(maxdiff, 0.0, "post-rollback forward diverges from clean baseline (maxdiff {maxdiff})");
-        assert_eq!(cos, 1.0, "cos {cos} != 1.0");
+        // NO assertion on `cos`. The `maxdiff == 0.0` check above already
+        // proves the two vectors are bit-identical, which is strictly
+        // stronger than any cosine check, so this one could only ever add
+        // false failures. It did: `cosine` computes `dot / (na * nb)`, and on
+        // identical inputs that is `s / (sqrt(s) * sqrt(s))`, where
+        // `sqrt(s) * sqrt(s)` is NOT guaranteed to round back to `s`. Whether
+        // it does depends on the target's sqrt rounding and FMA contraction —
+        // so `assert_eq!(cos, 1.0)` passed on aarch64 and failed on x86-64 CI
+        // with cos = 0.99999994, on code that was correct. `cos` stays in the
+        // eprintln above as a diagnostic.
     }
 
     /// INC-5a gate 2, synthetic: identical to
@@ -544,13 +558,27 @@ mod tests {
             .iter()
             .zip(logits_baseline.iter())
             .map(|(&a, &b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+            // NOT `f32::max`: it returns the non-NaN operand, so a NaN pair
+            // would fold away to 0.0 and the assertion below would pass on
+            // garbage. Propagate NaN instead, so `maxdiff == 0.0` is a real
+            // proof of bit-identity — which is what lets the redundant
+            // cosine assertion go (see below).
+            .fold(0.0f32, |m, d| if d.is_nan() || d > m { d } else { m });
         let cos = cosine(&logits_after_rollback, &logits_baseline);
         eprintln!(
             "partial-accept gate (synthetic): accept_len={} frontier={expected_frontier} maxdiff={maxdiff:.8} cos={cos:.6}",
             step.accept_len
         );
         assert_eq!(maxdiff, 0.0, "post-rollback forward diverges from clean baseline (maxdiff {maxdiff})");
-        assert_eq!(cos, 1.0, "cos {cos} != 1.0");
+        // NO assertion on `cos`. The `maxdiff == 0.0` check above already
+        // proves the two vectors are bit-identical, which is strictly
+        // stronger than any cosine check, so this one could only ever add
+        // false failures. It did: `cosine` computes `dot / (na * nb)`, and on
+        // identical inputs that is `s / (sqrt(s) * sqrt(s))`, where
+        // `sqrt(s) * sqrt(s)` is NOT guaranteed to round back to `s`. Whether
+        // it does depends on the target's sqrt rounding and FMA contraction —
+        // so `assert_eq!(cos, 1.0)` passed on aarch64 and failed on x86-64 CI
+        // with cos = 0.99999994, on code that was correct. `cos` stays in the
+        // eprintln above as a diagnostic.
     }
 }
