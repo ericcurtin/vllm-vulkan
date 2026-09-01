@@ -1388,27 +1388,24 @@ impl VulkanModel {
             let v_p = self.act_ptr(ACT_V_OUT);
 
             // Pre-extract weight buffer ptr + format/aux kind BEFORE borrowing
-            // `eng` (mirrors gemma_resident_layer's identical pattern, avoiding
-            // borrow conflicts between self.gpu_weights and self.engine).
-            let (q_w, q_fmt, q_kind) = {
-                let w = &self.gpu_weights[&ln("self_attn.q_proj.weight")];
-                let (fmt, kind) = gemma_res_mv_kind(w);
-                (&w.buffer as *const compute::Buffer, fmt, kind)
-            };
-            let (k_w, k_fmt, k_kind) = {
-                let w = &self.gpu_weights[&ln("self_attn.k_proj.weight")];
-                let (fmt, kind) = gemma_res_mv_kind(w);
-                (&w.buffer as *const compute::Buffer, fmt, kind)
-            };
-            // Value-less global layers have NO v_proj tensor at all — do not
-            // index gpu_weights for it.
-            let v_meta = if !uses_k_eq_v {
-                let w = &self.gpu_weights[&ln("self_attn.v_proj.weight")];
-                let (fmt, kind) = gemma_res_mv_kind(w);
-                Some((&w.buffer as *const compute::Buffer, fmt, kind))
-            } else {
-                None
-            };
+            // `eng` (`MvW` is Copy raw pointers, so the `gpu_weights` borrow ends
+            // before `self.engine.as_mut()` takes its mutable one).
+            //
+            // This body keeps its own CPU orchestration (norms, RoPE and SDPA run
+            // on the host here; only the matmuls are GPU) so it has no recordable
+            // sequence in common with the resident paths — but it resolves its
+            // weights through the SAME `layer_proj_weights`, which reads each
+            // weight's own recorded format and drops `v_proj` on a value-less
+            // layer. Those two rules are the ones that had to be fixed three times
+            // across copies; there is now one copy of them.
+            let mv = self.layer_proj_weights(
+                layer_idx, uses_k_eq_v, &[ProjW::Q, ProjW::K, ProjW::V]);
+            let q = mv[ProjW::Q as usize].expect("q_proj is unconditional");
+            let k = mv[ProjW::K as usize].expect("k_proj is unconditional");
+            let (q_w, q_fmt, q_kind) = (q.ptr, q.format, q.kind);
+            let (k_w, k_fmt, k_kind) = (k.ptr, k.format, k.kind);
+            // `None` exactly on a value-less global layer (no v_proj tensor at all).
+            let v_meta = mv[ProjW::V as usize].map(|v| (v.ptr, v.format, v.kind));
 
             // SUBMIT 1: Q, K, V in one command buffer (no barriers needed — independent)
             let eng = self.engine.as_mut().unwrap();
@@ -1529,11 +1526,8 @@ impl VulkanModel {
             unsafe { (*self.act_ptr_mut(ACT_O_IN)).write(&attnb).unwrap(); }
             let oi   = self.act_ptr(ACT_O_IN);
             let oo   = self.act_ptr(ACT_O_OUT);
-            let (ow, o_fmt, o_kind) = {
-                let w = &self.gpu_weights[&ln("self_attn.o_proj.weight")];
-                let (fmt, kind) = gemma_res_mv_kind(w);
-                (&w.buffer as *const compute::Buffer, fmt, kind)
-            };
+            let o = self.layer_proj_mv(layer_idx, ProjW::O);
+            let (ow, o_fmt, o_kind) = (o.ptr, o.format, o.kind);
             let eng  = self.engine.as_mut().unwrap();
             let cb   = eng.begin_batch().unwrap();
             unsafe {
@@ -1574,21 +1568,12 @@ impl VulkanModel {
             let mid_p  = self.act_ptr(ACT_MID);
             let down_p = self.act_ptr(ACT_DOWN);
 
-            let (gw, g_fmt, g_kind) = {
-                let w = &self.gpu_weights[&ln("mlp.gate_proj.weight")];
-                let (fmt, kind) = gemma_res_mv_kind(w);
-                (&w.buffer as *const compute::Buffer, fmt, kind)
-            };
-            let (uw, u_fmt, u_kind) = {
-                let w = &self.gpu_weights[&ln("mlp.up_proj.weight")];
-                let (fmt, kind) = gemma_res_mv_kind(w);
-                (&w.buffer as *const compute::Buffer, fmt, kind)
-            };
-            let (dw, d_fmt, d_kind) = {
-                let w = &self.gpu_weights[&ln("mlp.down_proj.weight")];
-                let (fmt, kind) = gemma_res_mv_kind(w);
-                (&w.buffer as *const compute::Buffer, fmt, kind)
-            };
+            let g = self.layer_proj_mv(layer_idx, ProjW::Gate);
+            let u = self.layer_proj_mv(layer_idx, ProjW::Up);
+            let d = self.layer_proj_mv(layer_idx, ProjW::Down);
+            let (gw, g_fmt, g_kind) = (g.ptr, g.format, g.kind);
+            let (uw, u_fmt, u_kind) = (u.ptr, u.format, u.kind);
+            let (dw, d_fmt, d_kind) = (d.ptr, d.format, d.kind);
 
             // Push constants for elementwise ops over ffn_inter elements
             // gelu_f32: local_size_x=512 (gelu.comp — the wg math below MUST
