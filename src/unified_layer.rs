@@ -212,6 +212,71 @@ impl LayerSpec {
     }
 }
 
+/// Every `gpu_weights` key the unified path will INDEX (`self.gpu_weights[..]`,
+/// which panics on a miss — it is not a lookup) while executing `layer_idx`
+/// under `spec`.
+///
+/// Kept beside `LayerSpec` and derived from the SAME spec fields the recording
+/// paths branch on, so the pre-flight and the execution cannot drift:
+///
+///  - q / k / o / gate / up / down: indexed unconditionally by both
+///    `gpu_layer_1cb` and `gpu_layer_2cb`.
+///  - v: NOT required when `spec.uses_k_eq_v`. Value-less global Gemma layers
+///    carry no `v_proj` tensor on disk AT ALL; `is_layer_1cb_eligible` routes
+///    them to `gpu_layer_2cb`, which reads `v_proj` only under
+///    `if spec.uses_k_eq_v { .. } else { .. }`. Demanding the key here would
+///    re-break the very layers an earlier fix un-broke, only from the other
+///    side (a spurious refusal instead of a panic).
+///  - PLE gate/projection: required only when `ple.ple_dim > 0`.
+///    `LayerSpec::gemma` populates `ple: Some(..)` on EVERY gemma layer (the
+///    `layer_scalar` multiply is unconditional), so `ple.is_some()` is NOT the
+///    condition — `unified_ple_tail` gates the two tensor lookups on
+///    `ple_dim > 0`, and g12b/g31b (`hidden_size_per_layer_input == 0`) carry
+///    no `per_layer*` tensors on disk.
+///
+/// Deliberately NOT included: `model.layers.{i}.layer_scalar` and the norm
+/// weights. Those come from `self.inner.weights` / `unified_norm_w`, not
+/// `gpu_weights`, and the norms already have their own `ensure_unified_norm`
+/// readiness pass.
+pub(crate) fn unified_layer_weight_keys(spec: &LayerSpec, layer_idx: usize) -> Vec<String> {
+    let ln = |s: &str| format!("model.layers.{layer_idx}.{s}");
+    let mut keys = vec![
+        ln("self_attn.q_proj.weight"),
+        ln("self_attn.k_proj.weight"),
+        ln("self_attn.o_proj.weight"),
+        ln("mlp.gate_proj.weight"),
+        ln("mlp.up_proj.weight"),
+        ln("mlp.down_proj.weight"),
+    ];
+    if !spec.uses_k_eq_v {
+        keys.push(ln("self_attn.v_proj.weight"));
+    }
+    if spec.ple.as_ref().is_some_and(|p| p.ple_dim > 0) {
+        keys.push(ln("per_layer_input_gate.weight"));
+        keys.push(ln("per_layer_projection.weight"));
+    }
+    keys
+}
+
+/// First `gpu_weights` key that is missing for ANY executed layer, or `None` if
+/// every layer is fully backed.
+///
+/// `specs` must be exactly the layers the caller will EXECUTE — the qwen path
+/// runs `0..num_hidden_layers`, the gemma path runs `pp_start..pp_end`. Passing
+/// the whole model on a PP rank that owns a slice would turn this guard into a
+/// spurious startup fallback on every non-first stage.
+pub(crate) fn first_missing_unified_weight(
+    specs: &[(usize, LayerSpec)],
+    present: impl Fn(&str) -> bool,
+) -> Option<String> {
+    for (layer_idx, spec) in specs {
+        for key in unified_layer_weight_keys(spec, *layer_idx) {
+            if !present(&key) { return Some(key); }
+        }
+    }
+    None
+}
+
 impl VulkanModel {
     /// Stable raw pointer to one persistent `UR_*` unified activation buffer.
     ///
@@ -898,10 +963,42 @@ impl VulkanModel {
         let vocab = cfg.vocab_size;
         let eps = cfg.rms_norm_eps;
 
-        let l0_q = "model.layers.0.self_attn.q_proj.weight".to_string();
-        let mut ready = self.engine.is_some()
-            && self.gpu_weights.contains_key(&l0_q)
-            && self.init_ures_bufs();
+        // PRE-FLIGHT. `gpu_layer` INDEXES `self.gpu_weights[..]` for every
+        // projection of every layer it records — a miss is a panic in the middle
+        // of an open command buffer, not a recoverable error. Probing layer 0's
+        // q_proj alone enabled the whole path on ONE key, so any other missing
+        // projection (a truncated / partially-uploaded checkpoint, a loader that
+        // declined to upload one tensor) got past readiness and died deep in the
+        // recording loop. Validate EVERY key of EVERY executed layer instead.
+        //
+        // Executed range = `0..cfg.num_hidden_layers` (the recording loop below),
+        // matching the existing norm-staging loop; the qwen unified path is not
+        // PP-sliced. The old `contains_key("model.layers.0.self_attn.q_proj.weight")`
+        // term is dropped here rather than kept alongside: layer 0 is inside that
+        // range and `q_proj` is unconditional, so the scan below is a strict
+        // superset of it.
+        let lm_name = self.qwen.as_ref().unwrap().lm_head_name.clone();
+        let mut ready = self.engine.is_some();
+        if ready {
+            let specs: Vec<(usize, LayerSpec)> = (0..cfg.num_hidden_layers)
+                .map(|li| (li, LayerSpec::qwen(&cfg, li)))
+                .collect();
+            if let Some(missing) =
+                first_missing_unified_weight(&specs, |k| self.gpu_weights.contains_key(k))
+            {
+                log::warn!("forward_unified_qwen: unified path OFF — gpu_weights has no \
+                            '{missing}'; falling back to forward_qwen_gpu");
+                ready = false;
+            } else if !self.gpu_weights.contains_key(&lm_name) {
+                // The LM head is indexed the same way after the layer loop.
+                log::warn!("forward_unified_qwen: unified path OFF — gpu_weights has no \
+                            lm_head '{lm_name}'; falling back to forward_qwen_gpu");
+                ready = false;
+            }
+        }
+        // Buffers are allocated only once the weights are known good (as before:
+        // `init_ures_bufs` sat behind the weight probe, not in front of it).
+        ready = ready && self.init_ures_bufs();
         if ready {
             // Stage all norm weights once (stable pointers during recording).
             for li in 0..cfg.num_hidden_layers {
@@ -931,7 +1028,7 @@ impl VulkanModel {
         }
 
         // Final norm + LM head (no softcap). Reuse UR_X / UR_LOGITS.
-        let lm_name = self.qwen.as_ref().unwrap().lm_head_name.clone();
+        // `lm_name` was resolved (and its key validated) in the pre-flight above.
         let ha = self.ures_ptr(UR_HA);
         let xp = self.ures_ptr(UR_X);
         let logitp = self.ures_ptr(UR_LOGITS);
@@ -957,9 +1054,33 @@ impl VulkanModel {
         let h = cfg.hidden_size;
         let ple_dim = cfg.hidden_size_per_layer_input;
 
+        // PRE-FLIGHT: see the twin in `forward_unified_qwen`. Executed range is
+        // `pp_start..pp_end` (the recording loop below), NOT the whole model —
+        // validating layers this rank does not own would refuse every PP stage.
+        //
+        // The `l0_q` probe is kept as-is on purpose: `gemma_embed_and_ple` and
+        // `gemma_final` around the layer loop are whole-model operations, so this
+        // entry is only valid on a rank that holds the head of the model. It is a
+        // weaker statement than the per-layer scan, not a redundant one.
         let l0_q = "model.layers.0.self_attn.q_proj.weight".to_string();
         let mut ready = self.engine.is_some()
-            && self.gpu_weights.contains_key(&l0_q)
+            && self.gpu_weights.contains_key(&l0_q);
+        if ready {
+            let specs: Vec<(usize, LayerSpec)> = (self.pp_start..self.pp_end)
+                // `layer_ple` / `layer_scalar` are execution inputs, not key
+                // selectors: only `uses_k_eq_v` and `ple.ple_dim` (both pure
+                // functions of `cfg` and `li`) decide which keys are required.
+                .map(|li| (li, LayerSpec::gemma(&cfg, li, Vec::new(), 0.0)))
+                .collect();
+            if let Some(missing) =
+                first_missing_unified_weight(&specs, |k| self.gpu_weights.contains_key(k))
+            {
+                log::warn!("forward_unified_gemma: unified path OFF — gpu_weights has no \
+                            '{missing}'; falling back to forward_gpu");
+                ready = false;
+            }
+        }
+        ready = ready
             && self.init_ures_bufs()
             // gemma_final reuses ACT_QKV_IN for the LM-head input; ensure those
             // buffers exist (the reference inits them inside forward_layer_gpu_matmuls).
@@ -993,5 +1114,177 @@ impl VulkanModel {
 
         let hidden = read_f32_buf(unsafe { &*self.ures_ptr(UR_HA) }, h);
         Ok(self.gemma_final(&hidden))
+    }
+}
+
+#[cfg(test)]
+mod unified_readiness_tests {
+    use super::{first_missing_unified_weight, unified_layer_weight_keys, LayerSpec};
+    use crate::model::{Gemma4Config, Qwen3Config};
+    use std::collections::HashSet;
+
+    fn qwen_cfg(layers: usize) -> Qwen3Config {
+        Qwen3Config {
+            hidden_size: 128, num_hidden_layers: layers, num_attention_heads: 4,
+            num_key_value_heads: 2, head_dim: 32, intermediate_size: 256,
+            vocab_size: 512, rms_norm_eps: 1e-6, rope_theta: 1e6,
+            tie_word_embeddings: false,
+        }
+    }
+
+    fn gemma_specs(cfg: &Gemma4Config, range: std::ops::Range<usize>) -> Vec<(usize, LayerSpec)> {
+        range.map(|li| (li, LayerSpec::gemma(cfg, li, Vec::new(), 0.0))).collect()
+    }
+
+    fn qwen_specs(cfg: &Qwen3Config, range: std::ops::Range<usize>) -> Vec<(usize, LayerSpec)> {
+        range.map(|li| (li, LayerSpec::qwen(cfg, li))).collect()
+    }
+
+    /// A "checkpoint": every key every listed spec needs, so the scan is clean.
+    fn complete_checkpoint(specs: &[(usize, LayerSpec)]) -> HashSet<String> {
+        specs.iter()
+            .flat_map(|(li, s)| unified_layer_weight_keys(s, *li))
+            .collect()
+    }
+
+    // ── key selection ────────────────────────────────────────────────────────
+
+    /// Qwen needs all seven projections and never a PLE tensor.
+    #[test]
+    fn qwen_layer_requires_all_seven_projections_and_no_ple() {
+        let cfg = qwen_cfg(2);
+        let keys = unified_layer_weight_keys(&LayerSpec::qwen(&cfg, 1), 1);
+        for suffix in ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
+                       "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"] {
+            assert!(keys.contains(&format!("model.layers.1.{suffix}.weight")),
+                    "qwen layer must require {suffix}: {keys:?}");
+        }
+        assert!(!keys.iter().any(|k| k.contains("per_layer")), "{keys:?}");
+        assert_eq!(keys.len(), 7);
+    }
+
+    /// ANTI-REGRESSION (v_proj). g12b's period-6 global layers are value-less
+    /// (`attention_k_eq_v`): there is no `v_proj` tensor on disk at all, and an
+    /// earlier fix stopped `gpu_layer_2cb` indexing one. Requiring the key here
+    /// would break the same layers from the other side — the model would be
+    /// refused for a tensor it is not supposed to have.
+    #[test]
+    fn gemma_value_less_global_layer_does_not_require_v_proj() {
+        let cfg = Gemma4Config::g12b();
+        assert!(cfg.layer_uses_k_eq_v(5), "layer 5 must be a value-less global layer");
+        let keys = unified_layer_weight_keys(&LayerSpec::gemma(&cfg, 5, Vec::new(), 0.0), 5);
+        assert!(!keys.contains(&"model.layers.5.self_attn.v_proj.weight".to_string()),
+                "value-less global layer must NOT require v_proj: {keys:?}");
+        assert!(keys.contains(&"model.layers.5.self_attn.k_proj.weight".to_string()));
+
+        // And end to end: a real g12b checkpoint (no v_proj on global layers)
+        // must scan clean rather than being refused.
+        let specs = gemma_specs(&cfg, 0..cfg.num_hidden_layers);
+        let present = complete_checkpoint(&specs);
+        assert!(!present.iter().any(|k| k.starts_with("model.layers.5.self_attn.v_proj")));
+        assert_eq!(first_missing_unified_weight(&specs, |k| present.contains(k)), None);
+    }
+
+    /// The conditional cuts BOTH ways: sliding layers do carry `v_proj`, and a
+    /// checkpoint missing it there must still be refused.
+    #[test]
+    fn gemma_sliding_layer_still_requires_v_proj() {
+        let cfg = Gemma4Config::g12b();
+        assert!(!cfg.layer_uses_k_eq_v(0), "layer 0 must be a sliding layer");
+        let specs = gemma_specs(&cfg, 0..cfg.num_hidden_layers);
+        let mut present = complete_checkpoint(&specs);
+        assert!(present.remove("model.layers.0.self_attn.v_proj.weight"));
+        assert_eq!(first_missing_unified_weight(&specs, |k| present.contains(k)),
+                   Some("model.layers.0.self_attn.v_proj.weight".to_string()));
+    }
+
+    /// ANTI-REGRESSION (PLE). `LayerSpec::gemma` sets `ple: Some(..)` on EVERY
+    /// gemma layer (the `layer_scalar` multiply is unconditional), so
+    /// `ple.is_some()` is the wrong test. g12b/g31b have
+    /// `hidden_size_per_layer_input == 0` and carry no `per_layer*` tensors;
+    /// demanding them would refuse both models outright.
+    #[test]
+    fn no_ple_checkpoint_does_not_require_per_layer_tensors() {
+        let cfg = Gemma4Config::g12b();
+        assert_eq!(cfg.hidden_size_per_layer_input, 0);
+        let spec = LayerSpec::gemma(&cfg, 0, Vec::new(), 0.0);
+        assert!(spec.ple.is_some(), "the trap: ple is Some even with ple_dim 0");
+        let keys = unified_layer_weight_keys(&spec, 0);
+        assert!(!keys.iter().any(|k| k.contains("per_layer")), "{keys:?}");
+    }
+
+    /// E2B (`hidden_size_per_layer_input == 256`) does need them.
+    #[test]
+    fn ple_checkpoint_requires_per_layer_tensors() {
+        let cfg = Gemma4Config::e2b();
+        assert!(cfg.hidden_size_per_layer_input > 0);
+        let keys = unified_layer_weight_keys(&LayerSpec::gemma(&cfg, 3, Vec::new(), 0.0), 3);
+        assert!(keys.contains(&"model.layers.3.per_layer_input_gate.weight".to_string()), "{keys:?}");
+        assert!(keys.contains(&"model.layers.3.per_layer_projection.weight".to_string()), "{keys:?}");
+    }
+
+    // ── the readiness scan ───────────────────────────────────────────────────
+
+    /// THE HEADLINE TEST. A checkpoint whose layer-0 q_proj is present but which
+    /// is missing a MID-SLICE weight must be caught by the pre-flight, BEFORE
+    /// the unified path engages. The old probe looked only at layer 0's q_proj,
+    /// declared itself ready, and then panicked indexing
+    /// `self.gpu_weights[&ln("mlp.down_proj.weight")]` in the middle of an open
+    /// command buffer at layer 31.
+    #[test]
+    fn mid_slice_missing_weight_is_caught_before_the_path_engages() {
+        let cfg = Gemma4Config::g12b();
+        let specs = gemma_specs(&cfg, 0..cfg.num_hidden_layers);
+        let mut present = complete_checkpoint(&specs);
+        let hole = "model.layers.31.mlp.down_proj.weight".to_string();
+        assert!(present.remove(&hole));
+
+        // The OLD readiness rule would have said "go".
+        assert!(present.contains("model.layers.0.self_attn.q_proj.weight"),
+                "precondition: the layer-0 probe still passes on this checkpoint");
+
+        assert_eq!(first_missing_unified_weight(&specs, |k| present.contains(k)), Some(hole));
+    }
+
+    /// Same for qwen, and for a hole in the LAST layer (the scan must not stop
+    /// early or check only a prefix of the model).
+    #[test]
+    fn qwen_missing_weight_in_the_last_layer_is_caught() {
+        let cfg = qwen_cfg(8);
+        let specs = qwen_specs(&cfg, 0..cfg.num_hidden_layers);
+        let mut present = complete_checkpoint(&specs);
+        let hole = "model.layers.7.self_attn.o_proj.weight".to_string();
+        assert!(present.remove(&hole));
+        assert!(present.contains("model.layers.0.self_attn.q_proj.weight"));
+        assert_eq!(first_missing_unified_weight(&specs, |k| present.contains(k)), Some(hole));
+    }
+
+    /// The executed RANGE is load-bearing. A PP rank owning `[12,24)` holds only
+    /// those layers' weights: scanning its own slice must pass, while scanning
+    /// the whole model would refuse it — which is why the gemma call site passes
+    /// `pp_start..pp_end` and not `0..num_hidden_layers`.
+    #[test]
+    fn pp_rank_validates_only_the_layers_it_executes() {
+        let cfg = Gemma4Config::g12b();
+        let owned = gemma_specs(&cfg, 12..24);
+        let present = complete_checkpoint(&owned);
+        assert_eq!(first_missing_unified_weight(&owned, |k| present.contains(k)), None);
+
+        let whole_model = gemma_specs(&cfg, 0..cfg.num_hidden_layers);
+        assert!(first_missing_unified_weight(&whole_model, |k| present.contains(k)).is_some(),
+                "scanning unowned layers on a PP rank must not be what the guard does");
+    }
+
+    /// A complete checkpoint is not refused (the guard adds no false negatives).
+    #[test]
+    fn complete_checkpoints_scan_clean() {
+        for specs in [
+            gemma_specs(&Gemma4Config::g12b(), 0..48),
+            gemma_specs(&Gemma4Config::e2b(), 0..35),
+            qwen_specs(&qwen_cfg(6), 0..6),
+        ] {
+            let present = complete_checkpoint(&specs);
+            assert_eq!(first_missing_unified_weight(&specs, |k| present.contains(k)), None);
+        }
     }
 }

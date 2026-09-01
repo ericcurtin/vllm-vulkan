@@ -222,11 +222,12 @@ impl VulkanModel {
         // the buffer (memory corruption, not a Rust panic). `start_pos` arrives
         // straight from Python via `forward_batched`, so it is untrusted.
         // Same precedent as `forward_prefill_gemma`.
-        if start_pos + t > max_seq {
-            return Err(format!(
-                "forward_batched: start_pos {start_pos} + t {t} exceeds max_seq_len {max_seq} — \
-                 construct VulkanModel with a larger max_seq_len").into());
-        }
+        // `start_pos + t` is itself attacker-reachable arithmetic: a huge
+        // `start_pos` OVERFLOWS the add before the comparison ever runs
+        // (debug: panic; release: wrap to a small value that PASSES this
+        // bound and then feeds `k_dst_off` a wrapped offset). `checked_add`
+        // folds the overflow into the same refusal as an out-of-range span.
+        let end_pos = batched_end_pos(start_pos, t, max_seq)?;
 
         if !self.init_bres_bufs() {
             return Err("forward_batched: failed to allocate T-wide buffers".to_string().into());
@@ -316,7 +317,9 @@ impl VulkanModel {
             }
 
             // KV bookkeeping (qwen dense: every layer appends its own KV).
-            self.qwen.as_mut().unwrap().kv_caches[layer_idx].seq_len = start_pos + t;
+            // `end_pos`, not a second `start_pos + t`: the value here is the one
+            // already proven in-range above, so the two can never disagree.
+            self.qwen.as_mut().unwrap().kv_caches[layer_idx].seq_len = end_pos;
             let kv_ptr = match self.ensure_gpu_kv(layer_idx, num_kv, head_dim, max_seq) {
                 Some(p) => p,
                 None => return Err("forward_batched: resident KV buffer unavailable".to_string().into()),
@@ -510,5 +513,81 @@ impl VulkanModel {
         let logits = read_f32_buf(&self.bres_bufs[BR_LOGITS], t * vocab);
         prof_add("batched_logits_readback", logits_readback_ts);
         Ok(logits)
+    }
+}
+
+/// Bound the whole appended span `[start_pos, start_pos+t)` against the
+/// PHYSICAL resident KV plane (`max_seq` == `VulkanModel::max_seq_len`, the
+/// slot count `ensure_gpu_kv` allocates), returning the validated END position.
+///
+/// `max_seq` here is the KV-plane CAPACITY, not the model's config
+/// `max_position_embeddings`: `k_dst_off`/`v_dst_off` in `forward_batched_impl`
+/// are raw byte offsets into that plane, consumed by `vkCmdCopyBuffer`, so the
+/// capacity is the only bound that prevents a write past the buffer end.
+///
+/// Split out of `forward_batched_impl` so the arithmetic is unit-testable
+/// without a Vulkan device. The message is the pre-existing one, verbatim.
+pub(crate) fn batched_end_pos(start_pos: usize, t: usize, max_seq: usize) -> Result<usize, String> {
+    match start_pos.checked_add(t) {
+        Some(end) if end <= max_seq => Ok(end),
+        _ => Err(format!(
+            "forward_batched: start_pos {start_pos} + t {t} exceeds max_seq_len {max_seq} — \
+             construct VulkanModel with a larger max_seq_len")),
+    }
+}
+
+#[cfg(test)]
+mod batched_bounds_tests {
+    use super::batched_end_pos;
+
+    /// In-range spans return the END position, so the caller has no reason to
+    /// recompute `start_pos + t` (the `seq_len` write uses this value).
+    #[test]
+    fn in_range_span_returns_end_position() {
+        assert_eq!(batched_end_pos(0, 4, 2048), Ok(4));
+        assert_eq!(batched_end_pos(2040, 8, 2048), Ok(2048));  // exact fit
+        assert_eq!(batched_end_pos(2047, 1, 2048), Ok(2048));
+    }
+
+    /// Plain over-capacity is still refused with the pre-existing message.
+    #[test]
+    fn over_capacity_span_is_refused() {
+        let e = batched_end_pos(2041, 8, 2048).unwrap_err();
+        assert!(e.contains("exceeds max_seq_len 2048"), "{e}");
+        assert!(e.contains("start_pos 2041 + t 8"), "{e}");
+    }
+
+    /// THE REGRESSION GUARD. `start_pos` arrives untrusted from Python. With the
+    /// old `if start_pos + t > max_seq` the add itself overflows BEFORE the
+    /// comparison: debug builds panic (`attempt to add with overflow`), release
+    /// builds wrap to a tiny value that PASSES the bound and then hands
+    /// `k_dst_off` a wrapped byte offset. Either way the guard never fires.
+    /// `checked_add` must turn every one of these into the ordinary refusal.
+    #[test]
+    fn overflowing_start_pos_is_refused_not_wrapped() {
+        for start in [usize::MAX, usize::MAX - 1, usize::MAX - 7] {
+            let r = batched_end_pos(start, 8, 2048);
+            assert!(r.is_err(), "start_pos={start} t=8 must be refused, got {r:?}");
+            assert!(r.unwrap_err().contains("exceeds max_seq_len"));
+        }
+        // The wrap that a release build would have accepted: MAX-1 + 2 == 0,
+        // which is <= max_seq. Must be an error, never Ok(0).
+        assert!(batched_end_pos(usize::MAX - 1, 2, 2048).is_err());
+    }
+
+    /// Property: whenever the check passes, the returned end is a usable KV
+    /// slot bound — every appended position `start_pos..end` is inside the plane.
+    #[test]
+    fn ok_implies_every_appended_position_is_in_plane() {
+        let max_seq = 64usize;
+        for start in [0usize, 1, 31, 63, 64, 65, usize::MAX - 4, usize::MAX] {
+            for t in 1..=8usize {
+                if let Ok(end) = batched_end_pos(start, t, max_seq) {
+                    assert_eq!(end, start + t);
+                    assert!(end <= max_seq);
+                    assert!(start < max_seq, "start {start} must itself be a valid slot");
+                }
+            }
+        }
     }
 }
