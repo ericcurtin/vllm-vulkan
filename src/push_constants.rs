@@ -371,19 +371,49 @@ pub(crate) fn matvec_cols_variant_by_format(fmt: QuantFormat, n: usize, t: usize
 ///     shared with the decode kernel) so each weight is read+dequantized once
 ///     per workgroup and MAC'd across all T columns. pipeline.rs compiles these
 ///     `_r*_c*` siblings from the same SPIR-V.
-///   - anything else (f16/bf16/…) -> the f16 scalar base (the pre-flip behavior;
-///     f16 weights already amortize the read across columns with no dequant).
+///   - f16 / bf16 / f32 -> that dtype's OWN scalar base. Each is the same
+///     `mul_mat_vec.comp` SPIR-V under a different `DATA_A_*`, so the `_r*_c*`
+///     sibling is a spec-constant recompile (NUM_COLS), not a new shader.
+///
+/// THE MATCH IS EXHAUSTIVE ON PURPOSE. It used to end in `_ =>
+/// matvec_shader_core(true, false)`, i.e. "everything that is not q8_0/q4 is
+/// f16". That silently routed a `Bf16` weight — a LIVE residency format
+/// (`VLLM_VULKAN_QUANT=bf16`; see the `mul_mat_vec_bf16_f32_f32` geometry
+/// entries below) — through the **f16** column kernel, which reads the bf16
+/// weight bytes under the wrong exponent bias and returns wrong verify logits
+/// with no error. The single-column `matvec_variant_core` has had a dedicated
+/// `Bf16` arm since it was introduced, so the two selectors disagreed about the
+/// same weight. Listing every variant makes the next codec a COMPILE error here
+/// instead of a silent mis-dispatch.
+///
+/// PACKED formats (Mlx4/Nvfp4/Fp8) have no `_c{t}` sibling at all — they need
+/// extra scale/bias bindings — and are refused upstream by
+/// `batched_forward::bres_proj`. Should a new caller ever reach here with one,
+/// the deliberately-unregistered base below turns it into a named
+/// `Shader '...' not found` error at dispatch instead of a plain matvec reading
+/// 4-bit nibbles as f16.
+///
 /// Bit-exact per column vs the serial decode matvec: same kernel, same
 /// accumulation order; the shader's dequant-hoist reorder is bit-neutral.
 pub(crate) fn matvec_cols_variant_core(quant: QuantFormat, n: usize, t: usize) -> (String, u32) {
     if t <= 1 {
-        return matvec_variant_core(quant, use_subgroup_flag(), true, matvec_rows_override(), n);
+        // Defer to the single-column selector rather than re-deriving it: it
+        // already keys `f16_weight` off the format (`matches!(fmt, F16)`).
+        // Re-deriving it here as a hardcoded `true` was the same defect as the
+        // `_` arm below, one format over (an `F32` weight got the f16 shader).
+        return matvec_variant_by_format(quant, n);
     }
     let base = match quant {
         QuantFormat::Q8_0 => "mul_mat_vec_q8_0deq_f32_f32",
         QuantFormat::Q4_0 => "mul_mat_vec_q4_0deq_f32_f32",
         QuantFormat::Q4_K => "mul_mat_vec_q4_kdeq_f32_f32",
-        _ => matvec_shader_core(true, false),
+        QuantFormat::Bf16 => "mul_mat_vec_bf16_f32_f32",
+        QuantFormat::F16 => "mul_mat_vec_f16_f32_f32",
+        QuantFormat::F32 => "mul_mat_vec_f32_f32_f32",
+        // No such pipeline is ever compiled — see the doc comment.
+        QuantFormat::Mlx4 | QuantFormat::Nvfp4 | QuantFormat::Fp8 => {
+            "mul_mat_vec_PACKED_HAS_NO_COLS_KERNEL"
+        }
     };
     let rows = (8 / t as u32).max(1);
     (format!("{base}_r{rows}_c{t}"), rows)
@@ -1888,6 +1918,72 @@ pub(crate) fn f32_to_f16_bytes(data: &[f32]) -> Vec<u8> {
 pub(crate) fn read_f32_buf(buf: &compute::Buffer, count: usize) -> Vec<f32> {
     let ptr = buf.mapped_ptr.unwrap() as *const f32;
     unsafe { std::slice::from_raw_parts(ptr, count).to_vec() }
+}
+
+// Dispatch-selector tests that are NOT model-specific. Deliberately OUTSIDE
+// `dispatch_tests` below: that module is `feature = "qwen35"`-gated, so anything
+// placed there is invisible to the gemma CI job — while
+// `matvec_cols_variant_core` is shared by every model.
+#[cfg(test)]
+mod cols_dispatch_tests {
+    use super::{matvec_cols_variant_core, matvec_variant_by_format};
+    use crate::flags::QuantFormat;
+
+    /// PR #89 review r3900946581. The batched (`t>1`) selector used to end in
+    /// `_ => matvec_shader_core(true, false)`, i.e. "anything that is not
+    /// q8_0/q4 is f16". `VLLM_VULKAN_QUANT=bf16` is a LIVE residency format with
+    /// its own single-column kernel, so a bf16-resident batched verify was
+    /// dispatched on the **f16** column kernel: the same bytes read under the
+    /// wrong exponent bias, wrong logits, no error.
+    ///
+    /// The invariant pinned here is not "bf16 has a `_c{t}` name" but the
+    /// general one: the multi-column selector must name the SAME weight-dtype
+    /// base the single-column decode selector names, for every format and every
+    /// T. A disagreement between the two selectors IS a reinterpretation of the
+    /// weight bytes.
+    ///
+    /// Env-independent by construction: the `t>1` path reads no flags, and the
+    /// single-column comparison is a prefix test, so a `VLLM_VULKAN_SUBGROUP` /
+    /// `VLLM_VULKAN_MATVEC_ROWS` set by a neighbouring test cannot flip it.
+    #[test]
+    fn matvec_cols_variant_never_reinterprets_the_weight_dtype() {
+        const BASES: [(QuantFormat, &str); 6] = [
+            // Bf16 first: it is the format the review found (r3900946581).
+            (QuantFormat::Bf16, "mul_mat_vec_bf16_f32_f32"),
+            (QuantFormat::F16, "mul_mat_vec_f16_f32_f32"),
+            (QuantFormat::F32, "mul_mat_vec_f32_f32_f32"),
+            (QuantFormat::Q8_0, "mul_mat_vec_q8_0deq_f32_f32"),
+            (QuantFormat::Q4_0, "mul_mat_vec_q4_0deq_f32_f32"),
+            (QuantFormat::Q4_K, "mul_mat_vec_q4_kdeq_f32_f32"),
+        ];
+        for (fmt, base) in BASES {
+            let (single, _) = matvec_variant_by_format(fmt, 2048);
+            assert!(
+                single.starts_with(base),
+                "single-column {fmt:?} -> {single}, expected the {base} family"
+            );
+            for t in 2..=8usize {
+                let rows = (8 / t as u32).max(1);
+                let (cols, r) = matvec_cols_variant_core(fmt, 2048, t);
+                assert_eq!(
+                    (cols.as_str(), r),
+                    (format!("{base}_r{rows}_c{t}").as_str(), rows),
+                    "batched {fmt:?} t={t} must stay on the {base} family"
+                );
+            }
+        }
+        // Packed codecs have no `_c{t}` sibling at any T. `bres_proj` refuses
+        // them first; if a new caller ever slips past, the name must be one that
+        // was never compiled, so the dispatch fails loudly by name instead of
+        // reading 4-bit nibbles as f16.
+        for fmt in [QuantFormat::Mlx4, QuantFormat::Nvfp4, QuantFormat::Fp8] {
+            let (name, _) = matvec_cols_variant_core(fmt, 2048, 4);
+            assert!(
+                name.starts_with("mul_mat_vec_PACKED_HAS_NO_COLS_KERNEL"),
+                "packed {fmt:?} must not borrow a real kernel's name, got {name}"
+            );
+        }
+    }
 }
 
 #[cfg(all(test, feature = "qwen35"))]
