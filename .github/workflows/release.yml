@@ -18,6 +18,9 @@ jobs:
       uses: actions/checkout@v4
       with:
         submodules: recursive
+        # No job needs git credentials after checkout, so do not leave the
+        # job's GITHUB_TOKEN in .git/config for later build steps to read.
+        persist-credentials: false
 
     - name: Build wheel
       run: ./scripts/build.sh
@@ -37,6 +40,12 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
+      with:
+        # Safe even though this job publishes a release: scripts/release.sh
+        # reaches GitHub through `gh release create`, which uses the GH_TOKEN
+        # env var and the REST API — it never pushes or tags over git, and its
+        # only git call is a local `git rev-parse HEAD`.
+        persist-credentials: false
 
     - name: Download all wheel artifacts
       uses: actions/download-artifact@v4

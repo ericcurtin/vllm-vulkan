@@ -254,6 +254,35 @@ mod tests {
             .collect();
     }
 
+    /// The exact sequence of draft WIDTHS `run_spec_decode` must request when
+    /// every drafted token is accepted — i.e. the block structure of a
+    /// full-accept run, derived from the driver's own budget invariant
+    /// (`step_k = min(k, remaining - 1)`, a full-accept block commits
+    /// `step_k + 1`).
+    ///
+    /// This exists so the identity gates can assert ACCEPTANCE, not just token
+    /// identity. `run_spec_decode` returns only the committed stream and does
+    /// not report `accept_len` to its caller (`spec_step` does, but the loop
+    /// consumes it). Rather than widen the driver's production signature just
+    /// to make a test easier, the gates observe acceptance through the drafter
+    /// closure, which the driver calls exactly ONCE per block and hands that
+    /// block's width: recording the widths yields both the block count and the
+    /// number of tokens offered, and with a stream of known length `n` that is
+    /// enough to pin the accepted count exactly. Each block commits one bonus
+    /// token plus its accepted drafts, so over the whole run
+    /// `accepted == n - block_count` — and a full-accept drafter must have
+    /// `accepted == sum(widths)`.
+    fn expected_full_accept_widths(k: usize, max_new_tokens: usize) -> Vec<usize> {
+        let mut widths = Vec::new();
+        let mut remaining = max_new_tokens;
+        while remaining > 0 {
+            let w = k.min(remaining - 1);
+            widths.push(w);
+            remaining -= w + 1; // a full-accept block commits width + bonus
+        }
+        widths
+    }
+
     /// Precomputes a SPEC-off serial greedy baseline of `n` tokens starting
     /// from `start_bonus` at `start_pos`, driving the model with plain
     /// `forward` calls only (no verify/rollback machinery at all) — this is
@@ -324,7 +353,12 @@ mod tests {
         // Stub drafter: forces draft[i] = baseline[pos_offset+1+i], i.e.
         // exactly the greedy continuation of whatever bonus token led into
         // this block. `baseline` is indexed relative to `start_pos`.
+        // `widths` records the width the driver asked for on each block — one
+        // push per block. See `expected_full_accept_widths` for why acceptance
+        // is observed here rather than through the driver's return type.
+        let mut widths: Vec<usize> = Vec::new();
         let draft_fn = |_bonus: u32, pos: usize, k: usize| -> Vec<u32> {
+            widths.push(k);
             let off = pos - start_pos;
             (0..k).map(|i| baseline[off + 1 + i]).collect()
         };
@@ -332,11 +366,34 @@ mod tests {
         let cfg = SpecConfig { k, max_new_tokens: n };
         let committed = run_spec_decode(&mut model, draft_fn, start_bonus, start_pos, &cfg);
 
-        assert!(committed.len() >= n, "expected >= {n} committed tokens, got {}", committed.len());
+        // EXACTLY n, not `>= n`: a full-accept block commits `accept_len + 1`,
+        // so the driver narrows each block's width to `min(k, remaining - 1)`
+        // and the returned stream is never longer than the budget. `>= n` was
+        // the loose bound that let the overshoot bug live.
+        assert_eq!(committed.len(), n, "expected EXACTLY {n} committed tokens, got {}", committed.len());
         for i in 0..n {
             assert_eq!(committed[i], baseline[i], "token {i}: spec-on {} != greedy baseline {}", committed[i], baseline[i]);
         }
-        eprintln!("identity gate: {} tokens matched greedy baseline exactly", n);
+
+        // ACCEPTANCE, not just token identity. The checks above are blind to
+        // whether speculation happened at all: a drafter whose every token is
+        // REJECTED commits only its bonus per block, and that stream is still
+        // the greedy stream — so the gate would stay green with the entire
+        // speculative lever disengaged. These two assertions are what make it
+        // observe the acceptance actually achieved.
+        let drafted: usize = widths.iter().sum();
+        let accepted = n - widths.len(); // n committed = accepted drafts + 1 bonus per block
+        assert_eq!(
+            accepted, drafted,
+            "full-accept drafter: expected all {drafted} drafted tokens accepted over \
+             {} blocks, but only {accepted} were (acceptance collapsed / speculation disengaged)",
+            widths.len());
+        assert_eq!(
+            widths, expected_full_accept_widths(k, n),
+            "full-accept block structure changed: k={k}, n={n} must run these draft widths");
+        eprintln!(
+            "identity gate: {n} tokens matched greedy baseline exactly; \
+             {} blocks, {accepted}/{drafted} drafted tokens accepted", widths.len());
     }
 
     /// INC-5a gate 1, synthetic: identical to
@@ -380,7 +437,12 @@ mod tests {
         // Stub drafter: forces draft[i] = baseline[pos_offset+1+i], i.e.
         // exactly the greedy continuation of whatever bonus token led into
         // this block. `baseline` is indexed relative to `start_pos`.
+        // `widths` records the width the driver asked for on each block — one
+        // push per block. See `expected_full_accept_widths` for why acceptance
+        // is observed here rather than through the driver's return type.
+        let mut widths: Vec<usize> = Vec::new();
         let draft_fn = |_bonus: u32, pos: usize, k: usize| -> Vec<u32> {
+            widths.push(k);
             let off = pos - start_pos;
             (0..k).map(|i| baseline[off + 1 + i]).collect()
         };
@@ -388,11 +450,100 @@ mod tests {
         let cfg = SpecConfig { k, max_new_tokens: n };
         let committed = run_spec_decode(&mut model, draft_fn, start_bonus, start_pos, &cfg);
 
-        assert!(committed.len() >= n, "expected >= {n} committed tokens, got {}", committed.len());
+        // EXACTLY n, not `>= n` — see the real-checkpoint twin above.
+        assert_eq!(committed.len(), n, "expected EXACTLY {n} committed tokens, got {}", committed.len());
         for i in 0..n {
             assert_eq!(committed[i], baseline[i], "token {i}: spec-on {} != greedy baseline {}", committed[i], baseline[i]);
         }
-        eprintln!("identity gate (synthetic): {} tokens matched greedy baseline exactly", n);
+
+        // ACCEPTANCE, not just token identity — the checks above stay green
+        // with speculation fully disengaged. See the real-checkpoint twin.
+        // `spec_decode_zero_acceptance_is_caught_by_the_identity_gate` below is
+        // the negative control that proves these two assertions have teeth.
+        let drafted: usize = widths.iter().sum();
+        let accepted = n - widths.len(); // n committed = accepted drafts + 1 bonus per block
+        assert_eq!(
+            accepted, drafted,
+            "full-accept drafter: expected all {drafted} drafted tokens accepted over \
+             {} blocks, but only {accepted} were (acceptance collapsed / speculation disengaged)",
+            widths.len());
+        assert_eq!(
+            widths, expected_full_accept_widths(k, n),
+            "full-accept block structure changed: k={k}, n={n} must run these draft widths");
+        eprintln!(
+            "identity gate (synthetic): {n} tokens matched greedy baseline exactly; \
+             {} blocks, {accepted}/{drafted} drafted tokens accepted", widths.len());
+    }
+
+    /// NEGATIVE CONTROL for the identity gates' acceptance assertions.
+    ///
+    /// Pins the failure mode those assertions exist to catch: a drafter whose
+    /// every token is rejected. It shows, on the same model and the same
+    /// starting state the synthetic identity gate uses, that
+    ///
+    ///   1. the committed stream is STILL bit-identical to the greedy baseline
+    ///      — so the pre-existing token-identity checks pass unchanged, and
+    ///      cannot distinguish speculation from no speculation at all; and
+    ///   2. the measured acceptance is exactly ZERO while the drafter offered
+    ///      `sum(widths)` tokens — which is what the identity gates now assert
+    ///      against, and what makes them fail on a disengaged lever.
+    ///
+    /// The block structure differs too, and deliberately so: with nothing
+    /// accepted every block commits only its bonus, so the run takes `n`
+    /// blocks instead of the full-accept structure's few.
+    #[test]
+    fn spec_decode_zero_acceptance_is_caught_by_the_identity_gate() {
+        let max_seq = 32usize;
+        let k = 4usize;
+        let n = 8usize;
+        let mut model = tiny_synthetic_gemma(max_seq);
+
+        let prefix = [2u32, 10, 20];
+        for (pos, &tok) in prefix.iter().enumerate() {
+            model.forward(tok, pos);
+        }
+        let start_bonus = 30u32;
+        let start_pos = prefix.len();
+
+        let baseline = greedy_baseline(&mut model, start_bonus, start_pos, n + k + 2);
+        reset_kv_caches(&mut model, max_seq);
+        for (pos, &tok) in prefix.iter().enumerate() {
+            model.forward(tok, pos);
+        }
+
+        // Mis-drafter: every id is the true next token bumped by one, so it is
+        // guaranteed to differ from the target's argmax and NOTHING is ever
+        // accepted. The bonus token still comes from the target's own argmax,
+        // which is why the committed stream stays greedy-identical.
+        let vocab = model.config.vocab_size as u32;
+        let mut widths: Vec<usize> = Vec::new();
+        let draft_fn = |_bonus: u32, pos: usize, kk: usize| -> Vec<u32> {
+            widths.push(kk);
+            let off = pos - start_pos;
+            (0..kk).map(|i| (baseline[off + 1 + i] + 1) % vocab).collect()
+        };
+
+        let cfg = SpecConfig { k, max_new_tokens: n };
+        let committed = run_spec_decode(&mut model, draft_fn, start_bonus, start_pos, &cfg);
+
+        // (1) The OLD gate's checks still pass with the lever fully disengaged.
+        assert_eq!(committed.len(), n, "budget must still be honoured exactly");
+        assert_eq!(committed[..], baseline[..n],
+                   "zero-acceptance stream must still equal the greedy baseline — this is \
+                    precisely why token identity alone cannot gate speculation");
+
+        // (2) ...but the acceptance measurement the identity gates assert on
+        // collapses to zero, so they fail.
+        let drafted: usize = widths.iter().sum();
+        let accepted = n - widths.len();
+        assert_eq!(accepted, 0, "nothing may be accepted from a deliberately wrong drafter");
+        assert!(drafted > 0, "the control is only meaningful if drafts were actually offered");
+        assert_eq!(widths.len(), n, "with nothing accepted every block commits its bonus alone");
+        assert_ne!(widths, expected_full_accept_widths(k, n),
+                   "the collapsed block structure must differ from the full-accept one");
+        eprintln!(
+            "negative control: greedy-identical stream, but {accepted}/{drafted} accepted over \
+             {} blocks (full-accept would be {:?})", widths.len(), expected_full_accept_widths(k, n));
     }
 
     /// `max_new_tokens` is a HARD CAP, not a floor.
