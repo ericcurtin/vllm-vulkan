@@ -100,6 +100,10 @@ pub mod gemma_spec;
 mod qwen35_forward;
 // The unified dense GPU layer + batched (EAGLE verify) forward operate purely
 // on the base Qwen3/Gemma4 dense path (`self.qwen`/`self.inner`) → `gemma`.
+// The shared decoder-layer BODY (dispatch sequence) that every GPU layer entry
+// point records through — see the module docs for why there is exactly one.
+#[cfg(feature = "gemma")]
+mod layer_core;
 #[cfg(feature = "gemma")]
 mod unified_layer;
 #[cfg(feature = "gemma")]
