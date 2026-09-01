@@ -203,3 +203,45 @@ jobs:
         # env/OnceLock snapshot under the parallel runner.
         cargo test --no-default-features --features "multiple-pymethods,gemma" --lib \
           -- --test-threads=1 --nocapture
+
+  # The qwen35 slice. `rust-test-gemma` above cannot cover it: the
+  # `push_constants::dispatch_tests` module is `#[cfg(all(test, feature =
+  # "qwen35"))]`, so ~70 dispatch/picker tests — the matvec kernel-routing
+  # contract — compile out of every job that does not enable `qwen35`. This
+  # job is what executes them.
+  #
+  # It builds the stacked configuration the PR advertises (gemma + qwen35),
+  # because `qwen35` stacks on `model-gemma` and must not regress it.
+  rust-test-qwen35:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v6
+      with:
+        submodules: recursive
+
+    - name: Install build + link deps
+      run: |
+        # Same deps as rust-test-foundation: glslang via the project's own
+        # installer (build.rs runs scripts/compile_shaders.sh), libvulkan for
+        # the -lvulkan link, libpython for the pyo3 test binary.
+        source scripts/lib.sh
+        ensure_vulkan
+        sudo apt-get install -y libvulkan-dev libpython3.12-dev
+
+    - name: Build the stacked gemma+qwen35 slice
+      run: |
+        cargo build --no-default-features --features "multiple-pymethods,gemma,qwen35"
+
+    - name: Run qwen35-slice Rust tests
+      env:
+        RUST_BACKTRACE: '1'
+      run: |
+        # The test binary embeds the interpreter; point it at the system Python.
+        export PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
+        # Single-threaded: two GEMM-picker tests race on a process-global
+        # env/OnceLock snapshot under the parallel runner.
+        cargo test --no-default-features --features "multiple-pymethods,gemma,qwen35" --lib \
+          -- --test-threads=1 --nocapture
