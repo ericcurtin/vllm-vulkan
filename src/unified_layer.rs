@@ -277,6 +277,80 @@ pub(crate) fn first_missing_unified_weight(
     None
 }
 
+/// Every HOST-weight (`self.inner.weights`) key the gemma unified path INDEXES
+/// for `layer_idx` and that the norm-staging pass does NOT already cover.
+///
+/// These are a DIFFERENT weight store from `unified_layer_weight_keys`: they are
+/// read with `Gemma4Weights::f32_slice`, never uploaded to `gpu_weights`, and
+/// never staged into `unified_norm_w`. Probing them against `gpu_weights` would
+/// refuse every checkpoint; probing them with `f32_slice` would panic, which is
+/// the failure the probe exists to avoid — hence `Gemma4Weights::contains`.
+///
+///  - `layer_scalar`: read unconditionally per layer by the recording loop, and
+///    present on EVERY gemma layer (g12b/g31b included) — the multiply runs
+///    whether or not the model has PLE.
+///  - `post_per_layer_input_norm.weight`: read by `unified_ple_tail` inside its
+///    `ple_dim > 0` block, so it is required exactly when the two `per_layer*`
+///    projections are, and MUST NOT be required otherwise: g12b/g31b
+///    (`hidden_size_per_layer_input == 0`) carry no `per_layer*` tensor at all.
+///    Same `ple_dim > 0` gate as `unified_layer_weight_keys`, for the same
+///    reason (`LayerSpec::gemma` sets `ple: Some(..)` on every layer).
+pub(crate) fn unified_gemma_host_weight_keys(ple_dim: usize, layer_idx: usize) -> Vec<String> {
+    let mut keys = vec![format!("model.layers.{layer_idx}.layer_scalar")];
+    if ple_dim > 0 {
+        keys.push(format!("model.layers.{layer_idx}.post_per_layer_input_norm.weight"));
+    }
+    keys
+}
+
+/// `first_missing_unified_weight`, MEMOIZED on the executed range and the size
+/// of the weight map.
+///
+/// The pre-flight sits in `forward_unified_*`, which is the PER-TOKEN decode
+/// entry (`forward_rs` in lib.rs calls it once per generated token) — not a
+/// one-time init. Re-scanning there costs one `format!` allocation plus one
+/// `String` hash per required key per layer, EVERY token: ~340 of each on a
+/// 48-layer gemma. Measured cost of the scan alone (`format!` + `HashMap<String,
+/// _>` lookup, 48 layers, 7 keys/layer): ~42 us/token release, ~120 us/token
+/// debug on an M-series host, and a BC-250-class host is slower still.
+///
+/// WHY THE CACHE KEY IS SOUND. The cache stores only the CLEAN verdict, keyed by
+/// `(range.start, range.end, weights_len)`:
+///
+///  - RANGE. The gemma caller passes `pp_start..pp_end` and the qwen caller
+///    `0..num_hidden_layers`; both are fixed per instance today, but keying on
+///    the range means a caller that ever varies it rescans instead of reusing a
+///    verdict about different layers.
+///  - MAP SIZE. `gpu_weights` is INSERT-ONLY: there is no `remove`/`clear`/
+///    `retain`/`drain`/`=` anywhere in the crate (only `insert`, all of it at
+///    load time plus the `mtp.*` head uploads in lib.rs). Under insert-only
+///    mutation the presence set can only GROW, so a key set that satisfied the
+///    scan still satisfies it; and an insert of a NEW key changes `len`, which
+///    misses the cache and forces a rescan anyway. An insert that OVERWRITES an
+///    existing key leaves `len` unchanged — and also leaves the presence set
+///    unchanged, which is the only thing this scan tests (it never looks at the
+///    buffer, format or aux). Both cases are therefore correct.
+///
+/// A MISS IS NEVER CACHED. The missing-weight path is untouched: it rescans
+/// every call, returns the same named key, and lets the caller log the same
+/// warning and fall back exactly as before. Caching a miss would be the one
+/// dangerous direction (a later insert could fill the hole), and the miss path
+/// is already the slow path — it abandons the unified engine entirely.
+pub(crate) fn unified_preflight_scan(
+    cache: &mut Option<(usize, usize, usize)>,
+    range: std::ops::Range<usize>,
+    weights_len: usize,
+    specs: impl FnOnce() -> Vec<(usize, LayerSpec)>,
+    present: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let key = (range.start, range.end, weights_len);
+    if *cache == Some(key) { return None; }
+    let missing = first_missing_unified_weight(&specs(), present);
+    // Only a clean scan is remembered; a miss clears any stale entry.
+    *cache = if missing.is_none() { Some(key) } else { None };
+    missing
+}
+
 impl VulkanModel {
     /// Stable raw pointer to one persistent `UR_*` unified activation buffer.
     ///
@@ -349,13 +423,24 @@ impl VulkanModel {
     }
     /// Upload a norm weight into `unified_norm_w` once (stable pointer). Returns
     /// false if absent / too short. `qwen` selects which weight store to read.
+    ///
+    /// "Returns false if ABSENT" was not true before: the store was read through
+    /// `f32_slice`, which routes to `Gemma4Weights::get` and PANICS on a miss
+    /// (`Weight '..' not found`). Every caller uses this as a readiness probe and
+    /// falls back to the proven path on `false`, so an absent norm has to be a
+    /// verdict, not a crash — the same reason the projection pre-flight exists.
     pub(crate) fn ensure_unified_norm(&mut self, name: &str, n: usize, qwen: bool) -> bool {
         if self.unified_norm_w.contains_key(name) { return true; }
-        let w: Vec<f32> = if qwen {
-            self.qwen.as_ref().unwrap().weights.f32_slice(name).to_vec()
+        let store = if qwen {
+            &self.qwen.as_ref().unwrap().weights
         } else {
-            self.inner.weights.f32_slice(name).to_vec()
+            &self.inner.weights
         };
+        if !store.contains(name) {
+            log::warn!("ensure_unified_norm: no host weight '{name}' — unified path OFF");
+            return false;
+        }
+        let w: Vec<f32> = store.f32_slice(name).to_vec();
         if w.len() < n { return false; }
         let eng = match self.engine.as_mut() { Some(e) => e, None => return false };
         let buf = match eng.alloc_host_coherent_storage((n * 4) as u64) {
@@ -979,13 +1064,21 @@ impl VulkanModel {
         // superset of it.
         let lm_name = self.qwen.as_ref().unwrap().lm_head_name.clone();
         let mut ready = self.engine.is_some();
+        //
+        // The scan is MEMOIZED (`unified_preflight_scan`): this runs per decode
+        // token, and `gpu_weights` is insert-only, so a clean verdict for the
+        // same range and the same map size is still clean. A MISS is never
+        // cached — it rescans and warns every call, as before.
         if ready {
-            let specs: Vec<(usize, LayerSpec)> = (0..cfg.num_hidden_layers)
-                .map(|li| (li, LayerSpec::qwen(&cfg, li)))
-                .collect();
-            if let Some(missing) =
-                first_missing_unified_weight(&specs, |k| self.gpu_weights.contains_key(k))
-            {
+            let n_layers = cfg.num_hidden_layers;
+            let weights_len = self.gpu_weights.len();
+            if let Some(missing) = unified_preflight_scan(
+                &mut self.unified_preflight_clean,
+                0..n_layers,
+                weights_len,
+                || (0..n_layers).map(|li| (li, LayerSpec::qwen(&cfg, li))).collect(),
+                |k| self.gpu_weights.contains_key(k),
+            ) {
                 log::warn!("forward_unified_qwen: unified path OFF — gpu_weights has no \
                             '{missing}'; falling back to forward_qwen_gpu");
                 ready = false;
@@ -1066,15 +1159,23 @@ impl VulkanModel {
         let mut ready = self.engine.is_some()
             && self.gpu_weights.contains_key(&l0_q);
         if ready {
-            let specs: Vec<(usize, LayerSpec)> = (self.pp_start..self.pp_end)
+            // Memoized on `pp_start..pp_end` (see `unified_preflight_scan`): the
+            // cached verdict is about THOSE layers, so a rank whose range ever
+            // changes rescans rather than reusing a verdict about others.
+            let (pp_start, pp_end) = (self.pp_start, self.pp_end);
+            let weights_len = self.gpu_weights.len();
+            if let Some(missing) = unified_preflight_scan(
+                &mut self.unified_preflight_clean,
+                pp_start..pp_end,
+                weights_len,
                 // `layer_ple` / `layer_scalar` are execution inputs, not key
                 // selectors: only `uses_k_eq_v` and `ple.ple_dim` (both pure
                 // functions of `cfg` and `li`) decide which keys are required.
-                .map(|li| (li, LayerSpec::gemma(&cfg, li, Vec::new(), 0.0)))
-                .collect();
-            if let Some(missing) =
-                first_missing_unified_weight(&specs, |k| self.gpu_weights.contains_key(k))
-            {
+                || (pp_start..pp_end)
+                    .map(|li| (li, LayerSpec::gemma(&cfg, li, Vec::new(), 0.0)))
+                    .collect(),
+                |k| self.gpu_weights.contains_key(k),
+            ) {
                 log::warn!("forward_unified_gemma: unified path OFF — gpu_weights has no \
                             '{missing}'; falling back to forward_gpu");
                 ready = false;
@@ -1097,6 +1198,23 @@ impl VulkanModel {
                 ready &= self.ensure_unified_norm(&p("post_attention_layernorm.weight"), h, false);
                 ready &= self.ensure_unified_norm(&p("pre_feedforward_layernorm.weight"), h, false);
                 ready &= self.ensure_unified_norm(&p("post_feedforward_layernorm.weight"), h, false);
+                // HOST-weight keys this layer indexes outside the staged norms:
+                // `layer_scalar` (recording loop) and, when the model has PLE,
+                // `post_per_layer_input_norm.weight` (`unified_ple_tail`). Both
+                // are read with `f32_slice`, which panics on a miss — and the
+                // PLE one is read AFTER two GPU submits, deep inside the layer.
+                // They are NOT `gpu_weights` keys, so the projection pre-flight
+                // above cannot see them, and they are NOT staged through
+                // `ensure_unified_norm` either: the tail normalizes on the HOST
+                // (`model::cpu_rms_norm`), so uploading a GPU buffer for it
+                // would allocate something nothing reads.
+                for k in unified_gemma_host_weight_keys(ple_dim, li) {
+                    if !self.inner.weights.contains(&k) {
+                        log::warn!("forward_unified_gemma: unified path OFF — host weights \
+                                    have no '{k}'; falling back to forward_gpu");
+                        ready = false;
+                    }
+                }
                 if !ready { break; }
             }
         }
@@ -1119,7 +1237,8 @@ impl VulkanModel {
 
 #[cfg(test)]
 mod unified_readiness_tests {
-    use super::{first_missing_unified_weight, unified_layer_weight_keys, LayerSpec};
+    use super::{first_missing_unified_weight, unified_gemma_host_weight_keys,
+                unified_layer_weight_keys, unified_preflight_scan, LayerSpec};
     use crate::model::{Gemma4Config, Qwen3Config};
     use std::collections::HashSet;
 
@@ -1286,5 +1405,144 @@ mod unified_readiness_tests {
             let present = complete_checkpoint(&specs);
             assert_eq!(first_missing_unified_weight(&specs, |k| present.contains(k)), None);
         }
+    }
+
+    // ── the MEMOIZED scan (`unified_preflight_scan`) ─────────────────────────
+    //
+    // The pre-flight runs on the per-token decode entry, so it is memoized. The
+    // risk is entirely in the invalidation: a cache that still says "ready"
+    // after `gpu_weights` changed is WORSE than the scan it replaces, because it
+    // re-creates the silent-lever failure the pre-flight exists to prevent.
+
+    /// Drive the cached scan exactly like the call sites do, counting how many
+    /// times the SCAN actually ran (the spec builder is only invoked on a real
+    /// scan, so the counter measures cache hits directly).
+    fn cached_scan(
+        cache: &mut Option<(usize, usize, usize)>,
+        cfg: &Gemma4Config,
+        range: std::ops::Range<usize>,
+        present: &HashSet<String>,
+        scans: &mut usize,
+    ) -> Option<String> {
+        let n = present.len();
+        let mut ran = false;
+        let out = unified_preflight_scan(cache, range.clone(), n, || { ran = true; gemma_specs(cfg, range) },
+                                         |k| present.contains(k));
+        if ran { *scans += 1; }
+        out
+    }
+
+    /// A clean verdict is reused: the second call does not rescan.
+    #[test]
+    fn clean_preflight_is_memoized_across_calls() {
+        let cfg = Gemma4Config::g12b();
+        let present = complete_checkpoint(&gemma_specs(&cfg, 0..cfg.num_hidden_layers));
+        let (mut cache, mut scans) = (None, 0usize);
+        for _ in 0..5 {
+            assert_eq!(cached_scan(&mut cache, &cfg, 0..cfg.num_hidden_layers, &present, &mut scans), None);
+        }
+        assert_eq!(scans, 1, "the clean scan must run once, not once per decode call");
+    }
+
+    /// THE INVALIDATION TEST — the one that matters. Mutate `gpu_weights` after
+    /// a clean verdict has been memoized and the memoized answer must CHANGE: a
+    /// cache that keeps answering "ready" here is a silent lever, exactly the
+    /// failure this pre-flight was added to stop.
+    #[test]
+    fn preflight_cache_invalidates_when_the_weight_map_changes() {
+        let cfg = Gemma4Config::g12b();
+        let range = 0..cfg.num_hidden_layers;
+        let mut present = complete_checkpoint(&gemma_specs(&cfg, range.clone()));
+        let (mut cache, mut scans) = (None, 0usize);
+
+        assert_eq!(cached_scan(&mut cache, &cfg, range.clone(), &present, &mut scans), None);
+        assert_eq!(scans, 1);
+        assert!(cache.is_some(), "precondition: the clean verdict was memoized");
+
+        // The map changes under the cache (here: a weight goes away — the one
+        // direction insert-only mutation cannot produce, and therefore the
+        // strictest test of the cache key).
+        let hole = "model.layers.31.mlp.down_proj.weight".to_string();
+        assert!(present.remove(&hole));
+
+        assert_eq!(cached_scan(&mut cache, &cfg, range, &present, &mut scans), Some(hole),
+                   "the memoized answer must be re-derived after gpu_weights changed");
+        assert_eq!(scans, 2, "a changed weight map must force a rescan");
+    }
+
+    /// An INSERT (the only mutation this crate actually performs on
+    /// `gpu_weights` outside load) also changes the key, so the hole a previous
+    /// scan reported is re-tested rather than remembered.
+    #[test]
+    fn a_miss_is_never_cached_and_is_rescanned_after_the_hole_is_filled() {
+        let cfg = Gemma4Config::g12b();
+        let range = 0..cfg.num_hidden_layers;
+        let mut present = complete_checkpoint(&gemma_specs(&cfg, range.clone()));
+        let hole = "model.layers.7.mlp.up_proj.weight".to_string();
+        assert!(present.remove(&hole));
+        let (mut cache, mut scans) = (None, 0usize);
+
+        // Missing-weight handling is UNCHANGED: same key, every call, no cache.
+        for i in 1..=3 {
+            assert_eq!(cached_scan(&mut cache, &cfg, range.clone(), &present, &mut scans),
+                       Some(hole.clone()));
+            assert_eq!(scans, i, "a miss must rescan every call");
+            assert_eq!(cache, None, "a miss must never be memoized");
+        }
+
+        present.insert(hole);
+        assert_eq!(cached_scan(&mut cache, &cfg, range, &present, &mut scans), None);
+    }
+
+    /// Keyed by the RANGE too: a clean verdict for a PP rank's slice must not be
+    /// reused as a verdict about the whole model.
+    #[test]
+    fn preflight_cache_is_keyed_by_the_executed_range() {
+        let cfg = Gemma4Config::g12b();
+        let present = complete_checkpoint(&gemma_specs(&cfg, 12..24));
+        let (mut cache, mut scans) = (None, 0usize);
+
+        assert_eq!(cached_scan(&mut cache, &cfg, 12..24, &present, &mut scans), None);
+        assert!(cached_scan(&mut cache, &cfg, 0..cfg.num_hidden_layers, &present, &mut scans).is_some(),
+                "a verdict about layers 12..24 says nothing about layers 0..12");
+        assert_eq!(scans, 2);
+    }
+
+    // ── host-weight keys (a DIFFERENT store from `gpu_weights`) ──────────────
+
+    /// `post_per_layer_input_norm.weight` is required exactly when the two
+    /// `per_layer*` projections are — and `layer_scalar` always, on every gemma
+    /// layer including the PLE-less ones.
+    #[test]
+    fn host_weight_keys_follow_the_same_ple_gate() {
+        let g12b = unified_gemma_host_weight_keys(Gemma4Config::g12b().hidden_size_per_layer_input, 4);
+        assert_eq!(g12b, vec!["model.layers.4.layer_scalar".to_string()],
+                   "a PLE-less checkpoint carries no post_per_layer_input_norm: {g12b:?}");
+
+        let e2b = unified_gemma_host_weight_keys(Gemma4Config::e2b().hidden_size_per_layer_input, 4);
+        assert!(e2b.contains(&"model.layers.4.layer_scalar".to_string()), "{e2b:?}");
+        assert!(e2b.contains(&"model.layers.4.post_per_layer_input_norm.weight".to_string()), "{e2b:?}");
+    }
+
+    /// These are HOST keys, not `gpu_weights` keys. Requiring them of the
+    /// projection pre-flight would refuse every PLE checkpoint at startup — the
+    /// mirror image of the v_proj / `ple.is_some()` traps above.
+    #[test]
+    fn host_weight_keys_are_not_in_the_gpu_key_set() {
+        let cfg = Gemma4Config::e2b();
+        let gpu_keys = unified_layer_weight_keys(&LayerSpec::gemma(&cfg, 4, Vec::new(), 0.0), 4);
+        for k in unified_gemma_host_weight_keys(cfg.hidden_size_per_layer_input, 4) {
+            assert!(!gpu_keys.contains(&k), "{k} is read from inner.weights, not gpu_weights");
+        }
+    }
+
+    /// `ensure_unified_norm` documents "returns false if absent" and is used as
+    /// a readiness probe — but it read the store through `f32_slice`, which
+    /// routes to `Gemma4Weights::get` and PANICS (`Weight '..' not found`). A
+    /// probe that crashes on the case it is probing for is not a probe.
+    #[test]
+    fn ensure_unified_norm_reports_an_absent_weight_instead_of_panicking() {
+        let mut m = crate::batched_forward_tests::tiny_qwen_model();
+        assert!(!m.ensure_unified_norm("model.layers.0.self_attn.no_such_norm.weight", 8, true));
     }
 }

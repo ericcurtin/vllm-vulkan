@@ -464,6 +464,14 @@ pub struct VulkanModel {
     ures_bufs: Vec<compute::Buffer>,
     ures_ready: bool,
     unified_norm_w: std::collections::HashMap<String, compute::Buffer>,
+    /// Memoized CLEAN result of the unified weight pre-flight (see
+    /// `unified_layer::unified_preflight_scan`): `Some((range_start, range_end,
+    /// gpu_weights.len()))` for a scan that found every required key. The
+    /// pre-flight runs on the PER-TOKEN decode entry, so without this it
+    /// re-hashes ~7 freshly formatted key strings per layer per token. `None`
+    /// (the initial state, and the state after any miss) forces a full rescan,
+    /// which is what keeps missing-weight handling identical.
+    unified_preflight_clean: Option<(usize, usize, usize)>,
     /// EAGLE3 fast-verify (`forward_batched`): persistent T-wide (max_t=8)
     /// activation buffers, one command buffer PER LAYER (1 submit/layer) over
     /// GEMM projections + resident-KV attention. Dense/Qwen3-unified only
@@ -1151,6 +1159,7 @@ impl VulkanModel {
                         ures_bufs: Vec::new(),
                         ures_ready: false,
                         unified_norm_w: HashMap::new(),
+                        unified_preflight_clean: None,
                         bres_bufs: Vec::new(),
                         bres_ready: false,
                         q35_f16_host: HashMap::new(),
@@ -1942,6 +1951,7 @@ impl VulkanModel {
                         ures_bufs: Vec::new(),
                         ures_ready: false,
                         unified_norm_w: std::collections::HashMap::new(),
+                        unified_preflight_clean: None,
                         bres_bufs: Vec::new(),
                         bres_ready: false,
                         q35_f16_host,
@@ -2481,6 +2491,7 @@ impl VulkanModel {
                         ures_bufs: Vec::new(),
                         ures_ready: false,
                         unified_norm_w: std::collections::HashMap::new(),
+                        unified_preflight_clean: None,
                         bres_bufs: Vec::new(),
                         bres_ready: false,
                         q35_f16_host: g12b_f16_host,
@@ -2956,6 +2967,7 @@ impl VulkanModel {
                         ures_bufs: Vec::new(),
                         ures_ready: false,
                         unified_norm_w: std::collections::HashMap::new(),
+                        unified_preflight_clean: None,
                         bres_bufs: Vec::new(),
                         bres_ready: false,
                         q35_f16_host: g31b_f16_host,
@@ -3094,6 +3106,7 @@ impl VulkanModel {
                             ures_bufs: Vec::new(),
                             ures_ready: false,
                             unified_norm_w: std::collections::HashMap::new(),
+                            unified_preflight_clean: None,
                             bres_bufs: Vec::new(),
                             bres_ready: false,
                             q35_f16_host: std::collections::HashMap::new(),
@@ -3185,6 +3198,7 @@ impl VulkanModel {
                         ures_bufs: Vec::new(),
                         ures_ready: false,
                         unified_norm_w: std::collections::HashMap::new(),
+                        unified_preflight_clean: None,
                         bres_bufs: Vec::new(),
                         bres_ready: false,
                         q35_f16_host: std::collections::HashMap::new(),
@@ -3308,6 +3322,7 @@ impl VulkanModel {
                         ures_bufs: Vec::new(),
                         ures_ready: false,
                         unified_norm_w: std::collections::HashMap::new(),
+                        unified_preflight_clean: None,
                         bres_bufs: Vec::new(),
                         bres_ready: false,
                         q35_f16_host: std::collections::HashMap::new(),
@@ -3438,6 +3453,7 @@ impl VulkanModel {
                         ures_bufs: Vec::new(),
                         ures_ready: false,
                         unified_norm_w: std::collections::HashMap::new(),
+                        unified_preflight_clean: None,
                         bres_bufs: Vec::new(),
                         bres_ready: false,
                         q35_f16_host: std::collections::HashMap::new(),
@@ -3672,6 +3688,7 @@ impl VulkanModel {
                         ures_bufs: Vec::new(),
                         ures_ready: false,
                         unified_norm_w: std::collections::HashMap::new(),
+                        unified_preflight_clean: None,
                         bres_bufs: Vec::new(),
                         bres_ready: false,
                         q35_f16_host: std::collections::HashMap::new(),
@@ -4177,6 +4194,7 @@ impl VulkanModel {
             ures_bufs: Vec::new(),
             ures_ready: false,
             unified_norm_w: std::collections::HashMap::new(),
+            unified_preflight_clean: None,
             bres_bufs: Vec::new(),
             bres_ready: false,
             q35_f16_host: std::collections::HashMap::new(),
@@ -4288,6 +4306,7 @@ impl VulkanModel {
             ures_bufs: Vec::new(),
             ures_ready: false,
             unified_norm_w: HashMap::new(),
+            unified_preflight_clean: None,
             bres_bufs: Vec::new(),
             bres_ready: false,
             q35_f16_host: HashMap::new(),
@@ -9071,7 +9090,7 @@ mod batched_forward_tests {
     /// head_dim=4 (q_dim=kv_dim=8, no GQA), intermediate=12, vocab=20, 2
     /// layers, tied embeddings. Every field mirrors `gpu_only`'s literal
     /// (§struct definition) with `qwen: Some(..)`, `engine: None`.
-    fn tiny_qwen_model() -> VulkanModel {
+    pub(crate) fn tiny_qwen_model() -> VulkanModel {
         let cfg = model::Qwen3Config {
             hidden_size: 8,
             num_hidden_layers: 2,
@@ -9163,6 +9182,7 @@ mod batched_forward_tests {
             ures_bufs: Vec::new(),
             ures_ready: false,
             unified_norm_w: HashMap::new(),
+            unified_preflight_clean: None,
             bres_bufs: Vec::new(),
             bres_ready: false,
             q35_f16_host: HashMap::new(),
@@ -9491,6 +9511,7 @@ mod qwen35_prefill_tests {
             ures_bufs: Vec::new(),
             ures_ready: false,
             unified_norm_w: HashMap::new(),
+            unified_preflight_clean: None,
             bres_bufs: Vec::new(),
             bres_ready: false,
             q35_f16_host: f16_host,
@@ -9845,6 +9866,7 @@ mod kv_cache_pymethod_tests {
             ures_bufs: Vec::new(),
             ures_ready: false,
             unified_norm_w: HashMap::new(),
+            unified_preflight_clean: None,
             bres_bufs: Vec::new(),
             bres_ready: false,
             q35_f16_host: HashMap::new(),
