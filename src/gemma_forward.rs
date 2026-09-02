@@ -672,17 +672,7 @@ impl VulkanModel {
                     // the old `k_up_to_now()` slice `[kv_start..slen)` for an
                     // unwrapped cache and correct once the ring wraps. Full
                     // layers keep the zero-copy absolute slice (`window=None`).
-                    let (kbuf, vbuf, vlen) = match window {
-                        Some(w) => {
-                            let (kw, vw, vl) = cache.windowed_view(w);
-                            (std::borrow::Cow::Owned(kw), std::borrow::Cow::Owned(vw), vl)
-                        }
-                        None => (
-                            std::borrow::Cow::Borrowed(cache.k_up_to_now()),
-                            std::borrow::Cow::Borrowed(cache.v_up_to_now()),
-                            cache.seq_len,
-                        ),
-                    };
+                    let (kbuf, vbuf, vlen) = cache.sdpa_view(window);
                     let mut ks = Vec::with_capacity(vlen * local_num_kv * head_dim);
                     let mut vs = Vec::with_capacity(vlen * local_num_kv * head_dim);
                     for pos_i in 0..vlen {

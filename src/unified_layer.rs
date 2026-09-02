@@ -859,8 +859,26 @@ impl VulkanModel {
                 layer_idx
             };
             let cache = &self.inner.kv_caches[target_cache_idx];
-            model::cpu_sdpa(q, cache.k_up_to_now(), cache.v_up_to_now(),
-                num_q, num_kv, head_dim, cache.seq_len, scale, spec.window)
+            // Per-layer KV sizing (`Gemma4Config::layer_kv_capacity`) makes a
+            // SLIDING layer's cache a `window`-sized RING: absolute position `p`
+            // lives at slot `p % capacity`. `k_up_to_now()` slices
+            // `..seq_len * stride` out of a `capacity * stride` buffer and
+            // assumes slot == absolute position — correct only until the first
+            // wrap, then it runs off the end (its own `debug_assert!` says so).
+            // Read the ring through `windowed_view`, which compacts the last
+            // `window` positions into ASCENDING-ABSOLUTE order and is therefore
+            // bit-for-bit identical to attending the full absolute cache with
+            // `Some(window)`; the compacted view is then attended with `None`
+            // (`valid_len` rows == exactly the window). Same treatment already
+            // applied in `gemma_forward.rs` (`gemma_attn_tp`,
+            // `forward_gemma_gpu*`). FULL layers keep the zero-copy absolute
+            // slice: `capacity == max_seq_len` there, so they never wrap.
+            //
+            // `kv_shared_target` always resolves to a layer of the SAME type
+            // (`is_full_attention(target) == is_full_attention(layer_idx)`, see
+            // model.rs), so `spec.window` describes the target cache's shape too.
+            let (kb, vb, vlen) = cache.sdpa_view(spec.window);
+            model::cpu_sdpa(q, &kb, &vb, num_q, num_kv, head_dim, vlen, scale, None)
         }
     }
     /// Gemma per-layer PLE tail: matmuls on GPU (UR_FFIN/UR_PLE_G/UR_PLE_C
@@ -1423,5 +1441,241 @@ mod unified_readiness_tests {
     fn ensure_unified_norm_reports_an_absent_weight_instead_of_panicking() {
         let mut m = crate::batched_forward_tests::tiny_qwen_model();
         assert!(!m.ensure_unified_norm("model.layers.0.self_attn.no_such_norm.weight", 8, true));
+    }
+
+    // ── unified_attention KV read across a ring wrap ─────────────────────────
+    //
+    // `unified_attention` (the 2-CB host attention boundary) read a gemma
+    // SLIDING layer's cache with `k_up_to_now()`. That accessor slices
+    // `..seq_len * stride` out of a `capacity * stride` ring and assumes
+    // slot == absolute position, so on the first wrap it runs exactly one row
+    // off the end. Its own `debug_assert!` says to use `windowed_view()`.
+    //
+    // Both tests below WRAP the ring many times on purpose. A test that stays
+    // under `capacity` agrees with the broken expression at every step and
+    // proves nothing — the same trap `gemma_pp_last_kv_slot_wraps_the_ring`
+    // (lib.rs) exists to close for the single-row carried-KV read.
+
+    use crate::model::KvCache;
+
+    /// Build the cache for gemma layer `l` EXACTLY as the loader does
+    /// (`layer_kv_capacity` / `layer_num_kv_heads` / `layer_head_dim`), so the
+    /// test is coupled to the same derivation the running model uses.
+    fn loader_cache(cfg: &Gemma4Config, l: usize, max_seq: usize) -> KvCache {
+        KvCache::new_windowed(
+            max_seq,
+            cfg.layer_kv_capacity(l, max_seq),
+            cfg.layer_num_kv_heads(l),
+            cfg.layer_head_dim(l),
+        )
+    }
+
+    /// A KV row whose every element encodes the absolute position that wrote it,
+    /// so a wrong ORDER is detectable — not just a wrong length. An ordering bug
+    /// reads the right NUMBER of rows and silently produces wrong logits.
+    fn row(pos: usize, stride: usize) -> Vec<f32> {
+        (0..stride).map(|i| (pos * 1000 + i) as f32).collect()
+    }
+
+    /// A g12b-shaped config with tiny head geometry: same layer TYPES (period-6
+    /// global / sliding, value-less MQA globals) and the same per-layer
+    /// derivations, small enough to run 64 decode steps in a unit test.
+    fn ring_cfg() -> Gemma4Config {
+        let mut cfg = Gemma4Config::g12b();
+        cfg.num_hidden_layers = 12;
+        cfg.num_attention_heads = 4;
+        cfg.num_key_value_heads = 2;
+        cfg.num_global_key_value_heads = 1;
+        cfg.head_dim = 8;
+        cfg.global_head_dim = 16;
+        cfg.hidden_size_per_layer_input = 0;
+        cfg.sliding_window = 8;   // small ring → many wraps
+        cfg
+    }
+
+    /// A CPU-only `VulkanModel` on the Gemma path whose KV caches are built
+    /// either as the loader builds them (`ring = true`, sliding layers are
+    /// `window`-sized rings) or uniformly `max_seq`-sized (`ring = false`,
+    /// pre-per-layer-sizing semantics — the ORACLE, since it never wraps).
+    /// `unified_attention` touches only `inner.kv_caches`, so no GPU engine and
+    /// no weights are needed.
+    fn ring_model(cfg: &Gemma4Config, max_seq: usize, ring: bool) -> crate::VulkanModel {
+        let mut m = crate::batched_forward_tests::tiny_qwen_model();
+        m.qwen = None;
+        m.max_seq_len = max_seq;
+        m.inner = crate::model::Gemma4Model {
+            config: cfg.clone(),
+            weights: crate::model::ModelWeights { tensors: std::collections::HashMap::new() },
+            kv_caches: (0..cfg.num_hidden_layers)
+                .map(|l| if ring { loader_cache(cfg, l, max_seq) } else {
+                    KvCache::new(max_seq, cfg.layer_num_kv_heads(l), cfg.layer_head_dim(l))
+                })
+                .collect(),
+        };
+        m
+    }
+
+    /// THE REGRESSION, end to end through `unified_attention` itself.
+    ///
+    /// Two models see the identical q/k/v stream for 8x the sliding window: one
+    /// with the real per-layer RING caches, one with uniform `max_seq` caches
+    /// (which never wrap, so `k_up_to_now` + `Some(window)` stays valid there —
+    /// the legacy oracle). Their attention output must be BIT-IDENTICAL at every
+    /// step, on a sliding layer AND on a full layer.
+    ///
+    /// Before the fix the ring model panics on the first wrap. Equality (not
+    /// merely "no panic") is what catches the more dangerous failure: reading
+    /// the right NUMBER of rows in the WRONG order.
+    #[test]
+    fn unified_attention_matches_the_uniform_cache_across_ring_wraps() {
+        let cfg = ring_cfg();
+        let max_seq = 8 * cfg.sliding_window;
+
+        let sliding = (0..cfg.num_hidden_layers).find(|&l| !cfg.is_full_attention(l)).unwrap();
+        let full = (0..cfg.num_hidden_layers).find(|&l| cfg.is_full_attention(l)).unwrap();
+        assert!(!cfg.is_kv_shared(sliding) && !cfg.is_kv_shared(full),
+            "this fixture has no KV-shared layers");
+
+        for l in [sliding, full] {
+            let spec = LayerSpec::gemma(&cfg, l, Vec::new(), 0.0);
+            let stride = spec.num_kv * spec.head_dim;
+            let q_dim = spec.num_q * spec.head_dim;
+
+            let mut m_ring = ring_model(&cfg, max_seq, true);
+            let mut m_uni = ring_model(&cfg, max_seq, false);
+            assert_eq!(m_ring.inner.kv_caches[l].capacity,
+                if spec.window.is_some() { cfg.sliding_window } else { max_seq });
+            assert_eq!(m_uni.inner.kv_caches[l].capacity, max_seq);
+
+            let mut seed = 0x1234_5678u32;
+            let mut next = || { seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                                (seed >> 8) as f32 / 8_388_608.0 - 1.0 };
+            for pos in 0..max_seq {
+                let q: Vec<f32> = (0..q_dim).map(|_| next()).collect();
+                let k: Vec<f32> = (0..stride).map(|_| next()).collect();
+                let v: Vec<f32> = (0..stride).map(|_| next()).collect();
+
+                let a_ring = m_ring.unified_attention(&spec, l, &q, &k, &v, 1.0);
+                let a_uni  = m_uni.unified_attention(&spec, l, &q, &k, &v, 1.0);
+
+                assert_eq!(a_ring.len(), q_dim);
+                for i in 0..a_uni.len() {
+                    assert_eq!(a_ring[i].to_bits(), a_uni[i].to_bits(),
+                        "layer {l} pos {pos} idx {i}: ring attention diverged from the \
+                         uniform-cache oracle ({} vs {})", a_ring[i], a_uni[i]);
+                }
+            }
+            if spec.window.is_some() {
+                assert!(m_ring.inner.kv_caches[l].has_wrapped(),
+                    "the sliding ring must have wrapped");
+                assert!(!m_uni.inner.kv_caches[l].has_wrapped(),
+                    "the oracle must NOT wrap — otherwise it is not a valid oracle");
+            } else {
+                assert!(!m_ring.inner.kv_caches[l].has_wrapped(),
+                    "a full layer's cache must never wrap");
+            }
+        }
+    }
+
+    /// The row-level companion: `sdpa_view` must return the last `window`
+    /// positions in ASCENDING ABSOLUTE order across many wraps, with content
+    /// that identifies the position that wrote each row.
+    #[test]
+    fn unified_attention_ring_view_wraps() {
+        let cfg = ring_cfg();
+        let max_seq = 8 * cfg.sliding_window;   // 8 full wraps of the sliding ring
+
+        let sliding = (0..cfg.num_hidden_layers).find(|&l| !cfg.is_full_attention(l)).unwrap();
+        let full = (0..cfg.num_hidden_layers).find(|&l| cfg.is_full_attention(l)).unwrap();
+
+        for l in [sliding, full] {
+            let spec = LayerSpec::gemma(&cfg, l, Vec::new(), 0.0);
+            let mut cache = loader_cache(&cfg, l, max_seq);
+            let stride = cache.num_kv_heads * cache.head_dim;
+            assert_eq!(stride, spec.num_kv * spec.head_dim,
+                "the spec and the cache must agree on the per-position stride");
+            let is_sliding = spec.window.is_some();
+            assert_eq!(is_sliding, l == sliding);
+            assert_eq!(cache.capacity, if is_sliding { cfg.sliding_window } else { max_seq });
+
+            let mut wrapped_steps = 0usize;
+            for pos in 0..max_seq {
+                let r = row(pos, stride);
+                cache.append(&r, &r);
+
+                // EXACTLY what unified_attention does.
+                let (kb, vb, vlen) = cache.sdpa_view(spec.window);
+
+                let expect_len = match spec.window {
+                    Some(w) => cache.seq_len.min(w),
+                    None => cache.seq_len,
+                };
+                assert_eq!(vlen, expect_len, "layer {l} pos {pos}: wrong row count");
+                assert_eq!(kb.len(), vlen * stride, "layer {l} pos {pos}: K buffer size");
+                assert_eq!(vb.len(), vlen * stride, "layer {l} pos {pos}: V buffer size");
+
+                // CONTENT + ORDER: row i must be absolute position
+                // `seq_len - vlen + i` — ascending, which is the order
+                // `cpu_sdpa` iterates and the order the causal/window mask
+                // assumes. This is the assertion a wrong-order read fails
+                // while never panicking.
+                let first_abs = cache.seq_len - vlen;
+                for i in 0..vlen {
+                    let want = row(first_abs + i, stride);
+                    assert_eq!(&kb[i * stride..(i + 1) * stride], &want[..],
+                        "layer {l} pos {pos}: K row {i} is not absolute position {}",
+                        first_abs + i);
+                    assert_eq!(&vb[i * stride..(i + 1) * stride], &want[..],
+                        "layer {l} pos {pos}: V row {i} is not absolute position {}",
+                        first_abs + i);
+                }
+
+                if cache.has_wrapped() {
+                    wrapped_steps += 1;
+                    // NEGATIVE CONTROL on the pre-fix expression: the old code
+                    // sliced `..seq_len * stride` out of `capacity * stride`.
+                    assert!(cache.seq_len * stride > cache.k.len(),
+                        "layer {l} pos {pos}: the pre-fix k_up_to_now() slice \
+                         (range end {}) must be out of range for the ring \
+                         (length {})", cache.seq_len * stride, cache.k.len());
+                }
+            }
+            if is_sliding {
+                assert!(wrapped_steps > 6 * cfg.sliding_window,
+                    "the sliding ring must wrap many times, not once (wrapped {wrapped_steps} steps)");
+            } else {
+                assert_eq!(wrapped_steps, 0, "a full layer's cache must never wrap");
+            }
+        }
+    }
+
+    /// Reproduces the REPORTED numbers exactly: real g12b geometry (sliding
+    /// stride 8*256 = 2048, window 1024) at the first wrap gives the panic
+    /// "range end index 2099200 out of range for slice of length 2097152".
+    /// Pins the arithmetic so a future capacity/stride change is noticed.
+    #[test]
+    fn unified_attention_first_wrap_is_the_reported_panic() {
+        let cfg = Gemma4Config::g12b();
+        let max_seq = 1500;                     // the ctx the cluster gate ran
+        let l = (0..cfg.num_hidden_layers).find(|&x| !cfg.is_full_attention(x)).unwrap();
+        let mut cache = loader_cache(&cfg, l, max_seq);
+        let stride = cache.num_kv_heads * cache.head_dim;
+        assert_eq!(stride, 2048);
+        assert_eq!(cache.capacity, 1024);
+        assert_eq!(cache.k.len(), 2_097_152);
+
+        let z = vec![0.0f32; stride];
+        for _ in 0..=cache.capacity { cache.append(&z, &z); }   // 1025 positions
+        assert_eq!(cache.seq_len, 1025);
+        assert!(cache.has_wrapped());
+        assert_eq!(cache.seq_len * stride, 2_099_200);
+        assert!(cache.seq_len * stride > cache.k.len(),
+            "this is the pre-fix out-of-range read");
+
+        // The fixed read stays inside the ring and returns the window.
+        let spec = LayerSpec::gemma(&cfg, l, Vec::new(), 0.0);
+        let (kb, _vb, vlen) = cache.sdpa_view(spec.window);
+        assert_eq!(vlen, 1024);
+        assert_eq!(kb.len(), 1024 * stride);
     }
 }
