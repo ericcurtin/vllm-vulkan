@@ -9335,7 +9335,7 @@ mod batched_forward_tests {
 // weight-source contract again should re-run the queued single-stage cluster
 // benchmark (`forward_qwen35_prefill` on a real checkpoint), not just this
 // unit suite, before trusting a fix.
-mod qwen35_prefill_tests {
+pub(crate) mod qwen35_prefill_tests {
     use super::*;
     use qwen35::{LayerType, Qwen35Config, Qwen35Model};
     use model::{ModelWeights, SimpleTensor};
@@ -9382,7 +9382,7 @@ mod qwen35_prefill_tests {
         m
     }
 
-    const H: usize = 16;
+    pub(crate) const H: usize = 16;
     const NQ: usize = 4;
     const NKV: usize = 2;
     const HD: usize = 4;
@@ -9392,7 +9392,7 @@ mod qwen35_prefill_tests {
     const VD: usize = 4;
     const KERN: usize = 3;
     const INTER: usize = 12;
-    const VOCAB: usize = 12;
+    pub(crate) const VOCAB: usize = 12;
 
     fn cfg() -> Qwen35Config {
         Qwen35Config {
@@ -9479,7 +9479,7 @@ mod qwen35_prefill_tests {
     /// A tiny `VulkanModel` with `qwen35: Some(..)`, `engine: None` — mirrors
     /// `batched_forward_tests::tiny_qwen_model`'s literal field-by-field style
     /// but for the qwen3_5 path.
-    fn tiny_qwen35_vulkan_model() -> VulkanModel {
+    pub(crate) fn tiny_qwen35_vulkan_model() -> VulkanModel {
         let mut weights = build_weights();
         // Mirrors the split loader: `q35_f16_host` is the ONLY source for
         // embed_tokens/lm_head (built above from the still-f32 copy), then

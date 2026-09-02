@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Per-model pyo3 seam for `qwen35` — moved verbatim out of the monolithic
 //! `VulkanModel` `#[pymethods]` block in `lib.rs` (Phase A upstream refactor).
-//! Behavior-preserving code motion: method bodies are byte-for-byte identical.
+//! The Phase A move itself was behavior-preserving (method bodies byte-for-byte
+//! identical), but this file is NOT move-only any more: later work ADDED methods
+//! here — `forward_tp_qwen35_verify_impl`, `qwen35_tp_verify_rollback_impl`,
+//! `debug_tp_qwen35_verify_vs_serial`, and the MTP pre-norm capture in
+//! `qwen35_tp_forward_normed` among them. Review those as new code.
 //! Kept as separate `#[pymethods] impl VulkanModel` block(s) via pyo3's
 //! `multiple-pymethods` feature so a per-model upstream PR can carve this file.
 #![allow(clippy::all)]
@@ -448,6 +452,12 @@ impl VulkanModel {
                 "forward_pp_qwen35_prefill: hidden_in.len()={} != seq*H={}",
                 hidden_in.len(), seq * h)));
         }
+        if first && tokens.len() < seq {
+            // The first stage indexes `tokens[pos]` for `pos in 0..seq`; only
+            // `hidden_in` was length-checked above.
+            return Err(PyRuntimeError::new_err(format!(
+                "forward_pp_qwen35_prefill: tokens.len()={} < seq={seq}", tokens.len())));
+        }
         let mut out: Vec<f32> = if last { Vec::new() } else { Vec::with_capacity(seq * h) };
         for pos in 0..seq {
             let step = if first {
@@ -517,6 +527,11 @@ impl VulkanModel {
                 .config;
             (cfg.hidden_size, cfg.rms_norm_eps, cfg.vocab_size)
         };
+        if t == 0 {
+            // `0 != 0` is false, so the length check below PASSES for t==0 and
+            // the last-window `(t - 1) * h` slice underflows `usize`.
+            return Err(PyRuntimeError::new_err("forward_qwen35_window: t must be >= 1"));
+        }
         if hidden_in.len() != t * h {
             return Err(PyRuntimeError::new_err(format!(
                 "forward_qwen35_window: hidden_in len {} != t*hidden {}", hidden_in.len(), t * h)));
@@ -664,7 +679,7 @@ impl VulkanModel {
         let vocab = self.qwen35.as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("forward_qwen35_verify_argmax needs a qwen3_5 model"))?
             .config.vocab_size;
-        if logits.len() % vocab != 0 {
+        if vocab == 0 || logits.len() % vocab != 0 {
             return Err(PyRuntimeError::new_err(
                 "forward_qwen35_verify_argmax: not a last-stage [T*vocab] result (call only on the last stage)"));
         }
@@ -866,6 +881,10 @@ impl VulkanModel {
             Ok(None)
         } else {
             let vocab = self.qwen35.as_ref().unwrap().config.vocab_size;
+            if vocab == 0 || out.len() % vocab != 0 {
+                return Err(PyRuntimeError::new_err(
+                    "pp_step_qwen35_verify: not a last-stage [T*vocab] result"));
+            }
             let tt = out.len() / vocab;
             let mut outs = Vec::with_capacity(tt);
             for ti in 0..tt {
@@ -1131,13 +1150,25 @@ impl VulkanModel {
         if t == 0 {
             return Ok(Vec::new());
         }
+        // Validate BEFORE `spec_verify_span` is set: `tokens` comes straight from
+        // Python, and a panic below would abort through the pyo3 boundary having
+        // already left a pending verify span behind.
+        let embed_w = self.q35_f16_host.get("model.embed_tokens.weight")
+            .ok_or_else(|| PyRuntimeError::new_err(
+                "forward_tp_qwen35_verify: qwen3_5 embed_tokens f16 host missing"))?;
+        if let Some(&tok) = tokens.iter().find(|&&tok| (tok as usize + 1) * h > embed_w.len()) {
+            return Err(PyRuntimeError::new_err(format!(
+                "forward_tp_qwen35_verify: token id {tok} is outside the embedding table \
+                 ({} rows of {h}, vocab {vocab})", embed_w.len() / h.max(1))));
+        }
+
         self.spec_verify_gdn_inputs.clear();
         self.spec_verify_span = Some((start_pos, t));
 
         // Embed all T tokens (replicated on every rank).
         let mut hidden: Vec<f32> = {
             let w = self.q35_f16_host.get("model.embed_tokens.weight")
-                .expect("qwen3_5 embed_tokens f16 host missing");
+                .expect("checked above");
             let mut hv = vec![0.0f32; t * h];
             for (ti, &tok) in tokens.iter().enumerate() {
                 let row = &w[tok as usize * h..(tok as usize + 1) * h];
@@ -1158,7 +1189,9 @@ impl VulkanModel {
             let norm_w = qm.weights.f32_slice("model.norm.weight").to_vec();
             let lm_name = qm.lm_head_name.clone();
             let lm_w = self.q35_f16_host.get(&lm_name)
-                .expect("qwen3_5 lm_head f16 host missing (TP verify CPU-fallback)");
+                .ok_or_else(|| PyRuntimeError::new_err(
+                    "forward_tp_qwen35_verify: qwen3_5 lm_head f16 host missing \
+                     (TP verify CPU-fallback)"))?;
             let lm_f32: Vec<f32> = lm_w.iter().map(|&b| half::f16::from_bits(b).to_f32()).collect();
             self.stash_verify_prenorm(&out, start_pos, t, h);
             let mut logits = vec![0.0f32; t * vocab];
@@ -1381,5 +1414,89 @@ impl VulkanModel {
         Ok(())
     }
 
+
+}
+
+/// Input validation at the qwen35 pyo3 seam.
+///
+/// Reuses the `qwen35_prefill_tests` fixture in `lib.rs` (a real `VulkanModel`
+/// with `qwen35: Some(..)`, `engine: None`) rather than rebuilding one, so these
+/// gates run against the same harness the prefill parity gates do.
+#[cfg(all(test, feature = "qwen35"))]
+mod pyseam_qwen35_input_tests {
+    use super::*;
+
+    /// PyO3-boundary input validation. Every method below is reachable from
+    /// Python with arbitrary arguments, and a Rust panic there ABORTS through
+    /// the boundary instead of raising — so each of these must be an `Err`.
+    ///
+    /// Each case is a real hole a sibling method on the same file already
+    /// closed: `forward_pp_qwen35_prefill` rejects `seq == 0` but not a short
+    /// `tokens`; `forward_qwen35_window` length-checks `hidden_in` with a test
+    /// that is vacuously true at `t == 0`; the TP verify's embed lookup panics
+    /// where `forward_qwen35_window`'s lm_head lookup returns a named error.
+    #[test]
+    fn qwen35_pymethods_reject_bad_input_instead_of_panicking() {
+        // Formatting a `PyErr` needs the interpreter, so initialise it up front
+        // rather than only for the `with_gil` block below.
+        pyo3::prepare_freethreaded_python();
+
+        // `t == 0` passes `hidden_in.len() != t * h` (0 != 0 is false) and then
+        // underflows the last-window `(t - 1) * h` slice.
+        {
+            let mut vm = crate::qwen35_prefill_tests::tiny_qwen35_vulkan_model();
+            let e = vm.forward_qwen35_window(Vec::new(), 0, 0)
+                .expect_err("t == 0 must be refused");
+            assert!(format!("{e}").contains("t must be >= 1"), "got: {e}");
+            // ...and a well-formed t == 1 call still works.
+            vm.forward_qwen35_window(vec![0.0f32; crate::qwen35_prefill_tests::H], 0, 1)
+                .expect("t == 1 must still be served");
+        }
+
+        // The first stage indexes `tokens[pos]` for `pos in 0..seq`; only
+        // `hidden_in` was length-checked.
+        {
+            let mut vm = crate::qwen35_prefill_tests::tiny_qwen35_vulkan_model();
+            let e = vm.forward_pp_qwen35_prefill(vec![1, 2], Vec::new(), 4)
+                .expect_err("tokens shorter than seq must be refused");
+            assert!(format!("{e}").contains("tokens.len()=2 < seq=4"), "got: {e}");
+            // ...and tokens.len() == seq is still served.
+            vm.forward_pp_qwen35_prefill(vec![1, 2, 3, 4], Vec::new(), 4)
+                .expect("a full-length prompt must still be served");
+        }
+
+        // The TP verify embeds Python-supplied ids out of `q35_f16_host`.
+        pyo3::Python::with_gil(|py| {
+            // (a) an out-of-range token id sliced the f16 embed table directly.
+            let mut vm = crate::qwen35_prefill_tests::tiny_qwen35_vulkan_model();
+            let e = vm.forward_tp_qwen35_verify_impl(py, vec![0, crate::qwen35_prefill_tests::VOCAB as u32], 0, py.None())
+                .expect_err("a token id at vocab_size must be refused");
+            assert!(format!("{e}").contains("outside the embedding table"), "got: {e}");
+            // ...and the refusal must not leave a pending verify span behind,
+            // which a panic at the embed slice would have done.
+            assert!(vm.spec_verify_span.is_none(),
+                    "a refused verify must not leave `spec_verify_span` set");
+
+            // (b) the f16 host table absent (the lean-host load shape).
+            let mut vm = crate::qwen35_prefill_tests::tiny_qwen35_vulkan_model();
+            vm.q35_f16_host.remove("model.embed_tokens.weight");
+            let e = vm.forward_tp_qwen35_verify_impl(py, vec![0, 1], 0, py.None())
+                .expect_err("a missing embed table must be refused");
+            assert!(format!("{e}").contains("embed_tokens f16 host missing"), "got: {e}");
+
+            // (c) the lm_head table absent, on the same CPU-fallback path.
+            let mut vm = crate::qwen35_prefill_tests::tiny_qwen35_vulkan_model();
+            vm.q35_f16_host.remove("lm_head.weight");
+            let e = vm.forward_tp_qwen35_verify_impl(py, vec![0, 1], 0, py.None())
+                .expect_err("a missing lm_head table must be refused");
+            assert!(format!("{e}").contains("lm_head f16 host missing"), "got: {e}");
+
+            // ...and the valid call still returns [T*vocab] logits.
+            let mut vm = crate::qwen35_prefill_tests::tiny_qwen35_vulkan_model();
+            let ok = vm.forward_tp_qwen35_verify_impl(py, vec![0, 1], 0, py.None())
+                .expect("a well-formed TP verify must still be served");
+            assert_eq!(ok.len(), 2 * crate::qwen35_prefill_tests::VOCAB);
+        });
+    }
 
 }
