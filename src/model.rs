@@ -388,6 +388,44 @@ impl KvCache {
         (k, v, valid_len)
     }
 
+    /// THE canonical "what does SDPA read from this cache" accessor — the one
+    /// place that knows whether a layer's cache is a ring or a plain absolute
+    /// array, so a new attention call site cannot get it wrong again.
+    ///
+    /// `window` is the layer's sliding window (`None` == full causal attention).
+    /// Returns `(k, v, valid_len)` ALREADY in `cpu_sdpa`'s row order (ascending
+    /// absolute position), to be fed with `sliding_window = None`:
+    ///
+    /// * `None`  → the zero-copy absolute slices (`k_up_to_now`/`v_up_to_now`),
+    ///   `valid_len == seq_len`. A full layer's `capacity == max_seq_len`, so it
+    ///   never wraps and slot == absolute position holds forever.
+    /// * `Some(w)` → [`windowed_view`], `valid_len == min(seq_len, w)`. A
+    ///   sliding layer's cache is a `w`-sized RING (`layer_kv_capacity`), where
+    ///   absolute position `p` lives at slot `p % capacity`. Passing such a
+    ///   cache to `k_up_to_now()` slices `..seq_len * stride` out of a
+    ///   `capacity * stride` buffer: correct up to the first wrap, then one row
+    ///   past the end (panic) — and, with a bigger overrun, silently the WRONG
+    ///   rows in the WRONG order. `windowed_view` re-linearizes instead, which
+    ///   is bit-for-bit identical to attending the full absolute array with
+    ///   `Some(w)` (see `ring_windowed_view_bit_exact_vs_full_and_legacy`).
+    ///
+    /// Same lesson as `crate::kv_last_slot` for the single-row carried-KV read:
+    /// any test that stays under `capacity` agrees with the broken expression,
+    /// so the guard test must WRAP. See `unified_attention_ring_view_wraps`.
+    pub fn sdpa_view(&self, window: Option<usize>) -> (std::borrow::Cow<'_, [f32]>, std::borrow::Cow<'_, [f32]>, usize) {
+        match window {
+            Some(w) => {
+                let (k, v, vlen) = self.windowed_view(w);
+                (std::borrow::Cow::Owned(k), std::borrow::Cow::Owned(v), vlen)
+            }
+            None => (
+                std::borrow::Cow::Borrowed(self.k_up_to_now()),
+                std::borrow::Cow::Borrowed(self.v_up_to_now()),
+                self.seq_len,
+            ),
+        }
+    }
+
     pub fn k_up_to_now(&self) -> &[f32] {
         debug_assert!(!self.has_wrapped(),
             "k_up_to_now() on a wrapped windowed KvCache (seq_len {} > capacity {}); use windowed_view()",
