@@ -3612,9 +3612,26 @@ impl VulkanModel {
         let h = cfg.hidden_size;
         let eps = cfg.rms_norm_eps;
         let vocab = cfg.vocab_size;
+        let (pp_start, pp_end, pp_last) = (self.pp_start, self.pp_end, self.pp_last);
+        // The CPU-fallback last stage below reads the f16-host lm_head AFTER
+        // `forward_pp_range_batched_capture` has advanced the resident KV and
+        // GDN state, and it read it with an `expect` — a missing table aborted
+        // through the pyo3 boundary, and even as an `Err` it would leave a
+        // pending `spec_verify_span` on a model that had already moved. Check it
+        // while nothing has changed yet. (Sibling of the same defect in
+        // `pyseam_qwen35::forward_tp_qwen35_verify_impl`.)
+        if self.engine.is_none() && pp_last {
+            let lm_name = self.qwen35.as_ref()
+                .map(|m| m.lm_head_name.clone())
+                .unwrap_or_default();
+            if !self.q35_f16_host.contains_key(&lm_name) {
+                return Err(PyRuntimeError::new_err(format!(
+                    "forward_qwen35_verify: qwen3_5 lm_head f16 host missing \
+                     (verify CPU-fallback last stage, '{lm_name}')")));
+            }
+        }
         self.spec_verify_gdn_inputs.clear();
         self.spec_verify_span = Some((start_pos, t));
-        let (pp_start, pp_end, pp_last) = (self.pp_start, self.pp_end, self.pp_last);
 
         // ── CPU fallback (no GPU engine) — Mac identity-gate path ────────────
         if self.engine.is_none() {
@@ -3629,7 +3646,9 @@ impl VulkanModel {
             let norm_w = qm.weights.f32_slice("model.norm.weight").to_vec();
             let lm_name = qm.lm_head_name.clone();
             let lm_w = self.q35_f16_host.get(&lm_name)
-                .expect("qwen3_5 lm_head f16 host missing (verify CPU-fallback last stage)");
+                .ok_or_else(|| PyRuntimeError::new_err(
+                    "forward_qwen35_verify: qwen3_5 lm_head f16 host missing \
+                     (verify CPU-fallback last stage)"))?;
             let lm_f32: Vec<f32> = lm_w.iter().map(|&b| half::f16::from_bits(b).to_f32()).collect();
             self.stash_verify_prenorm(&hidden, start_pos, t, h);
             let mut logits = vec![0.0f32; t * vocab];

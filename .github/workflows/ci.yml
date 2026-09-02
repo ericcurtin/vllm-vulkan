@@ -92,7 +92,14 @@ jobs:
     - name: Run foundation-slice Rust tests
       run: |
         # The test binary embeds the interpreter; point it at the system Python.
-        export PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
+        # `export VAR=$(cmd)` MASKS a failing lookup: `export`'s own exit status
+        # is 0, so `bash -e` does not stop and the job runs with an EMPTY
+        # PYTHONHOME. The symptom is `ModuleNotFoundError: No module named
+        # 'encodings'` from the embedded interpreter, which reads as a test
+        # failure rather than a missing python3.12. Assign, check, then export.
+        PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
+        test -n "$PYTHONHOME" || { echo "python3.12 reported no base_prefix" >&2; exit 1; }
+        export PYTHONHOME
         cargo test --no-default-features --features "multiple-pymethods" --lib
 
     # lavapipe is Mesa's CPU Vulkan driver. With it selected the kernel
@@ -124,7 +131,9 @@ jobs:
         RUST_BACKTRACE: '1'
       run: |
         # VK_ICD_FILENAMES comes from the discovery step above via GITHUB_ENV.
-        export PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
+        PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
+        test -n "$PYTHONHOME" || { echo "python3.12 reported no base_prefix" >&2; exit 1; }
+        export PYTHONHOME
         cargo test --no-default-features --features "multiple-pymethods" --lib -- --nocapture
 
     # Structural validation of every compiled module. Complements the Rust
@@ -205,7 +214,9 @@ jobs:
         RUST_BACKTRACE: '1'
       run: |
         # The test binary embeds the interpreter; point it at the system Python.
-        export PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
+        PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
+        test -n "$PYTHONHOME" || { echo "python3.12 reported no base_prefix" >&2; exit 1; }
+        export PYTHONHOME
         # Single-threaded: two GEMM-picker tests race on a process-global
         # env/OnceLock snapshot under the parallel runner.
         cargo test --no-default-features --features "multiple-pymethods,gemma" --lib \
@@ -251,7 +262,9 @@ jobs:
         RUST_BACKTRACE: '1'
       run: |
         # The test binary embeds the interpreter; point it at the system Python.
-        export PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
+        PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
+        test -n "$PYTHONHOME" || { echo "python3.12 reported no base_prefix" >&2; exit 1; }
+        export PYTHONHOME
         # Single-threaded: two GEMM-picker tests race on a process-global
         # env/OnceLock snapshot under the parallel runner.
         cargo test --no-default-features --features "multiple-pymethods,gemma,qwen35" --lib \
@@ -268,6 +281,8 @@ jobs:
       env:
         RUST_BACKTRACE: '1'
       run: |
-        export PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
+        PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
+        test -n "$PYTHONHOME" || { echo "python3.12 reported no base_prefix" >&2; exit 1; }
+        export PYTHONHOME
         cargo test --no-default-features --features "multiple-pymethods,gemma,qwen35,mtp" --lib \
           -- --test-threads=1 --nocapture

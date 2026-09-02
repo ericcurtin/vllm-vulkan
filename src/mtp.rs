@@ -449,14 +449,28 @@ impl MtpHead {
             kv: KvCache::new(MTP_KV_CAP, nkv, hd),
             max_depth,
         };
-        assert_eq!(head.fc.len(), h * 2 * h, "fc [{h},{}]", 2 * h);
-        assert_eq!(head.q_proj.len(), nq * 2 * hd * h, "q_proj [{},{h}]", nq * 2 * hd);
-        assert_eq!(head.k_proj.len(), nkv * hd * h, "k_proj");
-        assert_eq!(head.o_proj.len(), h * nq * hd, "o_proj");
-        if let Some(dm) = &head.dense_mlp {
-            assert_eq!(dm.gate.len(), inter * h, "gate_proj [{inter},{h}]");
-            assert_eq!(dm.up.len(), inter * h, "up_proj [{inter},{h}]");
-            assert_eq!(dm.down.len(), h * inter, "down_proj [{h},{inter}]");
+        // Shape sanity, same treatment as `from_raw`'s: `load_dense` reads an
+        // arbitrary `model.safetensors`, so a truncated or mis-paired DENSE head
+        // file is user input and must come back as an `Err` the pyo3 boundary
+        // can raise — not a panic that aborts through it. `v_proj` is included:
+        // `layer_step` runs `ops.matvec(MV_V, ..)` on it and it had no check at
+        // all, exactly as on the MoE constructor.
+        let dm = head.dense_mlp.as_ref()
+            .ok_or_else(|| "dense MTP head lost its DenseMlp".to_string())?;
+        for (name, got, want) in [
+            ("fc", head.fc.len(), h * 2 * h),
+            ("q_proj", head.q_proj.len(), nq * 2 * hd * h),
+            ("k_proj", head.k_proj.len(), nkv * hd * h),
+            ("v_proj", head.v_proj.len(), nkv * hd * h),
+            ("o_proj", head.o_proj.len(), h * nq * hd),
+            ("gate_proj", dm.gate.len(), inter * h),
+            ("up_proj", dm.up.len(), inter * h),
+            ("down_proj", dm.down.len(), h * inter),
+        ] {
+            if got != want {
+                return Err(format!(
+                    "dense MTP tensor '{name}' has {got} elements, expected {want}"));
+            }
         }
         Ok(head)
     }
@@ -1273,6 +1287,44 @@ mod tests {
         m.insert("layers.0.mlp.up_proj.weight".into(), mk(inter * h, 0.1));
         m.insert("layers.0.mlp.down_proj.weight".into(), mk(h * inter, 0.1));
         m
+    }
+
+    /// The DENSE twin of `from_raw_reports_a_bad_tensor_shape_as_an_error`.
+    ///
+    /// `from_raw_dense` is a SEPARATE constructor reached from `load_dense`,
+    /// which reads an arbitrary `model.safetensors`. It kept the `assert_eq!`
+    /// form after the MoE `from_raw` was converted, so a truncated or mis-paired
+    /// DENSE head file still aborted the process through the pyo3 boundary
+    /// rather than raising. `v_proj` is in the loop for the same reason it is in
+    /// the MoE one: `layer_step` runs `ops.matvec(MV_V, ..)` on it and it had no
+    /// check at all. The three dense-MLP tensors are here too — they were
+    /// asserts as well, and the reviewer's report named only four of the seven.
+    #[test]
+    fn from_raw_dense_reports_a_bad_tensor_shape_as_an_error() {
+        let cfg = tiny_dense_cfg();
+        for name in ["fc.weight",
+                     "layers.0.self_attn.q_proj.weight",
+                     "layers.0.self_attn.k_proj.weight",
+                     "layers.0.self_attn.v_proj.weight",
+                     "layers.0.self_attn.o_proj.weight",
+                     "layers.0.mlp.gate_proj.weight",
+                     "layers.0.mlp.up_proj.weight",
+                     "layers.0.mlp.down_proj.weight"] {
+            let mut raw = tiny_dense_raw(&cfg);
+            let full = raw[name].len();
+            raw.get_mut(name).unwrap().truncate(full - 1); // a truncated shard
+            let short = name.rsplit('.').nth(1).unwrap();
+            let err = match MtpHead::from_raw_dense(&raw, &cfg, 4) {
+                Ok(_) => panic!("{name}: a truncated tensor must not build a dense head"),
+                Err(e) => e,
+            };
+            assert!(err.contains(short) && err.contains(&(full - 1).to_string())
+                        && err.contains(&full.to_string()),
+                    "{name}: the error must name the tensor and both counts; got: {err}");
+        }
+        // ...and the intact set still builds.
+        MtpHead::from_raw_dense(&tiny_dense_raw(&cfg), &cfg, 4)
+            .expect("the intact dense fixture must still build");
     }
 
     /// THE strong P1 gate for the DENSE head: the inline dense `layer_step` +

@@ -48,7 +48,8 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
 use crate::gemma_assistant::{
-    draft_block, load_assistant_weights, AssistantConfig, AssistantSharedKv,
+    draft_block, expected_tensor_shapes, load_assistant_weights, AssistantConfig,
+    AssistantSharedKv,
 };
 use crate::gemma_spec::{run_spec_decode_coupled, SpecConfig, SpecRun};
 use crate::model::Gemma4Model;
@@ -171,6 +172,31 @@ impl SpecDrafter {
                  same. The drafter checkpoint is not paired with this target.",
                 cfg.vocab_size, target.config.vocab_size));
         }
+        // The drafter's OWN tensors. `load_assistant_weights` is a plain
+        // safetensors read with no shape opinion, and `assistant_forward`'s `w`
+        // / `amv` PANIC on a name they cannot find — through the pyo3 boundary,
+        // mid-`gemma_spec_generate`, several blocks into a generation. A
+        // wrong-sized tensor is worse: it reaches `cpu_matmul`'s dimension
+        // check (a panic) or, on the GPU path, a matvec that reads whatever is
+        // resident. `expected_tensor_shapes` is the checkpoint tensor map and
+        // is gated as COMPLETE and EXACT for what the forward reads
+        // (`gemma_assistant::tests::gemma_assistant_synthetic_fixture_covers_
+        // the_checkpoint_tensor_map`), so checking it here converts every one of
+        // those into a load-time `Err` that NAMES the tensor.
+        for (name, shape) in expected_tensor_shapes(&cfg) {
+            let want: usize = shape.iter().product();
+            match weights.get(&name) {
+                None => return Err(format!(
+                    "spec drafter: required tensor '{name}' (shape {shape:?}) is missing from the \
+                     drafter checkpoint. The drafter is incomplete or not paired with this \
+                     target.")),
+                Some(v) if v.len() != want => return Err(format!(
+                    "spec drafter: tensor '{name}' has {} elements, expected {want} (shape \
+                     {shape:?}). The drafter checkpoint is not paired with this target.",
+                    v.len())),
+                Some(_) => {}
+            }
+        }
         let kv = Self::borrow_kv(target, &cfg)?;
         Ok(SpecDrafter {
             target_embed: target.weights.f32_slice(EMBED).to_vec(),
@@ -289,6 +315,41 @@ pub fn spec_decode_gemma(
         return Ok(SpecDecodeReport { tokens: Vec::new(), blocks: 0, drafted: 0, accepted: 0 });
     }
 
+    // ── The seed precondition, checked HERE rather than discovered inside the
+    //    loop ────────────────────────────────────────────────────────────────
+    //
+    // `recompute_seed_hidden` has exactly ONE failure mode: the caller's
+    // position cursor has drifted from the target's KV frontier. It refuses
+    // BEFORE it truncates anything, so the refusal itself is state-neutral —
+    // but the closure below cannot stop `run_spec_decode_coupled`, which then
+    // runs every REMAINING block on filler drafts and ADVANCES the target's KV
+    // and frontier before `first_error` is re-raised. A caller that catches the
+    // error and retries would then be decoding from a context that moved.
+    //
+    // Hoisting the check makes that unreachable for the production seed source:
+    //   * it holds (or does not) at the FIRST block, and
+    //   * `spec_step_coupled` ends every block with `verify_rollback` leaving
+    //     the frontier at `pos + committed.len()`, which is exactly the next
+    //     block's `pos` — so if the invariant holds at block 0 it holds at
+    //     every block.
+    // Failing here returns with the target EXACTLY as the caller handed it over.
+    //
+    // `SeedSource::ByPosition` is caller-supplied and can fail at any block;
+    // that is a Rust-API-only path (the pymethod hardcodes `Recompute`) and it
+    // cannot be stopped mid-loop without giving `draft_fn` a `Result` return,
+    // which is the INC-5a contract every stub-drafter call site is written
+    // against. Its error message below says the state advanced instead.
+    if matches!(&seed, SeedSource::Recompute) {
+        if let Some((li, n)) = target.kv_caches.iter().map(|c| c.seq_len).enumerate()
+            .find(|&(_, n)| n != start_pos)
+        {
+            return Err(format!(
+                "spec_decode_gemma: layer {li}'s KV frontier is {n}, expected start_pos \
+                 {start_pos}. The caller's position cursor and the target's KV have drifted \
+                 apart; nothing was generated and the target is untouched."));
+        }
+    }
+
     // Errors raised inside the drafter closure cannot propagate through
     // `run_spec_decode_coupled` (its `draft_fn` returns draft ids, and giving it
     // a Result would change the INC-5a contract for every stub-drafter call
@@ -333,7 +394,16 @@ pub fn spec_decode_gemma(
     );
 
     if let Some(e) = first_error {
-        return Err(format!("spec_decode_gemma: drafter seed unavailable: {e}"));
+        // Only `SeedSource::ByPosition` can get here — the `Recompute`
+        // precondition is checked above, before any block runs. The loop could
+        // not be stopped at the failing block, so the target's KV and frontier
+        // HAVE advanced past `start_pos` on filler drafts. Say so: the tokens
+        // are discarded, but the model is not where the caller left it and must
+        // be re-prefilled, not retried in place.
+        return Err(format!(
+            "spec_decode_gemma: drafter seed unavailable: {e}. The target's KV and position \
+             frontier ADVANCED before this could be raised — discard the target's generation \
+             state and re-prefill; do not retry in place."));
     }
     let (blocks, drafted, accepted) = (run.blocks(), run.drafted(), run.accepted());
     Ok(SpecDecodeReport { tokens: run.tokens, blocks, drafted, accepted })

@@ -1162,6 +1162,23 @@ impl VulkanModel {
                  ({} rows of {h}, vocab {vocab})", embed_w.len() / h.max(1))));
         }
 
+        // The CPU-fallback branch below reads the f16-host lm_head, but only
+        // AFTER `forward_pp_range_batched_capture` has advanced the resident KV
+        // and GDN state. A missing table there returns an `Err` with a pending
+        // `spec_verify_span` and a model that has already moved — the same
+        // ordering defect the embed check above was hoisted to fix. Resolve the
+        // name and check its presence while nothing has changed yet.
+        if self.engine.is_none() {
+            let lm_name = self.qwen35.as_ref()
+                .map(|m| m.lm_head_name.clone())
+                .unwrap_or_default();
+            if !self.q35_f16_host.contains_key(&lm_name) {
+                return Err(PyRuntimeError::new_err(format!(
+                    "forward_tp_qwen35_verify: qwen3_5 lm_head f16 host missing \
+                     (TP verify CPU-fallback, '{lm_name}')")));
+            }
+        }
+
         self.spec_verify_gdn_inputs.clear();
         self.spec_verify_span = Some((start_pos, t));
 
@@ -1435,6 +1452,15 @@ mod pyseam_qwen35_input_tests {
     /// `tokens`; `forward_qwen35_window` length-checks `hidden_in` with a test
     /// that is vacuously true at `t == 0`; the TP verify's embed lookup panics
     /// where `forward_qwen35_window`'s lm_head lookup returns a named error.
+    /// Every full-attention layer's KV frontier. The probe for "this refusal
+    /// did not advance the model", which `spec_verify_span` alone cannot show.
+    fn kv_frontiers(vm: &VulkanModel) -> Vec<usize> {
+        vm.qwen35.as_ref().map(|m| m.layer_state.iter().filter_map(|s| match s {
+            crate::qwen35::LayerState::Full(kv) => Some(kv.seq_len),
+            crate::qwen35::LayerState::Linear(_) => None,
+        }).collect()).unwrap_or_default()
+    }
+
     #[test]
     fn qwen35_pymethods_reject_bad_input_instead_of_panicking() {
         // Formatting a `PyErr` needs the interpreter, so initialise it up front
@@ -1485,11 +1511,24 @@ mod pyseam_qwen35_input_tests {
             assert!(format!("{e}").contains("embed_tokens f16 host missing"), "got: {e}");
 
             // (c) the lm_head table absent, on the same CPU-fallback path.
+            //
+            // Refusing is only half of it. The lm_head read sits AFTER
+            // `forward_pp_range_batched_capture`, so a refusal raised where the
+            // read happens leaves a pending `spec_verify_span` on a model whose
+            // resident KV / GDN state has already advanced by T tokens — the
+            // caller's rollback then has no span to roll back to. Assert BOTH
+            // the span and the KV frontiers, so the check cannot slide back
+            // down past the state change.
             let mut vm = crate::qwen35_prefill_tests::tiny_qwen35_vulkan_model();
             vm.q35_f16_host.remove("lm_head.weight");
+            let before = kv_frontiers(&vm);
             let e = vm.forward_tp_qwen35_verify_impl(py, vec![0, 1], 0, py.None())
                 .expect_err("a missing lm_head table must be refused");
             assert!(format!("{e}").contains("lm_head f16 host missing"), "got: {e}");
+            assert!(vm.spec_verify_span.is_none(),
+                    "a refused verify must not leave `spec_verify_span` set");
+            assert_eq!(kv_frontiers(&vm), before,
+                       "a refused verify must not advance the model's KV frontiers");
 
             // ...and the valid call still returns [T*vocab] logits.
             let mut vm = crate::qwen35_prefill_tests::tiny_qwen35_vulkan_model();
@@ -1497,6 +1536,38 @@ mod pyseam_qwen35_input_tests {
                 .expect("a well-formed TP verify must still be served");
             assert_eq!(ok.len(), 2 * crate::qwen35_prefill_tests::VOCAB);
         });
+    }
+
+    /// The SIBLING of the TP-verify ordering defect, in the single-node /
+    /// PP verify core.
+    ///
+    /// `forward_qwen35_verify_core` set `spec_verify_span`, ran
+    /// `forward_pp_range_batched_capture`, and only THEN read the f16-host
+    /// lm_head — with an `expect`, so a missing table aborted the process
+    /// through the pyo3 boundary; converted to an `Err` it would still have
+    /// returned with a pending verify span on a model whose KV had already
+    /// advanced by T. Both properties are asserted here so the check cannot
+    /// slide back down past the state change.
+    #[test]
+    fn qwen35_verify_core_refuses_a_missing_lm_head_before_it_advances_state() {
+        pyo3::prepare_freethreaded_python();
+        let h = crate::qwen35_prefill_tests::H;
+        let mut vm = crate::qwen35_prefill_tests::tiny_qwen35_vulkan_model();
+        vm.q35_f16_host.remove("lm_head.weight");
+        let before = kv_frontiers(&vm);
+        let e = vm.forward_qwen35_verify_core(vec![0.0f32; 2 * h], 0, 2)
+            .expect_err("a missing lm_head table must be refused");
+        assert!(format!("{e}").contains("lm_head f16 host missing"), "got: {e}");
+        assert!(vm.spec_verify_span.is_none(),
+                "a refused verify must not leave `spec_verify_span` set");
+        assert_eq!(kv_frontiers(&vm), before,
+                   "a refused verify must not advance the model's KV frontiers");
+
+        // ...and with the table present the same call is still served.
+        let mut vm = crate::qwen35_prefill_tests::tiny_qwen35_vulkan_model();
+        let ok = vm.forward_qwen35_verify_core(vec![0.0f32; 2 * h], 0, 2)
+            .expect("a well-formed verify must still be served");
+        assert_eq!(ok.len(), 2 * crate::qwen35_prefill_tests::VOCAB);
     }
 
 }

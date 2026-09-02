@@ -1627,6 +1627,94 @@ mod tests {
         ).expect("production spec-decode seam")
     }
 
+    /// A drafter checkpoint that is missing a tensor, or carries one at the
+    /// wrong size, must be refused at LOAD with the tensor NAMED.
+    ///
+    /// `load_assistant_weights` is a plain safetensors read with no shape
+    /// opinion, and `assistant_forward`'s `w` / `amv` panic on a name they
+    /// cannot find. Without this check the failure surfaces as an abort through
+    /// the pyo3 boundary, several blocks into `gemma_spec_generate`, naming
+    /// nothing the operator can act on. Every entry of `expected_tensor_shapes`
+    /// is covered because that map is gated as complete and exact for what the
+    /// forward reads.
+    #[test]
+    fn spec_drafter_refuses_a_checkpoint_with_a_missing_or_mis_sized_tensor() {
+        let f = build_fixture(2);
+        let names: Vec<String> = expected_tensor_shapes(&f.acfg).into_iter()
+            .map(|(n, _)| n).collect();
+        assert!(names.len() >= 4 + 11, "the fixture must cover the whole map");
+
+        for name in &names {
+            // (a) absent entirely.
+            let mut aw = f.aw.clone();
+            aw.remove(name);
+            let err = match crate::gemma_spec_wire::SpecDrafter::from_parts(
+                f.acfg.clone(), aw, &f.model) {
+                Ok(_) => panic!("a checkpoint missing '{name}' must be refused"),
+                Err(e) => e,
+            };
+            assert!(err.contains(name.as_str()),
+                    "the refusal must NAME the missing tensor; got: {err}");
+
+            // (b) present but one element short — the case that reaches
+            //     `cpu_matmul`'s dimension check instead of a lookup panic.
+            let mut aw = f.aw.clone();
+            let full = aw[name].len();
+            aw.get_mut(name).unwrap().truncate(full - 1);
+            let err = match crate::gemma_spec_wire::SpecDrafter::from_parts(
+                f.acfg.clone(), aw, &f.model) {
+                Ok(_) => panic!("a truncated '{name}' must be refused"),
+                Err(e) => e,
+            };
+            assert!(err.contains(name.as_str()) && err.contains(&(full - 1).to_string())
+                        && err.contains(&full.to_string()),
+                    "the refusal must name the tensor and both counts; got: {err}");
+        }
+
+        // ...and the intact fixture still builds.
+        crate::gemma_spec_wire::SpecDrafter::from_parts(f.acfg.clone(), f.aw.clone(), &f.model)
+            .expect("the intact fixture must still build a drafter");
+    }
+
+    /// A drifted position cursor must be refused BEFORE any block runs, with
+    /// the target left exactly as the caller handed it over.
+    ///
+    /// `recompute_seed_hidden` refuses a drifted frontier from inside the draft
+    /// closure, and that refusal CANNOT stop `run_spec_decode_coupled`: the
+    /// remaining blocks still run on filler drafts and advance the target's KV
+    /// before the stashed error is re-raised. A caller that catches the error
+    /// and retries would then be decoding from a context that moved. So the
+    /// assertion is not just "it returns `Err`" — it is that the KV frontiers
+    /// are untouched.
+    #[test]
+    fn production_seam_refuses_a_drifted_cursor_without_advancing_the_target() {
+        let mut f = build_fixture(SPEC_BASELINE_LEN);
+        f.rewind();
+        let drafter = crate::gemma_spec_wire::SpecDrafter::from_parts(
+            f.acfg.clone(), f.aw.clone(), &f.model).expect("build drafter");
+        let prompt_last = *f.prompt.last().unwrap();
+        let cfg = SpecConfig { k: SPEC_K, max_new_tokens: SPEC_N };
+        let before: Vec<usize> = f.model.kv_caches.iter().map(|c| c.seq_len).collect();
+
+        // `start_pos` one past where the KV actually stands.
+        let err = crate::gemma_spec_wire::spec_decode_gemma(
+            &mut f.model, &drafter, crate::gemma_spec_wire::SeedSource::Recompute,
+            prompt_last, f.start_bonus, f.start_pos + 1, &cfg,
+        ).expect_err("a drifted start_pos must be refused");
+        assert!(err.contains("drifted apart") && err.contains(&f.start_pos.to_string()),
+                "the refusal must name the drift and the frontier; got: {err}");
+        let after: Vec<usize> = f.model.kv_caches.iter().map(|c| c.seq_len).collect();
+        assert_eq!(after, before,
+                   "a refused spec-decode must leave every KV frontier where it found it");
+
+        // ...and the undrifted call still runs to completion from that state.
+        let report = crate::gemma_spec_wire::spec_decode_gemma(
+            &mut f.model, &drafter, crate::gemma_spec_wire::SeedSource::Recompute,
+            prompt_last, f.start_bonus, f.start_pos, &cfg,
+        ).expect("the matching cursor must still be served");
+        assert_eq!(report.tokens.len(), SPEC_N);
+    }
+
     /// THE WIRING GATE. The production caller must be BOTH greedy-identical and
     /// actually speculating; either assertion alone is satisfiable by a broken
     /// implementation.
