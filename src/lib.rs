@@ -93,6 +93,12 @@ mod gemma_forward;
 pub mod gemma_assistant;
 #[cfg(feature = "gemma")]
 pub mod gemma_spec;
+// The production caller for `gemma_spec` + `gemma_assistant` (PR #89 follow-up:
+// both were reachable only from `#[cfg(test)]` before this). Holds the
+// `VLLM_VULKAN_GEMMA_SPEC` pymethod, so it must be a sibling of `lib.rs` to see
+// `VulkanModel`'s private fields, exactly like `pyseam_gemma`.
+#[cfg(feature = "gemma")]
+pub mod gemma_spec_wire;
 // qwen35_forward holds BOTH the base Qwen3 dense GPU path (`qwen_*`, gemma) and
 // the qwen3_5 hybrid path (`qwen35_*`, qwen35) — split into two feature-gated
 // impl blocks inside. Present whenever either family is enabled.
