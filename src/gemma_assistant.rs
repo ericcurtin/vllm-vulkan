@@ -480,6 +480,80 @@ pub fn assistant_forward(
     AssistantOutput { logits, post_projection_out }
 }
 
+/// ONE draft block: `k` chained drafter steps, implementing the plan's draft
+/// loop (`GEMMA31B_SPEC_PLAN.md` §1.4 pseudocode) verbatim on top of
+/// [`assistant_forward`]:
+///
+/// ```text
+/// for _ in 0..k:
+///     tok_embed     = target.embed(tok) * target.embed_scale
+///     inputs_embeds = concat([tok_embed, h_prev])      # embed FIRST
+///     h_prev, logits = drafter(inputs_embeds, shared_kv, pos)
+///     tok = argmax(logits)
+/// ```
+///
+/// with `position_offset` held CONSTANT across the block and `shared_kv` a
+/// fixed snapshot the drafter never appends to.
+///
+/// This is the EAGLE coupling itself, and it is deliberately NOT inside a
+/// `#[cfg(test)]` module: `gemma_spec_wire`'s production driver and the
+/// synthetic CI gate must run the SAME drafter, or the gate measures something
+/// production does not do. (It began life as a test helper; a second copy for
+/// production would be precisely the "parallel acceptance path" this area has
+/// already been burned by.)
+///
+/// `target_embed` is the TARGET's `model.embed_tokens.weight`, `[vocab,
+/// backbone_hidden_size]` row-major — the drafter's own 1024-dim table is NOT
+/// used on the input side. `seed_hidden` is the target hidden that produced
+/// `bonus` (plan §1.1 step-0 `recurrent_hidden`).
+///
+/// `forced` teacher-forces the FED token (the drafter still computes its own
+/// argmax, which is what is returned) — used only when constructing an aligned
+/// fixture, never in production, where it is `None`.
+///
+/// Returns `(argmax, logits)` per step.
+#[allow(clippy::too_many_arguments)]
+pub fn draft_block(
+    acfg: &AssistantConfig,
+    aw: &HashMap<String, Vec<f32>>,
+    target_embed: &[f32],
+    embed_scale: f32,
+    kv: &AssistantSharedKv,
+    bonus: u32,
+    seed_hidden: &[f32],
+    position_offset: usize,
+    k: usize,
+    forced: Option<&[u32]>,
+    mut gpu: Option<&mut AssistantGpu>,
+) -> Vec<(u32, Vec<f32>)> {
+    let backbone = acfg.backbone_hidden_size;
+    assert_eq!(seed_hidden.len(), backbone,
+               "draft_block: seed_hidden is [{}], expected the target's backbone hidden [{backbone}]",
+               seed_hidden.len());
+    let mut out: Vec<(u32, Vec<f32>)> = Vec::with_capacity(k);
+    let mut recurrent = seed_hidden.to_vec();
+    let mut tok = bonus;
+    for i in 0..k {
+        if i > 0 {
+            tok = match forced {
+                Some(f) => f[i - 1],
+                None => out[i - 1].0,
+            };
+        }
+        let lo = tok as usize * backbone;
+        assert!(lo + backbone <= target_embed.len(),
+                "draft_block: token {tok} is outside the target embed table ({} rows of {backbone})",
+                target_embed.len() / backbone.max(1));
+        let embed: Vec<f32> = target_embed[lo..lo + backbone].iter().map(|&v| v * embed_scale).collect();
+        let inputs_embeds = build_inputs_embeds(&embed, &recurrent);
+        let step = assistant_forward(acfg, aw, &inputs_embeds, position_offset, kv,
+                                     gpu.as_deref_mut());
+        recurrent = step.post_projection_out;
+        out.push((model::argmax(&step.logits) as u32, step.logits));
+    }
+    out
+}
+
 /// INC-5b piece 3 — pyo3 wrapper around the CPU `assistant_forward` drafter,
 /// loaded/held independently of `VulkanModel` (the drafter is tiny — 0.5B,
 /// 939MB host-f32 — and per `GEMMA31B_SPEC_PLAN.md` §1.5 runs on rank0 ONLY,
@@ -928,61 +1002,6 @@ mod tests {
         Baseline { ids, hidden_before }
     }
 
-    /// ONE draft block, implementing the plan's draft loop
-    /// (`GEMMA31B_SPEC_PLAN.md` §1.4 pseudocode) verbatim on top of the real
-    /// `assistant_forward`:
-    ///
-    /// ```text
-    /// for _ in 0..k:
-    ///     tok_embed     = target.embed(tok) * target.embed_scale
-    ///     inputs_embeds = concat([tok_embed, h_prev])      # embed FIRST
-    ///     h_prev, logits = drafter(inputs_embeds, shared_kv, pos)
-    ///     tok = argmax(logits)
-    /// ```
-    ///
-    /// with `position_offset` held CONSTANT across the block and `shared_kv` a
-    /// fixed snapshot the drafter never appends to. This is the INC-5b coupling
-    /// that has no in-crate caller yet; writing it here is what makes the
-    /// drafter and the driver meet at all.
-    ///
-    /// `forced` teacher-forces the fed token (the drafter still computes its
-    /// own argmax, which is returned) — used only when BUILDING the aligned
-    /// fixture below, never when gating it.
-    ///
-    /// Returns `(argmax, logits)` per step.
-    #[allow(clippy::too_many_arguments)]
-    fn draft_block(
-        acfg: &AssistantConfig,
-        aw: &HashMap<String, Vec<f32>>,
-        target_embed: &[f32],
-        embed_scale: f32,
-        kv: &AssistantSharedKv,
-        bonus: u32,
-        seed_hidden: &[f32],
-        position_offset: usize,
-        k: usize,
-        forced: Option<&[u32]>,
-    ) -> Vec<(u32, Vec<f32>)> {
-        let backbone = acfg.backbone_hidden_size;
-        let mut out: Vec<(u32, Vec<f32>)> = Vec::with_capacity(k);
-        let mut recurrent = seed_hidden.to_vec();
-        let mut tok = bonus;
-        for i in 0..k {
-            if i > 0 {
-                tok = match forced {
-                    Some(f) => f[i - 1],
-                    None => out[i - 1].0,
-                };
-            }
-            let embed: Vec<f32> = target_embed[tok as usize * backbone..(tok as usize + 1) * backbone]
-                .iter().map(|&v| v * embed_scale).collect();
-            let inputs_embeds = build_inputs_embeds(&embed, &recurrent);
-            let step = assistant_forward(acfg, aw, &inputs_embeds, position_offset, kv, None);
-            recurrent = step.post_projection_out;
-            out.push((argmax(&step.logits) as u32, step.logits));
-        }
-        out
-    }
 
     /// The fixed fixture state every gate below starts from: a tiny target with
     /// a replayed prompt, its borrowed-KV snapshot, the drafter config/weights,
@@ -1063,7 +1082,7 @@ mod tests {
             -> Vec<(u32, Vec<f32>)>
         {
             draft_block(&self.acfg, &self.aw, &self.target_embed, self.embed_scale,
-                        &self.kv, bonus, seed_hidden, pos, k, forced)
+                        &self.kv, bonus, seed_hidden, pos, k, forced, None)
         }
     }
 
@@ -1384,7 +1403,7 @@ mod tests {
             let steps = draft_block(
                 &f.acfg, &probe, &f.target_embed, f.embed_scale, &f.kv,
                 f.baseline.ids[off], &f.baseline.hidden_before[off],
-                f.start_pos + off, w, Some(&desired[b]));
+                f.start_pos + off, w, Some(&desired[b]), None);
             for (i, (_, logits)) in steps.iter().enumerate() {
                 inners.push(logits[..hs].to_vec());
                 targets.push(desired[b][i]);
@@ -1450,7 +1469,7 @@ mod tests {
                 widths.push(k);
                 let off = pos - start_pos;
                 let steps = draft_block(&acfg, &aw, &target_embed, embed_scale, &kv,
-                                        bonus, &hidden_before[off], pos, k, None);
+                                        bonus, &hidden_before[off], pos, k, None, None);
                 let ids: Vec<u32> = steps.into_iter().map(|(t, _)| t).collect();
                 drafts.push(ids.clone());
                 ids
@@ -1569,6 +1588,196 @@ mod tests {
 
         eprintln!("assistant negative control: greedy-identical stream, but {accepted}/{drafted} \
                    accepted over {blocks} blocks (the accepting gate runs {:?})", SPEC_WIDTHS);
+    }
+
+    // ── Gates 5 + 6: the PRODUCTION seam (`gemma_spec_wire`) ─────────────
+    //
+    // The two gates above drive `run_spec_decode` from a hand-written test
+    // closure that is handed the drafter seeds out of a precomputed baseline
+    // and snoops the block widths from inside itself. That gates the DRIVER,
+    // not the production caller: nothing there loads a drafter, sources a seed
+    // the way production must, reads the env flag, or reports acceptance
+    // through an API a caller could actually use.
+    //
+    // The two below drive `gemma_spec_wire::spec_decode_gemma` — the exact body
+    // the `VLLM_VULKAN_GEMMA_SPEC` pymethod runs, minus the pyo3 marshalling —
+    // and read acceptance off its RETURN VALUE.
+
+    /// Runs the production seam over the fixture with drafter weights `aw`.
+    ///
+    /// `SeedSource::Recompute` is deliberate: it is the production default, and
+    /// pointing it at a fixture whose drafter was CONSTRUCTED against the
+    /// baseline's recorded hidden states is what proves the recompute
+    /// reproduces those hidden states exactly. A recompute that is off by any
+    /// amount moves the drafter's trajectory, the constructed drafts stop
+    /// appearing, and acceptance collapses to the negative control's zero.
+    fn run_production_seam(
+        f: &mut Fixture,
+        aw: HashMap<String, Vec<f32>>,
+        n: usize,
+    ) -> crate::gemma_spec_wire::SpecDecodeReport {
+        f.rewind();
+        let drafter = crate::gemma_spec_wire::SpecDrafter::from_parts(
+            f.acfg.clone(), aw, &f.model).expect("build production drafter from the fixture");
+        let prompt_last = *f.prompt.last().unwrap();
+        let cfg = SpecConfig { k: SPEC_K, max_new_tokens: n };
+        crate::gemma_spec_wire::spec_decode_gemma(
+            &mut f.model, &drafter, crate::gemma_spec_wire::SeedSource::Recompute,
+            prompt_last, f.start_bonus, f.start_pos, &cfg,
+        ).expect("production spec-decode seam")
+    }
+
+    /// THE WIRING GATE. The production caller must be BOTH greedy-identical and
+    /// actually speculating; either assertion alone is satisfiable by a broken
+    /// implementation.
+    ///
+    ///   * greedy-identical alone is satisfied by a decoder that accepts
+    ///     nothing (the negative control below is exactly that run), and
+    ///   * non-zero acceptance alone is satisfied by a decoder that commits
+    ///     drafts without checking them.
+    #[test]
+    fn gemma_spec_wire_production_seam_is_greedy_identical_and_accepts() {
+        let mut f = build_fixture(SPEC_BASELINE_LEN);
+        let vocab = f.acfg.vocab_size as u32;
+        let desired = desired_drafts(&f.baseline.ids, vocab);
+        let aligned = aligned_drafter_weights(&f, &desired);
+        let baseline = f.baseline.ids.clone();
+
+        let report = run_production_seam(&mut f, aligned, SPEC_N);
+
+        // 1. Output-identical to greedy, and the budget honoured EXACTLY.
+        assert_eq!(report.tokens.len(), SPEC_N,
+                   "expected EXACTLY {SPEC_N} committed tokens, got {}", report.tokens.len());
+        assert_eq!(report.tokens[..], baseline[..SPEC_N],
+                   "the wired spec-decode path diverged from the greedy baseline — speculation is \
+                    a latency optimisation, not a sampling change");
+
+        // 2. ...AND speculation actually ran, measured through the production
+        //    report rather than reconstructed by the test.
+        assert!(report.engaged(),
+                "the wired path accepted 0 of {} drafted tokens over {} blocks: the lever is \
+                 INERT. Every assertion above still passes in this state, which is why this one \
+                 exists.", report.drafted, report.blocks);
+        assert_eq!(report.blocks, SPEC_WIDTHS.len(),
+                   "block structure changed: k={SPEC_K}, n={SPEC_N} must run {} blocks",
+                   SPEC_WIDTHS.len());
+        assert_eq!(report.drafted, SPEC_WIDTHS.iter().sum::<usize>(), "tokens offered");
+        assert_eq!(report.accepted, SPEC_FORCED_CORRECT * report.blocks,
+                   "expected {SPEC_FORCED_CORRECT} of each block's drafts accepted over {} blocks, \
+                    got {} of {} offered", report.blocks, report.accepted, report.drafted);
+
+        // 3. The production seam measures the SAME acceptance the driver-level
+        //    gate does. A production wrapper that quietly ran a different
+        //    drafter, or seeded it differently, would show up right here.
+        let (_, widths, _) = {
+            let mut g = build_fixture(SPEC_BASELINE_LEN);
+            let d2 = desired_drafts(&g.baseline.ids, vocab);
+            let a2 = aligned_drafter_weights(&g, &d2);
+            run_with_assistant_drafter(&mut g, a2, SPEC_N)
+        };
+        assert_eq!(widths, SPEC_WIDTHS.to_vec(), "driver-level gate's block structure");
+        assert_eq!(report.accepted, SPEC_N - widths.len(),
+                   "production acceptance must equal the driver-level gate's");
+
+        // 4. Rollback: every layer's KV frontier sits at exactly the committed
+        //    length, so the rejected drafts left nothing behind — and neither
+        //    did the seed recompute, which rewinds and re-appends each block.
+        let frontier = f.start_pos + SPEC_N;
+        for (li, c) in f.model.kv_caches.iter().enumerate() {
+            assert_eq!(c.seq_len, frontier, "layer {li}: KV frontier {} != {frontier}", c.seq_len);
+        }
+
+        // 5. The OTHER seed source — a caller that already holds the producing
+        //    hidden and hands it over — must give the identical run. This is
+        //    what pins `SeedSource::Recompute` to the plan's §1.1 seed rather
+        //    than to whatever it happens to compute: the hiddens fed here are
+        //    the ones the SPEC-OFF greedy baseline recorded.
+        {
+            let mut g = build_fixture(SPEC_BASELINE_LEN);
+            let d2 = desired_drafts(&g.baseline.ids, vocab);
+            let a2 = aligned_drafter_weights(&g, &d2);
+            g.rewind();
+            let drafter = crate::gemma_spec_wire::SpecDrafter::from_parts(
+                g.acfg.clone(), a2, &g.model).expect("drafter");
+            let start_pos = g.start_pos;
+            let hidden_before = g.baseline.hidden_before.clone();
+            let by_pos = move |pos: usize| -> Result<Vec<f32>, String> {
+                // `pos` is the position of the token whose hidden seeds the
+                // block, i.e. one BEFORE the bonus: baseline index pos+1-start_pos.
+                hidden_before.get(pos + 1 - start_pos).cloned()
+                    .ok_or_else(|| format!("no baseline hidden for pos {pos}"))
+            };
+            let cfg = SpecConfig { k: SPEC_K, max_new_tokens: SPEC_N };
+            let r2 = crate::gemma_spec_wire::spec_decode_gemma(
+                &mut g.model, &drafter, crate::gemma_spec_wire::SeedSource::ByPosition(&by_pos),
+                *g.prompt.last().unwrap(), g.start_bonus, start_pos, &cfg).expect("ByPosition run");
+            assert_eq!(r2.tokens, report.tokens, "seed sources disagree on the token stream");
+            assert_eq!((r2.blocks, r2.drafted, r2.accepted),
+                       (report.blocks, report.drafted, report.accepted),
+                       "seed sources disagree on acceptance: the recompute is not reproducing the \
+                        target hidden the greedy baseline recorded");
+        }
+
+        eprintln!("production seam gate: {} tokens greedy-identical; {} blocks, {}/{} accepted \
+                   (rate {:?})", report.tokens.len(), report.blocks, report.accepted,
+                   report.drafted, report.accept_rate());
+    }
+
+    /// NEGATIVE CONTROL for the gate above, at the production seam.
+    ///
+    /// Same seam, same flag state, same budget — only the drafter is the
+    /// fixture's PLAIN weights, which agree with the target about nothing. The
+    /// token stream is still bit-identical to greedy and the budget is still
+    /// exact, so every "the output looks right" assertion passes while
+    /// speculation contributes zero. `engaged()` is the only thing that moves.
+    #[test]
+    fn gemma_spec_wire_zero_acceptance_is_caught_by_the_production_report() {
+        let mut f = build_fixture(SPEC_BASELINE_LEN);
+        let baseline = f.baseline.ids.clone();
+        let plain = f.aw.clone();
+
+        let report = run_production_seam(&mut f, plain, SPEC_N);
+
+        assert_eq!(report.tokens.len(), SPEC_N, "budget must still be honoured exactly");
+        assert_eq!(report.tokens[..], baseline[..SPEC_N],
+                   "a zero-acceptance run must STILL equal the greedy baseline — precisely why \
+                    token identity alone cannot gate speculation");
+        assert!(report.drafted > 0, "the control is only meaningful if drafts were offered");
+        assert_eq!(report.accepted, 0, "an unaligned drafter must have nothing accepted");
+        assert!(!report.engaged(), "engaged() must be false at zero acceptance");
+        assert_eq!(report.accept_rate(), Some(0.0), "a measured zero, not a missing measurement");
+        assert_eq!(report.blocks, SPEC_N,
+                   "with nothing accepted every block commits its bonus alone");
+
+        eprintln!("production seam negative control: greedy-identical stream, {}/{} accepted over \
+                   {} blocks", report.accepted, report.drafted, report.blocks);
+    }
+
+    /// The seed recompute must be STATE-NEUTRAL — it rewinds every KV cache by
+    /// one position, re-runs the target, and must leave the caches byte-for-byte
+    /// as it found them. If it did not, the verify that follows would attend
+    /// over a corrupted cache and the whole path would be silently wrong (and
+    /// still greedy-identical for a few tokens, which is the dangerous part).
+    #[test]
+    fn gemma_spec_wire_seed_recompute_is_state_neutral_and_exact() {
+        let mut f = build_fixture(2);
+        f.rewind();
+        let pos = f.start_pos - 1; // last prompt position
+        let before: Vec<(usize, Vec<f32>, Vec<f32>)> = f.model.kv_caches.iter()
+            .map(|c| (c.seq_len, c.k.clone(), c.v.clone())).collect();
+
+        let seed = crate::gemma_spec_wire::recompute_seed_hidden(
+            &mut f.model, *f.prompt.last().unwrap(), pos).expect("recompute the first block's seed");
+
+        for (li, (c, (n, k, v))) in f.model.kv_caches.iter().zip(before.iter()).enumerate() {
+            assert_eq!(c.seq_len, *n, "layer {li}: frontier moved");
+            assert_eq!(&c.k, k, "layer {li}: K bytes changed");
+            assert_eq!(&c.v, v, "layer {li}: V bytes changed");
+        }
+        // ...and the value is the one the baseline recorded for the first
+        // block, which is what the drafter is constructed against.
+        assert_eq!(seed, f.baseline.hidden_before[0],
+                   "recomputed seed differs from the hidden the greedy baseline recorded");
     }
 
     /// Number of drafter steps the pinned chain below covers.

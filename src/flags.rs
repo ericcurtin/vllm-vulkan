@@ -874,6 +874,33 @@ pub struct Flags {
     /// Engine-less builds fall back to host inside `AssistantGpu::build`
     /// regardless of this flag.
     pub assistant_gpu: bool,
+
+    /// `VLLM_VULKAN_GEMMA_SPEC` — EAGLE speculative decode for the Gemma4
+    /// target (`gemma_spec_wire.rs`), DEFAULT OFF. The whole `VLLM_VULKAN_`
+    /// prefix matters: this project has already lost real time to a lever whose
+    /// env var was read under an unprefixed name, so it read as absent on every
+    /// node and the "regression" that followed was the lever never engaging.
+    ///
+    /// OFF is not "run greedy instead" — `VulkanModel::gemma_spec_generate`
+    /// REFUSES to run with the flag off rather than silently falling back, so a
+    /// caller can never believe it measured speculation when it measured greedy
+    /// decode. Speculation is output-identical to greedy at temperature 0, so a
+    /// silent fallback would be undetectable from the token stream alone.
+    pub gemma_spec: bool,
+
+    /// `VLLM_VULKAN_GEMMA_SPEC_K` — drafted tokens per block (block size is
+    /// `k + 1`, counting the bonus token). Default 4, per
+    /// `GEMMA31B_SPEC_PLAN.md` §INC-5. `0` is legal and means "verify the bonus
+    /// alone", i.e. greedy decode through the verify path — useful as an A/B
+    /// reference, and reported as `accept_rate = None` rather than 0.0 so it
+    /// cannot be mistaken for a collapsed acceptance.
+    pub gemma_spec_k: usize,
+
+    /// `VLLM_VULKAN_GEMMA_SPEC_ASSISTANT_DIR` — directory holding the drafter's
+    /// `model.safetensors` (`gemma-4-31B-it-assistant`). No default path, on
+    /// purpose: a default that exists on one developer machine turns a missing
+    /// checkpoint into a silent skip everywhere else.
+    pub gemma_spec_assistant_dir: Option<String>,
 }
 
 impl Flags {
@@ -909,6 +936,15 @@ impl Flags {
             gemma_lmhead_q4: b1("VLLM_VULKAN_GEMMA_LMHEAD_Q4"), // default OFF; H2 (lm_head f16->4bit requant); see field doc
             gemma_prefill_cols: bdef1("VLLM_VULKAN_GEMMA_PREFILL_COLS"), // default ON (on-node GO n75 2026-08-03: argmax-exact + net-positive prefill, stacks w/ ring); =0 reverts to serial per-row prefill. See field doc.
             assistant_gpu: bdef1("VLLM_VULKAN_ASSISTANT_GPU"), // default ON; =0 selects the bit-exact host-f32 drafter. See field doc.
+            gemma_spec: b1("VLLM_VULKAN_GEMMA_SPEC"), // default OFF; EAGLE spec-decode production seam. See field doc.
+            // A malformed VLLM_VULKAN_GEMMA_SPEC_K falls back to the plan's k=4
+            // rather than to 0: 0 is a MEANINGFUL value here (no drafts at all),
+            // so silently turning a typo into it would disengage speculation
+            // while leaving the flag looking enabled.
+            gemma_spec_k: std::env::var("VLLM_VULKAN_GEMMA_SPEC_K").ok()
+                .and_then(|v| v.parse().ok()).unwrap_or(4),
+            gemma_spec_assistant_dir: std::env::var("VLLM_VULKAN_GEMMA_SPEC_ASSISTANT_DIR").ok()
+                .filter(|s| !s.is_empty()),
             qwen35_gpu: b1("VLLM_VULKAN_QWEN35_GPU"),
             q35_gpu_attn: b1("VLLM_VULKAN_Q35_GPU_ATTN"), // default OFF; see field doc
             q35_kv_f16: b1("VLLM_VULKAN_Q35_KV_F16"), // default OFF; RESERVED, not yet wired — see field doc
