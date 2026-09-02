@@ -1753,6 +1753,115 @@ mod tests {
                    {} blocks", report.accepted, report.drafted, report.blocks);
     }
 
+    /// A drafter whose vocabulary does not match the target's must be refused
+    /// at LOAD, by name.
+    ///
+    /// The drafter samples ids from its OWN tied `lm_head` over
+    /// `cfg.vocab_size`; `draft_block` then indexes the TARGET's embedding table
+    /// with them. Without this check a wider drafter passes construction and
+    /// fails later, mid-generation, on `draft_block`'s embed-table assert —
+    /// inside the pymethod, as a panic across the pyo3 boundary, at whichever
+    /// token first sampled an id past the target's vocab. Which token that is
+    /// depends on the weights, so the SAME mis-paired checkpoint can survive a
+    /// short run and abort a long one.
+    ///
+    /// Everything else here is the working pairing: only `vocab_size` moves.
+    #[test]
+    fn gemma_spec_wire_refuses_a_drafter_whose_vocab_is_not_the_targets() {
+        let f = build_fixture(2);
+        let target_vocab = f.model.config.vocab_size;
+
+        // Sanity: the fixture pairing IS matched, so a failure below is the
+        // perturbation and not a broken fixture.
+        assert_eq!(f.acfg.vocab_size, target_vocab, "the fixture pairing must start matched");
+
+        for wrong in [target_vocab + 1, target_vocab - 1] {
+            let mut bad = f.acfg.clone();
+            bad.vocab_size = wrong;
+            let err = crate::gemma_spec_wire::SpecDrafter::from_parts(
+                bad, f.aw.clone(), &f.model)
+                .err().expect("a mis-paired vocabulary must be refused at load");
+            assert!(err.contains("vocab_size") && err.contains(&wrong.to_string())
+                        && err.contains(&target_vocab.to_string()),
+                    "the refusal must NAME both vocabularies, like the hidden-size pairing \
+                     check does; got: {err}");
+        }
+
+        // ...and the matched pairing still constructs.
+        crate::gemma_spec_wire::SpecDrafter::from_parts(f.acfg.clone(), f.aw.clone(), &f.model)
+            .expect("the matched pairing must still build");
+    }
+
+    /// A drafter-seed failure must come back as an `Err`, not a panic.
+    ///
+    /// `spec_decode_gemma` cannot propagate an error out of the drafter closure
+    /// (`draft_fn` returns ids, not a `Result`), so it stashes the first one and
+    /// re-raises it after the loop. That only works if the failing closure still
+    /// returns a draft of the width the DRIVER chose: `spec_step_coupled`
+    /// asserts `draft.len() == k`, so a short draft aborts the process before
+    /// the re-raise can run.
+    ///
+    /// This is reachable in production: `recompute_seed_hidden` returns `Err` on
+    /// a KV-frontier mismatch, and `start_pos` arrives from Python — exactly the
+    /// cursor drift that check exists to catch.
+    ///
+    /// Both branches are covered: a seed that fails on the FIRST block (the
+    /// `Err(e)` arm) and one that fails on a LATER block, which then also drives
+    /// the `first_error.is_some()` arm for every block after it.
+    #[test]
+    fn gemma_spec_wire_seed_failure_returns_err_rather_than_panicking() {
+        let expect_err = |r: Result<crate::gemma_spec_wire::SpecDecodeReport, String>,
+                          case: &str| {
+            let e = match r {
+                Ok(_) => panic!("{case}: a failing seed must not produce Ok"),
+                Err(e) => e,
+            };
+            assert!(e.contains("drafter seed unavailable") && e.contains("kaboom"),
+                    "{case}: the re-raised error must carry the seed's own message; got: {e}");
+        };
+
+        // (a) the FIRST block's seed fails.
+        {
+            let mut f = build_fixture(SPEC_BASELINE_LEN);
+            f.rewind();
+            let drafter = crate::gemma_spec_wire::SpecDrafter::from_parts(
+                f.acfg.clone(), f.aw.clone(), &f.model).expect("drafter");
+            let by_pos = |_pos: usize| -> Result<Vec<f32>, String> { Err("kaboom".to_string()) };
+            let cfg = SpecConfig { k: SPEC_K, max_new_tokens: SPEC_N };
+            let r = crate::gemma_spec_wire::spec_decode_gemma(
+                &mut f.model, &drafter, crate::gemma_spec_wire::SeedSource::ByPosition(&by_pos),
+                *f.prompt.last().unwrap(), f.start_bonus, f.start_pos, &cfg);
+            expect_err(r, "first-block seed failure");
+        }
+
+        // (b) a LATER block's seed fails: block 0 is served the hidden the
+        //     greedy baseline recorded, every later block errors. Block 1 takes
+        //     the `Err(e)` arm and block 2 the `first_error.is_some()` arm, both
+        //     with a non-zero width the driver picked (SPEC_WIDTHS = [4, 4, 2]).
+        {
+            let mut f = build_fixture(SPEC_BASELINE_LEN);
+            f.rewind();
+            let drafter = crate::gemma_spec_wire::SpecDrafter::from_parts(
+                f.acfg.clone(), f.aw.clone(), &f.model).expect("drafter");
+            let start_pos = f.start_pos;
+            let hidden_before = f.baseline.hidden_before.clone();
+            let by_pos = move |pos: usize| -> Result<Vec<f32>, String> {
+                if pos >= start_pos {
+                    return Err("kaboom".to_string()); // every block after the first
+                }
+                hidden_before.get(pos + 1 - start_pos).cloned()
+                    .ok_or_else(|| "no baseline hidden".to_string())
+            };
+            assert!(SPEC_WIDTHS.len() >= 3 && SPEC_WIDTHS[1] > 0 && SPEC_WIDTHS[2] > 0,
+                    "this case needs at least two non-zero-width blocks after the first");
+            let cfg = SpecConfig { k: SPEC_K, max_new_tokens: SPEC_N };
+            let r = crate::gemma_spec_wire::spec_decode_gemma(
+                &mut f.model, &drafter, crate::gemma_spec_wire::SeedSource::ByPosition(&by_pos),
+                *f.prompt.last().unwrap(), f.start_bonus, start_pos, &cfg);
+            expect_err(r, "later-block seed failure");
+        }
+    }
+
     /// The seed recompute must be STATE-NEUTRAL — it rewinds every KV cache by
     /// one position, re-runs the target, and must leave the caches byte-for-byte
     /// as it found them. If it did not, the verify that follows would attend

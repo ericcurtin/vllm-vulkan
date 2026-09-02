@@ -158,6 +158,19 @@ impl SpecDrafter {
                  drafter checkpoint is not paired with this target.",
                 target.config.hidden_size));
         }
+        if cfg.vocab_size != target.config.vocab_size {
+            // The drafter samples ids from its OWN tied `lm_head` over
+            // `cfg.vocab_size`, and `draft_block` then indexes the TARGET's
+            // embedding table with them. A wider drafter vocab therefore fires
+            // `draft_block`'s "token {t} is outside the target embed table"
+            // assert MID-GENERATION, inside the pymethod, instead of failing
+            // here at load with a pairing message.
+            return Err(format!(
+                "spec drafter: vocab_size {} != target vocab_size {} — the drafter samples ids \
+                 that index the TARGET's embedding table, so the two vocabularies must be the \
+                 same. The drafter checkpoint is not paired with this target.",
+                cfg.vocab_size, target.config.vocab_size));
+        }
         let kv = Self::borrow_kv(target, &cfg)?;
         Ok(SpecDrafter {
             target_embed: target.weights.f32_slice(EMBED).to_vec(),
@@ -279,18 +292,26 @@ pub fn spec_decode_gemma(
     // Errors raised inside the drafter closure cannot propagate through
     // `run_spec_decode_coupled` (its `draft_fn` returns draft ids, and giving it
     // a Result would change the INC-5a contract for every stub-drafter call
-    // site). They are stashed here and re-raised after the loop instead; the
-    // closure returns an EMPTY draft on failure, which is a legal width-0 block,
-    // so the loop still terminates and still emits the correct greedy stream —
-    // it just stops speculating. The `first_error` check below is what keeps
-    // that from becoming a silent degradation.
+    // site). They are stashed here and re-raised after the loop instead.
+    //
+    // The failure draft must still be EXACTLY `k` wide. The block width is the
+    // DRIVER's choice (`min(k, remaining - 1)`), not the closure's, and
+    // `spec_step_coupled` asserts `draft.len() == k` — so returning an empty
+    // draft for a `k > 0` block PANICS through the pyo3 boundary before
+    // `first_error` can be turned into a `PyRuntimeError`. `bonus` is a valid
+    // token id (the target's own argmax), and the whole run is discarded by the
+    // `first_error` check below, so a filler draft is inert: it only keeps the
+    // loop legal long enough to reach that check.
     let mut first_error: Option<String> = None;
 
     let run: SpecRun = run_spec_decode_coupled(
         target,
         |model, emitted, bonus, pos, k| {
-            if k == 0 || first_error.is_some() {
+            if k == 0 {
                 return Vec::new();
+            }
+            if first_error.is_some() {
+                return vec![bonus; k];
             }
             // The token at `pos - 1`: the previous block's last committed token,
             // or the prompt's last token on the first block.
@@ -301,7 +322,7 @@ pub fn spec_decode_gemma(
             };
             let seed_hidden = match seed_hidden {
                 Ok(h) => h,
-                Err(e) => { first_error = Some(e); return Vec::new(); }
+                Err(e) => { first_error = Some(e); return vec![bonus; k]; }
             };
             draft_block(
                 &drafter.cfg, &drafter.weights, &drafter.target_embed, drafter.embed_scale,
