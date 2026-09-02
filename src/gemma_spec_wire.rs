@@ -74,6 +74,71 @@ pub struct SpecDrafter {
     pub kv: AssistantSharedKv,
 }
 
+/// Check a drafter tensor map against `expected_tensor_shapes` — the tensor map
+/// gated as COMPLETE and EXACT for what the forward reads
+/// (`gemma_assistant::tests::gemma_assistant_synthetic_fixture_covers_the_
+/// checkpoint_tensor_map`).
+///
+/// Without this, `assistant_forward`'s `w`/`amv` PANIC on a name they cannot
+/// find — through the pyo3 boundary, mid-`gemma_spec_generate`, several blocks
+/// into a generation. A wrong-sized tensor is worse: it reaches `cpu_matmul`'s
+/// dimension check (a panic) or, on the GPU path, a matvec that reads whatever
+/// is resident. Checking here converts every one of those into a load-time
+/// `Err` that NAMES the tensor.
+///
+/// TWO checks, because the element count is not the shape:
+///
+///   * `weights` is the flattened data, so it can only give an element COUNT.
+///     `[hidden, q_dim]` and `[q_dim, hidden]` have the same count, so a
+///     TRANSPOSED projection passes a count check and is then read in the
+///     expected layout — a checkpoint defect that produces silently wrong
+///     numbers instead of a load failure.
+///   * `dims`, when the caller has it (`crate::model::read_safetensors_dims`),
+///     is the on-disk dimension list, and it is compared EXACTLY. Verified
+///     against the real 939MB `gemma-4-31B-it-assistant` checkpoint: all 48
+///     tensors match `expected_tensor_shapes` element for element, `[1]`
+///     `layer_scalar` included, so exact is the right comparison and not one
+///     that would refuse a good checkpoint over a degenerate axis.
+///
+/// `dims` is `None` for the loader-free path (`SpecDrafter::from_parts` with
+/// the synthetic CI fixture): there is no file, and the fixture is BUILT from
+/// `expected_tensor_shapes`, so it has no independent dimension order to check.
+pub fn validate_assistant_tensors(
+    cfg: &AssistantConfig,
+    weights: &HashMap<String, Vec<f32>>,
+    dims: Option<&HashMap<String, Vec<usize>>>,
+) -> Result<(), String> {
+    for (name, shape) in expected_tensor_shapes(cfg) {
+        let want: usize = shape.iter().product();
+        match weights.get(&name) {
+            None => return Err(format!(
+                "spec drafter: required tensor '{name}' (shape {shape:?}) is missing from the \
+                 drafter checkpoint. The drafter is incomplete or not paired with this \
+                 target.")),
+            Some(v) if v.len() != want => return Err(format!(
+                "spec drafter: tensor '{name}' has {} elements, expected {want} (shape \
+                 {shape:?}). The drafter checkpoint is not paired with this target.",
+                v.len())),
+            Some(_) => {}
+        }
+        if let Some(d) = dims {
+            match d.get(&name) {
+                None => return Err(format!(
+                    "spec drafter: required tensor '{name}' (shape {shape:?}) is missing from the \
+                     drafter checkpoint's safetensors header. The drafter is incomplete or not \
+                     paired with this target.")),
+                Some(got) if got[..] != shape[..] => return Err(format!(
+                    "spec drafter: tensor '{name}' has dimensions {got:?}, expected {shape:?}. \
+                     The element count matches, so this is a TRANSPOSED or otherwise \
+                     mis-ordered tensor — it would load clean and then be read in the wrong \
+                     layout. The drafter checkpoint is not paired with this target.")),
+                Some(_) => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 impl SpecDrafter {
     /// Take the borrowed-K/V snapshot from a target's live caches: the LAST
     /// layer of each attention type, in the `[seq_len, n_kv_heads, head_dim]`
@@ -132,7 +197,14 @@ impl SpecDrafter {
     /// has been prefilled, not before).
     pub fn load(dir: &str, target: &Gemma4Model) -> Result<Self, String> {
         let cfg = AssistantConfig::g31b_pair();
-        let weights = load_assistant_weights(std::path::Path::new(dir))?;
+        let path = std::path::Path::new(dir);
+        let weights = load_assistant_weights(path)?;
+        // The DIMENSIONS, which `load_assistant_weights` throws away. Only the
+        // loader path can check them — `from_parts` sees flattened data — and
+        // only the loader path needs to: it is the one reading an arbitrary
+        // file off disk. See `validate_assistant_tensors`.
+        let dims = crate::model::read_safetensors_dims(&path.join("model.safetensors"))?;
+        validate_assistant_tensors(&cfg, &weights, Some(&dims))?;
         Self::from_parts(cfg, weights, target)
     }
 
@@ -172,31 +244,12 @@ impl SpecDrafter {
                  same. The drafter checkpoint is not paired with this target.",
                 cfg.vocab_size, target.config.vocab_size));
         }
-        // The drafter's OWN tensors. `load_assistant_weights` is a plain
-        // safetensors read with no shape opinion, and `assistant_forward`'s `w`
-        // / `amv` PANIC on a name they cannot find — through the pyo3 boundary,
-        // mid-`gemma_spec_generate`, several blocks into a generation. A
-        // wrong-sized tensor is worse: it reaches `cpu_matmul`'s dimension
-        // check (a panic) or, on the GPU path, a matvec that reads whatever is
-        // resident. `expected_tensor_shapes` is the checkpoint tensor map and
-        // is gated as COMPLETE and EXACT for what the forward reads
-        // (`gemma_assistant::tests::gemma_assistant_synthetic_fixture_covers_
-        // the_checkpoint_tensor_map`), so checking it here converts every one of
-        // those into a load-time `Err` that NAMES the tensor.
-        for (name, shape) in expected_tensor_shapes(&cfg) {
-            let want: usize = shape.iter().product();
-            match weights.get(&name) {
-                None => return Err(format!(
-                    "spec drafter: required tensor '{name}' (shape {shape:?}) is missing from the \
-                     drafter checkpoint. The drafter is incomplete or not paired with this \
-                     target.")),
-                Some(v) if v.len() != want => return Err(format!(
-                    "spec drafter: tensor '{name}' has {} elements, expected {want} (shape \
-                     {shape:?}). The drafter checkpoint is not paired with this target.",
-                    v.len())),
-                Some(_) => {}
-            }
-        }
+        // The drafter's OWN tensors — see `validate_assistant_tensors` for why
+        // this is checked here rather than discovered inside a draft step.
+        // `None`: `weights` is already flattened, so this constructor has no
+        // dimensions to check. `SpecDrafter::load`, which DOES read a file,
+        // checks them before calling us.
+        validate_assistant_tensors(&cfg, &weights, None)?;
         let kv = Self::borrow_kv(target, &cfg)?;
         Ok(SpecDrafter {
             target_embed: target.weights.f32_slice(EMBED).to_vec(),

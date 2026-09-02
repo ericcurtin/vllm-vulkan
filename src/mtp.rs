@@ -298,12 +298,38 @@ impl MtpHead {
         // through it. Same treatment the `gate_up_proj` length gets above.
         // `v_proj` is included: `layer_step` runs `ops.matvec(MV_V, ..)` on it,
         // and it had no check at all.
+        //
+        // The 7 RMSNorm weights and the MoE tensors are here for the same
+        // reason the DENSE twin lists them: they are read from the same
+        // arbitrary file, and their consumers assume the layout rather than
+        // check it — `cpu_rms_norm_inplace` asserts on a norm whose length does
+        // not divide its input (a panic through the pyo3 boundary), and
+        // `moe::moe_forward_token` indexes `MoeWeights` purely from `MoeDims`
+        // (see the layout comments on `moe::MoeWeights`), so a short expert
+        // tensor is an out-of-bounds slice or silently wrong routing. The list
+        // is COMPLETE for this constructor: every tensor `from_raw` reads off
+        // `raw` is either checked below or is `gate_up_proj`, checked above
+        // where it is split.
+        let si = cfg.shared_expert_intermediate_size;
         for (name, got, want) in [
             ("fc", head.fc.len(), h * 2 * h),
+            ("pre_fc_norm_embedding", head.enorm.len(), h),
+            ("pre_fc_norm_hidden", head.hnorm.len(), h),
+            ("norm", head.final_norm.len(), h),
+            ("input_layernorm", head.in_ln.len(), h),
+            ("post_attention_layernorm", head.post_ln.len(), h),
+            ("q_norm", head.q_norm.len(), hd),
+            ("k_norm", head.k_norm.len(), hd),
             ("q_proj", head.q_proj.len(), nq * 2 * hd * h),
             ("k_proj", head.k_proj.len(), nkv * hd * h),
             ("v_proj", head.v_proj.len(), nkv * hd * h),
             ("o_proj", head.o_proj.len(), h * nq * hd),
+            ("gate", head.moe_w.gate.len(), e * h),
+            ("down_proj", head.moe_w.switch_down.len(), e * h * mi),
+            ("shared_expert.gate_proj", head.moe_w.shared_gate.len(), si * h),
+            ("shared_expert.up_proj", head.moe_w.shared_up.len(), si * h),
+            ("shared_expert.down_proj", head.moe_w.shared_down.len(), h * si),
+            ("shared_expert_gate", head.moe_w.shared_expert_gate.len(), h),
         ] {
             if got != want {
                 return Err(format!(
@@ -347,6 +373,31 @@ impl MtpHead {
         let mut head_cfg = cfg.clone();
         head_cfg.num_hidden_layers = 1;
         head_cfg.layer_types = vec![crate::qwen35::LayerType::FullAttention];
+        // Same length gate the two full constructors run. The lean path reads
+        // the SAME arbitrary `mtp.safetensors` — it just streams the big
+        // projections straight to the GPU — so its 7 norms are checkpoint input
+        // too, and they are the only host tensors this head keeps. Without this
+        // a truncated norm survives the load and aborts the process inside
+        // `cpu_rms_norm_inplace` mid-draft.
+        // A key that is absent is left to `get_norm` below, which already
+        // reports it by name.
+        for (key, want) in [
+            ("mtp.pre_fc_norm_embedding.weight", h),
+            ("mtp.pre_fc_norm_hidden.weight", h),
+            ("mtp.norm.weight", h),
+            ("mtp.layers.0.input_layernorm.weight", h),
+            ("mtp.layers.0.post_attention_layernorm.weight", h),
+            ("mtp.layers.0.self_attn.q_norm.weight", hd),
+            ("mtp.layers.0.self_attn.k_norm.weight", hd),
+        ] {
+            if let Some(v) = norms.get(key) {
+                if v.len() != want {
+                    return Err(format!(
+                        "MTP norm '{key}' has {} elements, expected {want} (lean load)",
+                        v.len()));
+                }
+            }
+        }
         Ok(MtpHead {
             cfg: head_cfg,
             fc: Vec::new(),
@@ -455,10 +506,31 @@ impl MtpHead {
         // can raise — not a panic that aborts through it. `v_proj` is included:
         // `layer_step` runs `ops.matvec(MV_V, ..)` on it and it had no check at
         // all, exactly as on the MoE constructor.
+        //
+        // The list is COMPLETE for this constructor: `from_raw_dense` reads
+        // exactly 15 tensors off `raw` — `fc`, the 7 RMSNorm weights, the 4
+        // attention projections and the 3 dense-MLP projections — and every one
+        // of them is below. The head's remaining fields are not checkpoint data:
+        // `moe_w` is `default()` (a dense head never calls `ops.moe`), `dims`/
+        // `cfg`/`kv`/`max_depth` are derived from `cfg` and the caller.
         let dm = head.dense_mlp.as_ref()
             .ok_or_else(|| "dense MTP head lost its DenseMlp".to_string())?;
         for (name, got, want) in [
             ("fc", head.fc.len(), h * 2 * h),
+            // The 7 RMSNorm weights. `cpu_rms_norm_inplace` asserts
+            // `x.len() % weight.len() == 0`, so a truncated norm is a PANIC
+            // through the pyo3 boundary mid-draft — and a norm whose length
+            // happens to divide its input is worse still: it silently normalizes
+            // in the wrong chunking. `enorm`/`hnorm`/`final_norm`/`in_ln`/
+            // `post_ln` are applied to hidden-wide vectors; `q_norm`/`k_norm` are
+            // applied PER HEAD, to a `head_dim` slice (`layer_step`).
+            ("pre_fc_norm_embedding", head.enorm.len(), h),
+            ("pre_fc_norm_hidden", head.hnorm.len(), h),
+            ("norm", head.final_norm.len(), h),
+            ("input_layernorm", head.in_ln.len(), h),
+            ("post_attention_layernorm", head.post_ln.len(), h),
+            ("q_norm", head.q_norm.len(), hd),
+            ("k_norm", head.k_norm.len(), hd),
             ("q_proj", head.q_proj.len(), nq * 2 * hd * h),
             ("k_proj", head.k_proj.len(), nkv * hd * h),
             ("v_proj", head.v_proj.len(), nkv * hd * h),
@@ -979,15 +1051,36 @@ mod tests {
     #[test]
     fn from_raw_reports_a_bad_tensor_shape_as_an_error() {
         let cfg = tiny_cfg();
-        for name in ["mtp.fc.weight",
-                     "mtp.layers.0.self_attn.q_proj.weight",
-                     "mtp.layers.0.self_attn.k_proj.weight",
-                     "mtp.layers.0.self_attn.v_proj.weight",
-                     "mtp.layers.0.self_attn.o_proj.weight"] {
+        // (checkpoint key, the substring the refusal must name). The 7 RMSNorm
+        // weights and the MoE tensors join the projections here: they had no
+        // check at all, and their consumers assume rather than verify the
+        // layout — `cpu_rms_norm_inplace` asserts on a norm that does not
+        // divide its input, and `moe::moe_forward_token` slices `MoeWeights`
+        // straight off `MoeDims`. `gate_up_proj` is absent because it is
+        // checked earlier, where `from_raw` splits it.
+        for (name, short) in [
+            ("mtp.fc.weight", "fc"),
+            ("mtp.pre_fc_norm_embedding.weight", "pre_fc_norm_embedding"),
+            ("mtp.pre_fc_norm_hidden.weight", "pre_fc_norm_hidden"),
+            ("mtp.norm.weight", "norm"),
+            ("mtp.layers.0.input_layernorm.weight", "input_layernorm"),
+            ("mtp.layers.0.post_attention_layernorm.weight", "post_attention_layernorm"),
+            ("mtp.layers.0.self_attn.q_norm.weight", "q_norm"),
+            ("mtp.layers.0.self_attn.k_norm.weight", "k_norm"),
+            ("mtp.layers.0.self_attn.q_proj.weight", "q_proj"),
+            ("mtp.layers.0.self_attn.k_proj.weight", "k_proj"),
+            ("mtp.layers.0.self_attn.v_proj.weight", "v_proj"),
+            ("mtp.layers.0.self_attn.o_proj.weight", "o_proj"),
+            ("mtp.layers.0.mlp.gate.weight", "gate"),
+            ("mtp.layers.0.mlp.experts.down_proj", "down_proj"),
+            ("mtp.layers.0.mlp.shared_expert.gate_proj.weight", "shared_expert.gate_proj"),
+            ("mtp.layers.0.mlp.shared_expert.up_proj.weight", "shared_expert.up_proj"),
+            ("mtp.layers.0.mlp.shared_expert.down_proj.weight", "shared_expert.down_proj"),
+            ("mtp.layers.0.mlp.shared_expert_gate.weight", "shared_expert_gate"),
+        ] {
             let mut raw = tiny_raw(&cfg);
             let full = raw[name].len();
             raw.get_mut(name).unwrap().truncate(full - 1); // a truncated shard
-            let short = name.rsplit('.').nth(1).unwrap();
             let err = match MtpHead::from_raw(&raw, &cfg, 4) {
                 Ok(_) => panic!("{name}: a truncated tensor must not build a head"),
                 Err(e) => e,
@@ -1302,18 +1395,32 @@ mod tests {
     #[test]
     fn from_raw_dense_reports_a_bad_tensor_shape_as_an_error() {
         let cfg = tiny_dense_cfg();
-        for name in ["fc.weight",
-                     "layers.0.self_attn.q_proj.weight",
-                     "layers.0.self_attn.k_proj.weight",
-                     "layers.0.self_attn.v_proj.weight",
-                     "layers.0.self_attn.o_proj.weight",
-                     "layers.0.mlp.gate_proj.weight",
-                     "layers.0.mlp.up_proj.weight",
-                     "layers.0.mlp.down_proj.weight"] {
+        // (checkpoint key, the substring the refusal must name). The 7 RMSNorm
+        // weights are in the loop because they were validated NOWHERE: a
+        // truncated norm reached `cpu_rms_norm_inplace`, whose
+        // `x.len() % weight.len()` assert aborts through the pyo3 boundary
+        // mid-draft. This list is the COMPLETE set of tensors `from_raw_dense`
+        // reads (15).
+        for (name, short) in [
+            ("fc.weight", "fc"),
+            ("pre_fc_norm_embedding.weight", "pre_fc_norm_embedding"),
+            ("pre_fc_norm_hidden.weight", "pre_fc_norm_hidden"),
+            ("norm.weight", "norm"),
+            ("layers.0.input_layernorm.weight", "input_layernorm"),
+            ("layers.0.post_attention_layernorm.weight", "post_attention_layernorm"),
+            ("layers.0.self_attn.q_norm.weight", "q_norm"),
+            ("layers.0.self_attn.k_norm.weight", "k_norm"),
+            ("layers.0.self_attn.q_proj.weight", "q_proj"),
+            ("layers.0.self_attn.k_proj.weight", "k_proj"),
+            ("layers.0.self_attn.v_proj.weight", "v_proj"),
+            ("layers.0.self_attn.o_proj.weight", "o_proj"),
+            ("layers.0.mlp.gate_proj.weight", "gate_proj"),
+            ("layers.0.mlp.up_proj.weight", "up_proj"),
+            ("layers.0.mlp.down_proj.weight", "down_proj"),
+        ] {
             let mut raw = tiny_dense_raw(&cfg);
             let full = raw[name].len();
             raw.get_mut(name).unwrap().truncate(full - 1); // a truncated shard
-            let short = name.rsplit('.').nth(1).unwrap();
             let err = match MtpHead::from_raw_dense(&raw, &cfg, 4) {
                 Ok(_) => panic!("{name}: a truncated tensor must not build a dense head"),
                 Err(e) => e,

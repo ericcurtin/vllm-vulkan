@@ -582,9 +582,19 @@ impl GemmaAssistant {
     #[pyo3(signature = (dir, device_idx = 0))]
     #[new]
     fn new(dir: String, device_idx: usize) -> PyResult<Self> {
-        let weights = load_assistant_weights(std::path::Path::new(&dir))
+        let path = std::path::Path::new(&dir);
+        let weights = load_assistant_weights(path)
             .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
         let cfg = AssistantConfig::g31b_pair();
+        // The SECOND checkpoint-loading entry point for the same drafter, and
+        // until now the unvalidated one: `SpecDrafter::load` refuses a missing
+        // or mis-shaped tensor, this pyclass took whatever was on disk and let
+        // `AssistantGpu::build` / `assistant_forward` panic on it later, inside
+        // a `.forward()` call. Same file, same tensor map, same check.
+        let dims = crate::model::read_safetensors_dims(&path.join("model.safetensors"))
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        crate::gemma_spec_wire::validate_assistant_tensors(&cfg, &weights, Some(&dims))
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
         // GPU-resident drafter matvecs, default ON (`VLLM_VULKAN_ASSISTANT_GPU=0`
         // → bit-exact host-f32 A/B path). Mirrors the qwen dense-MTP fix: kills
         // the single-threaded host `cpu_matmul` per draft step that made the
@@ -1676,6 +1686,74 @@ mod tests {
             .expect("the intact fixture must still build a drafter");
     }
 
+    /// The element count is NOT the shape.
+    ///
+    /// The check above is all `from_parts` can do: `load_assistant_weights`
+    /// flattens every tensor to a `Vec<f32>` and drops the SafeTensors
+    /// dimensions, so `[hidden, q_dim]` and `[q_dim, hidden]` are
+    /// indistinguishable to it. A TRANSPOSED projection therefore loads clean
+    /// and `assistant_forward` then reads it in the expected layout — the
+    /// checkpoint defect that produces silently wrong numbers rather than a
+    /// load failure, which is the dangerous kind.
+    ///
+    /// `SpecDrafter::load` and `GemmaAssistant::new` close that by reading the
+    /// header dimensions (`model::read_safetensors_dims`) and handing them to
+    /// `validate_assistant_tensors`. This drives that comparison directly.
+    #[test]
+    fn assistant_tensor_validation_rejects_a_transposed_tensor() {
+        // The synthetic fixture's config/weights: a real, complete tensor map
+        // at CI size (`g31b_pair`'s own map would allocate a 1GB embed table).
+        let f = build_fixture(2);
+        let cfg = f.acfg.clone();
+        let weights = f.aw.clone();
+        let expected = expected_tensor_shapes(&cfg);
+        let dims: HashMap<String, Vec<usize>> = expected.iter()
+            .map(|(n, s)| (n.clone(), s.clone())).collect();
+
+        // The honest map passes with the dimensions supplied...
+        crate::gemma_spec_wire::validate_assistant_tensors(&cfg, &weights, Some(&dims))
+            .expect("the expected shapes must validate against themselves");
+
+        // ...and every RECTANGULAR tensor's transpose is refused. A square one
+        // is its own transpose, so it is not a case; assert there is at least
+        // one real case rather than silently testing nothing.
+        let mut cases = 0usize;
+        for (name, shape) in &expected {
+            if shape.len() != 2 || shape[0] == shape[1] { continue; }
+            cases += 1;
+            let flipped = vec![shape[1], shape[0]];
+            let mut d = dims.clone();
+            d.insert(name.clone(), flipped.clone());
+
+            // The premise: the transpose has the SAME element count, so the
+            // count check cannot see it.
+            assert_eq!(flipped.iter().product::<usize>(), shape.iter().product::<usize>());
+            crate::gemma_spec_wire::validate_assistant_tensors(&cfg, &weights, None)
+                .expect("a transpose is invisible without the dimensions — that is the point");
+
+            let err = match crate::gemma_spec_wire::validate_assistant_tensors(
+                &cfg, &weights, Some(&d)) {
+                Ok(()) => panic!("a transposed '{name}' must be refused"),
+                Err(e) => e,
+            };
+            assert!(err.contains(name.as_str())
+                        && err.contains(&format!("{flipped:?}"))
+                        && err.contains(&format!("{shape:?}")),
+                    "the refusal must name the tensor and BOTH shapes; got: {err}");
+        }
+        assert!(cases >= 4, "the tensor map must have rectangular tensors to flip, got {cases}");
+
+        // A tensor present in the data but absent from the header is refused
+        // too — `read_safetensors_dims` keeps tensors of every dtype, so this
+        // is a genuinely absent tensor, not a skipped one.
+        let mut d = dims.clone();
+        let victim = expected[0].0.clone();
+        d.remove(&victim);
+        let err = crate::gemma_spec_wire::validate_assistant_tensors(&cfg, &weights, Some(&d))
+            .expect_err("a tensor missing from the header must be refused");
+        assert!(err.contains(victim.as_str()), "got: {err}");
+    }
+
     /// A drifted position cursor must be refused BEFORE any block runs, with
     /// the target left exactly as the caller handed it over.
     ///
@@ -1684,8 +1762,19 @@ mod tests {
     /// remaining blocks still run on filler drafts and advance the target's KV
     /// before the stashed error is re-raised. A caller that catches the error
     /// and retries would then be decoding from a context that moved. So the
-    /// assertion is not just "it returns `Err`" — it is that the KV frontiers
-    /// are untouched.
+    /// assertion is not just "it returns `Err`" — it is that the KV is untouched.
+    ///
+    /// It is untouched BYTE-FOR-BYTE, not merely frontier-for-frontier. The
+    /// frontier alone is too weak a control here, and specifically weak against
+    /// the most likely WRONG fix: `KvCache::truncate` moves the counter and
+    /// nothing else (the storage is overwrite-in-place), so a version of this
+    /// seam that let the loop run and then rewound the caches to `start_pos`
+    /// before re-raising would restore every frontier while leaving the
+    /// speculative K/V of the abandoned blocks in the buffers. The frontier
+    /// check passes, the retry attends over the stale rows. Snapshotting `k`
+    /// and `v` is what separates "did not advance" from "did not write". Both
+    /// are asserted per cache, so a single dirty layer cannot hide behind the
+    /// others.
     #[test]
     fn production_seam_refuses_a_drifted_cursor_without_advancing_the_target() {
         let mut f = build_fixture(SPEC_BASELINE_LEN);
@@ -1694,7 +1783,9 @@ mod tests {
             f.acfg.clone(), f.aw.clone(), &f.model).expect("build drafter");
         let prompt_last = *f.prompt.last().unwrap();
         let cfg = SpecConfig { k: SPEC_K, max_new_tokens: SPEC_N };
-        let before: Vec<usize> = f.model.kv_caches.iter().map(|c| c.seq_len).collect();
+        assert!(!f.model.kv_caches.is_empty(), "the fixture must have KV caches to guard");
+        let before: Vec<(usize, Vec<f32>, Vec<f32>)> = f.model.kv_caches.iter()
+            .map(|c| (c.seq_len, c.k.clone(), c.v.clone())).collect();
 
         // `start_pos` one past where the KV actually stands.
         let err = crate::gemma_spec_wire::spec_decode_gemma(
@@ -1703,9 +1794,12 @@ mod tests {
         ).expect_err("a drifted start_pos must be refused");
         assert!(err.contains("drifted apart") && err.contains(&f.start_pos.to_string()),
                 "the refusal must name the drift and the frontier; got: {err}");
-        let after: Vec<usize> = f.model.kv_caches.iter().map(|c| c.seq_len).collect();
-        assert_eq!(after, before,
-                   "a refused spec-decode must leave every KV frontier where it found it");
+        for (li, (c, (n, k, v))) in f.model.kv_caches.iter().zip(before.iter()).enumerate() {
+            assert_eq!(c.seq_len, *n,
+                       "layer {li}: a refused spec-decode moved the KV frontier");
+            assert_eq!(&c.k, k, "layer {li}: a refused spec-decode wrote to the K buffer");
+            assert_eq!(&c.v, v, "layer {li}: a refused spec-decode wrote to the V buffer");
+        }
 
         // ...and the undrifted call still runs to completion from that state.
         let report = crate::gemma_spec_wire::spec_decode_gemma(

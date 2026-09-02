@@ -1620,6 +1620,46 @@ pub(crate) fn tile_row_range(is_full: bool, upto: usize, window: usize) -> (usiz
 
 // ─── Weight loading from SafeTensors ─────────────────────────────────────────
 
+/// Read ONLY the tensor DIMENSIONS out of a safetensors file — the header, not
+/// the payload.
+///
+/// [`load_weights_from_safetensors`] flattens every tensor to a `Vec<f32>` and
+/// throws the shape away, so a caller that checks a tensor by element count
+/// cannot tell `[a, b]` from `[b, a]`. A transposed projection therefore loads
+/// clean and is then read in the expected layout — silently wrong numbers
+/// rather than a load failure. This is the missing half: keep the dimensions so
+/// the caller can compare them exactly.
+///
+/// The names are normalised EXACTLY as `load_weights_from_safetensors`
+/// normalises them (the vLLM `model.language_model.` → `model.` rewrite), so
+/// the two maps are keyed alike and can be zipped by name. Unlike that
+/// function this one does NOT skip unsupported dtypes: a tensor it cannot
+/// widen still has a shape, and reporting the shape mismatch is more useful
+/// than reporting the tensor as missing.
+///
+/// Cost is the header parse only — `SafeTensors::deserialize` reads the JSON
+/// header and takes slices of the mmap; no tensor data is touched.
+pub fn read_safetensors_dims(path: &Path) -> Result<HashMap<String, Vec<usize>>, String> {
+    use safetensors::SafeTensors;
+    use memmap2::Mmap;
+    use std::fs::File;
+
+    let file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mmap = unsafe { Mmap::map(&file) }.map_err(|e| format!("mmap: {e}"))?;
+    let st = SafeTensors::deserialize(&mmap).map_err(|e| format!("parse safetensors: {e}"))?;
+
+    let mut out = HashMap::new();
+    for (raw_name, tensor) in st.tensors() {
+        let name = if raw_name.starts_with("model.language_model.") {
+            format!("model.{}", &raw_name["model.language_model.".len()..])
+        } else {
+            raw_name.to_string()
+        };
+        out.insert(name, tensor.shape().to_vec());
+    }
+    Ok(out)
+}
+
 /// Load Gemma4-E2B weights from a safetensors file.
 ///
 /// Returns a flat map of tensor name → Vec<f32> (all converted to f32 for
@@ -6569,6 +6609,55 @@ mod quant_tests {
         expected.sort();
         assert_eq!(found_names, expected, "discover_shards must find exactly the 3 real shard files");
         assert!(found.windows(2).all(|w| w[0] <= w[1]), "discover_shards result must be sorted");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `read_safetensors_dims` must report the on-disk DIMENSIONS, and key them
+    /// exactly as `load_weights_from_safetensors` keys its data — otherwise a
+    /// caller that zips the two by name silently checks nothing.
+    ///
+    /// The `[2,3]` / `[3,2]` pair is the whole point: both are 6 elements, so
+    /// the flattened `Vec<f32>` the data loader returns cannot tell them apart.
+    #[test]
+    fn read_safetensors_dims_reports_dimensions_and_the_loader_name_rewrite() {
+        use safetensors::tensor::TensorView;
+        use safetensors::Dtype;
+
+        let dir = std::env::temp_dir()
+            .join(format!("vvk_st_dims_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.safetensors");
+
+        // f32 payloads, little-endian, so the DATA loader can read them too.
+        let six: Vec<u8> = (0..6u32).flat_map(|i| (i as f32).to_le_bytes()).collect();
+        let one: Vec<u8> = 1.0f32.to_le_bytes().to_vec();
+        let items: Vec<(&str, TensorView)> = vec![
+            ("a.weight", TensorView::new(Dtype::F32, vec![2, 3], &six).unwrap()),
+            ("b.weight", TensorView::new(Dtype::F32, vec![3, 2], &six).unwrap()),
+            ("model.language_model.c.weight",
+             TensorView::new(Dtype::F32, vec![1], &one).unwrap()),
+        ];
+        std::fs::write(&path,
+            safetensors::serialize(items.iter().map(|(n, v)| (*n, v)), &None).unwrap()).unwrap();
+
+        let dims = read_safetensors_dims(&path).expect("read the header");
+        assert_eq!(dims.get("a.weight"), Some(&vec![2usize, 3]));
+        assert_eq!(dims.get("b.weight"), Some(&vec![3usize, 2]));
+        // The vLLM `model.language_model.` -> `model.` rewrite, the same one the
+        // data loader applies.
+        assert_eq!(dims.get("model.c.weight"), Some(&vec![1usize]));
+        assert!(!dims.contains_key("model.language_model.c.weight"));
+
+        // The two maps agree by name, and the counts are IDENTICAL for the
+        // transposed pair — which is exactly why the dimensions are needed.
+        let data = load_weights_from_safetensors(&path).expect("read the data");
+        let mut a: Vec<&String> = dims.keys().collect();
+        let mut b: Vec<&String> = data.keys().collect();
+        a.sort();
+        b.sort();
+        assert_eq!(a, b, "the dims map and the data map must be keyed alike");
+        assert_eq!(data["a.weight"].len(), data["b.weight"].len());
 
         std::fs::remove_dir_all(&dir).ok();
     }
