@@ -1,0 +1,144 @@
+#version 450
+
+// Qwen3.6 GatedDeltaNet SEQUENTIAL MULTI-TOKEN scan (P1a, batched-prefill
+// foundation — see `plan-batched-prefill.md` §1c/§7). Extends `q35_gdn_step.comp`
+// (the decode kernel) with an inner `for t in 0..n_tokens` loop; the delta-rule
+// state column is held in PRIVATE (register) storage across the whole loop and
+// only touches the GTT-resident `SBuf` once at entry and once at exit — the
+// T-1 state round trips that `q35_gdn_step` pays (one dispatch per token) are
+// the thing this kernel removes.
+//
+// One workgroup per value-head `j` (dispatch (nv,1,1)); one thread per value
+// column `vv` (vd <= 128, same constraint as `q35_gdn_step`). Bit-exact by
+// construction vs `q35_gdn_step` dispatched `n_tokens` times in a row: the
+// per-token body (softplus/decay/beta, the two decay+kv_mem / update+out
+// fused passes, the gated RMSNorm) is copied VERBATIM, same accumulation
+// order over `kk`; only the state's storage location changes (registers held
+// across `t` instead of round-tripping through `SBuf` every token).
+//
+// Referenced (not copied) for the register-carry SHAPE: the dormant
+// `gated_delta_net.comp` (upstream artifact) uses the same "shard state into
+// per-thread registers, loop `for t in 0..n_tokens`, write back once"
+// pattern — but it takes pre-computed q/k/v/g/beta (no conv, no qk-norm, no
+// gated-RMSNorm/silu(z) tail) and a different decay/output convention, so it
+// is a structural reference only; the per-token math here is qwen35's exact
+// delta rule from `q35_gdn_step`/`Qwen35Model::delta_net`.
+//
+// params[] packs the per-layer constants exactly as q35_gdn_step:
+// [A_log(nv) | dt_bias(nv) | norm_w(vd)].
+//
+// Per-token buffers are laid out row-major `[n_tokens, stride]` (stride =
+// key_dim for q_in/k_in, conv_dim for conv_out, nv for a_in/b_in, value_dim
+// for z_in/gated) — the exact per-token slices `delta_net_scan`'s batched
+// pre-passes (projections, conv1d+SiLU, qk-norm) produce on the CPU side.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint kd;
+    uint vd;
+    uint ratio;      // nv / nk (repeat_interleave: v-head j uses k-head j/ratio)
+    uint v_off;      // v_flat offset into a conv_out ROW (= 2*key_dim)
+    float eps;
+    uint nv;
+    uint n_tokens;   // T
+    uint conv_dim;   // conv_out row stride
+    uint key_dim;    // q_in / k_in row stride
+    uint value_dim;  // z_in / gated row stride
+};
+
+layout(binding = 0) readonly buffer QBuf { float q_in[]; };      // [T, key_dim] normed
+layout(binding = 1) readonly buffer KBuf { float k_in[]; };      // [T, key_dim] normed
+layout(binding = 2) readonly buffer CBuf { float conv_out[]; };  // [T, conv_dim], v at v_off
+layout(binding = 3) readonly buffer ABuf { float a_in[]; };      // [T, nv]
+layout(binding = 4) readonly buffer BBuf { float b_in[]; };      // [T, nv]
+layout(binding = 5) readonly buffer ZBuf { float z_in[]; };      // [T, value_dim]
+layout(binding = 6) readonly buffer PBuf { float params[]; };    // [2*nv + vd]
+layout(binding = 7) buffer SBuf { float state[]; };              // [nv, kd, vd]
+layout(binding = 8) writeonly buffer GBuf { float gated[]; };    // [T, value_dim]
+
+shared float sh_out[128];
+shared float sh_scale;
+
+// Max supported key_head_dim for the register-resident state column (live
+// configs: 27B/35B-A3B both use kd=128). Bump alongside the shader if a
+// future config needs a larger linear_key_head_dim.
+#define MAX_KD 128
+
+void main() {
+    const uint j = gl_WorkGroupID.x;
+    const uint vv = gl_LocalInvocationID.x;
+    const uint kh = j / ratio;
+    const uint sb = j * kd * vd;
+
+    // Load this thread's state column ONCE (register/private-storage carry
+    // across all T tokens), instead of every token as q35_gdn_step does.
+    float s_col[MAX_KD];
+    if (vv < vd) {
+        for (uint kk = 0u; kk < kd; kk++) {
+            s_col[kk] = state[sb + kk * vd + vv];
+        }
+    }
+
+    for (uint t = 0u; t < n_tokens; t++) {
+        const uint a_base = t * nv;
+        const uint qk_base = t * key_dim;
+        const uint c_base = t * conv_dim;
+        const uint zg_base = t * value_dim;
+
+        // Per-head scalars (uniform across the workgroup; recomputed per
+        // thread — identical to q35_gdn_step, indexed per token here).
+        const float xx = a_in[a_base + j] + params[nv + j];
+        const float sp = (xx > 20.0) ? xx : log(1.0 + exp(xx)); // softplus
+        const float g = -exp(params[j]) * sp;
+        const float decay = exp(g);
+        const float beta = 1.0 / (1.0 + exp(-b_in[a_base + j]));
+
+        float outv = 0.0;
+        if (vv < vd) {
+            // Pass 1: state *= decay fused with kv_mem = state^T . k (kk order
+            // matches the CPU loops; same fusion as q35_gdn_step, register-held).
+            float kv_mem = 0.0;
+            for (uint kk = 0u; kk < kd; kk++) {
+                const float s = s_col[kk] * decay;
+                s_col[kk] = s;
+                kv_mem += s * k_in[qk_base + kh * kd + kk];
+            }
+            const float delta = (conv_out[c_base + v_off + j * vd + vv] - kv_mem) * beta;
+            // Pass 2: state += k (x) delta fused with out = state . q.
+            float o = 0.0;
+            for (uint kk = 0u; kk < kd; kk++) {
+                const float s = s_col[kk] + k_in[qk_base + kh * kd + kk] * delta;
+                s_col[kk] = s;
+                o += s * q_in[qk_base + kh * kd + kk];
+            }
+            outv = o;
+            sh_out[vv] = o;
+        }
+        barrier();
+        if (vv == 0u) {
+            float ss = 0.0;
+            for (uint i = 0u; i < vd; i++) {
+                const float v = sh_out[i];
+                ss += v * v;
+            }
+            sh_scale = 1.0 / sqrt(ss / float(vd) + eps);
+        }
+        barrier();
+        if (vv < vd) {
+            const float normed = outv * sh_scale * params[2u * nv + vv];
+            const float zz = z_in[zg_base + j * vd + vv];
+            gated[zg_base + j * vd + vv] = normed * (zz / (1.0 + exp(-zz))); // * silu(z)
+        }
+        // Prevent the next token's `sh_out[vv] = o` write (top of the loop)
+        // from racing this token's `sh_scale` read above (WAR on shared mem).
+        barrier();
+    }
+
+    // Write back the final state column ONCE.
+    if (vv < vd) {
+        for (uint kk = 0u; kk < kd; kk++) {
+            state[sb + kk * vd + vv] = s_col[kk];
+        }
+    }
+}

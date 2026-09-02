@@ -114,6 +114,29 @@ pub(crate) fn cols_tile_schedule(t: usize, tile: usize) -> Vec<(usize, usize)> {
     sched
 }
 
+/// `shaders/q35_gdn_scan.comp`'s `MAX_KD`.
+///
+/// The scan kernel carries each thread's delta-rule state column in a PRIVATE
+/// `float s_col[MAX_KD]` array and indexes it `kk < kd`, so a
+/// `linear_key_head_dim` above this writes PAST the array — silent corruption,
+/// not a truncated result, and no bound the shader itself can enforce.
+///
+/// This limit is the SCAN's alone. `q35_gdn_step` (the per-token decode kernel,
+/// and the fallback when the scan refuses) keeps the same column in the `SBuf`
+/// storage buffer the host sizes as `nv*kd*vd`, so it has no `kd` ceiling — which
+/// is why the guard lives at the scan dispatch site and NOT in the shared
+/// `ensure_dn_gpu_layer`, where it would needlessly disable GPU decode too.
+/// `ensure_dn_gpu_layer` already carries the OTHER kernel limit, `vd <= 128`
+/// (the 128-thread workgroup + 128-slot `sh_out`), which both kernels share.
+pub(crate) const GDN_SCAN_MAX_KD: usize = 128;
+
+/// True when `q35_gdn_scan` can serve a `linear_key_head_dim` of `kd`.
+/// Extracted so the kernel limit is host-testable without a GPU, in the same
+/// spirit as `cols_tile_schedule` above.
+pub(crate) fn gdn_scan_kd_ok(kd: usize) -> bool {
+    kd <= GDN_SCAN_MAX_KD
+}
+
 // ── Base Qwen3 dense GPU path (`qwen_*`) — the `gemma`/base-dense feature ────
 #[cfg(feature = "gemma")]
 impl VulkanModel {
@@ -2851,6 +2874,13 @@ impl VulkanModel {
         if !self.ensure_dn_gpu_layer(cfg, layer_idx) {
             return None;
         }
+        // `ensure_dn_gpu_layer` carries the limit BOTH GDN kernels share
+        // (`vd <= 128`). `kd` is the SCAN's own — see `GDN_SCAN_MAX_KD`.
+        // Refusing here sends the caller to T serial `qwen35_delta_net_gpu`
+        // calls, the documented fallback, which has no such ceiling.
+        if !gdn_scan_kd_ok(kd) {
+            return None;
+        }
 
         // STEP-7 conv-window staleness fix (resolves the FLAG above): seed the
         // CPU `DeltaNetState.conv_state` from the GPU-AUTHORITATIVE
@@ -3582,9 +3612,26 @@ impl VulkanModel {
         let h = cfg.hidden_size;
         let eps = cfg.rms_norm_eps;
         let vocab = cfg.vocab_size;
+        let (pp_start, pp_end, pp_last) = (self.pp_start, self.pp_end, self.pp_last);
+        // The CPU-fallback last stage below reads the f16-host lm_head AFTER
+        // `forward_pp_range_batched_capture` has advanced the resident KV and
+        // GDN state, and it read it with an `expect` — a missing table aborted
+        // through the pyo3 boundary, and even as an `Err` it would leave a
+        // pending `spec_verify_span` on a model that had already moved. Check it
+        // while nothing has changed yet. (Sibling of the same defect in
+        // `pyseam_qwen35::forward_tp_qwen35_verify_impl`.)
+        if self.engine.is_none() && pp_last {
+            let lm_name = self.qwen35.as_ref()
+                .map(|m| m.lm_head_name.clone())
+                .unwrap_or_default();
+            if !self.q35_f16_host.contains_key(&lm_name) {
+                return Err(PyRuntimeError::new_err(format!(
+                    "forward_qwen35_verify: qwen3_5 lm_head f16 host missing \
+                     (verify CPU-fallback last stage, '{lm_name}')")));
+            }
+        }
         self.spec_verify_gdn_inputs.clear();
         self.spec_verify_span = Some((start_pos, t));
-        let (pp_start, pp_end, pp_last) = (self.pp_start, self.pp_end, self.pp_last);
 
         // ── CPU fallback (no GPU engine) — Mac identity-gate path ────────────
         if self.engine.is_none() {
@@ -3599,7 +3646,9 @@ impl VulkanModel {
             let norm_w = qm.weights.f32_slice("model.norm.weight").to_vec();
             let lm_name = qm.lm_head_name.clone();
             let lm_w = self.q35_f16_host.get(&lm_name)
-                .expect("qwen3_5 lm_head f16 host missing (verify CPU-fallback last stage)");
+                .ok_or_else(|| PyRuntimeError::new_err(
+                    "forward_qwen35_verify: qwen3_5 lm_head f16 host missing \
+                     (verify CPU-fallback last stage)"))?;
             let lm_f32: Vec<f32> = lm_w.iter().map(|&b| half::f16::from_bits(b).to_f32()).collect();
             self.stash_verify_prenorm(&hidden, start_pos, t, h);
             let mut logits = vec![0.0f32; t * vocab];
@@ -5115,5 +5164,67 @@ impl VulkanModel {
             logits[j] = acc;
         }
         logits
+    }
+}
+
+/// The GatedDeltaNet kernels' shape ceilings, pinned against the shader sources
+/// they come from.
+///
+/// Both limits are storage sizes the shaders cannot check for themselves: a
+/// config past either one produces silent corruption (uninitialised RMSNorm
+/// terms, or a write past a private array), not a diagnosable failure. The
+/// dispatch sites are the only place they can be enforced, so what these gates
+/// pin is that the Rust constants still MATCH the shaders.
+#[cfg(all(test, feature = "qwen35"))]
+mod gdn_shape_guard_tests {
+    use super::*;
+
+    /// `GDN_SCAN_MAX_KD` must equal `q35_gdn_scan.comp`'s own `#define MAX_KD`.
+    /// Bumping the shader's private `s_col[MAX_KD]` without this constant (or
+    /// the reverse) silently re-opens the overrun the guard exists to close.
+    #[test]
+    fn scan_max_kd_matches_the_shader_define() {
+        let src = include_str!("../shaders/q35_gdn_scan.comp");
+        let n: usize = src
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("#define MAX_KD "))
+            .expect("q35_gdn_scan.comp must define MAX_KD")
+            .trim()
+            .parse()
+            .expect("MAX_KD must be a plain integer");
+        assert_eq!(
+            n, GDN_SCAN_MAX_KD,
+            "q35_gdn_scan.comp defines MAX_KD={n} but GDN_SCAN_MAX_KD={GDN_SCAN_MAX_KD}; \
+             the dispatch guard would let a kd of {} write past `float s_col[MAX_KD]`",
+            n.min(GDN_SCAN_MAX_KD) + 1);
+    }
+
+    /// The guard admits exactly the representable range. `kd == MAX_KD` is the
+    /// live 27B/35B-A3B geometry and must keep the scan; one past it must not.
+    #[test]
+    fn scan_guard_admits_max_kd_and_refuses_one_past_it() {
+        assert!(gdn_scan_kd_ok(128), "kd=128 is the live config; the scan must serve it");
+        assert!(gdn_scan_kd_ok(GDN_SCAN_MAX_KD));
+        assert!(!gdn_scan_kd_ok(GDN_SCAN_MAX_KD + 1));
+        assert!(!gdn_scan_kd_ok(256));
+    }
+
+    /// `q35_gdn_step`'s 128-thread workgroup and 128-slot `sh_out` are the OTHER
+    /// limit — the one `ensure_dn_gpu_layer` enforces as `vd > 128`. Pin the
+    /// workgroup size so that guard cannot drift away from the kernel either.
+    #[test]
+    fn step_workgroup_is_the_128_columns_ensure_dn_gpu_layer_assumes() {
+        for shader in ["../shaders/q35_gdn_step.comp", "../shaders/q35_gdn_scan.comp"] {
+            let src = match shader {
+                "../shaders/q35_gdn_step.comp" => include_str!("../shaders/q35_gdn_step.comp"),
+                _ => include_str!("../shaders/q35_gdn_scan.comp"),
+            };
+            assert!(src.contains("local_size_x = 128"),
+                    "{shader}: ensure_dn_gpu_layer's `vd > 128` guard assumes a \
+                     128-thread workgroup");
+            assert!(src.contains("shared float sh_out[128];"),
+                    "{shader}: ensure_dn_gpu_layer's `vd > 128` guard assumes a \
+                     128-slot sh_out");
+        }
     }
 }

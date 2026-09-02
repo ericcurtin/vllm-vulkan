@@ -2230,13 +2230,19 @@ mod dispatch_tests {
     #[test]
     fn nvfp4_dispatch_routes_by_flag() {
         // OFF -> f32-fold kernel + 20-byte mlx4 pc; ON -> e4m3 kernel + 24-byte pc.
+        // (n=512 stays under the repack shape guard's n>=1024 floor, so it's
+        // still the byte-identical v1 dispatch regardless of NVFP4_REPACK.)
         let (s_off, r_off, pc_off) = nvfp4_dispatch(2048, 512, 16, false, 1.0);
         assert_eq!(s_off, "mul_mat_vec_nvfp4_f32_f32");
         assert_eq!(r_off, 1);
         assert_eq!(pc_off.len(), 20);
+        // n=2048 clears the repack shape guard (k%32==0, k,n>=1024), and
+        // VLLM_VULKAN_NVFP4_REPACK is default ON (2026-07-26 fleet-regression
+        // GO) — so this now routes to the e4m3-resident repack twin, not the
+        // v1 r8 oracle.
         let (s_on, r_on, pc_on) = nvfp4_dispatch(2048, 2048, 16, true, 0.25);
-        assert_eq!(s_on, "mul_mat_vec_nvfp4_e4m3_f32_f32_r8");
-        assert_eq!(r_on, 8);
+        assert_eq!(s_on, "mul_mat_vec_nvfp4_e4m3repack_f32_f32_bs64_r4");
+        assert_eq!(r_on, 4);
         assert_eq!(pc_on.len(), 24);
         assert_eq!(f32::from_le_bytes(pc_on[20..24].try_into().unwrap()), 0.25);
     }
@@ -2402,20 +2408,26 @@ mod dispatch_tests {
 
     #[test]
     fn nvfp4_repack_routes_only_on_flag_and_shape() {
-        // Flag default-OFF in the test process (env unset) -> v1 everywhere.
-        assert!(!nvfp4_repack_flag(), "VLLM_VULKAN_NVFP4_REPACK must be unset in tests");
-        // Shape guard is false without the flag regardless of shape.
-        assert!(!nvfp4_repack_shape_ok(17408, 5120, 16));
-        // f32-fold dispatch stays v1 (byte-identical default).
+        // VLLM_VULKAN_NVFP4_REPACK is default ON (2026-07-26 fleet-regression
+        // GO, src/flags.rs bdef1) — the test process does not override it, so
+        // this reads the shipped production default.
+        assert!(nvfp4_repack_flag(), "VLLM_VULKAN_NVFP4_REPACK default flipped ON 2026-07-26; if this is intentionally OFF again, update this test's expectations too");
+        // Shape guard is true for a qualifying large mlp/expert shape...
+        assert!(nvfp4_repack_shape_ok(17408, 5120, 16));
+        // ...and false outside the shape guard (n<1024) regardless of the flag.
+        assert!(!nvfp4_repack_shape_ok(17408, 512, 16));
+        // f32-fold dispatch now routes to the repack refactor for a qualifying shape.
         let (s, _r, pc) = nvfp4_dispatch(17408, 5120, 16, false, 1.0);
-        assert_eq!(s, "mul_mat_vec_nvfp4_f32_f32_r8");
+        assert_eq!(s, "mul_mat_vec_nvfp4repack_f32_f32_bs64_r4");
         assert_eq!(pc.len(), 20);
-        // e4m3 dispatch stays v1 too.
+        // e4m3 dispatch routes to its repack twin too.
         let (se, _re, pce) = nvfp4_dispatch(17408, 5120, 16, true, 0.25);
-        assert_eq!(se, "mul_mat_vec_nvfp4_e4m3_f32_f32_r8");
+        assert_eq!(se, "mul_mat_vec_nvfp4_e4m3repack_f32_f32_bs64_r4");
         assert_eq!(pce.len(), 24);
-        // nemotron path (matvec_nvfp4_variant_k) stays v1.
-        assert_eq!(matvec_nvfp4_variant_k(17408, 5120), matvec_nvfp4_variant(5120));
+        // nemotron path (matvec_nvfp4_variant_k) routes to the repack twin too
+        // for this qualifying shape (same shape guard as nvfp4_dispatch above).
+        assert_eq!(matvec_nvfp4_variant_k(17408, 5120),
+                   ("mul_mat_vec_nvfp4repack_f32_f32_bs64_r4".to_string(), 4));
         // The repack combos are compiled at init (geom_combos_for non-empty).
         assert_eq!(geom_combos_for("mul_mat_vec_nvfp4repack_f32_f32").len(), 5);
         assert_eq!(geom_combos_for("mul_mat_vec_nvfp4_e4m3repack_f32_f32").len(), 5);
@@ -2541,8 +2553,19 @@ mod dispatch_tests {
     #[test]
     fn geom_pickers_return_swept_winners() {
         // The sweep-derived win region (geom_sweep.csv, GFX1013, 2026-07-04).
+        // MoE gate/up: superseded by the L1 VLLM_VULKAN_MLX4_RGU_REPACK lever
+        // (default ON, 2026-07-30 PP-5 fleet A/B GO) — k%32==0 && n==512
+        // self-scopes to this exact shape and now wins over the bs128/r2 sweep
+        // winner asserted here previously.
+        // Assert the DEFAULT this expectation rides on, the way
+        // `nvfp4_repack_routes_only_on_flag_and_shape` does — otherwise a flipped
+        // default fails below as a shader-NAME mismatch that points at the
+        // geometry sweep table rather than at the flag.
+        assert!(mlx4_rgu_repack_flag(),
+                "VLLM_VULKAN_MLX4_RGU_REPACK default flipped ON 2026-07-30; if it is \
+                 intentionally OFF again, update this test's expectations too");
         assert_eq!(matvec_mlx4_variant_k(2048, 512),
-                   ("mul_mat_vec_mlx4_f32_f32_bs128_r2".to_string(), 2)); // MoE gate/up
+                   ("mul_mat_vec_mlx4repack_f32_f32_bs64_r4".to_string(), 4)); // MoE gate/up
         // MoE down: 1850MHz-pinned re-sweep rewired this shape onto the w8sg
         // base (VLLM_VULKAN_MLX4_W8 default ON — see matvec_mlx4_variant_k).
         assert_eq!(matvec_mlx4_variant_k(512, 2048),
@@ -2580,12 +2603,25 @@ mod dispatch_tests {
     #[test]
     fn geom_pickers_fall_back_to_legacy_outside_win_region() {
         // G3 no-regression: everything outside the swept shapes is the exact
-        // legacy string (byte-identical dispatch). lm_head-shaped (k=2048,
-        // n=vocab), dense projections, TP shards, shared gate/up (legacy won
-        // the sweep), dn a/b (noise-level win — kept legacy).
-        assert_eq!(matvec_mlx4_variant_k(2048, 151936), matvec_mlx4_variant(151936));
-        assert_eq!(matvec_mlx4_variant_k(2048, 1024), matvec_mlx4_variant(1024));
-        assert_eq!(matvec_mlx4_variant_k(256, 2048), matvec_mlx4_variant(2048));
+        // legacy string (byte-identical dispatch), EXCEPT where a later default-
+        // ON repack lever's shape guard (k%32==0 && k,n>=1024) also applies —
+        // VLLM_VULKAN_MLX4_REPACK + VLLM_VULKAN_MLX4_REPACK_R8 are both default
+        // ON (2026-07-26 / 2026-07-30 fleet GO), and their shape guard has no
+        // upper bound on n, so it also captures lm_head-shaped and TP-shard
+        // shapes here — this is intentional generalization (correctness is
+        // shape-invariant by construction, see matvec_mlx4_variant_k), not a
+        // regression. dn a/b and the true sub-1024-k shapes still fall through
+        // to legacy.
+        // Same reason as in `geom_pickers_return_swept_winners`: name the flags
+        // these two expectations depend on, so a flipped default says so.
+        assert!(mlx4_repack_flag() && mlx4_repack_r8_flag(),
+                "VLLM_VULKAN_MLX4_REPACK / _R8 are both default ON (2026-07-26 / \
+                 2026-07-30); if either is intentionally OFF again, update this test");
+        assert_eq!(matvec_mlx4_variant_k(2048, 151936), // lm_head-shaped, k<n
+                   ("mul_mat_vec_mlx4repack_f32_f32_bs64_r8".to_string(), 8));
+        assert_eq!(matvec_mlx4_variant_k(2048, 1024), // TP-shard-shaped, k>n
+                   ("mul_mat_vec_mlx4repack_f32_f32_bs128_r8".to_string(), 8));
+        assert_eq!(matvec_mlx4_variant_k(256, 2048), matvec_mlx4_variant(2048)); // k<1024: still legacy
         assert_eq!(matvec_f32_variant_k(2048, 512), matvec_f32_variant(512)); // shared gate/up
         assert_eq!(matvec_f32_variant_k(2048, 1), matvec_f32_variant(1));
         assert_eq!(geom_pick("mul_mat_vec_bf16_f32_f32", 2048, 32), None);    // dn a/b
@@ -2655,8 +2691,12 @@ mod dispatch_tests {
         // Outside the swept win region, every `_k` wrapper must resolve to the
         // exact legacy `matvec_*_variant(n)` dispatch (name + rows) for
         // representative Nemotron shapes.
-        assert_eq!(matvec_nvfp4_variant_k(2048, 512), matvec_nvfp4_variant(512));
-        assert_eq!(matvec_nvfp4_variant_k(4096, 2048), matvec_nvfp4_variant(2048));
+        assert_eq!(matvec_nvfp4_variant_k(2048, 512), matvec_nvfp4_variant(512)); // n<1024: outside repack guard too
+        // k=4096,n=2048 clears the NVFP4_REPACK shape guard (default ON,
+        // 2026-07-26 fleet-regression GO), so this no longer matches the
+        // legacy oracle — it routes to the repack twin.
+        assert_eq!(matvec_nvfp4_variant_k(4096, 2048),
+                   ("mul_mat_vec_nvfp4repack_f32_f32_bs64_r4".to_string(), 4));
         assert_eq!(matvec_fp8_variant_k(2048, 8192), matvec_fp8_variant(8192));
         assert_eq!(matvec_f16_variant_k(2048, 4096), matvec_f16_variant(4096));
     }
@@ -2664,14 +2704,23 @@ mod dispatch_tests {
     #[test]
     fn nvfp4_fp8_f16_k_pickers_return_swept_winners() {
         // NEW-2 Phase 2 cluster-sweep winners (cos=1.0, no pipeline hang).
+        // Both shapes below also clear the NVFP4_REPACK shape guard (k%32==0,
+        // k,n>=1024; default ON since 2026-07-26), which now wins over these
+        // sweep winners — same generalization as the mlx4 twin.
         assert_eq!(matvec_nvfp4_variant_k(1024, 1280),
-                   ("mul_mat_vec_nvfp4_f32_f32_bs256_r2".to_string(), 2)); // MoE expert up
+                   ("mul_mat_vec_nvfp4repack_f32_f32_bs64_r4".to_string(), 4)); // MoE expert up
         assert_eq!(matvec_nvfp4_variant_k(1280, 1024),
-                   ("mul_mat_vec_nvfp4_f32_f32_bs128_r1".to_string(), 1)); // MoE expert down
+                   ("mul_mat_vec_nvfp4repack_f32_f32_bs64_r4".to_string(), 4)); // MoE expert down
+        // VLLM_VULKAN_FP8_FAST is default ON (address-gen cure; see
+        // fp8_variant_selects_r8_for_wide), so fp8_base() resolves to the
+        // "fp8fast" stem — the geom sweep table only has entries for the
+        // pre-fast "mul_mat_vec_fp8_f32_f32" base, so geom_name finds no
+        // winner here and matvec_fp8_variant_k falls through to the plain
+        // r-tier picker (r8 for n>=1024) on the fast base, for both shapes.
         assert_eq!(matvec_fp8_variant_k(4096, 5376),
-                   ("mul_mat_vec_fp8_f32_f32_bs512_r4".to_string(), 4)); // shared up
+                   ("mul_mat_vec_fp8fast_f32_f32_r8".to_string(), 8)); // shared up
         assert_eq!(matvec_fp8_variant_k(5376, 4096),
-                   ("mul_mat_vec_fp8_f32_f32_bs256_r1".to_string(), 1)); // shared down
+                   ("mul_mat_vec_fp8fast_f32_f32_r8".to_string(), 8)); // shared down
         assert_eq!(matvec_f16_variant_k(4096, 1024),
                    ("mul_mat_vec_f16_f32_f32_bs512_r2".to_string(), 2)); // fc1
         assert_eq!(matvec_f16_variant_k(4096, 4096),

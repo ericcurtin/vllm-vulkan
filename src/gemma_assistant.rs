@@ -480,6 +480,80 @@ pub fn assistant_forward(
     AssistantOutput { logits, post_projection_out }
 }
 
+/// ONE draft block: `k` chained drafter steps, implementing the plan's draft
+/// loop (`GEMMA31B_SPEC_PLAN.md` §1.4 pseudocode) verbatim on top of
+/// [`assistant_forward`]:
+///
+/// ```text
+/// for _ in 0..k:
+///     tok_embed     = target.embed(tok) * target.embed_scale
+///     inputs_embeds = concat([tok_embed, h_prev])      # embed FIRST
+///     h_prev, logits = drafter(inputs_embeds, shared_kv, pos)
+///     tok = argmax(logits)
+/// ```
+///
+/// with `position_offset` held CONSTANT across the block and `shared_kv` a
+/// fixed snapshot the drafter never appends to.
+///
+/// This is the EAGLE coupling itself, and it is deliberately NOT inside a
+/// `#[cfg(test)]` module: `gemma_spec_wire`'s production driver and the
+/// synthetic CI gate must run the SAME drafter, or the gate measures something
+/// production does not do. (It began life as a test helper; a second copy for
+/// production would be precisely the "parallel acceptance path" this area has
+/// already been burned by.)
+///
+/// `target_embed` is the TARGET's `model.embed_tokens.weight`, `[vocab,
+/// backbone_hidden_size]` row-major — the drafter's own 1024-dim table is NOT
+/// used on the input side. `seed_hidden` is the target hidden that produced
+/// `bonus` (plan §1.1 step-0 `recurrent_hidden`).
+///
+/// `forced` teacher-forces the FED token (the drafter still computes its own
+/// argmax, which is what is returned) — used only when constructing an aligned
+/// fixture, never in production, where it is `None`.
+///
+/// Returns `(argmax, logits)` per step.
+#[allow(clippy::too_many_arguments)]
+pub fn draft_block(
+    acfg: &AssistantConfig,
+    aw: &HashMap<String, Vec<f32>>,
+    target_embed: &[f32],
+    embed_scale: f32,
+    kv: &AssistantSharedKv,
+    bonus: u32,
+    seed_hidden: &[f32],
+    position_offset: usize,
+    k: usize,
+    forced: Option<&[u32]>,
+    mut gpu: Option<&mut AssistantGpu>,
+) -> Vec<(u32, Vec<f32>)> {
+    let backbone = acfg.backbone_hidden_size;
+    assert_eq!(seed_hidden.len(), backbone,
+               "draft_block: seed_hidden is [{}], expected the target's backbone hidden [{backbone}]",
+               seed_hidden.len());
+    let mut out: Vec<(u32, Vec<f32>)> = Vec::with_capacity(k);
+    let mut recurrent = seed_hidden.to_vec();
+    let mut tok = bonus;
+    for i in 0..k {
+        if i > 0 {
+            tok = match forced {
+                Some(f) => f[i - 1],
+                None => out[i - 1].0,
+            };
+        }
+        let lo = tok as usize * backbone;
+        assert!(lo + backbone <= target_embed.len(),
+                "draft_block: token {tok} is outside the target embed table ({} rows of {backbone})",
+                target_embed.len() / backbone.max(1));
+        let embed: Vec<f32> = target_embed[lo..lo + backbone].iter().map(|&v| v * embed_scale).collect();
+        let inputs_embeds = build_inputs_embeds(&embed, &recurrent);
+        let step = assistant_forward(acfg, aw, &inputs_embeds, position_offset, kv,
+                                     gpu.as_deref_mut());
+        recurrent = step.post_projection_out;
+        out.push((model::argmax(&step.logits) as u32, step.logits));
+    }
+    out
+}
+
 /// INC-5b piece 3 — pyo3 wrapper around the CPU `assistant_forward` drafter,
 /// loaded/held independently of `VulkanModel` (the drafter is tiny — 0.5B,
 /// 939MB host-f32 — and per `GEMMA31B_SPEC_PLAN.md` §1.5 runs on rank0 ONLY,
@@ -508,9 +582,19 @@ impl GemmaAssistant {
     #[pyo3(signature = (dir, device_idx = 0))]
     #[new]
     fn new(dir: String, device_idx: usize) -> PyResult<Self> {
-        let weights = load_assistant_weights(std::path::Path::new(&dir))
+        let path = std::path::Path::new(&dir);
+        let weights = load_assistant_weights(path)
             .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
         let cfg = AssistantConfig::g31b_pair();
+        // The SECOND checkpoint-loading entry point for the same drafter, and
+        // until now the unvalidated one: `SpecDrafter::load` refuses a missing
+        // or mis-shaped tensor, this pyclass took whatever was on disk and let
+        // `AssistantGpu::build` / `assistant_forward` panic on it later, inside
+        // a `.forward()` call. Same file, same tensor map, same check.
+        let dims = crate::model::read_safetensors_dims(&path.join("model.safetensors"))
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        crate::gemma_spec_wire::validate_assistant_tensors(&cfg, &weights, Some(&dims))
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
         // GPU-resident drafter matvecs, default ON (`VLLM_VULKAN_ASSISTANT_GPU=0`
         // → bit-exact host-f32 A/B path). Mirrors the qwen dense-MTP fix: kills
         // the single-threaded host `cpu_matmul` per draft step that made the
@@ -752,5 +836,1296 @@ mod tests {
         assert!(logits_cos >= 0.999, "logits cos {logits_cos} < 0.999");
         assert_eq!(amx_r, amx_g, "argmax mismatch: rust={amx_r} golden={amx_g}");
         assert!(post_cos >= 0.999, "post_projection cos {post_cos} < 0.999");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // SYNTHETIC (checkpoint-free) DRAFTER FIXTURE
+    //
+    // Everything above this line needs `VLLM_TEST_GEMMA31B_ASSISTANT_DIR` and
+    // a 939MB checkpoint, so in CI it prints SKIP and the whole assistant path
+    // stays unexercised — green without being tested. The fixture below is the
+    // unconditional twin: a TINY deterministic drafter, paired with
+    // `model::tiny_synthetic_gemma` as its target, running the REAL
+    // `assistant_forward` and the REAL `gemma_spec::run_spec_decode`.
+    //
+    // It reproduces the pairing `gemma_spec.rs` already uses (real-checkpoint
+    // gate `#[ignore]`d / skipped, synthetic twin unconditional), and reuses
+    // `model::synth_vec` — the SAME deterministic generator
+    // `tiny_synthetic_gemma`'s weights come from — rather than forking a second
+    // near-copy of it.
+    //
+    // WHAT IT CANNOT DO, stated so the gap is on the record: it has no external
+    // reference. The real golden gate
+    // (`gemma31b_assistant_forward_cos_vs_golden`) compares against numbers
+    // dumped from upstream mlx_vlm, which is what pins attention `scale = 1.0`
+    // (not `1/sqrt(head_dim)`) and the borrowed-K "already rotated, do not
+    // re-rotate" convention to something outside this crate. Nothing synthetic
+    // can replace that: a fixture generated by this code cannot prove this code
+    // agrees with mlx_vlm. The checkpoint gate keeps its value on a machine
+    // that has the weights; what follows covers the invariants that do NOT
+    // need an outside oracle.
+    // ─────────────────────────────────────────────────────────────────────
+
+    use crate::model::{synth_vec, tiny_synthetic_gemma, Gemma4Config, Gemma4Model};
+    use crate::gemma_spec::{run_spec_decode, SpecConfig};
+
+    /// The drafter geometry paired with `tiny_synthetic_gemma`.
+    ///
+    /// Every field that must AGREE with the target is derived from the target's
+    /// own config rather than restated: `backbone_hidden_size` is the target's
+    /// hidden size, and the KV-head counts / head dims are read off the
+    /// target's LAST layer of each attention type — the two layers the drafter
+    /// borrows K/V from (`GEMMA31B_SPEC_PLAN.md` §1.2). Restating them as
+    /// literals is how the pairing silently rots when the target fixture
+    /// changes, and a mis-sized borrowed KV is the exact class of the g12b
+    /// 4096-vs-512 panic `AssistantConfig::layer_num_kv_heads` documents.
+    ///
+    /// The drafter's OWN sizes (hidden 64, ffn 128) are free and are chosen
+    /// tiny; the 4-layer `[sliding, sliding, sliding, full]` layer_types is the
+    /// real 31B pairing's shape, kept verbatim so the fixture exercises both
+    /// attention kinds and the head_dim/theta switch between them.
+    fn tiny_assistant_cfg(t: &Gemma4Config) -> AssistantConfig {
+        let last_sliding = (0..t.num_hidden_layers)
+            .rev().find(|&l| !t.is_full_attention(l)).expect("target has a sliding layer");
+        let last_full = (0..t.num_hidden_layers)
+            .rev().find(|&l| t.is_full_attention(l)).expect("target has a full-attention layer");
+        AssistantConfig {
+            hidden_size: 64,
+            backbone_hidden_size: t.hidden_size,
+            num_hidden_layers: 4,
+            num_attention_heads: t.num_attention_heads,
+            num_key_value_heads: t.layer_num_kv_heads(last_sliding),
+            num_global_key_value_heads: t.layer_num_kv_heads(last_full),
+            head_dim: t.layer_head_dim(last_sliding),
+            global_head_dim: t.layer_head_dim(last_full),
+            intermediate_size: 128,
+            sliding_window: t.sliding_window,
+            rms_norm_eps: 1e-6,
+            // Tied lm_head: the drafter samples token ids that are fed straight
+            // back to the TARGET, so its vocab must be the target's.
+            vocab_size: t.vocab_size,
+            layer_types: ["sliding_attention", "sliding_attention", "sliding_attention", "full_attention"]
+                .iter().map(|s| AssistantLayerKind::parse(s).unwrap()).collect(),
+            full_rope_theta: 1_000_000.0,
+            sliding_rope_theta: 10_000.0,
+        }
+    }
+
+    /// Deterministic drafter weights, built from `expected_tensor_shapes` and
+    /// NOTHING else.
+    ///
+    /// That is deliberate and is itself a gate: the checkpoint tensor map is
+    /// the only source of names and shapes here, so a name `assistant_forward`
+    /// reads but the map does not list makes every test below panic with
+    /// "assistant weight '<name>' not found" instead of passing. On the real
+    /// checkpoint that agreement is only checked when someone has the 939MB
+    /// weights.
+    ///
+    /// Centering follows `model::synthetic_gemma`: RMSNorm weights and the
+    /// residual `layer_scalar` multiply the WHOLE stream and are centered on
+    /// 1.0 (centering them on 0 compounds a near-zero multiplier across the
+    /// layers and collapses the hidden state into noise); projections are
+    /// centered on 0.
+    fn tiny_assistant_weights(cfg: &AssistantConfig, tag: &str) -> HashMap<String, Vec<f32>> {
+        expected_tensor_shapes(cfg)
+            .into_iter()
+            .map(|(name, shape)| {
+                let n: usize = shape.iter().product();
+                let (center, half) = if name.ends_with("norm.weight") || name.ends_with("layer_scalar") {
+                    (1.0f32, 0.05f32)
+                } else {
+                    (0.0f32, 0.05f32)
+                };
+                let data = synth_vec(&format!("{tag}{name}"), n, center, half);
+                (name, data)
+            })
+            .collect()
+    }
+
+    /// The target's borrowed K/V snapshot: the LAST layer of each attention
+    /// type, read straight out of the target's own caches in the same
+    /// `[seq_len, n_kv_heads, head_dim]` absolute layout `gemma_kv_layer`
+    /// (`pyseam_gemma.rs`) hands the production driver.
+    ///
+    /// The dimension asserts are the point: they are what fails if the drafter
+    /// config and the target's layers ever stop lining up.
+    fn borrowed_kv(model: &Gemma4Model, acfg: &AssistantConfig) -> AssistantSharedKv {
+        let t = &model.config;
+        let last_sliding = (0..t.num_hidden_layers).rev().find(|&l| !t.is_full_attention(l)).unwrap();
+        let last_full = (0..t.num_hidden_layers).rev().find(|&l| t.is_full_attention(l)).unwrap();
+        let cs = &model.kv_caches[last_sliding];
+        let cf = &model.kv_caches[last_full];
+        assert!(!cs.has_wrapped() && !cf.has_wrapped(),
+                "borrowed_kv needs the absolute-position layout; the ring must not have wrapped");
+        assert_eq!(cs.seq_len, cf.seq_len, "both borrowed layers must be at the same frontier");
+        assert_eq!(cs.num_kv_heads, acfg.num_key_value_heads,
+                   "sliding kv-head count: target layer {last_sliding} vs drafter config");
+        assert_eq!(cs.head_dim, acfg.head_dim,
+                   "sliding head_dim: target layer {last_sliding} vs drafter config");
+        assert_eq!(cf.num_kv_heads, acfg.num_global_key_value_heads,
+                   "full kv-head count: target layer {last_full} vs drafter config");
+        assert_eq!(cf.head_dim, acfg.global_head_dim,
+                   "full head_dim: target layer {last_full} vs drafter config");
+        AssistantSharedKv {
+            sliding_k: cs.k_up_to_now().to_vec(),
+            sliding_v: cs.v_up_to_now().to_vec(),
+            full_k: cf.k_up_to_now().to_vec(),
+            full_v: cf.v_up_to_now().to_vec(),
+            kv_len: cs.seq_len,
+        }
+    }
+
+    /// A greedy SPEC-OFF baseline that ALSO keeps, for every emitted token, the
+    /// target hidden state that produced it.
+    ///
+    /// `gemma_spec.rs`'s `greedy_baseline` returns ids only, which is all its
+    /// stub drafter needs. The real drafter needs more: the plan's step-0
+    /// `recurrent_hidden` IS the target's final hidden — the state the bonus
+    /// token was sampled from (`GEMMA31B_SPEC_PLAN.md` §1.1) — so a gate that
+    /// drives the real drafter has to carry it. `hidden_before[j]` is the
+    /// hidden that produced `ids[j]`, i.e. the recurrent seed for a block whose
+    /// bonus is `ids[j]`; `hidden_before[0]` is the post-prompt hidden, the
+    /// state `start_bonus` would have been sampled from in a real run.
+    struct Baseline {
+        ids: Vec<u32>,
+        hidden_before: Vec<Vec<f32>>,
+    }
+
+    fn greedy_baseline_with_hidden(
+        model: &mut Gemma4Model,
+        prompt_hidden: Vec<f32>,
+        start_bonus: u32,
+        start_pos: usize,
+        n: usize,
+    ) -> Baseline {
+        let mut ids = Vec::with_capacity(n);
+        let mut hidden_before = Vec::with_capacity(n);
+        let mut tok = start_bonus;
+        let mut prev_hidden = prompt_hidden;
+        for i in 0..n {
+            ids.push(tok);
+            hidden_before.push(prev_hidden);
+            let (logits, normed) = model.forward_with_normed(tok, start_pos + i);
+            tok = crate::model::argmax(&logits) as u32;
+            prev_hidden = normed;
+        }
+        Baseline { ids, hidden_before }
+    }
+
+
+    /// The fixed fixture state every gate below starts from: a tiny target with
+    /// a replayed prompt, its borrowed-KV snapshot, the drafter config/weights,
+    /// and the greedy baseline (+ hidden) the spec-decode driver must reproduce.
+    struct Fixture {
+        model: Gemma4Model,
+        acfg: AssistantConfig,
+        aw: HashMap<String, Vec<f32>>,
+        kv: AssistantSharedKv,
+        target_embed: Vec<f32>,
+        embed_scale: f32,
+        baseline: Baseline,
+        start_pos: usize,
+        start_bonus: u32,
+        max_seq: usize,
+        prompt: Vec<u32>,
+    }
+
+    const FIXTURE_MAX_SEQ: usize = 64;
+    const FIXTURE_PROMPT: [u32; 6] = [2, 10, 20, 33, 41, 7];
+    const FIXTURE_START_BONUS: u32 = 30;
+
+    /// Builds the fixture and leaves the target's KV holding EXACTLY the
+    /// prompt, so a caller can drive the spec-decode loop from the same clean
+    /// state the baseline was computed from.
+    fn build_fixture(baseline_len: usize) -> Fixture {
+        let max_seq = FIXTURE_MAX_SEQ;
+        let mut model = tiny_synthetic_gemma(max_seq);
+        let tcfg = model.config.clone();
+        let acfg = tiny_assistant_cfg(&tcfg);
+        let aw = tiny_assistant_weights(&acfg, "");
+        let prompt = FIXTURE_PROMPT.to_vec();
+
+        let mut prompt_hidden = Vec::new();
+        for (pos, &tok) in prompt.iter().enumerate() {
+            let (_, normed) = model.forward_with_normed(tok, pos);
+            prompt_hidden = normed;
+        }
+        let start_pos = prompt.len();
+        let baseline = greedy_baseline_with_hidden(
+            &mut model, prompt_hidden, FIXTURE_START_BONUS, start_pos, baseline_len);
+
+        // Rewind to the post-prompt state and snapshot the borrowed KV there.
+        crate::model::gemma_reset_kv(&mut model);
+        for (pos, &tok) in prompt.iter().enumerate() {
+            model.forward(tok, pos);
+        }
+        let kv = borrowed_kv(&model, &acfg);
+        let target_embed = model.weights.f32_slice("model.embed_tokens.weight").to_vec();
+
+        Fixture {
+            embed_scale: tcfg.embed_scale,
+            target_embed,
+            model, acfg, aw, kv, baseline, start_pos,
+            start_bonus: FIXTURE_START_BONUS,
+            max_seq, prompt,
+        }
+    }
+
+    impl Fixture {
+        /// Rebuild the target's KV caches and replay the prompt, so a second
+        /// run starts from the identical state the first did.
+        fn rewind(&mut self) {
+            let cfg = self.model.config.clone();
+            self.model.kv_caches = (0..cfg.num_hidden_layers)
+                .map(|l| crate::model::KvCache::new_windowed(
+                    self.max_seq,
+                    cfg.layer_kv_capacity(l, self.max_seq),
+                    cfg.layer_num_kv_heads(l),
+                    cfg.layer_head_dim(l)))
+                .collect();
+            for (pos, &tok) in self.prompt.iter().enumerate() {
+                self.model.forward(tok, pos);
+            }
+        }
+
+        fn draft(&self, bonus: u32, seed_hidden: &[f32], pos: usize, k: usize, forced: Option<&[u32]>)
+            -> Vec<(u32, Vec<f32>)>
+        {
+            draft_block(&self.acfg, &self.aw, &self.target_embed, self.embed_scale,
+                        &self.kv, bonus, seed_hidden, pos, k, forced, None)
+        }
+    }
+
+    /// Largest RELATIVE difference between two equal-length vectors, scaled by
+    /// the larger vector norm — a scale-free "did this change at all" measure
+    /// for the wiring gates below.
+    fn rel_change(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        let maxdiff = a.iter().zip(b).map(|(&x, &y)| (x - y).abs())
+            .fold(0.0f32, |m, d| if d.is_nan() || d > m { d } else { m });
+        let scale = a.iter().chain(b.iter()).map(|v| v.abs())
+            .fold(0.0f32, |m, d| if d.is_nan() || d > m { d } else { m });
+        if scale == 0.0 { return 0.0; }
+        maxdiff / scale
+    }
+
+    // ── Gate 1: the fixture IS the checkpoint tensor map ──────────────────
+
+    /// Synthetic twin of `gemma31b_assistant_load_shapes`.
+    ///
+    /// It cannot check the real checkpoint's contents (that needs the
+    /// checkpoint), but it does check the half of that gate which is about
+    /// THIS CRATE: that `expected_tensor_shapes` is a complete and exact
+    /// description of what `assistant_forward` reads, that the map contains no
+    /// forbidden Q-only-violating name, and that the forward's output shapes
+    /// are the ones `GemmaAssistant::forward` promises Python. A weight name
+    /// the forward reads but the map omits panics here; a map entry with the
+    /// wrong shape trips a `cpu_matmul` dimension check.
+    #[test]
+    fn gemma_assistant_synthetic_fixture_covers_the_checkpoint_tensor_map() {
+        let f = build_fixture(2);
+        let cfg = &f.acfg;
+
+        // Same 4 + 11-per-layer structure the real 48-tensor map has.
+        let expected = expected_tensor_shapes(cfg);
+        assert_eq!(expected.len(), 4 + 11 * cfg.num_hidden_layers,
+                   "tensor map shape changed: {} entries for {} layers",
+                   expected.len(), cfg.num_hidden_layers);
+        assert_eq!(expected_tensor_shapes(&AssistantConfig::g31b_pair()).len(), 48,
+                   "the real 31B pairing must still be a 48-tensor map");
+
+        // The fixture was built from the map alone, so this also proves the
+        // map has no duplicate names.
+        assert_eq!(f.aw.len(), expected.len(), "fixture must hold exactly the mapped tensors");
+        for (name, shape) in &expected {
+            let numel: usize = shape.iter().product();
+            assert_eq!(f.aw.get(name).map(|v| v.len()), Some(numel),
+                       "fixture tensor '{name}' must be {shape:?} ({numel} elems)");
+        }
+        for name in forbidden_tensor_names(cfg) {
+            assert!(!f.aw.contains_key(&name),
+                    "drafter is Q-only: '{name}' must not exist");
+        }
+
+        // The forward runs consuming ONLY mapped names (a miss panics inside
+        // `amv`/`w`), and returns the shapes the pyclass contract promises.
+        let seed = f.baseline.hidden_before[0].clone();
+        let steps = f.draft(f.start_bonus, &seed, f.start_pos, 1, None);
+        let (tok, logits) = &steps[0];
+        assert_eq!(logits.len(), cfg.vocab_size, "logits must be [vocab_size]");
+        assert!((*tok as usize) < cfg.vocab_size, "drafted id {tok} outside the target's vocab");
+        assert!(logits.iter().all(|v| v.is_finite()), "drafter produced non-finite logits");
+    }
+
+    // ── Gate 2: every drafter input is actually wired in ──────────────────
+
+    /// ENGAGEMENT gate: each of the drafter's five inputs must demonstrably
+    /// change its output.
+    ///
+    /// A drafter that ignores an input is the assistant-path form of "the lever
+    /// is disengaged but the gate is green": the spec-decode committed stream
+    /// is greedy-identical no matter how bad the drafts are (see
+    /// `gemma_assistant_zero_acceptance_is_caught_by_the_drafter_gate` below),
+    /// so nothing downstream notices. Each check below is a differential, which
+    /// is why it needs no external oracle and no platform-sensitive constant.
+    ///
+    /// The inputs_embeds ORDER check is the one with history: recurrent-first
+    /// instead of embed-first collapses real acceptance 0.43 -> 0.01
+    /// (`GEMMA31B_SPEC_PLAN.md` risk #5), and it is invisible to any check that
+    /// only looks at shapes.
+    #[test]
+    fn gemma_assistant_synthetic_forward_is_wired_to_every_input() {
+        let f = build_fixture(2);
+        let cfg = &f.acfg;
+        let backbone = cfg.backbone_hidden_size;
+        let seed = f.baseline.hidden_before[0].clone();
+
+        // `build_inputs_embeds` puts the token embedding FIRST. Exact, not a
+        // differential: this is the concat order itself.
+        let a: Vec<f32> = (0..backbone).map(|i| i as f32).collect();
+        let b: Vec<f32> = (0..backbone).map(|i| -(i as f32)).collect();
+        let ie = build_inputs_embeds(&a, &b);
+        assert_eq!(ie.len(), 2 * backbone);
+        assert!(ie[..backbone] == a[..],
+                "prev_token_embed must be the FIRST half of inputs_embeds (got ie[1]={}, want {})",
+                ie[1], a[1]);
+        assert!(ie[backbone..] == b[..],
+                "recurrent_hidden must be the SECOND half of inputs_embeds (got ie[{}]={}, want {})",
+                backbone + 1, ie[backbone + 1], b[1]);
+
+        let tok = f.start_bonus as usize;
+        let embed: Vec<f32> = f.target_embed[tok * backbone..(tok + 1) * backbone]
+            .iter().map(|&v| v * f.embed_scale).collect();
+        let base = assistant_forward(cfg, &f.aw, &build_inputs_embeds(&embed, &seed),
+                                     f.start_pos, &f.kv, None);
+
+        // 1. Concat ORDER: halves swapped must change the logits.
+        let swapped = assistant_forward(cfg, &f.aw, &build_inputs_embeds(&seed, &embed),
+                                        f.start_pos, &f.kv, None);
+        let d = rel_change(&base.logits, &swapped.logits);
+        assert!(d > 1e-3, "inputs_embeds order is not observable (rel change {d:.3e}) — \
+                           embed-first vs recurrent-first must not be interchangeable");
+
+        // 2. RECURRENT half: the rolling target-space hidden must feed the forward.
+        let mut rec2 = seed.clone();
+        rec2.iter_mut().for_each(|v| *v += 0.25);
+        let r = assistant_forward(cfg, &f.aw, &build_inputs_embeds(&embed, &rec2),
+                                  f.start_pos, &f.kv, None);
+        let d = rel_change(&base.logits, &r.logits);
+        assert!(d > 1e-3, "recurrent_hidden is not observable (rel change {d:.3e}) — \
+                           the drafter's recurrence is disengaged");
+
+        // 3-6. BORROWED KV: the sliding layers (0..2) read the sliding pair and
+        // the global layer (3) reads the full pair. All four tensors must move
+        // the logits — if they do not, the cross-attention is not attending to
+        // the target's KV at all, which is the whole point of an EAGLE drafter.
+        //
+        // The perturbation is applied to ONE kv POSITION, not to the whole
+        // tensor, and that detail is load-bearing: adding the same constant to
+        // every K row shifts every attention logit by the same amount, which
+        // softmax cancels exactly — the first draft of this gate did that and
+        // measured a 5.0e-7 change on a correctly-wired drafter. A K check has
+        // to break the symmetry between positions to be a check at all.
+        let bump_first_row = |t: &[f32], stride: usize| -> Vec<f32> {
+            let mut v = t.to_vec();
+            v[..stride].iter_mut().for_each(|x| *x += 0.5);
+            v
+        };
+        let s_stride = cfg.num_key_value_heads * cfg.head_dim;
+        let g_stride = cfg.num_global_key_value_heads * cfg.global_head_dim;
+        let variants: [(&str, AssistantSharedKv); 4] = [
+            ("SLIDING K", AssistantSharedKv {
+                sliding_k: bump_first_row(&f.kv.sliding_k, s_stride), sliding_v: f.kv.sliding_v.clone(),
+                full_k: f.kv.full_k.clone(), full_v: f.kv.full_v.clone(), kv_len: f.kv.kv_len }),
+            ("SLIDING V", AssistantSharedKv {
+                sliding_k: f.kv.sliding_k.clone(), sliding_v: bump_first_row(&f.kv.sliding_v, s_stride),
+                full_k: f.kv.full_k.clone(), full_v: f.kv.full_v.clone(), kv_len: f.kv.kv_len }),
+            ("FULL K", AssistantSharedKv {
+                sliding_k: f.kv.sliding_k.clone(), sliding_v: f.kv.sliding_v.clone(),
+                full_k: bump_first_row(&f.kv.full_k, g_stride), full_v: f.kv.full_v.clone(), kv_len: f.kv.kv_len }),
+            ("FULL V", AssistantSharedKv {
+                sliding_k: f.kv.sliding_k.clone(), sliding_v: f.kv.sliding_v.clone(),
+                full_k: f.kv.full_k.clone(), full_v: bump_first_row(&f.kv.full_v, g_stride), kv_len: f.kv.kv_len }),
+        ];
+        for (what, kv) in &variants {
+            let r = assistant_forward(cfg, &f.aw, &build_inputs_embeds(&embed, &seed),
+                                      f.start_pos, kv, None);
+            let d = rel_change(&base.logits, &r.logits);
+            assert!(d > 1e-3, "borrowed {what} is not observable (rel change {d:.3e}) — \
+                               the drafter is not cross-attending the target's KV");
+        }
+
+        // 5. POSITION: the drafter RoPEs its own Q at `position_offset`.
+        let r = assistant_forward(cfg, &f.aw, &build_inputs_embeds(&embed, &seed),
+                                  f.start_pos + 1, &f.kv, None);
+        let d = rel_change(&base.logits, &r.logits);
+        assert!(d > 1e-3, "position_offset is not observable (rel change {d:.3e}) — \
+                           the drafter's own-Q RoPE is disengaged");
+
+        // The borrowed K/V must NOT be re-rotated by the drafter, so the
+        // drafter's output must be invariant to which ABSOLUTE positions the
+        // borrowed rows came from — there is no place to feed them, and the
+        // check above already proves `position_offset` reaches only Q. Stated
+        // here because a future "helpfully" re-rotating K would still pass
+        // every shape check. The real golden gate is what pins the numbers.
+        assert_eq!(base.post_projection_out.len(), backbone,
+                   "post_projection must produce a backbone-wide recurrent hidden");
+    }
+
+    // ── Gates 3 + 4: the drafter driving the real spec-decode loop ────────
+
+    // Block structure of the acceptance gate below, derived from
+    // `run_spec_decode`'s own budget rule `step_k = min(k, remaining - 1)` and
+    // a drafter constructed to have exactly `SPEC_FORCED_CORRECT` of each
+    // block's drafts accepted:
+    //
+    //   remaining 9 -> width min(4,8)=4, accepts 2, commits 3   (block at off 0)
+    //   remaining 6 -> width min(4,5)=4, accepts 2, commits 3   (block at off 3)
+    //   remaining 3 -> width min(4,2)=2, accepts 2, commits 3   (block at off 6)
+    //
+    // so 3 blocks, 10 tokens drafted, 6 accepted, 9 committed. `k = 4` with a
+    // budget of 9 is deliberately a non-dividing pair: it forces the last block
+    // to be narrowed, the case the driver's overshoot bug lived in. The first
+    // two blocks reject a suffix and therefore exercise `verify_rollback`; the
+    // third accepts its full width and exercises the rollback NO-OP path.
+    const SPEC_K: usize = 4;
+    const SPEC_N: usize = 9;
+    const SPEC_FORCED_CORRECT: usize = 2;
+    const SPEC_WIDTHS: [usize; 3] = [4, 4, 2];
+    const SPEC_OFFS: [usize; 3] = [0, 3, 6];
+    /// Greedy-baseline length the gates need. The deepest read is the last
+    /// block's last draft, `SPEC_OFFS[2] + 1 + (SPEC_WIDTHS[2] - 1) == 8`, and
+    /// the committed-stream comparison reads `0..SPEC_N`; one spare keeps a
+    /// small change to the block structure from running off the end. Every
+    /// extra token here is a full target forward, so it is not padded further.
+    const SPEC_BASELINE_LEN: usize = SPEC_N + 1;
+
+    /// The draft ids the constructed drafter must produce, per block: the
+    /// target's own greedy continuation for the first `SPEC_FORCED_CORRECT`
+    /// slots, then ids guaranteed to be rejected (the true next token bumped by
+    /// one). Rejection is decided by the TARGET's argmax, so bumping is enough
+    /// to guarantee it.
+    fn desired_drafts(baseline: &[u32], vocab: u32) -> Vec<Vec<u32>> {
+        SPEC_OFFS.iter().zip(SPEC_WIDTHS.iter()).map(|(&off, &w)| {
+            (0..w).map(|i| {
+                let truth = baseline[off + 1 + i];
+                if i < SPEC_FORCED_CORRECT { truth } else { (truth + 1) % vocab }
+            }).collect()
+        }).collect()
+    }
+
+    /// Inverse of a small dense f64 matrix by Gauss-Jordan with partial
+    /// pivoting. Panics on a singular matrix — the caller only ever inverts a
+    /// Gram matrix, whose singularity would mean the fixture's hidden states
+    /// are linearly dependent and the construction below is impossible; that
+    /// deserves a loud failure, not a silently degraded fixture.
+    fn invert(mut a: Vec<Vec<f64>>) -> Vec<Vec<f64>> {
+        let n = a.len();
+        let mut inv: Vec<Vec<f64>> = (0..n).map(|i| {
+            (0..n).map(|j| if i == j { 1.0 } else { 0.0 }).collect()
+        }).collect();
+        for col in 0..n {
+            let piv = (col..n).max_by(|&x, &y| a[x][col].abs().partial_cmp(&a[y][col].abs()).unwrap()).unwrap();
+            assert!(a[piv][col].abs() > 1e-12, "singular Gram matrix at column {col}");
+            a.swap(col, piv);
+            inv.swap(col, piv);
+            let d = a[col][col];
+            for j in 0..n { a[col][j] /= d; inv[col][j] /= d; }
+            for r in 0..n {
+                if r == col { continue; }
+                let f = a[r][col];
+                if f == 0.0 { continue; }
+                for j in 0..n { a[r][j] -= f * a[col][j]; inv[r][j] -= f * inv[col][j]; }
+            }
+        }
+        inv
+    }
+
+    /// Dual (biorthogonal) basis of `vs`: vectors `d_i` with
+    /// `vs[s] · d[i] == 1` when `s == i` and `0` otherwise.
+    ///
+    /// `d = G^-1 V` where `G` is the Gram matrix, since
+    /// `vs[s] · d[i] = sum_j G^-1[i][j] G[s][j] = (G G^-1)[s][i]`.
+    fn dual_basis(vs: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        let m = vs.len();
+        let h = vs[0].len();
+        let gram: Vec<Vec<f64>> = (0..m).map(|i| (0..m).map(|j|
+            vs[i].iter().zip(vs[j].iter()).map(|(&a, &b)| a as f64 * b as f64).sum()
+        ).collect()).collect();
+        let gi = invert(gram);
+        (0..m).map(|i| {
+            let mut d = vec![0.0f64; h];
+            for j in 0..m {
+                let c = gi[i][j];
+                for t in 0..h { d[t] += c * vs[j][t] as f64; }
+            }
+            d.into_iter().map(|x| x as f32).collect()
+        }).collect()
+    }
+
+    /// Builds a drafter that, running the REAL `assistant_forward`, drafts
+    /// exactly `desired`.
+    ///
+    /// This is the assistant-path analogue of `gemma_spec.rs`'s stub drafter
+    /// ("always draft the target's own argmax") — with the crucial difference
+    /// that the drafts here come out of the actual drafter forward instead of
+    /// out of a closure that bypasses it. Random weights cannot serve: measured
+    /// on this fixture they accept 0 of the 26 tokens they offer (that run is the
+    /// negative control below), which would make the acceptance assertion this
+    /// gate exists for vacuous.
+    ///
+    /// How: the drafter's logits are `inner @ E^T` where `E` is the tied
+    /// lm_head `model.embed_tokens.weight`, and `E` is read NOWHERE ELSE in
+    /// `assistant_forward` — the input side uses the TARGET's embedding table,
+    /// and the recurrent feedback is `post_projection`'s output. So `inner`,
+    /// and with it the whole drafter trajectory, is independent of `E`, and `E`
+    /// can be solved for after the fact:
+    ///
+    ///   1. run the chain with `E = [I; 0]`, which makes `logits[..hidden]`
+    ///      read out `inner` itself, teacher-forcing the tokens `desired`;
+    ///   2. set `E[desired[s]] += dual_s`, the dual basis of those `inner`
+    ///      vectors. Then at step `s` the desired row scores exactly 1.0, every
+    ///      other constructed row exactly 0.0, and every untouched row exactly
+    ///      0.0 — an argmax margin of 1.0, immune to any platform float
+    ///      difference. Repeated desired tokens are handled by the `+=`: the
+    ///      duals of the other steps contribute 0 at step `s` by construction.
+    ///
+    /// What this does and does not gate: it does NOT re-check the drafter's
+    /// numerics (step 1 and the gated run compute `inner` the same way, so a
+    /// change to the forward moves both together). It DOES gate that the
+    /// drafter is deterministic, that the driver feeds it exactly what the
+    /// reference loop feeds it, and — the reason it exists — that the whole
+    /// accept/rollback/commit path runs at a NONZERO, exactly-known acceptance
+    /// instead of the zero a random drafter yields.
+    fn aligned_drafter_weights(f: &Fixture, desired: &[Vec<u32>]) -> HashMap<String, Vec<f32>> {
+        let hs = f.acfg.hidden_size;
+        let vocab = f.acfg.vocab_size;
+
+        // (1) Probe: E = [I; 0] makes logits[..hs] == inner.
+        let mut probe = f.aw.clone();
+        let mut eye = vec![0.0f32; vocab * hs];
+        for i in 0..hs { eye[i * hs + i] = 1.0; }
+        probe.insert("model.embed_tokens.weight".to_string(), eye);
+
+        let mut inners: Vec<Vec<f32>> = Vec::new();
+        let mut targets: Vec<u32> = Vec::new();
+        for (b, (&off, &w)) in SPEC_OFFS.iter().zip(SPEC_WIDTHS.iter()).enumerate() {
+            let steps = draft_block(
+                &f.acfg, &probe, &f.target_embed, f.embed_scale, &f.kv,
+                f.baseline.ids[off], &f.baseline.hidden_before[off],
+                f.start_pos + off, w, Some(&desired[b]), None);
+            for (i, (_, logits)) in steps.iter().enumerate() {
+                inners.push(logits[..hs].to_vec());
+                targets.push(desired[b][i]);
+            }
+        }
+
+        // (2) Solve for E.
+        let duals = dual_basis(&inners);
+        let mut e = vec![0.0f32; vocab * hs];
+        for (d, &tok) in duals.iter().zip(targets.iter()) {
+            for t in 0..hs { e[tok as usize * hs + t] += d[t]; }
+        }
+        // The construction must actually separate: the desired row must beat
+        // every other row by a wide margin at every step. A near-singular Gram
+        // would silently give a fixture that only sometimes drafts what it was
+        // built to draft.
+        for (s, inner) in inners.iter().enumerate() {
+            let scores: Vec<f32> = (0..vocab).map(|w|
+                (0..hs).map(|t| inner[t] * e[w * hs + t]).sum()).collect();
+            let want = targets[s] as usize;
+            let runner_up = (0..vocab).filter(|&w| w != want)
+                .fold(f32::MIN, |m, w| if scores[w] > m { scores[w] } else { m });
+            assert!(scores[want] - runner_up > 0.5,
+                    "aligned fixture step {s}: margin {} is too small (want {} = {}, runner-up {}) — \
+                     the Gram matrix of the drafter's hidden states is too ill-conditioned for \
+                     this construction",
+                    scores[want] - runner_up, want, scores[want], runner_up);
+        }
+
+        let mut aligned = f.aw.clone();
+        aligned.insert("model.embed_tokens.weight".to_string(), e);
+        aligned
+    }
+
+    /// Runs `run_spec_decode` with the REAL drafter and returns
+    /// `(committed, widths, drafts)`.
+    fn run_with_assistant_drafter(
+        f: &mut Fixture,
+        aw: HashMap<String, Vec<f32>>,
+        n: usize,
+    ) -> (Vec<u32>, Vec<usize>, Vec<Vec<u32>>) {
+        f.rewind();
+        let acfg = f.acfg.clone();
+        let kv = AssistantSharedKv {
+            sliding_k: f.kv.sliding_k.clone(), sliding_v: f.kv.sliding_v.clone(),
+            full_k: f.kv.full_k.clone(), full_v: f.kv.full_v.clone(), kv_len: f.kv.kv_len,
+        };
+        let target_embed = f.target_embed.clone();
+        let embed_scale = f.embed_scale;
+        let start_pos = f.start_pos;
+        // The drafter closure cannot borrow the target (the driver holds it
+        // `&mut`), so the per-block recurrent seed — the target hidden that
+        // produced this block's bonus token — is taken from the precomputed
+        // baseline. That is the SAME value a production driver reads off the
+        // target, valid precisely because this gate also asserts the committed
+        // stream equals that baseline.
+        let hidden_before = f.baseline.hidden_before.clone();
+
+        let mut widths: Vec<usize> = Vec::new();
+        let mut drafts: Vec<Vec<u32>> = Vec::new();
+        let committed = {
+            let draft_fn = |bonus: u32, pos: usize, k: usize| -> Vec<u32> {
+                widths.push(k);
+                let off = pos - start_pos;
+                let steps = draft_block(&acfg, &aw, &target_embed, embed_scale, &kv,
+                                        bonus, &hidden_before[off], pos, k, None, None);
+                let ids: Vec<u32> = steps.into_iter().map(|(t, _)| t).collect();
+                drafts.push(ids.clone());
+                ids
+            };
+            let cfg = SpecConfig { k: SPEC_K, max_new_tokens: n };
+            run_spec_decode(&mut f.model, draft_fn, f.start_bonus, start_pos, &cfg)
+        };
+        (committed, widths, drafts)
+    }
+
+    /// THE GATE the maintainer follow-up asks for: the EAGLE drafter and the
+    /// target meeting, unconditionally, with no checkpoint and no env var.
+    ///
+    /// It runs the real `assistant_forward` as the drafter inside the real
+    /// `gemma_spec::run_spec_decode` over `tiny_synthetic_gemma`, wiring them
+    /// together exactly as `GEMMA31B_SPEC_PLAN.md` §1.4 specifies (embed-first
+    /// `inputs_embeds`, `position_offset` constant across a block, a fixed
+    /// borrowed-KV snapshot the drafter never appends to, `post_projection`
+    /// fed back as the next step's recurrent hidden). That coupling is INC-5b
+    /// and has no in-crate caller, so before this gate nothing in the crate
+    /// ever ran the drafter and the driver together.
+    ///
+    /// It asserts MEASURED quantities, not just that the output looks right.
+    /// Committed-stream equality alone is worthless here: it holds even when
+    /// every draft is rejected (that is exactly what the negative control below
+    /// demonstrates), so a gate resting on it would stay green with the
+    /// speculative lever completely disengaged.
+    #[test]
+    fn gemma_assistant_synthetic_drafter_drives_spec_decode_with_measured_acceptance() {
+        let mut f = build_fixture(SPEC_BASELINE_LEN);
+        let vocab = f.acfg.vocab_size as u32;
+        let desired = desired_drafts(&f.baseline.ids, vocab);
+        let aligned = aligned_drafter_weights(&f, &desired);
+        let baseline = f.baseline.ids.clone();
+
+        let (committed, widths, drafts) = run_with_assistant_drafter(&mut f, aligned, SPEC_N);
+
+        // 1. Committed-stream equality against the SPEC-off greedy baseline,
+        //    and the budget honoured EXACTLY (not `>=`).
+        assert_eq!(committed.len(), SPEC_N,
+                   "expected EXACTLY {SPEC_N} committed tokens, got {}", committed.len());
+        assert_eq!(committed[..], baseline[..SPEC_N],
+                   "spec-decode stream diverged from the greedy baseline");
+
+        // 2. ACCEPTANCE, measured. Each block commits its bonus plus its
+        //    accepted drafts, so over the run `accepted == n - blocks`.
+        let blocks = widths.len();
+        let drafted: usize = widths.iter().sum();
+        let accepted = SPEC_N - blocks;
+        assert_eq!(accepted, SPEC_FORCED_CORRECT * blocks,
+                   "expected {SPEC_FORCED_CORRECT} of each block's drafts accepted over {blocks} \
+                    blocks, got {accepted} of {drafted} offered (acceptance collapsed / the \
+                    drafter is disengaged)");
+        assert!(accepted > 0, "a gate that passes at zero acceptance gates nothing");
+        assert_eq!(widths, SPEC_WIDTHS.to_vec(),
+                   "block structure changed: k={SPEC_K}, n={SPEC_N} must run these draft widths");
+        assert_eq!(drafted, SPEC_WIDTHS.iter().sum::<usize>(), "tokens offered");
+
+        // 3. The drafter produced what it was constructed to produce — i.e. the
+        //    driver fed it the same bonus/position/recurrent state the
+        //    reference loop did, block after block.
+        assert_eq!(drafts, desired,
+                   "the drafter did not emit its constructed drafts: the driver is feeding it \
+                    different state than the reference draft loop does");
+
+        // 4. Rollback: the KV frontier of EVERY layer sits at exactly the
+        //    committed length, so the rejected drafts left nothing behind.
+        let frontier = f.start_pos + SPEC_N;
+        for (li, c) in f.model.kv_caches.iter().enumerate() {
+            assert_eq!(c.seq_len, frontier, "layer {li}: KV frontier {} != {frontier}", c.seq_len);
+        }
+
+        eprintln!("assistant spec gate (synthetic): {SPEC_N} committed tokens match the greedy \
+                   baseline; {blocks} blocks, {accepted}/{drafted} drafted tokens accepted");
+    }
+
+    /// NEGATIVE CONTROL for the acceptance assertion above, and the reason it
+    /// is not decoration.
+    ///
+    /// The same fixture with the drafter's PLAIN synthetic weights — a drafter
+    /// with no reason to agree with the target — shows that:
+    ///
+    ///   1. the committed stream is still bit-identical to the greedy baseline
+    ///      and the budget is still honoured exactly, so every "the output
+    ///      looks right" check passes with speculation contributing nothing;
+    ///   2. the measured acceptance is ZERO across the 26 tokens offered, which is
+    ///      what the gate above asserts against.
+    ///
+    /// The block structure differs too: with nothing accepted every block
+    /// commits its bonus alone, so the run takes 9 blocks instead of 3.
+    #[test]
+    fn gemma_assistant_zero_acceptance_is_caught_by_the_drafter_gate() {
+        let mut f = build_fixture(SPEC_BASELINE_LEN);
+        let baseline = f.baseline.ids.clone();
+        let plain = f.aw.clone();
+
+        let (committed, widths, drafts) = run_with_assistant_drafter(&mut f, plain, SPEC_N);
+
+        // (1) Everything the acceptance assertions do NOT cover still passes.
+        assert_eq!(committed.len(), SPEC_N, "budget must still be honoured exactly");
+        assert_eq!(committed[..], baseline[..SPEC_N],
+                   "zero-acceptance stream must still equal the greedy baseline — this is \
+                    precisely why token identity alone cannot gate speculation");
+
+        // (2) ...but acceptance collapses, and the block structure with it.
+        let blocks = widths.len();
+        let drafted: usize = widths.iter().sum();
+        let accepted = SPEC_N - blocks;
+        assert!(drafted > 0, "the control is only meaningful if drafts were actually offered");
+        assert!(drafts.iter().all(|d| !d.is_empty()) || widths.contains(&0),
+                "every non-zero-width block must have produced drafts");
+        assert_eq!(accepted, 0, "an unaligned drafter must have nothing accepted");
+        assert_eq!(blocks, SPEC_N, "with nothing accepted every block commits its bonus alone");
+        assert_ne!(widths, SPEC_WIDTHS.to_vec(),
+                   "the collapsed block structure must differ from the accepting one");
+
+        eprintln!("assistant negative control: greedy-identical stream, but {accepted}/{drafted} \
+                   accepted over {blocks} blocks (the accepting gate runs {:?})", SPEC_WIDTHS);
+    }
+
+    // ── Gates 5 + 6: the PRODUCTION seam (`gemma_spec_wire`) ─────────────
+    //
+    // The two gates above drive `run_spec_decode` from a hand-written test
+    // closure that is handed the drafter seeds out of a precomputed baseline
+    // and snoops the block widths from inside itself. That gates the DRIVER,
+    // not the production caller: nothing there loads a drafter, sources a seed
+    // the way production must, reads the env flag, or reports acceptance
+    // through an API a caller could actually use.
+    //
+    // The two below drive `gemma_spec_wire::spec_decode_gemma` — the exact body
+    // the `VLLM_VULKAN_GEMMA_SPEC` pymethod runs, minus the pyo3 marshalling —
+    // and read acceptance off its RETURN VALUE.
+
+    /// Runs the production seam over the fixture with drafter weights `aw`.
+    ///
+    /// `SeedSource::Recompute` is deliberate: it is the production default, and
+    /// pointing it at a fixture whose drafter was CONSTRUCTED against the
+    /// baseline's recorded hidden states is what proves the recompute
+    /// reproduces those hidden states exactly. A recompute that is off by any
+    /// amount moves the drafter's trajectory, the constructed drafts stop
+    /// appearing, and acceptance collapses to the negative control's zero.
+    fn run_production_seam(
+        f: &mut Fixture,
+        aw: HashMap<String, Vec<f32>>,
+        n: usize,
+    ) -> crate::gemma_spec_wire::SpecDecodeReport {
+        f.rewind();
+        let drafter = crate::gemma_spec_wire::SpecDrafter::from_parts(
+            f.acfg.clone(), aw, &f.model).expect("build production drafter from the fixture");
+        let prompt_last = *f.prompt.last().unwrap();
+        let cfg = SpecConfig { k: SPEC_K, max_new_tokens: n };
+        crate::gemma_spec_wire::spec_decode_gemma(
+            &mut f.model, &drafter, crate::gemma_spec_wire::SeedSource::Recompute,
+            prompt_last, f.start_bonus, f.start_pos, &cfg,
+        ).expect("production spec-decode seam")
+    }
+
+    /// A drafter checkpoint that is missing a tensor, or carries one at the
+    /// wrong size, must be refused at LOAD with the tensor NAMED.
+    ///
+    /// `load_assistant_weights` is a plain safetensors read with no shape
+    /// opinion, and `assistant_forward`'s `w` / `amv` panic on a name they
+    /// cannot find. Without this check the failure surfaces as an abort through
+    /// the pyo3 boundary, several blocks into `gemma_spec_generate`, naming
+    /// nothing the operator can act on. Every entry of `expected_tensor_shapes`
+    /// is covered because that map is gated as complete and exact for what the
+    /// forward reads.
+    #[test]
+    fn spec_drafter_refuses_a_checkpoint_with_a_missing_or_mis_sized_tensor() {
+        let f = build_fixture(2);
+        let names: Vec<String> = expected_tensor_shapes(&f.acfg).into_iter()
+            .map(|(n, _)| n).collect();
+        assert!(names.len() >= 4 + 11, "the fixture must cover the whole map");
+
+        for name in &names {
+            // (a) absent entirely.
+            let mut aw = f.aw.clone();
+            aw.remove(name);
+            let err = match crate::gemma_spec_wire::SpecDrafter::from_parts(
+                f.acfg.clone(), aw, &f.model) {
+                Ok(_) => panic!("a checkpoint missing '{name}' must be refused"),
+                Err(e) => e,
+            };
+            assert!(err.contains(name.as_str()),
+                    "the refusal must NAME the missing tensor; got: {err}");
+
+            // (b) present but one element short — the case that reaches
+            //     `cpu_matmul`'s dimension check instead of a lookup panic.
+            let mut aw = f.aw.clone();
+            let full = aw[name].len();
+            aw.get_mut(name).unwrap().truncate(full - 1);
+            let err = match crate::gemma_spec_wire::SpecDrafter::from_parts(
+                f.acfg.clone(), aw, &f.model) {
+                Ok(_) => panic!("a truncated '{name}' must be refused"),
+                Err(e) => e,
+            };
+            assert!(err.contains(name.as_str()) && err.contains(&(full - 1).to_string())
+                        && err.contains(&full.to_string()),
+                    "the refusal must name the tensor and both counts; got: {err}");
+        }
+
+        // ...and the intact fixture still builds.
+        crate::gemma_spec_wire::SpecDrafter::from_parts(f.acfg.clone(), f.aw.clone(), &f.model)
+            .expect("the intact fixture must still build a drafter");
+    }
+
+    /// The element count is NOT the shape.
+    ///
+    /// The check above is all `from_parts` can do: `load_assistant_weights`
+    /// flattens every tensor to a `Vec<f32>` and drops the SafeTensors
+    /// dimensions, so `[hidden, q_dim]` and `[q_dim, hidden]` are
+    /// indistinguishable to it. A TRANSPOSED projection therefore loads clean
+    /// and `assistant_forward` then reads it in the expected layout — the
+    /// checkpoint defect that produces silently wrong numbers rather than a
+    /// load failure, which is the dangerous kind.
+    ///
+    /// `SpecDrafter::load` and `GemmaAssistant::new` close that by reading the
+    /// header dimensions (`model::read_safetensors_dims`) and handing them to
+    /// `validate_assistant_tensors`. This drives that comparison directly.
+    #[test]
+    fn assistant_tensor_validation_rejects_a_transposed_tensor() {
+        // The synthetic fixture's config/weights: a real, complete tensor map
+        // at CI size (`g31b_pair`'s own map would allocate a 1GB embed table).
+        let f = build_fixture(2);
+        let cfg = f.acfg.clone();
+        let weights = f.aw.clone();
+        let expected = expected_tensor_shapes(&cfg);
+        let dims: HashMap<String, Vec<usize>> = expected.iter()
+            .map(|(n, s)| (n.clone(), s.clone())).collect();
+
+        // The honest map passes with the dimensions supplied...
+        crate::gemma_spec_wire::validate_assistant_tensors(&cfg, &weights, Some(&dims))
+            .expect("the expected shapes must validate against themselves");
+
+        // ...and every RECTANGULAR tensor's transpose is refused. A square one
+        // is its own transpose, so it is not a case; assert there is at least
+        // one real case rather than silently testing nothing.
+        let mut cases = 0usize;
+        for (name, shape) in &expected {
+            if shape.len() != 2 || shape[0] == shape[1] { continue; }
+            cases += 1;
+            let flipped = vec![shape[1], shape[0]];
+            let mut d = dims.clone();
+            d.insert(name.clone(), flipped.clone());
+
+            // The premise: the transpose has the SAME element count, so the
+            // count check cannot see it.
+            assert_eq!(flipped.iter().product::<usize>(), shape.iter().product::<usize>());
+            crate::gemma_spec_wire::validate_assistant_tensors(&cfg, &weights, None)
+                .expect("a transpose is invisible without the dimensions — that is the point");
+
+            let err = match crate::gemma_spec_wire::validate_assistant_tensors(
+                &cfg, &weights, Some(&d)) {
+                Ok(()) => panic!("a transposed '{name}' must be refused"),
+                Err(e) => e,
+            };
+            assert!(err.contains(name.as_str())
+                        && err.contains(&format!("{flipped:?}"))
+                        && err.contains(&format!("{shape:?}")),
+                    "the refusal must name the tensor and BOTH shapes; got: {err}");
+        }
+        assert!(cases >= 4, "the tensor map must have rectangular tensors to flip, got {cases}");
+
+        // A tensor present in the data but absent from the header is refused
+        // too — `read_safetensors_dims` keeps tensors of every dtype, so this
+        // is a genuinely absent tensor, not a skipped one.
+        let mut d = dims.clone();
+        let victim = expected[0].0.clone();
+        d.remove(&victim);
+        let err = crate::gemma_spec_wire::validate_assistant_tensors(&cfg, &weights, Some(&d))
+            .expect_err("a tensor missing from the header must be refused");
+        assert!(err.contains(victim.as_str()), "got: {err}");
+    }
+
+    /// A drifted position cursor must be refused BEFORE any block runs, with
+    /// the target left exactly as the caller handed it over.
+    ///
+    /// `recompute_seed_hidden` refuses a drifted frontier from inside the draft
+    /// closure, and that refusal CANNOT stop `run_spec_decode_coupled`: the
+    /// remaining blocks still run on filler drafts and advance the target's KV
+    /// before the stashed error is re-raised. A caller that catches the error
+    /// and retries would then be decoding from a context that moved. So the
+    /// assertion is not just "it returns `Err`" — it is that the KV is untouched.
+    ///
+    /// It is untouched BYTE-FOR-BYTE, not merely frontier-for-frontier. The
+    /// frontier alone is too weak a control here, and specifically weak against
+    /// the most likely WRONG fix: `KvCache::truncate` moves the counter and
+    /// nothing else (the storage is overwrite-in-place), so a version of this
+    /// seam that let the loop run and then rewound the caches to `start_pos`
+    /// before re-raising would restore every frontier while leaving the
+    /// speculative K/V of the abandoned blocks in the buffers. The frontier
+    /// check passes, the retry attends over the stale rows. Snapshotting `k`
+    /// and `v` is what separates "did not advance" from "did not write". Both
+    /// are asserted per cache, so a single dirty layer cannot hide behind the
+    /// others.
+    #[test]
+    fn production_seam_refuses_a_drifted_cursor_without_advancing_the_target() {
+        let mut f = build_fixture(SPEC_BASELINE_LEN);
+        f.rewind();
+        let drafter = crate::gemma_spec_wire::SpecDrafter::from_parts(
+            f.acfg.clone(), f.aw.clone(), &f.model).expect("build drafter");
+        let prompt_last = *f.prompt.last().unwrap();
+        let cfg = SpecConfig { k: SPEC_K, max_new_tokens: SPEC_N };
+        assert!(!f.model.kv_caches.is_empty(), "the fixture must have KV caches to guard");
+        let before: Vec<(usize, Vec<f32>, Vec<f32>)> = f.model.kv_caches.iter()
+            .map(|c| (c.seq_len, c.k.clone(), c.v.clone())).collect();
+
+        // `start_pos` one past where the KV actually stands.
+        let err = crate::gemma_spec_wire::spec_decode_gemma(
+            &mut f.model, &drafter, crate::gemma_spec_wire::SeedSource::Recompute,
+            prompt_last, f.start_bonus, f.start_pos + 1, &cfg,
+        ).expect_err("a drifted start_pos must be refused");
+        assert!(err.contains("drifted apart") && err.contains(&f.start_pos.to_string()),
+                "the refusal must name the drift and the frontier; got: {err}");
+        for (li, (c, (n, k, v))) in f.model.kv_caches.iter().zip(before.iter()).enumerate() {
+            assert_eq!(c.seq_len, *n,
+                       "layer {li}: a refused spec-decode moved the KV frontier");
+            assert_eq!(&c.k, k, "layer {li}: a refused spec-decode wrote to the K buffer");
+            assert_eq!(&c.v, v, "layer {li}: a refused spec-decode wrote to the V buffer");
+        }
+
+        // ...and the undrifted call still runs to completion from that state.
+        let report = crate::gemma_spec_wire::spec_decode_gemma(
+            &mut f.model, &drafter, crate::gemma_spec_wire::SeedSource::Recompute,
+            prompt_last, f.start_bonus, f.start_pos, &cfg,
+        ).expect("the matching cursor must still be served");
+        assert_eq!(report.tokens.len(), SPEC_N);
+    }
+
+    /// THE WIRING GATE. The production caller must be BOTH greedy-identical and
+    /// actually speculating; either assertion alone is satisfiable by a broken
+    /// implementation.
+    ///
+    ///   * greedy-identical alone is satisfied by a decoder that accepts
+    ///     nothing (the negative control below is exactly that run), and
+    ///   * non-zero acceptance alone is satisfied by a decoder that commits
+    ///     drafts without checking them.
+    #[test]
+    fn gemma_spec_wire_production_seam_is_greedy_identical_and_accepts() {
+        let mut f = build_fixture(SPEC_BASELINE_LEN);
+        let vocab = f.acfg.vocab_size as u32;
+        let desired = desired_drafts(&f.baseline.ids, vocab);
+        let aligned = aligned_drafter_weights(&f, &desired);
+        let baseline = f.baseline.ids.clone();
+
+        let report = run_production_seam(&mut f, aligned, SPEC_N);
+
+        // 1. Output-identical to greedy, and the budget honoured EXACTLY.
+        assert_eq!(report.tokens.len(), SPEC_N,
+                   "expected EXACTLY {SPEC_N} committed tokens, got {}", report.tokens.len());
+        assert_eq!(report.tokens[..], baseline[..SPEC_N],
+                   "the wired spec-decode path diverged from the greedy baseline — speculation is \
+                    a latency optimisation, not a sampling change");
+
+        // 2. ...AND speculation actually ran, measured through the production
+        //    report rather than reconstructed by the test.
+        assert!(report.engaged(),
+                "the wired path accepted 0 of {} drafted tokens over {} blocks: the lever is \
+                 INERT. Every assertion above still passes in this state, which is why this one \
+                 exists.", report.drafted, report.blocks);
+        assert_eq!(report.blocks, SPEC_WIDTHS.len(),
+                   "block structure changed: k={SPEC_K}, n={SPEC_N} must run {} blocks",
+                   SPEC_WIDTHS.len());
+        assert_eq!(report.drafted, SPEC_WIDTHS.iter().sum::<usize>(), "tokens offered");
+        assert_eq!(report.accepted, SPEC_FORCED_CORRECT * report.blocks,
+                   "expected {SPEC_FORCED_CORRECT} of each block's drafts accepted over {} blocks, \
+                    got {} of {} offered", report.blocks, report.accepted, report.drafted);
+
+        // 3. The production seam measures the SAME acceptance the driver-level
+        //    gate does. A production wrapper that quietly ran a different
+        //    drafter, or seeded it differently, would show up right here.
+        let (_, widths, _) = {
+            let mut g = build_fixture(SPEC_BASELINE_LEN);
+            let d2 = desired_drafts(&g.baseline.ids, vocab);
+            let a2 = aligned_drafter_weights(&g, &d2);
+            run_with_assistant_drafter(&mut g, a2, SPEC_N)
+        };
+        assert_eq!(widths, SPEC_WIDTHS.to_vec(), "driver-level gate's block structure");
+        assert_eq!(report.accepted, SPEC_N - widths.len(),
+                   "production acceptance must equal the driver-level gate's");
+
+        // 4. Rollback: every layer's KV frontier sits at exactly the committed
+        //    length, so the rejected drafts left nothing behind — and neither
+        //    did the seed recompute, which rewinds and re-appends each block.
+        let frontier = f.start_pos + SPEC_N;
+        for (li, c) in f.model.kv_caches.iter().enumerate() {
+            assert_eq!(c.seq_len, frontier, "layer {li}: KV frontier {} != {frontier}", c.seq_len);
+        }
+
+        // 5. The OTHER seed source — a caller that already holds the producing
+        //    hidden and hands it over — must give the identical run. This is
+        //    what pins `SeedSource::Recompute` to the plan's §1.1 seed rather
+        //    than to whatever it happens to compute: the hiddens fed here are
+        //    the ones the SPEC-OFF greedy baseline recorded.
+        {
+            let mut g = build_fixture(SPEC_BASELINE_LEN);
+            let d2 = desired_drafts(&g.baseline.ids, vocab);
+            let a2 = aligned_drafter_weights(&g, &d2);
+            g.rewind();
+            let drafter = crate::gemma_spec_wire::SpecDrafter::from_parts(
+                g.acfg.clone(), a2, &g.model).expect("drafter");
+            let start_pos = g.start_pos;
+            let hidden_before = g.baseline.hidden_before.clone();
+            let by_pos = move |pos: usize| -> Result<Vec<f32>, String> {
+                // `pos` is the position of the token whose hidden seeds the
+                // block, i.e. one BEFORE the bonus: baseline index pos+1-start_pos.
+                hidden_before.get(pos + 1 - start_pos).cloned()
+                    .ok_or_else(|| format!("no baseline hidden for pos {pos}"))
+            };
+            let cfg = SpecConfig { k: SPEC_K, max_new_tokens: SPEC_N };
+            let r2 = crate::gemma_spec_wire::spec_decode_gemma(
+                &mut g.model, &drafter, crate::gemma_spec_wire::SeedSource::ByPosition(&by_pos),
+                *g.prompt.last().unwrap(), g.start_bonus, start_pos, &cfg).expect("ByPosition run");
+            assert_eq!(r2.tokens, report.tokens, "seed sources disagree on the token stream");
+            assert_eq!((r2.blocks, r2.drafted, r2.accepted),
+                       (report.blocks, report.drafted, report.accepted),
+                       "seed sources disagree on acceptance: the recompute is not reproducing the \
+                        target hidden the greedy baseline recorded");
+        }
+
+        eprintln!("production seam gate: {} tokens greedy-identical; {} blocks, {}/{} accepted \
+                   (rate {:?})", report.tokens.len(), report.blocks, report.accepted,
+                   report.drafted, report.accept_rate());
+    }
+
+    /// NEGATIVE CONTROL for the gate above, at the production seam.
+    ///
+    /// Same seam, same flag state, same budget — only the drafter is the
+    /// fixture's PLAIN weights, which agree with the target about nothing. The
+    /// token stream is still bit-identical to greedy and the budget is still
+    /// exact, so every "the output looks right" assertion passes while
+    /// speculation contributes zero. `engaged()` is the only thing that moves.
+    #[test]
+    fn gemma_spec_wire_zero_acceptance_is_caught_by_the_production_report() {
+        let mut f = build_fixture(SPEC_BASELINE_LEN);
+        let baseline = f.baseline.ids.clone();
+        let plain = f.aw.clone();
+
+        let report = run_production_seam(&mut f, plain, SPEC_N);
+
+        assert_eq!(report.tokens.len(), SPEC_N, "budget must still be honoured exactly");
+        assert_eq!(report.tokens[..], baseline[..SPEC_N],
+                   "a zero-acceptance run must STILL equal the greedy baseline — precisely why \
+                    token identity alone cannot gate speculation");
+        assert!(report.drafted > 0, "the control is only meaningful if drafts were offered");
+        assert_eq!(report.accepted, 0, "an unaligned drafter must have nothing accepted");
+        assert!(!report.engaged(), "engaged() must be false at zero acceptance");
+        assert_eq!(report.accept_rate(), Some(0.0), "a measured zero, not a missing measurement");
+        assert_eq!(report.blocks, SPEC_N,
+                   "with nothing accepted every block commits its bonus alone");
+
+        eprintln!("production seam negative control: greedy-identical stream, {}/{} accepted over \
+                   {} blocks", report.accepted, report.drafted, report.blocks);
+    }
+
+    /// A drafter whose vocabulary does not match the target's must be refused
+    /// at LOAD, by name.
+    ///
+    /// The drafter samples ids from its OWN tied `lm_head` over
+    /// `cfg.vocab_size`; `draft_block` then indexes the TARGET's embedding table
+    /// with them. Without this check a wider drafter passes construction and
+    /// fails later, mid-generation, on `draft_block`'s embed-table assert —
+    /// inside the pymethod, as a panic across the pyo3 boundary, at whichever
+    /// token first sampled an id past the target's vocab. Which token that is
+    /// depends on the weights, so the SAME mis-paired checkpoint can survive a
+    /// short run and abort a long one.
+    ///
+    /// Everything else here is the working pairing: only `vocab_size` moves.
+    #[test]
+    fn gemma_spec_wire_refuses_a_drafter_whose_vocab_is_not_the_targets() {
+        let f = build_fixture(2);
+        let target_vocab = f.model.config.vocab_size;
+
+        // Sanity: the fixture pairing IS matched, so a failure below is the
+        // perturbation and not a broken fixture.
+        assert_eq!(f.acfg.vocab_size, target_vocab, "the fixture pairing must start matched");
+
+        for wrong in [target_vocab + 1, target_vocab - 1] {
+            let mut bad = f.acfg.clone();
+            bad.vocab_size = wrong;
+            let err = crate::gemma_spec_wire::SpecDrafter::from_parts(
+                bad, f.aw.clone(), &f.model)
+                .err().expect("a mis-paired vocabulary must be refused at load");
+            assert!(err.contains("vocab_size") && err.contains(&wrong.to_string())
+                        && err.contains(&target_vocab.to_string()),
+                    "the refusal must NAME both vocabularies, like the hidden-size pairing \
+                     check does; got: {err}");
+        }
+
+        // ...and the matched pairing still constructs.
+        crate::gemma_spec_wire::SpecDrafter::from_parts(f.acfg.clone(), f.aw.clone(), &f.model)
+            .expect("the matched pairing must still build");
+    }
+
+    /// A drafter-seed failure must come back as an `Err`, not a panic.
+    ///
+    /// `spec_decode_gemma` cannot propagate an error out of the drafter closure
+    /// (`draft_fn` returns ids, not a `Result`), so it stashes the first one and
+    /// re-raises it after the loop. That only works if the failing closure still
+    /// returns a draft of the width the DRIVER chose: `spec_step_coupled`
+    /// asserts `draft.len() == k`, so a short draft aborts the process before
+    /// the re-raise can run.
+    ///
+    /// This is reachable in production: `recompute_seed_hidden` returns `Err` on
+    /// a KV-frontier mismatch, and `start_pos` arrives from Python — exactly the
+    /// cursor drift that check exists to catch.
+    ///
+    /// Both branches are covered: a seed that fails on the FIRST block (the
+    /// `Err(e)` arm) and one that fails on a LATER block, which then also drives
+    /// the `first_error.is_some()` arm for every block after it.
+    #[test]
+    fn gemma_spec_wire_seed_failure_returns_err_rather_than_panicking() {
+        let expect_err = |r: Result<crate::gemma_spec_wire::SpecDecodeReport, String>,
+                          case: &str| {
+            let e = match r {
+                Ok(_) => panic!("{case}: a failing seed must not produce Ok"),
+                Err(e) => e,
+            };
+            assert!(e.contains("drafter seed unavailable") && e.contains("kaboom"),
+                    "{case}: the re-raised error must carry the seed's own message; got: {e}");
+        };
+
+        // (a) the FIRST block's seed fails.
+        {
+            let mut f = build_fixture(SPEC_BASELINE_LEN);
+            f.rewind();
+            let drafter = crate::gemma_spec_wire::SpecDrafter::from_parts(
+                f.acfg.clone(), f.aw.clone(), &f.model).expect("drafter");
+            let by_pos = |_pos: usize| -> Result<Vec<f32>, String> { Err("kaboom".to_string()) };
+            let cfg = SpecConfig { k: SPEC_K, max_new_tokens: SPEC_N };
+            let r = crate::gemma_spec_wire::spec_decode_gemma(
+                &mut f.model, &drafter, crate::gemma_spec_wire::SeedSource::ByPosition(&by_pos),
+                *f.prompt.last().unwrap(), f.start_bonus, f.start_pos, &cfg);
+            expect_err(r, "first-block seed failure");
+        }
+
+        // (b) a LATER block's seed fails: block 0 is served the hidden the
+        //     greedy baseline recorded, every later block errors. Block 1 takes
+        //     the `Err(e)` arm and block 2 the `first_error.is_some()` arm, both
+        //     with a non-zero width the driver picked (SPEC_WIDTHS = [4, 4, 2]).
+        {
+            let mut f = build_fixture(SPEC_BASELINE_LEN);
+            f.rewind();
+            let drafter = crate::gemma_spec_wire::SpecDrafter::from_parts(
+                f.acfg.clone(), f.aw.clone(), &f.model).expect("drafter");
+            let start_pos = f.start_pos;
+            let hidden_before = f.baseline.hidden_before.clone();
+            let by_pos = move |pos: usize| -> Result<Vec<f32>, String> {
+                if pos >= start_pos {
+                    return Err("kaboom".to_string()); // every block after the first
+                }
+                hidden_before.get(pos + 1 - start_pos).cloned()
+                    .ok_or_else(|| "no baseline hidden".to_string())
+            };
+            assert!(SPEC_WIDTHS.len() >= 3 && SPEC_WIDTHS[1] > 0 && SPEC_WIDTHS[2] > 0,
+                    "this case needs at least two non-zero-width blocks after the first");
+            let cfg = SpecConfig { k: SPEC_K, max_new_tokens: SPEC_N };
+            let r = crate::gemma_spec_wire::spec_decode_gemma(
+                &mut f.model, &drafter, crate::gemma_spec_wire::SeedSource::ByPosition(&by_pos),
+                *f.prompt.last().unwrap(), f.start_bonus, start_pos, &cfg);
+            expect_err(r, "later-block seed failure");
+        }
+    }
+
+    /// The seed recompute must be STATE-NEUTRAL — it rewinds every KV cache by
+    /// one position, re-runs the target, and must leave the caches byte-for-byte
+    /// as it found them. If it did not, the verify that follows would attend
+    /// over a corrupted cache and the whole path would be silently wrong (and
+    /// still greedy-identical for a few tokens, which is the dangerous part).
+    #[test]
+    fn gemma_spec_wire_seed_recompute_is_state_neutral_and_exact() {
+        let mut f = build_fixture(2);
+        f.rewind();
+        let pos = f.start_pos - 1; // last prompt position
+        let before: Vec<(usize, Vec<f32>, Vec<f32>)> = f.model.kv_caches.iter()
+            .map(|c| (c.seq_len, c.k.clone(), c.v.clone())).collect();
+
+        let seed = crate::gemma_spec_wire::recompute_seed_hidden(
+            &mut f.model, *f.prompt.last().unwrap(), pos).expect("recompute the first block's seed");
+
+        for (li, (c, (n, k, v))) in f.model.kv_caches.iter().zip(before.iter()).enumerate() {
+            assert_eq!(c.seq_len, *n, "layer {li}: frontier moved");
+            assert_eq!(&c.k, k, "layer {li}: K bytes changed");
+            assert_eq!(&c.v, v, "layer {li}: V bytes changed");
+        }
+        // ...and the value is the one the baseline recorded for the first
+        // block, which is what the drafter is constructed against.
+        assert_eq!(seed, f.baseline.hidden_before[0],
+                   "recomputed seed differs from the hidden the greedy baseline recorded");
+    }
+
+    /// Number of drafter steps the pinned chain below covers.
+    const PINNED_CHAIN_LEN: usize = 8;
+    /// The draft ids the fixture's UNALIGNED drafter emits, chained from the
+    /// fixture's start state. Regenerate with:
+    ///   cargo test --features "multiple-pymethods,gemma" --lib \
+    ///     gemma_assistant_synthetic_forward_matches_its_pinned_draft_chain -- --nocapture
+    const PINNED_CHAIN: [u32; PINNED_CHAIN_LEN] = [83, 333, 404, 444, 213, 452, 452, 419];
+
+    /// CHARACTERIZATION gate — the one check here that pins the drafter's
+    /// NUMBERS rather than its wiring.
+    ///
+    /// It is needed because the acceptance gate cannot do it: that gate's
+    /// lm_head is solved for from the drafter's own hidden states, so a change
+    /// to the forward moves the construction and the run together and the gate
+    /// stays green. Concretely, changing the cross-attention scale from the
+    /// target's QK-norm convention (`1.0`) to the conventional
+    /// `1/sqrt(head_dim)` is invisible to every other test in this module that
+    /// runs without a checkpoint; it is visible here.
+    ///
+    /// This pins THIS implementation's output, not upstream mlx_vlm's — it
+    /// cannot find a bug that was present when the values were generated. That
+    /// remains the real golden gate's job. What it does catch is the change
+    /// nobody meant to make.
+    ///
+    /// Platform note: the assertion is on argmax, and the run below prints the
+    /// top-1/top-2 gap and requires it to stay far above float noise, so the
+    /// pin cannot become a coin-flip between x86-64 and aarch64 without saying
+    /// so first.
+    #[test]
+    fn gemma_assistant_synthetic_forward_matches_its_pinned_draft_chain() {
+        let f = build_fixture(2);
+        let seed = f.baseline.hidden_before[0].clone();
+        let steps = f.draft(f.start_bonus, &seed, f.start_pos, PINNED_CHAIN_LEN, None);
+
+        let ids: Vec<u32> = steps.iter().map(|(t, _)| *t).collect();
+        let mut min_rel_gap = f32::MAX;
+        for (i, (tok, logits)) in steps.iter().enumerate() {
+            let top = logits[*tok as usize];
+            let second = logits.iter().enumerate()
+                .filter(|(w, _)| *w != *tok as usize)
+                .fold(f32::MIN, |m, (_, &v)| if v > m { v } else { m });
+            let rel = (top - second) / top.abs().max(1e-30);
+            min_rel_gap = min_rel_gap.min(rel);
+            eprintln!("pinned chain step {i}: id={tok} top1={top:.6} top2={second:.6} rel_gap={rel:.3e}");
+        }
+        eprintln!("pinned chain ids: {ids:?}  min rel gap {min_rel_gap:.3e}");
+
+        // ~1e-2 measured; f32 accumulation error over these dot products is
+        // ~1e-6 relative, so the argmax is not a float coin-flip. If this ever
+        // trips, the pin below must be replaced by a tolerance-based check —
+        // do NOT just widen it.
+        assert!(min_rel_gap > 1e-4,
+                "argmax margin {min_rel_gap:.3e} is too small for a cross-platform pin");
+        assert_eq!(ids, PINNED_CHAIN.to_vec(),
+                   "the drafter's output changed. If that was intended, regenerate the pin \
+                    (see the const); if not, this is the regression the gate is for");
     }
 }
