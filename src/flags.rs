@@ -577,6 +577,17 @@ pub struct Flags {
     /// LUT oracle for A/B). Decode change is ~ULP-reassociative (dot4 vs scalar
     /// accumulation) -> argmax-exact; on-node perf gate on a free node/staged A/B.
     pub fp8_fast: bool,
+    /// VLLM_VULKAN_MTP_CONCAT_FLIP: swap the MTP head's `fc` input to
+    /// `[norm_hidden ; norm_embedding]`. A STEP-7 draft bisect knob, so the
+    /// harness can confirm the documented EMBEDDING-FIRST order (validated at
+    /// alpha_1=0.855) is the one that accepts. Default OFF; ANY value other
+    /// than "0" enables it (the semantics `mtp::MtpHead::fc_input` shipped
+    /// with). Read here rather than per call: `fc_input` runs once per draft
+    /// position and `head_chain_cpu` calls it `depth` times per chain, so a
+    /// `std::env::var` there takes the process-wide environment lock and
+    /// allocates a String on every draft step.
+    #[allow(dead_code)] // read only under `feature = "mtp"`
+    pub mtp_concat_flip: bool,
     /// Requant resident Nemotron shared_experts.{up,down}_proj FP8->q8_0 at load
     /// (same is_fp8 loader branch as nemotron_mamba_q8; always-on dense MLP added
     /// to every token's routed output per MoE layer). Default OFF; cluster-gated.
@@ -1011,6 +1022,8 @@ impl Flags {
             nemotron_tp_ring: b1("VLLM_VULKAN_NEMOTRON_TP_RING"), // default OFF; cluster-gated
             nemotron_mamba_q8: b1("VLLM_VULKAN_NEMOTRON_MAMBA_Q8"), // default OFF; cluster-gated
             fp8_fast: bdef1("VLLM_VULKAN_FP8_FAST"), // default ON (address-gen cure: arithmetic E4M3 decode + vec4 word loads replace the const-LUT cascade + per-element word reloads; bit-exact decode, ~ULP dot4 reassoc); =0 reverts to the mul_mat_vec_fp8 LUT oracle
+            // Default OFF, but ANY non-"0" value enables — neither b1 nor bdef1.
+            mtp_concat_flip: std::env::var("VLLM_VULKAN_MTP_CONCAT_FLIP").map(|v| v != "0").unwrap_or(false),
             nemotron_shared_q8: b1("VLLM_VULKAN_NEMOTRON_SHARED_Q8"), // default OFF; cluster-gated
             laguna_embed_f16: b1("VLLM_VULKAN_LAGUNA_EMBED_F16"), // default OFF; footprint/load-OOM lever, cluster-gated
             laguna_pread_load: b1("VLLM_VULKAN_LAGUNA_PREAD_LOAD"), // default OFF; footprint/load-OOM lever, cluster-gated

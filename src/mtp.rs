@@ -292,11 +292,24 @@ impl MtpHead {
             kv: KvCache::new(MTP_KV_CAP, nkv, hd),
             max_depth,
         };
-        // shape sanity
-        assert_eq!(head.fc.len(), h * 2 * h, "fc [{h},{}]", 2 * h);
-        assert_eq!(head.q_proj.len(), nq * 2 * hd * h, "q_proj [{},{h}]", nq * 2 * hd);
-        assert_eq!(head.k_proj.len(), nkv * hd * h);
-        assert_eq!(head.o_proj.len(), h * nq * hd);
+        // Shape sanity. These are CHECKPOINT-derived (`load` reads an arbitrary
+        // `mtp.safetensors`), so a truncated or mis-paired head file must come
+        // back as an `Err` the pyo3 boundary can raise — not a panic that aborts
+        // through it. Same treatment the `gate_up_proj` length gets above.
+        // `v_proj` is included: `layer_step` runs `ops.matvec(MV_V, ..)` on it,
+        // and it had no check at all.
+        for (name, got, want) in [
+            ("fc", head.fc.len(), h * 2 * h),
+            ("q_proj", head.q_proj.len(), nq * 2 * hd * h),
+            ("k_proj", head.k_proj.len(), nkv * hd * h),
+            ("v_proj", head.v_proj.len(), nkv * hd * h),
+            ("o_proj", head.o_proj.len(), h * nq * hd),
+        ] {
+            if got != want {
+                return Err(format!(
+                    "MTP tensor '{name}' has {got} elements, expected {want}"));
+            }
+        }
         Ok(head)
     }
 
@@ -471,7 +484,7 @@ impl MtpHead {
         // `[norm_h ; norm_e]` so the harness can confirm the documented
         // EMBEDDING-FIRST order (validated at alpha_1=0.855) is the one that
         // accepts. Default = embedding first.
-        if std::env::var("VLLM_VULKAN_MTP_CONCAT_FLIP").map(|v| v != "0").unwrap_or(false) {
+        if crate::flags::flags_global().mtp_concat_flip {
             comb.extend_from_slice(&nh); // hidden first (flipped)
             comb.extend_from_slice(&ne);
         } else {
@@ -766,6 +779,22 @@ pub fn load_dense_mtp_weights(path: &Path) -> Result<HashMap<String, Vec<f32>>, 
                 let b = tmap
                     .get(&format!("{base}.biases"))
                     .ok_or_else(|| format!("{base}: .scales present but .biases missing"))?;
+                // A sibling `.scales` name is the ONLY evidence so far that this
+                // is an mlx4 triple. `read_u32` reinterprets raw bytes with no
+                // dtype check, so a BF16/F16 `.weight` would dequantize to
+                // garbage that `from_raw_dense`'s length assert still accepts
+                // (the element count is unchanged). Check dtype and rank before
+                // the `shape()[1]` reads below, which panic on a 1-D tensor.
+                if t.dtype() != safetensors::Dtype::U32 {
+                    return Err(format!(
+                        "{name}: .scales present but the packed weight dtype is {:?}, expected U32",
+                        t.dtype()));
+                }
+                if t.shape().len() != 2 || s.shape().len() != 2 {
+                    return Err(format!(
+                        "{name}: an mlx4 triple needs 2-D weight and scales; got {:?} / {:?}",
+                        t.shape(), s.shape()));
+                }
                 let out_f = t.shape()[0];
                 let in_f = t.shape()[1] * 8; // 8 × 4-bit nibbles per u32 word
                 let groups = s.shape()[1];
@@ -920,6 +949,102 @@ mod tests {
         m.insert("mtp.layers.0.mlp.shared_expert.down_proj.weight".into(), mk(h * si, 0.1));
         m.insert("mtp.layers.0.mlp.shared_expert_gate.weight".into(), mk(h, 0.1));
         m
+    }
+
+    /// A checkpoint-shape mismatch must be an `Err`, not a panic.
+    ///
+    /// `from_raw` is reached from `load`, which reads an ARBITRARY
+    /// `mtp.safetensors`, and it returns `Result<_, String>` that the pyo3 seam
+    /// turns into a Python exception. A truncated or mis-paired head file is
+    /// therefore user input, not a programmer error: an `assert_eq!` here aborts
+    /// the process through the boundary instead of raising.
+    ///
+    /// `v_proj` is in the loop because it had NO check at all, while
+    /// `layer_step` runs `ops.matvec(MV_V, ..)` on it — a short `v_proj` used to
+    /// reach the matvec and panic there.
+    #[test]
+    fn from_raw_reports_a_bad_tensor_shape_as_an_error() {
+        let cfg = tiny_cfg();
+        for name in ["mtp.fc.weight",
+                     "mtp.layers.0.self_attn.q_proj.weight",
+                     "mtp.layers.0.self_attn.k_proj.weight",
+                     "mtp.layers.0.self_attn.v_proj.weight",
+                     "mtp.layers.0.self_attn.o_proj.weight"] {
+            let mut raw = tiny_raw(&cfg);
+            let full = raw[name].len();
+            raw.get_mut(name).unwrap().truncate(full - 1); // a truncated shard
+            let short = name.rsplit('.').nth(1).unwrap();
+            let err = match MtpHead::from_raw(&raw, &cfg, 4) {
+                Ok(_) => panic!("{name}: a truncated tensor must not build a head"),
+                Err(e) => e,
+            };
+            assert!(err.contains(short) && err.contains(&(full - 1).to_string())
+                        && err.contains(&full.to_string()),
+                    "{name}: the error must name the tensor and both counts; got: {err}");
+        }
+        // ...and the intact set still builds.
+        MtpHead::from_raw(&tiny_raw(&cfg), &cfg, 4).expect("the intact fixture must still build");
+    }
+
+    /// `load_dense_mtp_weights` treats a tensor as mlx4-packed on the strength of
+    /// a sibling `.scales` NAME alone, then reads it with `read_u32`, which
+    /// reinterprets raw bytes with no dtype check. Two malformed layouts must be
+    /// refused rather than dequantized into silent garbage:
+    ///
+    ///   * a BF16/F16 `.weight` — `read_u32` would produce wrong words, and
+    ///     `from_raw_dense`'s length assert still passes because dequantizing
+    ///     does not change the element count, so the model would simply be
+    ///     WRONG; and
+    ///   * a 1-D `.weight` or `.scales` — the `shape()[1]` reads panic, and for
+    ///     `.weight` they happen before `read_floats` could report the dtype.
+    #[test]
+    fn dense_loader_refuses_a_packed_tensor_of_the_wrong_dtype_or_rank() {
+        use safetensors::tensor::TensorView;
+        use safetensors::Dtype;
+
+        let dir = std::env::temp_dir().join(format!(
+            "vv-mtp-dense-{}-{:?}", std::process::id(), std::thread::current().id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // out=2, in=16 -> 2 packed u32 words per row; 1 group of 16.
+        let write = |tag: &str, w: (Dtype, Vec<usize>, Vec<u8>), s_shape: Vec<usize>| {
+            let scales = vec![0u8; s_shape.iter().product::<usize>() * 4];
+            let biases = scales.clone();
+            let wv = TensorView::new(w.0, w.1, &w.2).unwrap();
+            let sv = TensorView::new(Dtype::F32, s_shape.clone(), &scales).unwrap();
+            let bv = TensorView::new(Dtype::F32, s_shape, &biases).unwrap();
+            let bytes = safetensors::serialize(
+                [("q.weight", &wv), ("q.scales", &sv), ("q.biases", &bv)], &None).unwrap();
+            let path = dir.join(format!("{tag}.safetensors"));
+            std::fs::write(&path, bytes).unwrap();
+            path
+        };
+
+        // Baseline: a WELL-FORMED mlx4 triple must still load, so the two
+        // refusals below are the malformation and not the guard over-firing.
+        let ok = write("ok", (Dtype::U32, vec![2, 2], vec![0u8; 2 * 2 * 4]), vec![2, 1]);
+        let m = super::load_dense_mtp_weights(&ok).expect("a well-formed mlx4 triple must load");
+        assert_eq!(m["q.weight"].len(), 2 * 16, "out*in f32 weights");
+
+        // (a) wrong dtype: same byte count, declared BF16.
+        let bad_dtype = write("bad_dtype", (Dtype::BF16, vec![2, 8], vec![0u8; 2 * 8 * 2]), vec![2, 1]);
+        let e = super::load_dense_mtp_weights(&bad_dtype)
+            .expect_err("a non-U32 packed weight must be refused");
+        assert!(e.contains("expected U32"), "got: {e}");
+
+        // (b) 1-D packed weight: `shape()[1]` would panic.
+        let bad_rank = write("bad_rank", (Dtype::U32, vec![4], vec![0u8; 4 * 4]), vec![2, 1]);
+        let e = super::load_dense_mtp_weights(&bad_rank)
+            .expect_err("a 1-D packed weight must be refused");
+        assert!(e.contains("2-D weight and scales"), "got: {e}");
+
+        // (c) 1-D scales: `s.shape()[1]` would panic.
+        let bad_scales = write("bad_scales", (Dtype::U32, vec![2, 2], vec![0u8; 2 * 2 * 4]), vec![2]);
+        let e = super::load_dense_mtp_weights(&bad_scales)
+            .expect_err("1-D scales must be refused");
+        assert!(e.contains("2-D weight and scales"), "got: {e}");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
