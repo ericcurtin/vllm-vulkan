@@ -538,7 +538,7 @@ impl crate::VulkanModel {
     }
 }
 
-/// The four projections an attention FRONT records (V dropped when value-less).
+/// The three projections an attention FRONT records (V dropped when value-less).
 pub(crate) const FRONT_PROJS: [ProjW; 3] = [ProjW::Q, ProjW::K, ProjW::V];
 /// The four projections a layer TAIL records.
 pub(crate) const TAIL_PROJS: [ProjW; 4] = [ProjW::O, ProjW::Gate, ProjW::Up, ProjW::Down];
@@ -888,10 +888,8 @@ mod layer_body_equivalence {
         let cfg = tiny_cfg();
         for li in 0..cfg.num_hidden_layers {
             let spec = LayerSpec::gemma(&cfg, li, Vec::new(), 1.0);
-            // Both entry points call `spec.front_params(true)` / `spec.tail_params()`.
-            assert_eq!(plan_front(&spec.front_params(true)), plan_front(&spec.front_params(true)));
-            assert_eq!(plan_tail(&spec.tail_params()), plan_tail(&spec.tail_params()));
-            // …and that plan is the one the gemma resident path records.
+            // Both entry points call `spec.front_params(true)` / `spec.tail_params()`,
+            // and that plan is the one the gemma resident path records.
             assert_eq!(
                 plan_front(&spec.front_params(true)),
                 plan_front(&gemma_front_params(&cfg, li, true, cfg.num_attention_heads)),

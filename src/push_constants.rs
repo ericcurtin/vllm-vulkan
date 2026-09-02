@@ -2557,6 +2557,13 @@ mod dispatch_tests {
         // (default ON, 2026-07-30 PP-5 fleet A/B GO) — k%32==0 && n==512
         // self-scopes to this exact shape and now wins over the bs128/r2 sweep
         // winner asserted here previously.
+        // Assert the DEFAULT this expectation rides on, the way
+        // `nvfp4_repack_routes_only_on_flag_and_shape` does — otherwise a flipped
+        // default fails below as a shader-NAME mismatch that points at the
+        // geometry sweep table rather than at the flag.
+        assert!(mlx4_rgu_repack_flag(),
+                "VLLM_VULKAN_MLX4_RGU_REPACK default flipped ON 2026-07-30; if it is \
+                 intentionally OFF again, update this test's expectations too");
         assert_eq!(matvec_mlx4_variant_k(2048, 512),
                    ("mul_mat_vec_mlx4repack_f32_f32_bs64_r4".to_string(), 4)); // MoE gate/up
         // MoE down: 1850MHz-pinned re-sweep rewired this shape onto the w8sg
@@ -2605,6 +2612,11 @@ mod dispatch_tests {
         // shape-invariant by construction, see matvec_mlx4_variant_k), not a
         // regression. dn a/b and the true sub-1024-k shapes still fall through
         // to legacy.
+        // Same reason as in `geom_pickers_return_swept_winners`: name the flags
+        // these two expectations depend on, so a flipped default says so.
+        assert!(mlx4_repack_flag() && mlx4_repack_r8_flag(),
+                "VLLM_VULKAN_MLX4_REPACK / _R8 are both default ON (2026-07-26 / \
+                 2026-07-30); if either is intentionally OFF again, update this test");
         assert_eq!(matvec_mlx4_variant_k(2048, 151936), // lm_head-shaped, k<n
                    ("mul_mat_vec_mlx4repack_f32_f32_bs64_r8".to_string(), 8));
         assert_eq!(matvec_mlx4_variant_k(2048, 1024), // TP-shard-shaped, k>n
