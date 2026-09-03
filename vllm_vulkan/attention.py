@@ -284,7 +284,9 @@ class VulkanAttentionBackendImpl(CPUAttentionBackendImpl):
                 self.attn_type,
             )
 
-        key_cache, value_cache = kv_cache.unbind(0)
+        # vLLM 0.23 HND layout: (num_blocks, num_kv_heads, block_size, 2*head_size)
+        _nb, _nkv, _bs, _ = kv_cache.size()
+        key_cache, value_cache = kv_cache.view((_nb, _nkv, _bs * 2, -1)).chunk(2, dim=2)
 
         # Keep vLLM's CPU KV cache updated first. This preserves the existing
         # fallback behavior and lets unsupported cases use CPU_ATTN immediately.
@@ -301,6 +303,9 @@ class VulkanAttentionBackendImpl(CPUAttentionBackendImpl):
                 value_cache,
                 attn_metadata.slot_mapping,
                 attn_metadata.isa,
+                k_scale=layer._k_scale_float,
+                v_scale=layer._v_scale_float,
+                kv_cache_dtype=self.kv_cache_dtype,
             )
             # The merged write+decode path is only attempted for the
             # common steady-state decode-only case, where the write and
@@ -374,6 +379,9 @@ class VulkanAttentionBackendImpl(CPUAttentionBackendImpl):
                     softcap=self.logits_soft_cap,
                     scheduler_metadata=attn_metadata.scheduler_metadata,
                     s_aux=self.sinks,
+                    k_scale=layer._k_scale_float,
+                    v_scale=layer._v_scale_float,
+                    kv_cache_dtype=self.kv_cache_dtype,
                 )
 
         return output

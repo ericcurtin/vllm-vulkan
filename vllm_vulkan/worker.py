@@ -161,3 +161,10 @@ class VulkanWorker(CPUWorker):
         from vllm_vulkan.model_runner import _VulkanCPUModelRunner  # noqa: PLC0415
 
         self.model_runner = _VulkanCPUModelRunner(self.vllm_config, torch.device("cpu"))
+
+
+# vLLM 0.23 compat: the CPU worker now inherits GPUWorker.load_model, whose
+# memory-pool context assumes a device allocator (cuda/xpu). The Vulkan/CPU
+# platform has none, so return a nullcontext.
+from contextlib import nullcontext as _nullctx  # noqa: E402
+VulkanWorker._maybe_get_memory_pool_context = lambda self, tag: _nullctx()

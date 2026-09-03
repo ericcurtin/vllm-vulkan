@@ -400,3 +400,15 @@ class VulkanPlatform(Platform):
 
     def __repr__(self) -> str:
         return f"VulkanPlatform(devices={self.get_device_count()})"
+
+
+# --- vLLM 0.23 compatibility shims -------------------------------------------
+# 0.23 renamed the platform seed hook (seed_everything -> manual_seed_all); CPU
+# RNG is already seeded in set_random_seed, so a no-op is correct.
+VulkanPlatform.manual_seed_all = classmethod(lambda cls, seed: None)
+
+# 0.23 profile_run queries num_compute_units; report CPU core count (Vulkan does
+# expose CU via VkPhysicalDeviceShaderCorePropertiesAMD, but _rs does not surface
+# it yet).
+import os as _os  # noqa: E402
+VulkanPlatform.num_compute_units = classmethod(lambda cls, *a, **k: _os.cpu_count() or 8)
