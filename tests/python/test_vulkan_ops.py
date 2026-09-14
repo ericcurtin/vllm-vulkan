@@ -848,6 +848,15 @@ class TestLinearMatvecDispatchThreshold:
         )
         assert upload_counter["n"] == 1
 
+    # wall-clock comparison, and the direction of this one is GPU-dependent:
+    # on a 7900 XTX (RADV NAVI31, gfx1100) against a 32-core host CPU the GPU
+    # batched-matvec measures ~480us/call against CPU's ~817us at this shape
+    # and T, i.e. 1.7x the other way from what this asserts. That does not
+    # make raising `_MATVEC_THRESHOLD` right -- `linear()` sends T>=4 to the
+    # tiled matmul, which reuses weight tiles and should beat both -- but it
+    # does mean this assertion encodes one machine's ratio and cannot run as
+    # a default-suite correctness check.
+    @pytest.mark.slow
     def test_matvec_batching_does_not_help_at_prefill_scale_t(self, vulkan_ctx):
         """Regression guard for `_MATVEC_THRESHOLD=4`: do NOT raise this
         threshold to also dispatch larger (prefill-scale) T to the GPU
