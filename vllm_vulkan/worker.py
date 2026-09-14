@@ -2,6 +2,7 @@
 """VulkanWorker — vLLM worker for the Vulkan backend."""
 
 import logging
+from typing import Any
 
 from vllm.v1.worker.cpu_worker import CPUWorker
 
@@ -15,6 +16,15 @@ class VulkanWorker(CPUWorker):
     attempt can silently no-op, then wraps whichever model runner
     ``CPUWorker`` built in ``_VulkanCPUModelRunner``.
     """
+
+    # Declared because `init_device` both reads and rebinds this attribute,
+    # and `CPUWorker` is untyped to mypy on the lint runners (vLLM isn't
+    # installed there), leaving mypy unable to infer it from the assignment
+    # alone. `Any` rather than a union of the runner types: it holds one of
+    # vLLM's two CPU model runners before the assignment and the
+    # `_VulkanCPUModelRunner` that wraps it after, and that wrapper is a
+    # `__getattr__`-forwarding proxy, so no single static type describes both.
+    model_runner: Any
 
     def init_device(self) -> None:  # type: ignore[override]
         # Re-apply the top-k/top-p Triton-CUDA guard here. It is also
