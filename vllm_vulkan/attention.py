@@ -284,7 +284,7 @@ class VulkanAttentionBackendImpl(CPUAttentionBackendImpl):
                 self.attn_type,
             )
 
-        key_cache, value_cache = kv_cache.unbind(0)
+        key_cache, value_cache = _split_kv_cache(kv_cache)
 
         # Keep vLLM's CPU KV cache updated first. This preserves the existing
         # fallback behavior and lets unsupported cases use CPU_ATTN immediately.
@@ -870,11 +870,7 @@ def _get_or_create_vulkan_kv_cache(
     if entry is not None:
         _VULKAN_KV_CACHES.pop(key, None)
 
-    if len(shape) != 5 or shape[0] != 2:
-        raise ValueError(
-            f"expected KV cache shape [2, blocks, heads, block, dim], got {shape}"
-        )
-    _, num_blocks, num_kv_heads, block_size, head_size = shape
+    num_blocks, num_kv_heads, block_size, head_size = _parse_kv_cache_shape(shape)
     dtype_size = _kv_cache_dtype_size(kv_cache.dtype)
     layout = VulkanPagedKVLayout(
         (
@@ -903,6 +899,51 @@ def _get_or_create_vulkan_kv_cache(
     _VULKAN_KV_CACHES[key] = entry
 
     return entry
+
+
+def _split_kv_cache(kv_cache: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split vLLM's per-layer paged KV cache into its key and value halves.
+
+    Two layouts are in the field, and the tensor's own rank tells them
+    apart, so this needs no `vllm.__version__` check:
+
+    - up to 0.20: ``(2, num_blocks, num_kv_heads, block_size, head_size)``,
+      split by `unbind(0)`.
+    - 0.23 onward: the HND layout ``(num_blocks, num_kv_heads, block_size,
+      2 * head_size)``, split by viewing `block_size` as `block_size * 2`
+      and chunking dim 2. That is verbatim what
+      `CPUAttentionBackendImpl.forward` does (vllm/v1/attention/backends/
+      cpu_attn.py), and is what the write side of the cache expects -- it
+      is not a per-token `[K_hs, V_hs]` interleave, so splitting the last
+      dimension instead would hand `ops.cpu_attention_with_kv_cache` the
+      wrong tensors.
+    """
+    if kv_cache.dim() == 5:
+        return kv_cache[0], kv_cache[1]
+    num_blocks, num_kv_heads, block_size, _ = kv_cache.shape
+    key_cache, value_cache = kv_cache.view(
+        num_blocks, num_kv_heads, block_size * 2, -1
+    ).chunk(2, dim=2)
+    return key_cache, value_cache
+
+
+def _parse_kv_cache_shape(shape: tuple[int, ...]) -> tuple[int, int, int, int]:
+    """(num_blocks, num_kv_heads, block_size, head_size) from either layout.
+
+    The Vulkan mirror is a separate GPU allocation written from the `key`/
+    `value` token tensors (see `_try_write_tokens_to_vulkan_cache`), not a
+    view of vLLM's CPU buffer, so these four numbers are all that vLLM's
+    own layout contributes -- which is why 0.23's HND cache needs no change
+    beyond reading `head_size` out of the doubled last dimension.
+    """
+    if len(shape) == 5 and shape[0] == 2:
+        return shape[1], shape[2], shape[3], shape[4]
+    if len(shape) == 4 and shape[3] % 2 == 0:
+        return shape[0], shape[1], shape[2], shape[3] // 2
+    raise ValueError(
+        f"expected KV cache shape [2, blocks, heads, block, dim] or "
+        f"[blocks, heads, block, 2*dim], got {shape}"
+    )
 
 
 def _kv_cache_storage_key(kv_cache: torch.Tensor) -> int:

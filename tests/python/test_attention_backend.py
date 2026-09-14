@@ -966,3 +966,113 @@ def test_multiple_decode_steps_reuse_kv_cache_entry_and_stay_correct():
                 "the same kv_cache tensor across decode steps must keep "
                 "reusing the identical cached entry, not re-resolve it"
             )
+
+
+class TestKVCacheLayouts:
+    """vLLM changed the per-layer KV cache layout in 0.23: up to 0.20 it is
+    ``(2, num_blocks, num_kv_heads, block_size, head_size)``, from 0.23 on it
+    is the HND ``(num_blocks, num_kv_heads, block_size, 2 * head_size)``.
+    `_split_kv_cache`/`_parse_kv_cache_shape` read the layout off the tensor's
+    rank so both work without a `vllm.__version__` check.
+    """
+
+    def test_split_returns_both_planes_at_head_size(self):
+        num_blocks, num_kv_heads, block_size, head_size = 4, 2, 16, 8
+        expected = (num_blocks, num_kv_heads, block_size, head_size)
+
+        hnd = torch.zeros(
+            (num_blocks, num_kv_heads, block_size, 2 * head_size),
+            dtype=torch.float16,
+        )
+        key_cache, value_cache = attention_mod._split_kv_cache(hnd)
+        assert key_cache.shape == expected
+        assert value_cache.shape == expected
+
+        legacy = torch.zeros((2, *expected), dtype=torch.float16)
+        key_cache, value_cache = attention_mod._split_kv_cache(legacy)
+        assert key_cache.shape == expected
+        assert value_cache.shape == expected
+
+    def test_hnd_split_takes_contiguous_halves_of_each_block(self):
+        """Each ``[block, head]`` slice of the HND cache holds all of K's
+        ``block_size * head_size`` elements first and all of V's second.
+
+        Shape alone does not pin the split down: reading the layout as a
+        per-token ``[K_hs, V_hs]`` interleave (chunking the *last*
+        dimension) yields two tensors of exactly the same shape, holding
+        exactly the same set of elements, in a different arrangement -- so
+        this states the contract in flat-index terms instead, which is what
+        `ops.cpu_attn_reshape_and_cache` actually writes.
+        """
+        num_blocks, num_kv_heads, block_size, head_size = 3, 2, 4, 8
+        n = num_blocks * num_kv_heads * block_size * 2 * head_size
+        hnd = torch.arange(n, dtype=torch.float32).reshape(
+            num_blocks, num_kv_heads, block_size, 2 * head_size
+        )
+        half = block_size * head_size
+
+        key_cache, value_cache = attention_mod._split_kv_cache(hnd)
+        for b in range(num_blocks):
+            for h in range(num_kv_heads):
+                flat = hnd[b, h].flatten()
+                torch.testing.assert_close(key_cache[b, h].flatten(), flat[:half])
+                torch.testing.assert_close(value_cache[b, h].flatten(), flat[half:])
+
+    def test_hnd_split_halves_are_independent_views(self):
+        """Writing through one half must not disturb the other -- they are
+        views into one buffer, so an off-by-one in the chunk offset would
+        show up here as aliasing rather than as a shape error."""
+        hnd = torch.zeros((2, 1, 4, 16), dtype=torch.float32)
+        key_cache, value_cache = attention_mod._split_kv_cache(hnd)
+
+        key_cache.fill_(1.0)
+        assert value_cache.eq(0.0).all(), "value half aliases the key half"
+        value_cache.fill_(2.0)
+        assert key_cache.eq(1.0).all(), "key half aliases the value half"
+
+    def test_both_layouts_parse_to_the_same_dimensions(self):
+        dims = (4, 2, 16, 8)  # num_blocks, num_kv_heads, block_size, head_size
+        num_blocks, num_kv_heads, block_size, head_size = dims
+
+        assert attention_mod._parse_kv_cache_shape((2, *dims)) == dims
+        assert (
+            attention_mod._parse_kv_cache_shape(
+                (num_blocks, num_kv_heads, block_size, 2 * head_size)
+            )
+            == dims
+        )
+
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            (4, 2, 16),  # too few dimensions
+            (3, 4, 2, 16, 8),  # 5-D but not a [K, V] pair
+            (4, 2, 16, 7),  # 4-D with an odd (un-splittable) last dimension
+        ],
+    )
+    def test_unrecognized_shapes_are_rejected(self, shape):
+        with pytest.raises(ValueError, match="expected KV cache shape"):
+            attention_mod._parse_kv_cache_shape(shape)
+
+    def test_hnd_cache_builds_the_same_vulkan_layout_as_the_legacy_cache(self):
+        """The Vulkan mirror is its own GPU allocation, written from the
+        `key`/`value` token tensors rather than from vLLM's buffer, so a
+        0.23 HND cache must produce a byte-identical `VulkanPagedKVLayout`
+        to the 0.20 cache describing the same model -- i.e. the layout
+        change costs the Vulkan decode path nothing, it does not fall back
+        to CPU.
+        """
+        ctx = _require_vulkan_context()
+        dims = (4, 2, 16, 8)
+        num_blocks, num_kv_heads, block_size, head_size = dims
+
+        legacy = torch.zeros((2, *dims), dtype=torch.float16)
+        hnd = torch.zeros(
+            (num_blocks, num_kv_heads, block_size, 2 * head_size),
+            dtype=torch.float16,
+        )
+
+        legacy_entry = attention_mod._get_or_create_vulkan_kv_cache(ctx, legacy)
+        hnd_entry = attention_mod._get_or_create_vulkan_kv_cache(ctx, hnd)
+
+        assert hnd_entry.layout == legacy_entry.layout
