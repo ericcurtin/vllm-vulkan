@@ -42,16 +42,15 @@ def _use_rust_model() -> bool:
 class _VulkanCPUModelRunner:
     """CPUModelRunner that patches the loaded model for Vulkan dispatch.
 
-    Wraps CPUModelRunner and intercepts load_model to additionally patch the
-    PyTorch model's RMSNorm/Linear modules to dispatch to Vulkan (via
-    ``vllm_vulkan._rs``) instead of running on CPU.
+    Wraps the CPU model runner `CPUWorker.init_device` built and intercepts
+    load_model to additionally patch the PyTorch model's RMSNorm/Linear
+    modules to dispatch to Vulkan (via ``vllm_vulkan._rs``) instead of
+    running on CPU.
     """
 
-    def __init__(self, vllm_config, device):
-        from vllm.v1.worker.cpu_model_runner import CPUModelRunner  # noqa: PLC0415
-
-        self._runner = CPUModelRunner(vllm_config, device)
-        self._vllm_config = vllm_config
+    def __init__(self, runner):
+        self._runner = runner
+        self._vllm_config = runner.vllm_config
 
     def __getattr__(self, name: str):
         return getattr(self._runner, name)
