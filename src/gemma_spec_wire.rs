@@ -543,12 +543,40 @@ impl VulkanModel {
                 self.tp_size)));
         }
 
-        let drafter = SpecDrafter::load(&dir, &self.inner).map_err(PyRuntimeError::new_err)?;
+        // Validate the two ids at the seam, before the (cached, but on a miss
+        // multi-GB) drafter load and before `spec_decode_gemma` touches the KV.
+        gemma_check_tokens(&self.inner, "gemma_spec_generate", &[prompt_last_token, start_token])
+            .map_err(PyRuntimeError::new_err)?;
+
+        // The drafter checkpoint is loaded ONCE per path and kept on `self`; a
+        // call with a different `VLLM_VULKAN_GEMMA_SPEC_ASSISTANT_DIR` reloads.
+        // Only the borrowed-K/V snapshot is per call: it is taken at the
+        // target's CURRENT frontier (`SpecDrafter::load`'s contract), so it is
+        // re-borrowed here every time.
+        let reuse = matches!(self.gemma_spec_drafter.as_ref(), Some((d, _)) if *d == dir);
+        if !reuse {
+            self.gemma_spec_drafter = None; // drop the old checkpoint before loading the new one
+            let drafter = SpecDrafter::load(&dir, &self.inner).map_err(PyRuntimeError::new_err)?;
+            self.gemma_spec_drafter = Some((dir.clone(), drafter));
+        }
+        let mut drafter = self.gemma_spec_drafter.take().expect("set above").1;
+        if reuse {
+            match SpecDrafter::borrow_kv(&self.inner, &drafter.cfg) {
+                Ok(kv) => drafter.kv = kv,
+                Err(e) => {
+                    self.gemma_spec_drafter = Some((dir, drafter));
+                    return Err(PyRuntimeError::new_err(e));
+                }
+            }
+        }
         let cfg = SpecConfig { k: flags.gemma_spec_k, max_new_tokens };
-        let report = spec_decode_gemma(
+        let result = spec_decode_gemma(
             &mut self.inner, &drafter, SeedSource::Recompute,
             prompt_last_token, start_token, start_pos, &cfg,
-        ).map_err(PyRuntimeError::new_err)?;
+        );
+        // Put the checkpoint back whether or not the run succeeded.
+        self.gemma_spec_drafter = Some((dir, drafter));
+        let report = result.map_err(PyRuntimeError::new_err)?;
 
         eprintln!(
             "[VLLM_VULKAN_GEMMA_SPEC] k={} n={} blocks={} drafted={} accepted={} accept_rate={}",

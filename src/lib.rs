@@ -441,6 +441,14 @@ pub struct VulkanModel {
     /// as f32 and OOMs a node). Row-major [vocab, num_layers*ple_dim]; one row
     /// is converted to f32 per token. Only loaded on the PLE-owning (first) stage.
     gemma_ple_bf16: Option<Vec<u16>>,
+    /// `gemma_spec_generate`'s drafter checkpoint, kept across calls keyed by
+    /// the directory it was loaded from (a different path reloads). The
+    /// borrowed-K/V snapshot inside it is refreshed per call.
+    #[cfg(feature = "gemma")]
+    gemma_spec_drafter: Option<(String, gemma_spec_wire::SpecDrafter)>,
+    #[cfg(not(feature = "gemma"))]
+    #[allow(dead_code)]
+    gemma_spec_drafter: Option<()>,
     /// GPU-resident KV cache (roadmap #3a): per-layer persistent device buffer
     /// laid out [K-plane(max_seq×num_kv×hd)][V-plane], so GPU attention reads the
     /// KV in place instead of re-uploading the whole host cache every token
@@ -1159,6 +1167,7 @@ impl VulkanModel {
                         tp_rank: s3_tp_rank,
                         tp_size: s3_tp_size,
                         gemma_ple_bf16: None,
+            gemma_spec_drafter: None,
                         gpu_kv: HashMap::new(),
                         qres_bufs: Vec::new(),
                         qres_ready: false,
@@ -1950,6 +1959,7 @@ impl VulkanModel {
                         tp_rank: q35_tp_rank,
                         tp_size: q35_tp_size,
                         gemma_ple_bf16: None,
+            gemma_spec_drafter: None,
                         gpu_kv: std::collections::HashMap::new(),
                         gemma_kv_filled: 0,
                         qres_bufs: Vec::new(),
@@ -2490,6 +2500,7 @@ impl VulkanModel {
                         // g12b has PLE off (hidden_size_per_layer_input=0); no
                         // per-layer-embedding table to load.
                         gemma_ple_bf16: None,
+            gemma_spec_drafter: None,
                         gpu_kv: std::collections::HashMap::new(),
                         gemma_kv_filled: 0,
                         qres_bufs: Vec::new(),
@@ -2966,6 +2977,7 @@ impl VulkanModel {
                         tp_rank: g31b_tp_rank,
                         tp_size: g31b_tp_size,
                         gemma_ple_bf16: None,
+            gemma_spec_drafter: None,
                         gpu_kv: std::collections::HashMap::new(),
                         gemma_kv_filled: 0,
                         qres_bufs: Vec::new(),
@@ -3105,6 +3117,7 @@ impl VulkanModel {
                             tp_rank: 0,
                             tp_size: 1,
                             gemma_ple_bf16: None,
+            gemma_spec_drafter: None,
                             gpu_kv: std::collections::HashMap::new(),
                             gemma_kv_filled: 0,
                             qres_bufs: Vec::new(),
@@ -3197,6 +3210,7 @@ impl VulkanModel {
                         tp_rank: 0,
                         tp_size: 1,
                         gemma_ple_bf16: None,
+            gemma_spec_drafter: None,
                         gpu_kv: std::collections::HashMap::new(),
                         gemma_kv_filled: 0,
                         qres_bufs: Vec::new(),
@@ -3321,6 +3335,7 @@ impl VulkanModel {
                         tp_rank: 0,
                         tp_size: 1,
                         gemma_ple_bf16: None,
+            gemma_spec_drafter: None,
                         gpu_kv: std::collections::HashMap::new(),
                         gemma_kv_filled: 0,
                         qres_bufs: Vec::new(),
@@ -3452,6 +3467,7 @@ impl VulkanModel {
                         tp_rank: 0,
                         tp_size: 1,
                         gemma_ple_bf16: None,
+            gemma_spec_drafter: None,
                         gpu_kv: std::collections::HashMap::new(),
                         gemma_kv_filled: 0,
                         qres_bufs: Vec::new(),
@@ -3687,6 +3703,7 @@ impl VulkanModel {
                         tp_rank: nem_tp_rank,
                         tp_size: nem_tp_size,
                         gemma_ple_bf16: None,
+            gemma_spec_drafter: None,
                         gpu_kv: std::collections::HashMap::new(),
                         gemma_kv_filled: 0,
                         qres_bufs: Vec::new(),
@@ -4193,6 +4210,7 @@ impl VulkanModel {
             tp_rank,
             tp_size,
             gemma_ple_bf16,
+            gemma_spec_drafter: None,
             gpu_kv: std::collections::HashMap::new(),
             gemma_kv_filled: 0,
             qres_bufs: Vec::new(),
@@ -4305,6 +4323,7 @@ impl VulkanModel {
             tp_rank: 0,
             tp_size: 1,
             gemma_ple_bf16: None,
+            gemma_spec_drafter: None,
             gpu_kv: HashMap::new(),
             gemma_kv_filled: 0,
             qres_bufs: Vec::new(),
@@ -9184,6 +9203,7 @@ mod batched_forward_tests {
             tp_rank: 0,
             tp_size: 1,
             gemma_ple_bf16: None,
+            gemma_spec_drafter: None,
             gpu_kv: HashMap::new(),
             gemma_kv_filled: 0,
             qres_bufs: Vec::new(),
@@ -9514,6 +9534,7 @@ pub(crate) mod qwen35_prefill_tests {
             tp_rank: 0,
             tp_size: 1,
             gemma_ple_bf16: None,
+            gemma_spec_drafter: None,
             gpu_kv: HashMap::new(),
             gemma_kv_filled: 0,
             qres_bufs: Vec::new(),
@@ -9870,6 +9891,7 @@ mod kv_cache_pymethod_tests {
             tp_rank: 0,
             tp_size: 1,
             gemma_ple_bf16: None,
+            gemma_spec_drafter: None,
             gpu_kv: HashMap::new(),
             gemma_kv_filled: 0,
             qres_bufs: Vec::new(),

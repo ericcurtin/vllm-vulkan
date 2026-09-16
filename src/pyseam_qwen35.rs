@@ -8,7 +8,7 @@
 //! `qwen35_tp_forward_normed` among them. Review those as new code.
 //! Kept as separate `#[pymethods] impl VulkanModel` block(s) via pyo3's
 //! `multiple-pymethods` feature so a per-model upstream PR can carve this file.
-#![allow(clippy::all)]
+
 
 use crate::*;
 use pyo3::prelude::*;
@@ -1458,15 +1458,6 @@ impl VulkanModel {
 mod pyseam_qwen35_input_tests {
     use super::*;
 
-    /// PyO3-boundary input validation. Every method below is reachable from
-    /// Python with arbitrary arguments, and a Rust panic there ABORTS through
-    /// the boundary instead of raising — so each of these must be an `Err`.
-    ///
-    /// Each case is a real hole a sibling method on the same file already
-    /// closed: `forward_pp_qwen35_prefill` rejects `seq == 0` but not a short
-    /// `tokens`; `forward_qwen35_window` length-checks `hidden_in` with a test
-    /// that is vacuously true at `t == 0`; the TP verify's embed lookup panics
-    /// where `forward_qwen35_window`'s lm_head lookup returns a named error.
     /// Every full-attention layer's KV frontier. The probe for "this refusal
     /// did not advance the model", which `spec_verify_span` alone cannot show.
     fn kv_frontiers(vm: &VulkanModel) -> Vec<usize> {
@@ -1476,6 +1467,15 @@ mod pyseam_qwen35_input_tests {
         }).collect()).unwrap_or_default()
     }
 
+    /// PyO3-boundary input validation. Every method below is reachable from
+    /// Python with arbitrary arguments, and a Rust panic there ABORTS through
+    /// the boundary instead of raising — so each of these must be an `Err`.
+    ///
+    /// Each case is a real hole a sibling method on the same file already
+    /// closed: `forward_pp_qwen35_prefill` rejects `seq == 0` but not a short
+    /// `tokens`; `forward_qwen35_window` length-checks `hidden_in` with a test
+    /// that is vacuously true at `t == 0`; the TP verify's embed lookup panics
+    /// where `forward_qwen35_window`'s lm_head lookup returns a named error.
     #[test]
     fn qwen35_pymethods_reject_bad_input_instead_of_panicking() {
         // Formatting a `PyErr` needs the interpreter, so initialise it up front

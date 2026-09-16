@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The UNIFIED GPU decode-layer engine (VLLM_VULKAN_UNIFIED=1): one slot set
-//! + one `gpu_layer` dispatch path serving both Qwen3 and Gemma4, described
+//! and one `gpu_layer` dispatch path serving both Qwen3 and Gemma4, described
 //! by a config-parameterized `LayerSpec`. Extracted verbatim from lib.rs
 //! (M1).
 
@@ -99,9 +99,9 @@ pub(crate) struct PleSpec {
 /// consumes it and records the whole layer. Qwen is a degenerate Gemma:
 ///   - residual: PRE-norm (sandwich=false) vs Gemma SANDWICH (sandwich=true)
 ///   - norms: qwen has only input + post_attention (reused as ffn_in_norm);
-///            gemma adds k_norm/v_norm + pre/post-feedforward norms + PLE norm
+///     gemma adds k_norm/v_norm + pre/post-feedforward norms + PLE norm
 ///   - rope: qwen full-rotary (rotary_dim=head_dim); gemma global=1e6 partial
-///            (head_dim/4) / sliding=1e4 full
+///     (head_dim/4) / sliding=1e4 full
 ///   - attention: qwen full (window=None); gemma windowed/KV-shared
 ///   - activation: Silu (qwen) vs Gelu (gemma)
 pub(crate) struct LayerSpec {
@@ -718,8 +718,8 @@ impl VulkanModel {
         let sdpa_kernel = attn_decode_kernel();
         let sdpa_wg = match sdpa_kernel {
             "paged_attn_decode_f32_sg"   => (num_q as u32, 1u32, 1u32),
-            "paged_attn_decode_f32_coop" => (num_q as u32, (head_dim as u32 + 255) / 256, 1u32),
-            _                            => ((q_dim as u32 + 255) / 256, 1u32, 1u32),
+            "paged_attn_decode_f32_coop" => (num_q as u32, (head_dim as u32).div_ceil(256), 1u32),
+            _                            => ((q_dim as u32).div_ceil(256), 1u32, 1u32),
         };
         // Byte offsets of this token's K/V slot inside the resident plane.
         let k_dst_off = (pos * kv_dim * 4) as u64;
@@ -785,6 +785,17 @@ impl VulkanModel {
         let q_dim = num_q * head_dim;
         let kv_dim = num_kv * head_dim;
         let scale = spec.attn_scale;
+        let max_seq = self.max_seq_len;
+
+        // Same bound as `gpu_layer_1cb`: `pos` comes from the Python decode
+        // driver, and past `max_seq_len` the host KV append and the RoPE
+        // position below index a plane that is not there. Refuse before the
+        // first device write (`UR_POS`).
+        if pos >= max_seq {
+            return Err(format!(
+                "gpu_layer_2cb: position {pos} exceeds max_seq_len {max_seq} — \
+                 construct VulkanModel with a larger max_seq_len").into());
+        }
 
         unsafe { (*self.ures_ptr_mut(UR_POS)).write(&(pos as i32).to_le_bytes())?; }
 
@@ -906,7 +917,7 @@ impl VulkanModel {
             let eng = self.engine.as_mut().expect("invariant: unified_ple_tail only called when self.engine is Some");
             let cb = eng.begin_batch()?;
             unsafe {
-                eng.record_to(cb, &ps, &[&*pgw, &*ffin_p, &*pg_p], &mv_pg, ((ple_dim as u32 + prr - 1)/prr, 1, 1))?;
+                eng.record_to(cb, &ps, &[&*pgw, &*ffin_p, &*pg_p], &mv_pg, ((ple_dim as u32).div_ceil(prr), 1, 1))?;
             }
             eng.submit_batch(cb)?;
             let gate_ple = read_f32_buf(unsafe { &*pg_p }, ple_dim);
@@ -922,7 +933,7 @@ impl VulkanModel {
             let eng = self.engine.as_mut().expect("invariant: unified_ple_tail only called when self.engine is Some");
             let cb = eng.begin_batch()?;
             unsafe {
-                eng.record_to(cb, &pps, &[&*ppw, &*pg_in, &*pc_p], &mv_pp, ((h as u32 + pprr - 1)/pprr, 1, 1))?;
+                eng.record_to(cb, &pps, &[&*ppw, &*pg_in, &*pc_p], &mv_pp, ((h as u32).div_ceil(pprr), 1, 1))?;
             }
             eng.submit_batch(cb)?;
             let contrib = read_f32_buf(unsafe { &*pc_p }, h);
@@ -1032,7 +1043,7 @@ impl VulkanModel {
         unsafe {
             eng.record_to(cb, "rms_norm_f32_mul", &[&*ha, &*norm_p, &*xp], &rms_f, (1, 1, 1))?;
             eng.record_barrier_to(cb);
-            eng.record_to(cb, &lms, &[&*lmw, &*xp, &*logitp], &mv_lm, ((vocab as u32 + lmr - 1)/lmr, 1, 1))?;
+            eng.record_to(cb, &lms, &[&*lmw, &*xp, &*logitp], &mv_lm, ((vocab as u32).div_ceil(lmr), 1, 1))?;
         }
         eng.submit_batch(cb)?;
         Ok(read_f32_buf(unsafe { &*logitp }, vocab))

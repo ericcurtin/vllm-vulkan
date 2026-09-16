@@ -6,7 +6,6 @@
 //! spec extracted from the qwen3.6-mlx reference. Config + state scaffolding is
 //! in place; the CPU reference forward passes are implemented and validated
 //! against the MLX oracle in Milestone A (see the checklist in that doc).
-#![allow(dead_code)]
 
 use crate::model::{
     cpu_matmul, cpu_rms_norm, cpu_rms_norm_no_weight, cpu_rope, cpu_sdpa, cpu_silu, KvCache,
@@ -449,7 +448,7 @@ pub fn synthetic_hybrid_qwen35(
 /// decode state (P1 speculative-pipelining rollback). Captures, keyed by
 /// stage-local `state_idx` (matches `layer_state`):
 ///   - every linear (GatedDeltaNet) layer's `DeltaNetState` (sliding conv window
-///     + delta-rule matrix). Authoritative on the CPU path (`DN_GPU` off /
+///     and delta-rule matrix). Authoritative on the CPU path (`DN_GPU` off /
 ///     engine-less Mac tests). When the GPU-resident `DnGpuLayer` buffers are
 ///     authoritative (`DN_GPU` on) the caller passes that layer's `state_idx` in
 ///     `skip_linear_si` so its stale host copy is NOT captured (the GPU buffers
@@ -538,7 +537,7 @@ fn read_f32_section(buf: &[u8], pos: &mut usize) -> Result<Vec<f32>, String> {
     if *pos + len > buf.len() {
         return Err("prefix blob truncated (section body)".to_string());
     }
-    if len % 4 != 0 {
+    if !len.is_multiple_of(4) {
         return Err(format!("prefix blob section length {len} not a multiple of 4"));
     }
     let n = len / 4;
@@ -594,9 +593,12 @@ pub struct Qwen35Model {
     /// crossed. Retain-latest: only the most-recently-crossed boundary is
     /// kept (constant ~13.2MB/stage regardless of prefix length); see
     /// `export_prefix`'s `Linear` arm for the read side.
-    pub gdn_boundary:
-        std::collections::HashMap<usize, std::collections::HashMap<usize, (Vec<f32>, Vec<f32>)>>,
+    pub gdn_boundary: GdnBoundaryMap,
 }
+
+/// `gdn_boundary`'s shape: `state_idx -> boundary_pos -> (conv_state, state)`.
+pub type GdnBoundaryMap =
+    std::collections::HashMap<usize, std::collections::HashMap<usize, (Vec<f32>, Vec<f32>)>>;
 
 impl Qwen35Model {
     /// Single-node / full model: resident range is `[0, num_hidden_layers)`.
@@ -639,7 +641,7 @@ impl Qwen35Model {
     /// Tensor-parallel constructor: full resident layer range `[0, num_layers)`
     /// but every per-layer state is sized for this rank's 1/tp head shard (KV
     /// cache `num_key_value_heads/tp` heads; DeltaNet `num_value_heads/tp` heads
-    /// + `conv_dim/tp` channels). `cfg` stays the FULL global config; only the
+    /// and `conv_dim/tp` channels). `cfg` stays the FULL global config; only the
     /// state is sharded.
     pub fn new_range_tp(
         config: Qwen35Config,
@@ -1043,7 +1045,7 @@ impl Qwen35Model {
         // (conv_state, state) now, since GatedDeltaNet can't rewind to
         // reconstruct it later from the post-prompt live state. See
         // `gdn_boundary`'s doc comment and `export_prefix`'s Linear arm.
-        if pos > 0 && pos % crate::kvstore::CHUNK == 0 {
+        if pos > 0 && pos.is_multiple_of(crate::kvstore::CHUNK) {
             let boundary = pos;
             let mut snap = std::collections::HashMap::new();
             for layer_idx in start..end {
@@ -1284,6 +1286,9 @@ impl Qwen35Model {
     /// `pub(crate)` (not inlined here) so a tape-replay path can reuse the exact
     /// same op sequence with a FROZEN `delta` (skipping the `kv_mem` read) and
     /// stay bit-exact with this forward path — see `gdn_tape_replay_tests`.
+    // Index-form loops mirror the reference `state[k, v]` math op-by-op; the
+    // MLX-oracle bit-exact gate was validated against this exact evaluation order.
+    #[allow(clippy::needless_range_loop)]
     pub fn delta_net(&mut self, layer_idx: usize, x: &[f32]) -> Vec<f32> {
         let cfg = self.config.clone();
         let h = cfg.hidden_size;
@@ -1563,6 +1568,9 @@ impl Qwen35Model {
     ///
     /// `xs`: `[t_count * hidden_size]` row-major. Returns `[t_count *
     /// hidden_size]` row-major (post `out_proj`).
+    // Index-form loops mirror `delta_net` op-by-op (see the note there); the
+    // scan is gated bit-exact against the serial recurrence.
+    #[allow(clippy::needless_range_loop)]
     pub fn delta_net_scan(&mut self, layer_idx: usize, xs: &[f32], t_count: usize) -> Vec<f32> {
         let cfg = self.config.clone();
         let h = cfg.hidden_size;
@@ -1892,10 +1900,10 @@ mod spec_rollback_tests {
     /// `text_config.rope_parameters`) with nothing hardcoded to the 35B geometry.
     #[test]
     fn parses_qwen35_122b_a10b_config() {
-        let ltypes = std::iter::repeat(
+        let ltypes = std::iter::repeat_n(
             ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+            12,
         )
-        .take(12)
         .flatten()
         .map(|s| format!("\"{s}\""))
         .collect::<Vec<_>>()
@@ -2247,7 +2255,7 @@ pub(crate) mod kv_prefix_tests {
         populate(&mut m_a, 3, 6);
         let blob_a = m_a.export_prefix(3).expect("export_prefix must succeed");
         let mut m_b = build_hybrid(layer_types);
-        m_b.config.head_dim = m_b.config.head_dim + 4; // diverge the fingerprint
+        m_b.config.head_dim += 4; // diverge the fingerprint
         let err = m_b
             .import_prefix(&blob_a)
             .expect_err("blob from a differently-configured model must be rejected");
@@ -2625,8 +2633,8 @@ mod kv_boundary_snapshot_tests {
         // token CHUNK mutates state (so it holds exactly [0, CHUNK)`), even
         // though the model keeps decoding another 44 tokens past it.
         let mut m_long = build_linear_only_model();
-        for pos in 0..n_total {
-            let _ = m_long.forward_pp_range(&xs[pos], pos, 0, 1);
+        for (pos, x) in xs.iter().enumerate().take(n_total) {
+            let _ = m_long.forward_pp_range(x, pos, 0, 1);
         }
         assert!(
             m_long.gdn_boundary.contains_key(&CHUNK),
@@ -2638,8 +2646,8 @@ mod kv_boundary_snapshot_tests {
         // CHUNK inputs) — its live state after the loop IS `[0, CHUNK)`, by
         // construction, with no contamination possible (nothing ran past it).
         let mut m_fresh = build_linear_only_model();
-        for pos in 0..CHUNK {
-            let _ = m_fresh.forward_pp_range(&xs[pos], pos, 0, 1);
+        for (pos, x) in xs.iter().enumerate().take(CHUNK) {
+            let _ = m_fresh.forward_pp_range(x, pos, 0, 1);
         }
         let (fresh_conv, fresh_state) = match &m_fresh.layer_state[0] {
             LayerState::Linear(d) => (d.conv_state.clone(), d.state.clone()),
@@ -2687,8 +2695,8 @@ mod kv_boundary_snapshot_tests {
         let xs: Vec<Vec<f32>> = (0..n_total).map(|_| (0..h).map(|_| g()).collect()).collect();
 
         let mut m = build_linear_only_model();
-        for pos in 0..n_total {
-            let _ = m.forward_pp_range(&xs[pos], pos, 0, 1);
+        for (pos, x) in xs.iter().enumerate().take(n_total) {
+            let _ = m.forward_pp_range(x, pos, 0, 1);
         }
         let (live_conv, live_state) = match &m.layer_state[0] {
             LayerState::Linear(d) => (d.conv_state.clone(), d.state.clone()),
