@@ -9420,6 +9420,7 @@ pub(crate) mod qwen35_prefill_tests {
             num_experts_per_tok: 0,
             moe_intermediate_size: 0,
             shared_expert_intermediate_size: 0,
+            norm_topk_prob: true,
             layer_types: vec![LayerType::LinearAttention, LayerType::FullAttention],
         }
     }
@@ -9835,6 +9836,7 @@ mod kv_cache_pymethod_tests {
             num_experts_per_tok: 0,
             moe_intermediate_size: 0,
             shared_expert_intermediate_size: 0,
+            norm_topk_prob: true,
             layer_types,
         };
         let weights = model::ModelWeights { tensors: HashMap::new() };

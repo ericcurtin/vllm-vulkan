@@ -2855,6 +2855,7 @@ mod dispatch_tests {
             linear_key_head_dim: 4, linear_value_head_dim: 4, linear_conv_kernel_dim: 4,
             intermediate_size: 16 * n, num_experts: 0, num_experts_per_tok: 0,
             moe_intermediate_size: 0, shared_expert_intermediate_size: 0,
+            norm_topk_prob: true,
             layer_types: vec![LinearAttention, FullAttention],
         };
         let h = cfg.hidden_size;

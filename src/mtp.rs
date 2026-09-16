@@ -262,6 +262,7 @@ impl MtpHead {
             top_k: cfg.num_experts_per_tok,
             moe_inter: mi,
             shared_inter: cfg.shared_expert_intermediate_size,
+            norm_topk_prob: cfg.norm_topk_prob,
         };
 
         // head config: identical geometry, forced to one full-attention layer.
@@ -369,6 +370,7 @@ impl MtpHead {
             top_k: cfg.num_experts_per_tok,
             moe_inter: cfg.moe_intermediate_size,
             shared_inter: cfg.shared_expert_intermediate_size,
+            norm_topk_prob: cfg.norm_topk_prob,
         };
         let mut head_cfg = cfg.clone();
         head_cfg.num_hidden_layers = 1;
@@ -476,7 +478,7 @@ impl MtpHead {
             down: get("layers.0.mlp.down_proj.weight")?,
             inter,
         });
-        let dims = MoeDims { hidden: h, num_experts: 0, top_k: 0, moe_inter: 0, shared_inter: 0 };
+        let dims = MoeDims { hidden: h, num_experts: 0, top_k: 0, moe_inter: 0, shared_inter: 0, norm_topk_prob: true };
         let mut head_cfg = cfg.clone();
         head_cfg.num_hidden_layers = 1;
         head_cfg.layer_types = vec![crate::qwen35::LayerType::FullAttention];
@@ -995,6 +997,7 @@ mod tests {
             num_experts_per_tok: 2,
             moe_intermediate_size: 6,
             shared_expert_intermediate_size: 6,
+            norm_topk_prob: true,
             layer_types: vec![LayerType::FullAttention],
         }
     }
@@ -1341,6 +1344,7 @@ mod tests {
             num_experts_per_tok: 0,
             moe_intermediate_size: 0,
             shared_expert_intermediate_size: 0,
+            norm_topk_prob: true,
             layer_types: vec![LayerType::FullAttention],
         }
     }

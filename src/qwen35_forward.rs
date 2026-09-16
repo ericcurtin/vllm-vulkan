@@ -2524,6 +2524,7 @@ impl VulkanModel {
             top_k: cfg.num_experts_per_tok,
             moe_inter: cfg.moe_intermediate_size,
             shared_inter: cfg.shared_expert_intermediate_size,
+            norm_topk_prob: cfg.norm_topk_prob,
         };
         // GPU-resident 4-bit expert path (the decode win): only when the layer's
         // experts are loaded packed (quant_moe) AND the flag is on AND we have an
@@ -3168,7 +3169,7 @@ impl VulkanModel {
         let routings: Vec<moe::Routing> = {
             use rayon::prelude::*;
             (0..t).into_par_iter()
-                .map(|ti| moe::route_from_logits(&logits[ti * e..(ti + 1) * e], top_k))
+                .map(|ti| moe::route_from_logits(&logits[ti * e..(ti + 1) * e], top_k, cfg.norm_topk_prob))
                 .collect()
         };
 
@@ -4114,7 +4115,7 @@ impl VulkanModel {
         }
         let logits = read_f32_buf(&logits_buf, d.num_experts);
         eng.return_to_pool(logits_buf);
-        let routing = moe::route_from_logits(&logits, d.top_k);
+        let routing = moe::route_from_logits(&logits, d.top_k, d.norm_topk_prob);
         prof_add("moe_route_gpu", t_route);
 
         // ── Submit 2: the WHOLE MLP in one command buffer. ─────────────────
@@ -4269,7 +4270,7 @@ impl VulkanModel {
         let t_route = std::time::Instant::now();
         let routing = {
             let m = self.mtp_moe_gpu.as_ref()?;
-            moe::route_par(ff_in, &m.router, h, d.num_experts, d.top_k)
+            moe::route_par(ff_in, &m.router, h, d.num_experts, d.top_k, d.norm_topk_prob)
         };
         prof_add("mtp_moe_route", t_route);
 
@@ -5019,7 +5020,7 @@ impl VulkanModel {
             // ── routing on host: top-8 over E logits (tiny). ────────────────
             let tr = std::time::Instant::now();
             let logits = read_f32_buf(unsafe { &*self.q35r_ptr(Q35R_RLOG) }, e_num);
-            let routing = moe::route_from_logits(&logits, top_k);
+            let routing = moe::route_from_logits(&logits, top_k, cfg.norm_topk_prob);
             if routing.indices.len() != 8 {
                 return None; // guarded by the probe's top_k == 8 check
             }

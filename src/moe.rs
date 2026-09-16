@@ -71,17 +71,19 @@ pub fn expert_swiglu_par(x: &[f32], gate_w: &[f32], up_w: &[f32], down_w: &[f32]
 
 /// Rayon-parallel router (the gate matmul 2048->256 is the cost; top-k is cheap).
 /// Bit-comparable to `route`.
-pub fn route_par(x: &[f32], gate_w: &[f32], hidden: usize, num_experts: usize, top_k: usize) -> Routing {
+pub fn route_par(x: &[f32], gate_w: &[f32], hidden: usize, num_experts: usize, top_k: usize, norm_topk_prob: bool) -> Routing {
     use crate::model::cpu_matvec_par;
     let logits = cpu_matvec_par(x, gate_w, hidden, num_experts);
-    route_from_logits(&logits, top_k)
+    route_from_logits(&logits, top_k, norm_topk_prob)
 }
 
 /// Router tail shared by all logit producers (CPU matmul, rayon matvec, or the
-/// WS2 GPU gate matvec): softmax over all experts, top-k by gate, renormalise
-/// the selected subset. Identical math to the body `route`/`route_par` always
+/// WS2 GPU gate matvec): softmax over all experts, top-k by gate, then — when
+/// `norm_topk_prob` (the HF config flag of that name) — renormalise the
+/// selected subset by its own sum; otherwise the selected softmax gates are
+/// the scores as-is. Identical math to the body `route`/`route_par` always
 /// ran — only the logits source varies.
-pub fn route_from_logits(logits: &[f32], top_k: usize) -> Routing {
+pub fn route_from_logits(logits: &[f32], top_k: usize, norm_topk_prob: bool) -> Routing {
     let num_experts = logits.len();
     let gates = softmax(logits);
     let mut order: Vec<usize> = (0..num_experts).collect();
@@ -91,8 +93,12 @@ pub fn route_from_logits(logits: &[f32], top_k: usize) -> Routing {
     let mut indices: Vec<usize> = order[..top_k].to_vec();
     indices.sort_unstable();
     let sel: Vec<f32> = indices.iter().map(|&i| gates[i]).collect();
-    let sum: f32 = sel.iter().sum();
-    let scores: Vec<f32> = sel.iter().map(|&s| if sum > 0.0 { s / sum } else { 0.0 }).collect();
+    let scores: Vec<f32> = if norm_topk_prob {
+        let sum: f32 = sel.iter().sum();
+        sel.iter().map(|&s| if sum > 0.0 { s / sum } else { 0.0 }).collect()
+    } else {
+        sel
+    };
     Routing { gates, indices, scores }
 }
 
@@ -113,9 +119,9 @@ pub struct Routing {
 /// but since the routed output is an order-independent weighted SUM, only the
 /// SELECTED SET matters for the final output. The returned `indices` are sorted
 /// ascending by expert id for a deterministic, comparable layout.
-pub fn route(x: &[f32], gate_w: &[f32], hidden: usize, num_experts: usize, top_k: usize) -> Routing {
+pub fn route(x: &[f32], gate_w: &[f32], hidden: usize, num_experts: usize, top_k: usize, norm_topk_prob: bool) -> Routing {
     let logits = cpu_matmul(x, gate_w, 1, hidden, num_experts);
-    route_from_logits(&logits, top_k)
+    route_from_logits(&logits, top_k, norm_topk_prob)
 }
 
 /// Per-layer dequantized MoE weights for the CPU reference path.
@@ -144,6 +150,8 @@ pub struct MoeDims {
     pub top_k: usize,
     pub moe_inter: usize,
     pub shared_inter: usize,
+    /// Renormalise the selected top-k gates (HF `norm_topk_prob`).
+    pub norm_topk_prob: bool,
 }
 
 /// Compute one token's MoE output, returning the routing (for validation) and
@@ -152,7 +160,7 @@ pub fn moe_forward_token(x: &[f32], w: &MoeWeights, d: MoeDims) -> (Routing, Vec
     let h = d.hidden;
     let mi = d.moe_inter;
 
-    let routing = route(x, &w.gate, h, d.num_experts, d.top_k);
+    let routing = route(x, &w.gate, h, d.num_experts, d.top_k, d.norm_topk_prob);
 
     // Routed experts: weighted sum of selected SwiGLU expert outputs.
     let mut routed = vec![0.0f32; h];
@@ -197,7 +205,7 @@ pub fn moe_forward_token_rayon(x: &[f32], w: &MoeWeights, d: MoeDims) -> (Routin
     let h = d.hidden;
     let mi = d.moe_inter;
 
-    let routing = route(x, &w.gate, h, d.num_experts, d.top_k);
+    let routing = route(x, &w.gate, h, d.num_experts, d.top_k, d.norm_topk_prob);
 
     let gate_stride = mi * h;
     let down_stride = h * mi;
@@ -312,7 +320,7 @@ pub fn moe_forward_token_quant(
     let p = format!("model.layers.{layer_idx}.mlp");
     let s = |name: &str| weights.f32_slice(&format!("{p}.{name}"));
 
-    let routing = route(x, s("gate.weight"), h, d.num_experts, d.top_k);
+    let routing = route(x, s("gate.weight"), h, d.num_experts, d.top_k, d.norm_topk_prob);
 
     let qg = &q.gate[&layer_idx];
     let qu = &q.up[&layer_idx];
@@ -372,7 +380,7 @@ pub fn moe_forward_token_borrowed(
     let switch_up = s("switch_mlp.up_proj.weight");
     let switch_down = s("switch_mlp.down_proj.weight");
 
-    let routing = route(x, gate_w, h, d.num_experts, d.top_k);
+    let routing = route(x, gate_w, h, d.num_experts, d.top_k, d.norm_topk_prob);
 
     let mut routed = vec![0.0f32; h];
     let gate_stride = mi * h;
@@ -431,5 +439,31 @@ pub fn load_moe_weights(
         shared_up: get(format!("{p}.shared_expert.up_proj.weight")),
         shared_down: get(format!("{p}.shared_expert.down_proj.weight")),
         shared_expert_gate: get(format!("{p}.shared_expert_gate.weight")),
+    }
+}
+
+#[cfg(test)]
+mod router_tests {
+    use super::*;
+
+    /// `norm_topk_prob` (HF config flag): `true` divides the selected softmax
+    /// gates by their sum (the HF `Qwen3_5Moe` router's behaviour, and the
+    /// parse default); `false` leaves them as the raw softmax gates. The
+    /// selected SET is the same either way.
+    #[test]
+    fn route_from_logits_honours_norm_topk_prob() {
+        let logits = [0.1f32, 2.0, -1.0, 1.5, 0.0];
+        let on = route_from_logits(&logits, 2, true);
+        let off = route_from_logits(&logits, 2, false);
+        assert_eq!(on.indices, vec![1, 3]);
+        assert_eq!(off.indices, on.indices);
+        let sum_on: f32 = on.scores.iter().sum();
+        assert!((sum_on - 1.0).abs() < 1e-6, "renormalised scores must sum to 1; got {sum_on}");
+        for (i, &e) in off.indices.iter().enumerate() {
+            assert_eq!(off.scores[i].to_bits(), off.gates[e].to_bits(),
+                       "norm_topk_prob=false must return the raw softmax gate");
+        }
+        let sum_off: f32 = off.scores.iter().sum();
+        assert!(sum_off < 1.0, "raw top-2 gates of 5 experts sum below 1; got {sum_off}");
     }
 }

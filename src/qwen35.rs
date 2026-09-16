@@ -119,6 +119,11 @@ pub struct Qwen35Config {
     pub num_experts_per_tok: usize,
     pub moe_intermediate_size: usize,
     pub shared_expert_intermediate_size: usize,
+    /// Divide the selected top-k router probabilities by their sum (HF
+    /// `norm_topk_prob`). The HF `Qwen3_5Moe` router always renormalises and
+    /// the Qwen3-Next config it descends from defaults this to `true`, so the
+    /// parse default is `true`; a config that sets it `false` is honoured.
+    pub norm_topk_prob: bool,
 
     /// Per-layer attention kind (length == num_hidden_layers).
     pub layer_types: Vec<LayerType>,
@@ -144,6 +149,65 @@ impl Qwen35Config {
         ((self.head_dim as f32) * self.partial_rotary_factor).round() as usize
     }
 
+    /// Structural checks on a parsed config. Every rule here is a division or
+    /// an index the forward performs without a guard: a value that fails one
+    /// is a divide-by-zero or an out-of-bounds panic later, deep inside a
+    /// layer, on a model that has already been built. Refuse at parse time
+    /// with the field and the value named.
+    pub fn validate(&self) -> Result<(), String> {
+        let bad = |field: &str, value: usize, why: &str| -> Result<(), String> {
+            Err(format!("config.json: `{field}` = {value} is not valid. {why}"))
+        };
+        let nonzero = [
+            ("hidden_size", self.hidden_size),
+            ("num_hidden_layers", self.num_hidden_layers),
+            ("vocab_size", self.vocab_size),
+            ("num_attention_heads", self.num_attention_heads),
+            ("num_key_value_heads", self.num_key_value_heads),
+            ("head_dim", self.head_dim),
+            ("linear_num_key_heads", self.linear_num_key_heads),
+            ("linear_num_value_heads", self.linear_num_value_heads),
+            ("linear_key_head_dim", self.linear_key_head_dim),
+            ("linear_value_head_dim", self.linear_value_head_dim),
+            ("linear_conv_kernel_dim", self.linear_conv_kernel_dim),
+        ];
+        for (field, value) in nonzero {
+            if value == 0 {
+                return bad(field, value, "The value must be 1 or more.");
+            }
+        }
+        if !self.num_attention_heads.is_multiple_of(self.num_key_value_heads) {
+            return bad("num_key_value_heads", self.num_key_value_heads,
+                &format!("The value must divide `num_attention_heads` ({}).", self.num_attention_heads));
+        }
+        if !self.linear_num_value_heads.is_multiple_of(self.linear_num_key_heads) {
+            return bad("linear_num_value_heads", self.linear_num_value_heads,
+                &format!("The value must be a multiple of `linear_num_key_heads` ({}).", self.linear_num_key_heads));
+        }
+        if self.layer_types.len() != self.num_hidden_layers {
+            return bad("layer_types", self.layer_types.len(),
+                &format!("The list must have one entry per layer (`num_hidden_layers` = {}).", self.num_hidden_layers));
+        }
+        if self.rotary_dim() == 0 || self.rotary_dim() > self.head_dim {
+            return Err(format!(
+                "config.json: `partial_rotary_factor` = {} is not valid. \
+                 `head_dim` ({}) * `partial_rotary_factor` must be from 1 to `head_dim`.",
+                self.partial_rotary_factor, self.head_dim));
+        }
+        if self.is_moe() {
+            if self.num_experts_per_tok > self.num_experts {
+                return bad("num_experts_per_tok", self.num_experts_per_tok,
+                    &format!("The value must not be more than `num_experts` ({}).", self.num_experts));
+            }
+            if self.moe_intermediate_size == 0 {
+                return bad("moe_intermediate_size", 0, "The value must be 1 or more when `num_experts` > 0.");
+            }
+        } else if self.intermediate_size == 0 {
+            return bad("intermediate_size", 0, "The value must be 1 or more for a dense model.");
+        }
+        Ok(())
+    }
+
     pub fn from_json(v: &serde_json::Value) -> Result<Self, String> {
         // `qwen3_5` ships dims under `text_config` (VL/text-only both); fall back
         // to top level for flattened configs.
@@ -153,6 +217,11 @@ impl Qwen35Config {
 
         let num_attention_heads = req("num_attention_heads")?;
         let hidden_size = req("hidden_size")?;
+        if num_attention_heads == 0 {
+            // Checked here as well as in `validate`: the `head_dim` default
+            // below divides by it.
+            return Err("config.json: `num_attention_heads` = 0 is not valid. The value must be 1 or more.".to_string());
+        }
         let head_dim = u("head_dim").unwrap_or(hidden_size / num_attention_heads);
 
         let layer_types: Vec<LayerType> = tc["layer_types"]
@@ -171,7 +240,7 @@ impl Qwen35Config {
         let partial_rotary_factor =
             rope["partial_rotary_factor"].as_f64().unwrap_or(0.25) as f32;
 
-        Ok(Qwen35Config {
+        let cfg = Qwen35Config {
             hidden_size,
             num_hidden_layers: req("num_hidden_layers")?,
             vocab_size: req("vocab_size")?,
@@ -196,8 +265,11 @@ impl Qwen35Config {
             num_experts_per_tok: u("num_experts_per_tok").unwrap_or(0),
             moe_intermediate_size: u("moe_intermediate_size").unwrap_or(0),
             shared_expert_intermediate_size: u("shared_expert_intermediate_size").unwrap_or(0),
+            norm_topk_prob: tc["norm_topk_prob"].as_bool().unwrap_or(true),
             layer_types,
-        })
+        };
+        cfg.validate()?;
+        Ok(cfg)
     }
 }
 
@@ -291,6 +363,7 @@ pub fn synthetic_hybrid_qwen35(
         num_experts_per_tok: 0,
         moe_intermediate_size: 0,
         shared_expert_intermediate_size: 0,
+        norm_topk_prob: true,
         layer_types: layer_types.clone(),
     };
 
@@ -877,43 +950,67 @@ impl Qwen35Model {
                 ));
             }
         }
-        for s in self.layer_state.iter_mut() {
+        // Phase 1 — parse and check EVERY layer's sections into locals. Nothing
+        // in `self` is written until the whole blob has been accepted: a blob
+        // that fails at layer `n` must leave the model exactly as it was, not
+        // with layers `0..n` overwritten and the rest stale.
+        enum Section {
+            Full { k: Vec<f32>, v: Vec<f32>, n: usize },
+            Linear { conv: Vec<f32>, state: Vec<f32> },
+        }
+        let mut parsed: Vec<Section> = Vec::with_capacity(self.layer_state.len());
+        for (si, s) in self.layer_state.iter().enumerate() {
             match s {
                 LayerState::Full(c) => {
                     let k = read_f32_section(blob, &mut pos)?;
                     let v = read_f32_section(blob, &mut pos)?;
                     if k.len() != v.len() {
-                        return Err("import_prefix: K/V section length mismatch".to_string());
+                        return Err(format!("import_prefix: layer {si} K/V section length mismatch"));
                     }
                     let stride = c.num_kv_heads * c.head_dim;
                     if stride == 0 || k.len() % stride != 0 {
-                        return Err("import_prefix: K section length not a multiple of stride".to_string());
+                        return Err(format!(
+                            "import_prefix: layer {si} K section length not a multiple of stride"));
                     }
                     let n = k.len() / stride;
                     if n != seq_len {
                         return Err(format!(
-                            "import_prefix: full-attn section length ({n} tok) != header seq_len ({seq_len})"
+                            "import_prefix: layer {si} full-attn section length ({n} tok) != header seq_len ({seq_len})"
                         ));
                     }
                     if n > c.max_seq_len {
                         return Err(format!(
-                            "import_prefix: prefix length {n} exceeds max_seq_len {}",
+                            "import_prefix: layer {si} prefix length {n} exceeds max_seq_len {}",
                             c.max_seq_len
                         ));
                     }
-                    c.k[..k.len()].copy_from_slice(&k);
-                    c.v[..v.len()].copy_from_slice(&v);
-                    c.seq_len = n;
+                    parsed.push(Section::Full { k, v, n });
                 }
                 LayerState::Linear(d) => {
                     let conv = read_f32_section(blob, &mut pos)?;
                     let state = read_f32_section(blob, &mut pos)?;
                     if conv.len() != d.conv_state.len() || state.len() != d.state.len() {
-                        return Err("import_prefix: DeltaNet state size mismatch".to_string());
+                        return Err(format!("import_prefix: layer {si} DeltaNet state size mismatch"));
                     }
+                    parsed.push(Section::Linear { conv, state });
+                }
+            }
+        }
+        // Phase 2 — commit. Every section above matched its layer's shape, so
+        // no write below can fail.
+        for (s, sec) in self.layer_state.iter_mut().zip(parsed) {
+            match (s, sec) {
+                (LayerState::Full(c), Section::Full { k, v, n }) => {
+                    c.k[..k.len()].copy_from_slice(&k);
+                    c.v[..v.len()].copy_from_slice(&v);
+                    c.seq_len = n;
+                }
+                (LayerState::Linear(d), Section::Linear { conv, state }) => {
                     d.conv_state.copy_from_slice(&conv);
                     d.state.copy_from_slice(&state);
                 }
+                // Phase 1 pushed one section per layer, of that layer's kind.
+                _ => unreachable!("import_prefix: section kind does not match layer kind"),
             }
         }
         Ok(seq_len)
@@ -1591,6 +1688,7 @@ impl Qwen35Model {
             top_k: cfg.num_experts_per_tok,
             moe_inter: cfg.moe_intermediate_size,
             shared_inter: cfg.shared_expert_intermediate_size,
+            norm_topk_prob: cfg.norm_topk_prob,
         };
         let (_routing, out) = if self.quant_moe.gate.contains_key(&layer_idx) {
             // 4-bit-resident experts: dequant only the routed ones on the fly.
@@ -1656,6 +1754,7 @@ mod spec_rollback_tests {
             num_experts_per_tok: 0,
             moe_intermediate_size: 0,
             shared_expert_intermediate_size: 0,
+            norm_topk_prob: true,
             layer_types: vec![LayerType::LinearAttention, LayerType::FullAttention],
         };
         let key_dim = nk * kd;
@@ -1980,6 +2079,7 @@ pub(crate) mod kv_prefix_tests {
             num_experts_per_tok: 0,
             moe_intermediate_size: 0,
             shared_expert_intermediate_size: 0,
+            norm_topk_prob: true,
             layer_types,
         };
         let weights = ModelWeights { tensors: HashMap::new() };
@@ -2160,6 +2260,83 @@ pub(crate) mod kv_prefix_tests {
         assert!(err.contains("bad magic"), "unexpected error: {err}");
     }
 
+    /// Every layer's live state, bit-for-bit (K/V planes in full, not just the
+    /// prefix; `seq_len`; DeltaNet conv + state).
+    fn snapshot_all(m: &Qwen35Model) -> Vec<(usize, Vec<u32>, Vec<u32>)> {
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+        m.layer_state.iter().map(|s| match s {
+            LayerState::Full(c) => (c.seq_len, bits(&c.k), bits(&c.v)),
+            LayerState::Linear(d) => (usize::MAX, bits(&d.conv_state), bits(&d.state)),
+        }).collect()
+    }
+
+    /// `import_prefix` used to write layer `i`'s sections into `self` as soon
+    /// as they parsed, so a blob that failed at layer `n` left layers `0..n`
+    /// overwritten and the rest stale — a half-imported cache with no error
+    /// path back. It now parses every section first and commits only when the
+    /// whole blob is accepted: a failure at the LAST layer must leave the model
+    /// byte-identical to how it was, and the same blob must still import when
+    /// intact.
+    #[test]
+    fn import_prefix_failure_leaves_the_model_unchanged() {
+        let layer_types = vec![
+            LayerType::LinearAttention,
+            LayerType::FullAttention,
+            LayerType::LinearAttention,
+        ];
+        // Source model: populated, exported.
+        let mut src = build_hybrid(layer_types.clone());
+        populate(&mut src, 4, 7);
+        let blob = src.export_prefix(4).expect("export_prefix must succeed");
+
+        // Destination model: a DIFFERENT state (scribbled), snapshotted.
+        let mut dst = build_hybrid(layer_types.clone());
+        scribble(&mut dst, 0x5EED);
+        let before = snapshot_all(&dst);
+
+        // (a) Cut the tail so layers 0 and 1 parse and layer 2 (the last
+        //     linear layer's `state` section) is truncated.
+        let cut = blob.len() - 8;
+        let err = dst.import_prefix(&blob[..cut]).expect_err("a truncated blob must be rejected");
+        assert!(err.contains("truncated"), "unexpected error: {err}");
+        assert_eq!(snapshot_all(&dst), before,
+                   "a rejected import must leave every layer's state exactly as it was");
+
+        // (b) A section-length corruption at the last layer: patch the final
+        //     section's u64 length word so the DeltaNet size check fails.
+        let mut bad = blob.clone();
+        let n = bad.len();
+        // Walk back over the final section: [u64 len][len bytes]. Its len is
+        // `state.len() * 4`; find the len word by reading the model's shape.
+        let state_len = match &dst.layer_state[2] {
+            LayerState::Linear(d) => d.state.len() * 4,
+            _ => unreachable!(),
+        };
+        let len_at = n - state_len - 8;
+        let stored = u64::from_le_bytes(bad[len_at..len_at + 8].try_into().unwrap()) as usize;
+        assert_eq!(stored, state_len, "test walked to the wrong length word");
+        // Shrink the declared length by one f32 (keeps it a multiple of 4).
+        bad[len_at..len_at + 8].copy_from_slice(&((state_len - 4) as u64).to_le_bytes());
+        let err = dst.import_prefix(&bad).expect_err("a mis-sized last section must be rejected");
+        assert!(err.contains("layer 2 DeltaNet state size mismatch"), "unexpected error: {err}");
+        assert_eq!(snapshot_all(&dst), before,
+                   "a rejected import must leave every layer's state exactly as it was");
+
+        // (c) The intact blob still imports, and lands the exported state.
+        let loaded = dst.import_prefix(&blob).expect("the intact blob must import");
+        assert_eq!(loaded, 4);
+        let src_snap = snapshot_all(&src);
+        for (li, (d, s)) in snapshot_all(&dst).iter().zip(src_snap.iter()).enumerate() {
+            // Full layers: only the prefix rows are defined by the blob; the
+            // DeltaNet layers are compared whole.
+            if d.0 == usize::MAX {
+                assert_eq!(d, s, "layer {li}: DeltaNet state must match the source");
+            } else {
+                assert_eq!(d.0, s.0, "layer {li}: seq_len must match the source");
+            }
+        }
+    }
+
     /// A 2-layer hybrid stage WITH real weights, sufficient to drive
     /// `delta_net`/`gated_attention` directly (same recipe as
     /// `spec_rollback_tests::build_model`) — needed only by the
@@ -2190,6 +2367,7 @@ pub(crate) mod kv_prefix_tests {
             num_experts_per_tok: 0,
             moe_intermediate_size: 0,
             shared_expert_intermediate_size: 0,
+            norm_topk_prob: true,
             layer_types: vec![LayerType::LinearAttention, LayerType::FullAttention],
         };
         let key_dim = nk * kd;
@@ -2395,6 +2573,7 @@ mod kv_boundary_snapshot_tests {
             num_experts_per_tok: 0,
             moe_intermediate_size: 0,
             shared_expert_intermediate_size: 0,
+            norm_topk_prob: true,
             layer_types: vec![LayerType::LinearAttention],
         };
         let key_dim = nk * kd;
@@ -2825,6 +3004,93 @@ mod shader_guard {
                 magic, 0x0723_0203,
                 "{name}: bad SPIR-V magic 0x{magic:08x} (expected 0x07230203)"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod config_validation_tests {
+    //! `Qwen35Config::from_json` structural checks. Each rejected shape below
+    //! is a value the forward divides by or indexes with unguarded; the loader
+    //! used to accept it and the model panicked later, deep inside a layer.
+    use super::*;
+    use serde_json::{json, Value};
+
+    /// A minimal, VALID `qwen3_5` text config (dense, 2 layers).
+    fn good() -> Value {
+        json!({
+            "text_config": {
+                "hidden_size": 16,
+                "num_hidden_layers": 2,
+                "vocab_size": 32,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 4,
+                "linear_num_key_heads": 1,
+                "linear_num_value_heads": 2,
+                "linear_key_head_dim": 4,
+                "linear_value_head_dim": 4,
+                "linear_conv_kernel_dim": 3,
+                "intermediate_size": 12,
+                "layer_types": ["linear_attention", "full_attention"],
+                "rope_parameters": { "rope_theta": 1e7, "partial_rotary_factor": 0.5 }
+            }
+        })
+    }
+
+    fn with(mut v: Value, key: &str, val: Value) -> Value {
+        v["text_config"][key] = val;
+        v
+    }
+
+    #[test]
+    fn from_json_accepts_a_well_formed_config() {
+        let cfg = Qwen35Config::from_json(&good()).expect("the good config must parse");
+        assert_eq!(cfg.num_hidden_layers, 2);
+        assert_eq!(cfg.layer_types, vec![LayerType::LinearAttention, LayerType::FullAttention]);
+        assert!(cfg.norm_topk_prob, "HF default: the Qwen3.5 MoE router renormalises top-k");
+    }
+
+    #[test]
+    fn from_json_reads_norm_topk_prob_from_the_config() {
+        let cfg = Qwen35Config::from_json(&with(good(), "norm_topk_prob", json!(false))).expect("parse");
+        assert!(!cfg.norm_topk_prob, "an explicit `false` must be honoured, not assumed `true`");
+        let cfg = Qwen35Config::from_json(&with(good(), "norm_topk_prob", json!(true))).expect("parse");
+        assert!(cfg.norm_topk_prob);
+    }
+
+    #[test]
+    fn from_json_rejects_structurally_invalid_configs() {
+        let cases: Vec<(&str, Value, &str)> = vec![
+            // divide-by-zero in the `head_dim` default and every per-head split
+            ("num_attention_heads = 0", with(good(), "num_attention_heads", json!(0)), "`num_attention_heads` = 0"),
+            // GQA ratio
+            ("num_key_value_heads does not divide heads", with(good(), "num_key_value_heads", json!(3)), "`num_key_value_heads` = 3"),
+            // `layer_types[g]` index panic in `new_range`
+            ("layer_types shorter than num_hidden_layers", with(good(), "layer_types", json!(["linear_attention"])), "`layer_types` = 1"),
+            ("layer_types longer than num_hidden_layers",
+             with(good(), "layer_types", json!(["linear_attention", "full_attention", "full_attention"])), "`layer_types` = 3"),
+            // `nv / nk` ratio in the delta rule
+            ("linear_num_value_heads not a multiple of key heads",
+             with(with(good(), "linear_num_key_heads", json!(2)), "linear_num_value_heads", json!(3)), "`linear_num_value_heads` = 3"),
+            ("linear_num_key_heads = 0", with(good(), "linear_num_key_heads", json!(0)), "`linear_num_key_heads` = 0"),
+            // conv window `kernel - 1` and the conv1d slice
+            ("linear_conv_kernel_dim = 0", with(good(), "linear_conv_kernel_dim", json!(0)), "`linear_conv_kernel_dim` = 0"),
+            ("hidden_size = 0", with(good(), "hidden_size", json!(0)), "`hidden_size` = 0"),
+            ("vocab_size = 0", with(good(), "vocab_size", json!(0)), "`vocab_size` = 0"),
+            ("head_dim = 0", with(good(), "head_dim", json!(0)), "`head_dim` = 0"),
+            // rotary_dim > head_dim slices past the head
+            ("partial_rotary_factor > 1", with(good(), "rope_parameters", json!({"partial_rotary_factor": 2.0})), "`partial_rotary_factor` = 2"),
+            // MoE: more routed experts than exist
+            ("num_experts_per_tok > num_experts",
+             with(with(with(good(), "num_experts", json!(4)), "num_experts_per_tok", json!(8)), "moe_intermediate_size", json!(8)),
+             "`num_experts_per_tok` = 8"),
+            ("dense model with intermediate_size = 0", with(good(), "intermediate_size", json!(0)), "`intermediate_size` = 0"),
+        ];
+        for (case, v, expect) in cases {
+            let err = Qwen35Config::from_json(&v).expect_err(&format!("{case}: must be rejected at parse"));
+            assert!(err.contains(expect) && err.contains("is not valid"),
+                    "{case}: the error must name the field and the value; got: {err}");
         }
     }
 }
