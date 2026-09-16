@@ -1136,19 +1136,55 @@ impl VulkanModel {
             }).collect()
         }
     }
-    /// Phase 2: GPU-accelerated qwen3_5 (Qwen3.6) forward for one token.
+    /// Refuse token ids that `q35_embed_row` cannot serve — at the pyo3 seam,
+    /// BEFORE any resident KV / GDN / ring state moves.
     ///
-    /// Mirrors `qwen35::Qwen35Model::forward` EXACTLY, but routes the large
-    /// projection matmuls (GatedDeltaNet in_proj_*/out_proj, GatedAttention
-    /// q/k/v/o_proj, dense MLP gate/up/down_proj, lm_head) to the GPU via
-    /// `qwen35_matvec*`. The cheap per-token math — depthwise conv1d, the
-    /// delta-rule recurrence, gated/RMS norms, partial RoPE, the SDPA — runs on
-    /// the CPU and replicates `qwen35.rs` bit-for-bit (f32). Per layer the
-    /// independent projections share their input and collapse to FEW submits.
+    /// `tokens` comes straight from Python. `q35_embed_row` slices the embed
+    /// table with it, so an id `>= vocab` (or past the rows the resident table
+    /// actually holds) is a slice panic that aborts through the pyo3 boundary,
+    /// and every seam that embeds mid-loop would have advanced state for the
+    /// positions before it. This is the ONE check every embedding seam calls
+    /// (`forward_pp_qwen35_impl`, `forward_pp_qwen35_prefill`,
+    /// `qwen35_embed_prompt`, `forward_qwen35_prefill_impl`,
+    /// `forward_qwen35_verify_impl`, `forward_tp_qwen35_verify_impl`,
+    /// `qwen35_tp_forward_normed`, and — as `q35_check_tokens_msg` — the
+    /// `GpuResult` seam `forward_rs`); grep for both to audit coverage. `who`
+    /// names the seam in the error.
+    pub(crate) fn q35_check_tokens(&self, who: &str, tokens: &[u32]) -> PyResult<()> {
+        self.q35_check_tokens_msg(who, tokens).map_err(PyRuntimeError::new_err)
+    }
+
+    /// `q35_check_tokens` for seams that do not speak `PyErr` (`forward_rs`).
+    pub(crate) fn q35_check_tokens_msg(&self, who: &str, tokens: &[u32]) -> Result<(), String> {
+        let m = self.qwen35.as_ref()
+            .ok_or_else(|| format!("{who} needs a qwen3_5 model"))?;
+        let vocab = m.config.vocab_size;
+        let h = m.config.hidden_size.max(1);
+        // The bound is the smaller of the config vocab and the rows the
+        // resident table holds (a lean load can carry a shorter table).
+        let rows = if let Some(pe) = m.embed_packed.as_ref() {
+            pe.vocab.min(vocab)
+        } else if let Some(w) = self.q35_f16_host.get("model.embed_tokens.weight") {
+            (w.len() / h).min(vocab)
+        } else {
+            return Err(format!(
+                "{who}: the qwen3_5 embedding table is not loaded. \
+                 Load a stage that owns `model.embed_tokens` (the first PP stage)."));
+        };
+        if let Some(&tok) = tokens.iter().find(|&&tok| tok as usize >= rows) {
+            return Err(format!(
+                "{who}: token id {tok} is out of range. \
+                 The embedding table has {rows} rows (vocab_size {vocab}). \
+                 Give a token id below {rows}."));
+        }
+        Ok(())
+    }
+
     /// f32 embedding row for `token_id` (`h` elems). Prefers the packed-4bit
     /// resident embed (per-row on-demand mlx-affine decode, bit-exact to the old
     /// whole-table f16 path); falls back to the legacy whole f16 host table.
     /// This is the single embed-lookup accessor for every qwen3_5 forward.
+    /// Callers validate `token_id` with `q35_check_tokens` first.
     pub(crate) fn q35_embed_row(&self, token_id: usize, h: usize) -> Vec<f32> {
         if let Some(q) = self.qwen35.as_ref() {
             if let Some(pe) = q.embed_packed.as_ref() {
@@ -1167,6 +1203,14 @@ impl VulkanModel {
 
     /// One qwen3_5-hybrid DECODE token on the GPU: embed, this stage's layers,
     /// final norm, lm_head — returning full `[vocab]` logits.
+    ///
+    /// Mirrors `qwen35::Qwen35Model::forward` EXACTLY, but routes the large
+    /// projection matmuls (GatedDeltaNet in_proj_*/out_proj, GatedAttention
+    /// q/k/v/o_proj, dense MLP gate/up/down_proj, lm_head) to the GPU via
+    /// `qwen35_matvec*`. The cheap per-token math — depthwise conv1d, the
+    /// delta-rule recurrence, gated/RMS norms, partial RoPE, the SDPA — runs on
+    /// the CPU and replicates `qwen35.rs` bit-for-bit (f32). Per layer the
+    /// independent projections share their input and collapse to FEW submits.
     ///
     /// The layer span is `[pp_start, pp_end)`, this rank's PP stage, NOT the
     /// whole network; a non-last stage's return value is not a logit vector any
@@ -1272,6 +1316,10 @@ impl VulkanModel {
         let (first, last) = (self.pp_first, self.pp_last);
 
         // First stage embeds the token (no scaling); else continue from hidden_in.
+        // Validate the id BEFORE the embed slice and before any layer state moves.
+        if first {
+            self.q35_check_tokens("forward_pp_qwen35", &[token_id])?;
+        }
         let mut hidden: Vec<f32> = if first {
             self.q35_embed_row(token_id as usize, h)
         } else {
@@ -3413,6 +3461,22 @@ impl VulkanModel {
         let h = cfg.hidden_size;
         let eps = cfg.rms_norm_eps;
         let vocab = cfg.vocab_size;
+        let (pp_start, pp_end, pp_last) = (self.pp_start, self.pp_end, self.pp_last);
+
+        // Validate every token BEFORE the embed slice and before
+        // `forward_pp_range_batched` advances the resident KV / GDN state.
+        self.q35_check_tokens("forward_qwen35_prefill", &tokens)?;
+        // The CPU-fallback last stage reads the f16-host lm_head only AFTER
+        // `forward_pp_range_batched` has advanced the state. A missing table
+        // there used to `expect` (an abort through the pyo3 boundary) on a model
+        // that had already moved. Check it here, while nothing has changed —
+        // the same hoist `forward_qwen35_verify_core` does.
+        let lm_name = self.qwen35.as_ref().unwrap().lm_head_name.clone();
+        if self.engine.is_none() && pp_last && !self.q35_f16_host.contains_key(&lm_name) {
+            return Err(PyRuntimeError::new_err(format!(
+                "forward_qwen35_prefill: qwen3_5 lm_head f16 host missing \
+                 (prefill CPU-fallback last stage, '{lm_name}')")));
+        }
 
         // Embed all T tokens -> hidden[T,h]. `embed_tokens` is ALWAYS split
         // into the f16 host table (`q35_f16_host`, per `want_f16` in
@@ -3445,7 +3509,6 @@ impl VulkanModel {
         // non-last stage returns the raw stage-output hidden `[T,h]` (the
         // inter-stage batched-prefill HOP that would consume this on the next
         // stage is NOT wired yet; that's a separate, larger follow-up item).
-        let (pp_start, pp_end, pp_last) = (self.pp_start, self.pp_end, self.pp_last);
         if self.engine.is_none() {
             let qm = self.qwen35.as_mut().unwrap();
             hidden = qm.forward_pp_range_batched(&hidden, start_pos, t, pp_start, pp_end);
@@ -3455,15 +3518,15 @@ impl VulkanModel {
             let norm_w = qm.weights.f32_slice("model.norm.weight").to_vec();
             let last = &hidden[(t - 1) * h..t * h];
             let normed = model::cpu_rms_norm(last, &norm_w, eps);
-            let lm_name = qm.lm_head_name.clone();
             // lm_head is ALWAYS split into the f16 host table by the loader
             // (`want_f16` in `load_qwen35_weights_split` is unconditional on
             // engine presence), never `weights.f32_slice` — mirrors the
             // GPU-resident path's `qwen35_matvec` f16-host fallback tier, and
             // is what the (engine-less) decode path effectively falls back to
-            // as well.
+            // as well. Presence was checked above, before the state advanced.
             let lm_w = self.q35_f16_host.get(&lm_name)
-                .expect("qwen3_5 lm_head f16 host missing (prefill CPU-fallback last stage)");
+                .ok_or_else(|| PyRuntimeError::new_err(
+                    "forward_qwen35_prefill: qwen3_5 lm_head f16 host missing"))?;
             let lm_f32: Vec<f32> = lm_w.iter().map(|&b| half::f16::from_bits(b).to_f32()).collect();
             return Ok(model::cpu_matmul(&normed, &lm_f32, 1, h, vocab));
         }
@@ -3576,17 +3639,18 @@ impl VulkanModel {
         let h = self.qwen35.as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("forward_qwen35_verify needs a qwen3_5 model"))?
             .config.hidden_size;
-        // Embed all T tokens -> hidden[T,h], f16 host table (identical to
-        // `forward_qwen35_prefill_impl`; the resident/first stage owns embed).
+        // Validate every id BEFORE the embed slice; `forward_qwen35_verify_core`
+        // sets `spec_verify_span` and advances state, so a panic here would
+        // have aborted through the pyo3 boundary (and an `Err` raised later
+        // would leave a pending span behind).
+        self.q35_check_tokens("forward_qwen35_verify", &tokens)?;
+        // Embed all T tokens -> hidden[T,h] through the single embed accessor
+        // (identical to `forward_qwen35_prefill_impl`; the resident/first stage
+        // owns embed).
         let hidden: Vec<f32> = {
-            let w = self.q35_f16_host.get("model.embed_tokens.weight")
-                .expect("qwen3_5 embed_tokens f16 host missing (verify first stage)");
             let mut hv = vec![0.0f32; t * h];
             for (ti, &tok) in tokens.iter().enumerate() {
-                hv[ti * h..(ti + 1) * h]
-                    .iter_mut()
-                    .zip(&w[tok as usize * h..(tok as usize + 1) * h])
-                    .for_each(|(dst, &b)| *dst = half::f16::from_bits(b).to_f32());
+                hv[ti * h..(ti + 1) * h].copy_from_slice(&self.q35_embed_row(tok as usize, h));
             }
             hv
         };
@@ -3613,6 +3677,19 @@ impl VulkanModel {
         let eps = cfg.rms_norm_eps;
         let vocab = cfg.vocab_size;
         let (pp_start, pp_end, pp_last) = (self.pp_start, self.pp_end, self.pp_last);
+        // `t == 0` underflows the `(t - 1) * h` last-row slices below (and in
+        // `stash_verify_prenorm`); a `hidden` that is not `[t, h]` slices past
+        // its end. Both reach here from Python via `pp_step_qwen35_verify`'s
+        // non-first stage, which passes `t` unguarded — refuse before any
+        // state moves, the way the first stage (`forward_qwen35_verify_impl`)
+        // already does.
+        if t == 0 {
+            return Err(PyRuntimeError::new_err("forward_qwen35_verify: empty verify batch (t must be >= 1)"));
+        }
+        if hidden.len() != t * h {
+            return Err(PyRuntimeError::new_err(format!(
+                "forward_qwen35_verify: hidden.len()={} != t*h={} (t={t}, h={h})", hidden.len(), t * h)));
+        }
         // The CPU-fallback last stage below reads the f16-host lm_head AFTER
         // `forward_pp_range_batched_capture` has advanced the resident KV and
         // GDN state, and it read it with an `expect` — a missing table aborted

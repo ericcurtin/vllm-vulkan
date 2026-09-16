@@ -6533,6 +6533,9 @@ impl VulkanModel {
         // (CPU, Phase 1; GPU = forward_qwen35_gpu, Phase 2).
         #[cfg(feature = "qwen35")]
         if self.qwen35.is_some() {
+            // Both forwards below embed `token_id` unguarded; refuse an id the
+            // table cannot serve before any layer state moves.
+            self.q35_check_tokens_msg("forward", &[token_id]).map_err(gpu_error::GpuError::from)?;
             // Phase 2: GPU projections when opted in and the engine exists; else
             // the CPU reference forward. (embed/lm_head live f16 in q35_f16_host,
             // so the CPU path is forward_qwen35_cpu_ref, not Qwen35Model::forward

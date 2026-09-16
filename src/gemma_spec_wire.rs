@@ -338,6 +338,32 @@ pub fn recompute_seed_hidden(
     Ok(normed)
 }
 
+/// Refuse token ids the target's embedding lookup cannot serve, BEFORE any
+/// KV cache is truncated or advanced.
+///
+/// `embed_and_ple` slices `model.embed_tokens.weight` with the id, so an id
+/// `>= vocab` is a slice panic — and in `spec_decode_gemma` the first thing
+/// that runs before it is `recompute_seed_hidden`, which truncates EVERY KV
+/// cache to `start_pos - 1` first. The bound is the smaller of the config
+/// vocab and the rows the resident table holds. `who` names the seam.
+pub fn gemma_check_tokens(target: &Gemma4Model, who: &str, tokens: &[u32]) -> Result<(), String> {
+    const EMBED: &str = "model.embed_tokens.weight";
+    let vocab = target.config.vocab_size;
+    let h = target.config.hidden_size.max(1);
+    let rows = if target.weights.contains(EMBED) {
+        (target.weights.f32_slice(EMBED).len() / h).min(vocab)
+    } else {
+        vocab
+    };
+    if let Some(&tok) = tokens.iter().find(|&&tok| tok as usize >= rows) {
+        return Err(format!(
+            "{who}: token id {tok} is out of range. \
+             The embedding table has {rows} rows (vocab_size {vocab}). \
+             Give a token id below {rows}."));
+    }
+    Ok(())
+}
+
 /// THE PRODUCTION DRIVER. Generates exactly `cfg.max_new_tokens` tokens from
 /// `start_bonus` at `start_pos`, drafting with the real EAGLE drafter and
 /// verifying with the target's batched verify.
@@ -364,6 +390,10 @@ pub fn spec_decode_gemma(
         return Err("spec_decode_gemma: start_pos must be >= 1 (the first block's drafter seed is \
                     the hidden at start_pos-1, which needs a prefilled prompt)".to_string());
     }
+    // Both ids are embedded by the target: `prompt_last_token` by the seed
+    // recompute (which truncates every KV cache FIRST), `start_bonus` by the
+    // first verify. Refuse before either touches state.
+    gemma_check_tokens(target, "spec_decode_gemma", &[prompt_last_token, start_bonus])?;
     if cfg.max_new_tokens == 0 {
         return Ok(SpecDecodeReport { tokens: Vec::new(), blocks: 0, drafted: 0, accepted: 0 });
     }

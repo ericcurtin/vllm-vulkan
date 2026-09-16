@@ -1948,6 +1948,51 @@ mod tests {
     /// short run and abort a long one.
     ///
     /// Everything else here is the working pairing: only `vocab_size` moves.
+    /// `gemma_spec_generate`'s `prompt_last_token` / `start_token` reach
+    /// `spec_decode_gemma` straight from Python. An id `>= vocab` used to get
+    /// as far as `recompute_seed_hidden`, which truncates EVERY KV cache to
+    /// `start_pos - 1` before embedding — and then panicked in `embed_and_ple`
+    /// on the embed-table slice, through the pyo3 boundary, on a target whose
+    /// caches had just been cut. Both ids must be refused first, with the
+    /// caches left exactly where they were.
+    #[test]
+    fn gemma_spec_wire_refuses_an_out_of_range_token_before_touching_the_kv() {
+        let mut f = build_fixture(SPEC_BASELINE_LEN);
+        f.rewind();
+        let drafter = crate::gemma_spec_wire::SpecDrafter::from_parts(
+            f.acfg.clone(), f.aw.clone(), &f.model).expect("drafter");
+        let cfg = SpecConfig { k: SPEC_K, max_new_tokens: SPEC_N };
+        let vocab = f.model.config.vocab_size as u32;
+        let before: Vec<(usize, Vec<f32>, Vec<f32>)> = f.model.kv_caches.iter()
+            .map(|c| (c.seq_len, c.k.clone(), c.v.clone())).collect();
+        let unchanged = |model: &Gemma4Model, case: &str| {
+            for (li, (c, (n, k, v))) in model.kv_caches.iter().zip(before.iter()).enumerate() {
+                assert_eq!(c.seq_len, *n, "{case}: layer {li}: frontier moved");
+                assert_eq!(&c.k, k, "{case}: layer {li}: K bytes changed");
+                assert_eq!(&c.v, v, "{case}: layer {li}: V bytes changed");
+            }
+        };
+
+        // (a) prompt_last_token at vocab (the seed-recompute embed).
+        let e = crate::gemma_spec_wire::spec_decode_gemma(
+            &mut f.model, &drafter, crate::gemma_spec_wire::SeedSource::Recompute,
+            vocab, f.start_bonus, f.start_pos, &cfg,
+        ).expect_err("prompt_last_token == vocab must be refused");
+        assert!(e.contains(&format!("token id {vocab} is out of range")), "got: {e}");
+        unchanged(&f.model, "prompt_last_token");
+
+        // (b) start_token at vocab (the first verify's embed).
+        let e = crate::gemma_spec_wire::spec_decode_gemma(
+            &mut f.model, &drafter, crate::gemma_spec_wire::SeedSource::Recompute,
+            *f.prompt.last().unwrap(), vocab, f.start_pos, &cfg,
+        ).expect_err("start_token == vocab must be refused");
+        assert!(e.contains(&format!("token id {vocab} is out of range")), "got: {e}");
+        unchanged(&f.model, "start_token");
+
+        // (c) the last valid id is still accepted by the check itself.
+        crate::gemma_spec_wire::gemma_check_tokens(&f.model, "test", &[vocab - 1]).expect("vocab-1 is in range");
+    }
+
     #[test]
     fn gemma_spec_wire_refuses_a_drafter_whose_vocab_is_not_the_targets() {
         let f = build_fixture(2);

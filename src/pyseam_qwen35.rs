@@ -458,6 +458,12 @@ impl VulkanModel {
             return Err(PyRuntimeError::new_err(format!(
                 "forward_pp_qwen35_prefill: tokens.len()={} < seq={seq}", tokens.len())));
         }
+        if first {
+            // Every id, BEFORE the teacher-forced loop below advances the
+            // resident state position by position — `forward_pp_qwen35_impl`
+            // checks only the one id it embeds.
+            self.q35_check_tokens("forward_pp_qwen35_prefill", &tokens[..seq])?;
+        }
         let mut out: Vec<f32> = if last { Vec::new() } else { Vec::with_capacity(seq * h) };
         for pos in 0..seq {
             let step = if first {
@@ -497,6 +503,7 @@ impl VulkanModel {
         let h = self.qwen35.as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("qwen35_embed_prompt needs a qwen3_5 model"))?
             .config.hidden_size;
+        self.q35_check_tokens("qwen35_embed_prompt", &tokens)?;
         let mut hv = vec![0.0f32; tokens.len() * h];
         for (ti, &tok) in tokens.iter().enumerate() {
             hv[ti * h..(ti + 1) * h].copy_from_slice(&self.q35_embed_row(tok as usize, h));
@@ -865,6 +872,15 @@ impl VulkanModel {
             .config.hidden_size;
         let comm = self.collective_comm as *mut std::os::raw::c_void;
         let (do_recv, is_last) = pp_step_role(recv_from, send_to);
+        // The first stage infers T from `tokens.len()` and refuses an empty
+        // batch inside `forward_qwen35_verify_impl`. A recv stage takes `t`
+        // straight from Python: `t == 0` would recv nothing and then underflow
+        // `(t - 1) * h` in the verify core. Mirror the first stage's guard
+        // BEFORE the wire op.
+        if do_recv && t == 0 {
+            return Err(PyRuntimeError::new_err(
+                "pp_step_qwen35_verify: empty verify batch (t must be >= 1 on a recv stage)"));
+        }
 
         // 1) First stage embeds `tokens`; mid/last stages recv the previous
         //    stage's [T*h] hidden (GIL dropped inside recv_f32).
@@ -1035,6 +1051,7 @@ impl VulkanModel {
             }
         };
 
+        self.q35_check_tokens("forward_tp_qwen35", &[token_id])?;
         let mut hidden: Vec<f32> = self.q35_embed_row(token_id as usize, h);
 
         // Q35_TP_FUSED (default ON as of 2026-07-25; =0 for host oracle): collapse
@@ -1152,15 +1169,13 @@ impl VulkanModel {
         }
         // Validate BEFORE `spec_verify_span` is set: `tokens` comes straight from
         // Python, and a panic below would abort through the pyo3 boundary having
-        // already left a pending verify span behind.
-        let embed_w = self.q35_f16_host.get("model.embed_tokens.weight")
-            .ok_or_else(|| PyRuntimeError::new_err(
-                "forward_tp_qwen35_verify: qwen3_5 embed_tokens f16 host missing"))?;
-        if let Some(&tok) = tokens.iter().find(|&&tok| (tok as usize + 1) * h > embed_w.len()) {
-            return Err(PyRuntimeError::new_err(format!(
-                "forward_tp_qwen35_verify: token id {tok} is outside the embedding table \
-                 ({} rows of {h}, vocab {vocab})", embed_w.len() / h.max(1))));
+        // already left a pending verify span behind. The embed below reads the
+        // f16 host table directly, so require that table (not the packed embed).
+        if !self.q35_f16_host.contains_key("model.embed_tokens.weight") {
+            return Err(PyRuntimeError::new_err(
+                "forward_tp_qwen35_verify: qwen3_5 embed_tokens f16 host missing"));
         }
+        self.q35_check_tokens("forward_tp_qwen35_verify", &tokens)?;
 
         // The CPU-fallback branch below reads the f16-host lm_head, but only
         // AFTER `forward_pp_range_batched_capture` has advanced the resident KV
@@ -1497,7 +1512,7 @@ mod pyseam_qwen35_input_tests {
             let mut vm = crate::qwen35_prefill_tests::tiny_qwen35_vulkan_model();
             let e = vm.forward_tp_qwen35_verify_impl(py, vec![0, crate::qwen35_prefill_tests::VOCAB as u32], 0, py.None())
                 .expect_err("a token id at vocab_size must be refused");
-            assert!(format!("{e}").contains("outside the embedding table"), "got: {e}");
+            assert!(format!("{e}").contains("token id 12 is out of range"), "got: {e}");
             // ...and the refusal must not leave a pending verify span behind,
             // which a panic at the embed slice would have done.
             assert!(vm.spec_verify_span.is_none(),
@@ -1568,6 +1583,148 @@ mod pyseam_qwen35_input_tests {
         let ok = vm.forward_qwen35_verify_core(vec![0.0f32; 2 * h], 0, 2)
             .expect("a well-formed verify must still be served");
         assert_eq!(ok.len(), 2 * crate::qwen35_prefill_tests::VOCAB);
+    }
+
+    /// Every seam that embeds Python-supplied token ids goes through
+    /// `q35_check_tokens`. An id at `vocab_size` used to slice the embed table
+    /// past its end (a panic through the pyo3 boundary), and the seams that
+    /// embed inside a position loop (`forward_pp_qwen35_prefill`) had already
+    /// advanced the resident state for every earlier position. Each seam must
+    /// (1) return an `Err` that names the id, (2) leave every KV frontier where
+    /// it was, and (3) still serve the last valid id, `vocab_size - 1`.
+    #[test]
+    fn qwen35_embedding_seams_refuse_an_out_of_range_token_before_any_state_moves() {
+        pyo3::prepare_freethreaded_python();
+        const VOCAB: usize = crate::qwen35_prefill_tests::VOCAB;
+        const H: usize = crate::qwen35_prefill_tests::H;
+        let bad = VOCAB as u32;
+        let last = (VOCAB - 1) as u32;
+        let fresh = crate::qwen35_prefill_tests::tiny_qwen35_vulkan_model;
+
+        // A refusal must (a) name the id, (b) not move the model.
+        fn refused(e: &PyErr, vm: &VulkanModel, before: &[usize], seam: &str) {
+            let msg = format!("{e}");
+            assert!(msg.contains("token id 12 is out of range") && msg.contains(seam),
+                    "{seam}: got: {msg}");
+            assert_eq!(kv_frontiers(vm), before, "{seam}: a refused call must not advance the KV");
+            assert!(vm.spec_verify_span.is_none(), "{seam}: a refused call must not leave a verify span");
+        }
+
+        // forward_pp_qwen35 (also pp_step_qwen35 / _logits / _topk / _argmax —
+        // every one routes through `forward_pp_qwen35_impl`).
+        {
+            let mut vm = fresh();
+            let before = kv_frontiers(&vm);
+            let e = vm.forward_pp_qwen35_impl(bad, Vec::new(), 0).expect_err("id == vocab must be refused");
+            refused(&e, &vm, &before, "forward_pp_qwen35");
+            let ok = vm.forward_pp_qwen35_impl(last, Vec::new(), 0).expect("vocab-1 must be served");
+            assert_eq!(ok.len(), VOCAB);
+        }
+        // forward_pp_qwen35_prefill: the bad id sits at position 2, so the OLD
+        // code had advanced positions 0 and 1 before it panicked.
+        {
+            let mut vm = fresh();
+            let before = kv_frontiers(&vm);
+            let e = vm.forward_pp_qwen35_prefill(vec![1, 2, bad, 3], Vec::new(), 4)
+                .expect_err("id == vocab must be refused");
+            refused(&e, &vm, &before, "forward_pp_qwen35_prefill");
+            // Ids past `seq` are not embedded and are not checked.
+            vm.forward_pp_qwen35_prefill(vec![1, 2, last, bad], Vec::new(), 3)
+                .expect("ids beyond seq are ignored; vocab-1 must be served");
+        }
+        // qwen35_embed_prompt (CPU-only oracle helper; no state, but it sliced).
+        {
+            let mut vm = fresh();
+            let e = vm.qwen35_embed_prompt(vec![0, bad]).expect_err("id == vocab must be refused");
+            assert!(format!("{e}").contains("qwen35_embed_prompt: token id 12 is out of range"), "got: {e}");
+            let ok = vm.qwen35_embed_prompt(vec![0, last]).expect("vocab-1 must be served");
+            assert_eq!(ok.len(), 2 * H);
+        }
+        // forward_qwen35_prefill (batched).
+        {
+            let mut vm = fresh();
+            let before = kv_frontiers(&vm);
+            let e = vm.forward_qwen35_prefill_impl(vec![0, bad], 0).expect_err("id == vocab must be refused");
+            refused(&e, &vm, &before, "forward_qwen35_prefill");
+            let ok = vm.forward_qwen35_prefill_impl(vec![0, last], 0).expect("vocab-1 must be served");
+            assert_eq!(ok.len(), VOCAB);
+        }
+        // forward_qwen35_verify (first / single stage).
+        {
+            let mut vm = fresh();
+            let before = kv_frontiers(&vm);
+            let e = vm.forward_qwen35_verify_impl(vec![0, bad], 0).expect_err("id == vocab must be refused");
+            refused(&e, &vm, &before, "forward_qwen35_verify");
+            let ok = vm.forward_qwen35_verify_impl(vec![0, last], 0).expect("vocab-1 must be served");
+            assert_eq!(ok.len(), 2 * VOCAB);
+        }
+        // forward_tp_qwen35_verify (already fixed; now on the shared helper),
+        // and the TP decode seams (`forward_tp_qwen35` / `_argmax` / `_topk`
+        // all embed through `qwen35_tp_forward_normed`).
+        pyo3::Python::with_gil(|py| {
+            let mut vm = fresh();
+            let before = kv_frontiers(&vm);
+            let e = vm.forward_tp_qwen35_verify_impl(py, vec![0, bad], 0, py.None())
+                .expect_err("id == vocab must be refused");
+            refused(&e, &vm, &before, "forward_tp_qwen35_verify");
+            let e = vm.qwen35_tp_forward_normed(py, bad, 0, py.None())
+                .expect_err("id == vocab must be refused");
+            refused(&e, &vm, &before, "forward_tp_qwen35");
+        });
+        // forward / forward_rs (single-node decode, the `GpuResult` seam).
+        {
+            let mut vm = fresh();
+            let before = kv_frontiers(&vm);
+            let e = vm.forward_rs(bad, 0).expect_err("id == vocab must be refused");
+            assert!(format!("{e}").contains("forward: token id 12 is out of range"), "got: {e}");
+            assert_eq!(kv_frontiers(&vm), before, "forward_rs: a refused call must not advance the KV");
+            let ok = vm.forward_rs(last, 0).expect("vocab-1 must be served");
+            assert_eq!(ok.len(), VOCAB);
+        }
+        // The embedding table absent altogether: a named error, not the
+        // `q35_embed_row` expect.
+        {
+            let mut vm = fresh();
+            vm.q35_f16_host.remove("model.embed_tokens.weight");
+            let e = vm.forward_pp_qwen35_impl(0, Vec::new(), 0).expect_err("a missing table must be refused");
+            assert!(format!("{e}").contains("embedding table is not loaded"), "got: {e}");
+        }
+    }
+
+    /// `forward_qwen35_prefill_impl`'s CPU-fallback last stage read the
+    /// f16-host lm_head with an `expect` AFTER `forward_pp_range_batched` had
+    /// advanced the KV / GDN state. The check is now hoisted above the state
+    /// change, like `forward_qwen35_verify_core`'s.
+    #[test]
+    fn qwen35_prefill_refuses_a_missing_lm_head_before_it_advances_state() {
+        pyo3::prepare_freethreaded_python();
+        let mut vm = crate::qwen35_prefill_tests::tiny_qwen35_vulkan_model();
+        vm.q35_f16_host.remove("lm_head.weight");
+        let before = kv_frontiers(&vm);
+        let e = vm.forward_qwen35_prefill_impl(vec![0, 1], 0)
+            .expect_err("a missing lm_head table must be refused");
+        assert!(format!("{e}").contains("lm_head f16 host missing"), "got: {e}");
+        assert_eq!(kv_frontiers(&vm), before,
+                   "a refused prefill must not advance the model's KV frontiers");
+    }
+
+    /// `pp_step_qwen35_verify`'s recv stages hand `t` straight to
+    /// `forward_qwen35_verify_core`; `t == 0` underflowed `(t - 1) * h` there
+    /// (the first stage guarded it in `forward_qwen35_verify_impl`). The core
+    /// now refuses `t == 0` and a `hidden` that is not `[t, h]`, before it sets
+    /// the verify span or moves any state.
+    #[test]
+    fn qwen35_verify_core_refuses_t0_and_a_misshapen_hidden() {
+        pyo3::prepare_freethreaded_python();
+        let h = crate::qwen35_prefill_tests::H;
+        let mut vm = crate::qwen35_prefill_tests::tiny_qwen35_vulkan_model();
+        let before = kv_frontiers(&vm);
+        let e = vm.forward_qwen35_verify_core(Vec::new(), 0, 0).expect_err("t == 0 must be refused");
+        assert!(format!("{e}").contains("t must be >= 1"), "got: {e}");
+        let e = vm.forward_qwen35_verify_core(vec![0.0f32; h], 0, 2).expect_err("[1,h] for t=2 must be refused");
+        assert!(format!("{e}").contains("hidden.len()="), "got: {e}");
+        assert!(vm.spec_verify_span.is_none(), "a refused verify must not leave `spec_verify_span` set");
+        assert_eq!(kv_frontiers(&vm), before, "a refused verify must not advance the KV");
     }
 
 }
