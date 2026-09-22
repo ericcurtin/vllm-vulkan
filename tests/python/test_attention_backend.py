@@ -13,7 +13,10 @@ pytest.importorskip("vllm", reason="vllm not installed; skipping attention tests
 _rs = pytest.importorskip("vllm_vulkan._rs", exc_type=ImportError)
 
 from vllm.v1.attention.backend import AttentionType  # noqa: E402
-from vllm.v1.attention.backends.cpu_attn import CPUAttentionMetadata  # noqa: E402
+from vllm.v1.attention.backends.cpu_attn import (  # noqa: E402
+    CPUAttentionBackendImpl,
+    CPUAttentionMetadata,
+)
 
 import vllm_vulkan.attention as attention_mod  # noqa: E402
 from vllm_vulkan.attention import VulkanAttentionBackendImpl  # noqa: E402
@@ -29,7 +32,53 @@ def _require_vulkan_context():
         pytest.skip(f"VulkanContext unavailable: {exc}")
 
 
-def test_vulkan_attention_backend_uses_paged_decode_for_single_token_batch(monkeypatch):
+@pytest.fixture
+def cpu_ops_stubbed(monkeypatch):
+    """Stub out the two `CPUAttentionBackendImpl` methods that call into
+    vLLM's C++ CPU attention ops, leaving the Vulkan path fully real.
+
+    vLLM 0.29 writes the KV cache through `do_kv_cache_update`
+    (`unified_kv_cache_update`), separately from `forward`. The plugin's
+    override writes vLLM's CPU cache via `super()` and then mirrors the same
+    tokens into the Vulkan cache; `forward` falls back to `super()` whenever
+    Vulkan decode isn't applicable. Both `super()` halves are
+    `ops.cpu_attn_reshape_and_cache` / `ops.cpu_attention_with_kv_cache`,
+    which exist only in a CPU-built vLLM -- the PyPI wheel is the CUDA build
+    and its `_C` has neither -- so stubbing them is what lets these tests run
+    outside a CPU build at all.
+
+    What they assert is untouched by this: the Vulkan mirror, the Vulkan
+    decode, `_last_vulkan_decode_used`, and the comparison against a torch
+    reference are all still real. A test whose Vulkan decode silently stopped
+    working would fall through to the stub and fail on both the flag and the
+    output.
+    """
+    monkeypatch.setattr(
+        CPUAttentionBackendImpl, "do_kv_cache_update", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        CPUAttentionBackendImpl,
+        "forward",
+        lambda self, layer, query, key, value, kv_cache, attn_metadata, output, *a: (
+            output
+        ),
+    )
+
+
+def _write_kv(impl, key, value, kv_cache, slot_mapping):
+    """What vLLM's `unified_kv_cache_update` op does before each forward."""
+    impl.do_kv_cache_update(
+        None,  # layer: only reached by the stubbed-out CPU write
+        key,
+        value,
+        kv_cache,
+        slot_mapping,
+    )
+
+
+def test_vulkan_attention_backend_uses_paged_decode_for_single_token_batch(
+    monkeypatch, cpu_ops_stubbed
+):
     _require_vulkan_context()
     logged_messages = []
     monkeypatch.setattr(
@@ -50,13 +99,12 @@ def test_vulkan_attention_backend_uses_paged_decode_for_single_token_batch(monke
     key = torch.randn(num_reqs, num_kv_heads, head_size, dtype=torch.float16)
     value = torch.randn(num_reqs, num_kv_heads, head_size, dtype=torch.float16)
     kv_cache = torch.zeros(
-        (2, num_blocks, num_kv_heads, block_size, head_size),
+        (num_blocks, num_kv_heads, block_size, 2 * head_size),
         dtype=torch.float16,
     )
     output = torch.empty((num_reqs, num_heads, head_size), dtype=torch.float32)
 
     metadata = CPUAttentionMetadata(
-        isa="vec16",
         num_actual_tokens=num_reqs,
         max_query_len=1,
         query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
@@ -80,6 +128,7 @@ def test_vulkan_attention_backend_uses_paged_decode_for_single_token_batch(monke
         kv_sharing_target_layer_name=None,
     )
 
+    _write_kv(impl, key, value, kv_cache, metadata.slot_mapping)
     result = impl.forward(
         layer=None,  # type: ignore[arg-type]
         query=query,
@@ -109,7 +158,7 @@ def test_vulkan_attention_backend_uses_paged_decode_for_single_token_batch(monke
 
 
 def test_vulkan_attention_backend_uses_paged_decode_for_single_token_batch_f32(
-    monkeypatch,
+    monkeypatch, cpu_ops_stubbed
 ):
     """Same scenario as
     `test_vulkan_attention_backend_uses_paged_decode_for_single_token_batch`
@@ -140,13 +189,12 @@ def test_vulkan_attention_backend_uses_paged_decode_for_single_token_batch_f32(
     key = torch.randn(num_reqs, num_kv_heads, head_size, dtype=torch.float32)
     value = torch.randn(num_reqs, num_kv_heads, head_size, dtype=torch.float32)
     kv_cache = torch.zeros(
-        (2, num_blocks, num_kv_heads, block_size, head_size),
+        (num_blocks, num_kv_heads, block_size, 2 * head_size),
         dtype=torch.float32,
     )
     output = torch.empty((num_reqs, num_heads, head_size), dtype=torch.float32)
 
     metadata = CPUAttentionMetadata(
-        isa="vec16",
         num_actual_tokens=num_reqs,
         max_query_len=1,
         query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
@@ -170,6 +218,7 @@ def test_vulkan_attention_backend_uses_paged_decode_for_single_token_batch_f32(
         kv_sharing_target_layer_name=None,
     )
 
+    _write_kv(impl, key, value, kv_cache, metadata.slot_mapping)
     result = impl.forward(
         layer=None,  # type: ignore[arg-type]
         query=query,
@@ -196,7 +245,9 @@ def test_vulkan_attention_backend_uses_paged_decode_for_single_token_batch_f32(
     torch.testing.assert_close(output, expected, rtol=5e-3, atol=5e-3)
 
 
-def test_vulkan_attention_backend_mirrors_prefill_kv_before_decode():
+def test_vulkan_attention_backend_mirrors_prefill_kv_before_decode(
+    cpu_ops_stubbed,
+):
     _require_vulkan_context()
 
     num_heads = 4
@@ -215,7 +266,7 @@ def test_vulkan_attention_backend_mirrors_prefill_kv_before_decode():
     decode_v = torch.randn_like(decode_k)
 
     kv_cache = torch.zeros(
-        (2, num_blocks, num_kv_heads, block_size, head_size),
+        (num_blocks, num_kv_heads, block_size, 2 * head_size),
         dtype=torch.float16,
     )
     impl = VulkanAttentionBackendImpl(
@@ -232,7 +283,6 @@ def test_vulkan_attention_backend_mirrors_prefill_kv_before_decode():
     )
 
     prefill_metadata = CPUAttentionMetadata(
-        isa="vec16",
         num_actual_tokens=seq_len - 1,
         max_query_len=seq_len - 1,
         query_start_loc=torch.tensor([0, seq_len - 1], dtype=torch.int32),
@@ -246,6 +296,7 @@ def test_vulkan_attention_backend_mirrors_prefill_kv_before_decode():
         num_decode_tokens=0,
         sdpa_start_loc=torch.tensor([0, seq_len - 1], dtype=torch.int32),
     )
+    _write_kv(impl, prefill_k, prefill_v, kv_cache, prefill_metadata.slot_mapping)
     impl.forward(
         layer=None,  # type: ignore[arg-type]
         query=torch.randn(seq_len - 1, num_heads, head_size, dtype=torch.float16),
@@ -259,7 +310,6 @@ def test_vulkan_attention_backend_mirrors_prefill_kv_before_decode():
 
     output = torch.empty((1, num_heads, head_size), dtype=torch.float32)
     metadata = CPUAttentionMetadata(
-        isa="vec16",
         num_actual_tokens=1,
         max_query_len=1,
         query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
@@ -270,6 +320,7 @@ def test_vulkan_attention_backend_mirrors_prefill_kv_before_decode():
         scheduler_metadata=None,
         causal=True,
     )
+    _write_kv(impl, decode_k, decode_v, kv_cache, metadata.slot_mapping)
     result = impl.forward(
         layer=None,  # type: ignore[arg-type]
         query=query,
@@ -315,7 +366,6 @@ def test_vulkan_attention_backend_rejects_unsupported_decode_features():
         kv_sharing_target_layer_name=None,
     )
     metadata = CPUAttentionMetadata(
-        isa="vec16",
         num_actual_tokens=1,
         max_query_len=1,
         query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
@@ -331,7 +381,7 @@ def test_vulkan_attention_backend_rejects_unsupported_decode_features():
         key=torch.zeros(1, num_kv_heads, head_size, dtype=torch.float16),
         value=torch.zeros(1, num_kv_heads, head_size, dtype=torch.float16),
         kv_cache=torch.zeros(
-            (2, 1, num_kv_heads, block_size, head_size),
+            (1, num_kv_heads, block_size, 2 * head_size),
             dtype=torch.float16,
         ),
         attn_metadata=metadata,
@@ -340,14 +390,13 @@ def test_vulkan_attention_backend_rejects_unsupported_decode_features():
     )
 
 
-def test_try_write_and_decode_vulkan_returns_false_for_zero_tokens():
-    """num_actual_tokens == 0 (e.g. a warmup/profiling call with no real
-    tokens) must make _try_write_and_decode_vulkan bail out immediately,
-    without touching the Vulkan context/KV-cache entry at all -
-    _supports_vulkan_decode's query_lens_all_ones check trivially passes
-    on an empty batch, so without an explicit guard this would otherwise
-    proceed into unnecessary Vulkan setup work for nothing to actually
-    write or decode.
+def test_forward_skips_vulkan_decode_for_zero_tokens():
+    """num_actual_tokens == 0 (a warmup/profiling call with no real tokens)
+    must skip the Vulkan decode attempt entirely rather than doing the
+    context lookup, KV-cache-entry resolution and cache scan for nothing:
+    `_supports_vulkan_decode`'s query_lens_all_ones check passes trivially
+    on an empty batch, so without the explicit guard in `forward` it would
+    proceed into all that setup work with nothing to decode.
     """
     num_heads = 2
     num_kv_heads = 1
@@ -367,7 +416,6 @@ def test_try_write_and_decode_vulkan_returns_false_for_zero_tokens():
         kv_sharing_target_layer_name=None,
     )
     metadata = CPUAttentionMetadata(
-        isa="vec16",
         num_actual_tokens=0,
         max_query_len=1,
         query_start_loc=torch.tensor([0], dtype=torch.int32),
@@ -379,23 +427,28 @@ def test_try_write_and_decode_vulkan_returns_false_for_zero_tokens():
         causal=True,
     )
     kv_cache = torch.zeros(
-        (2, 1, num_kv_heads, block_size, head_size), dtype=torch.float16
+        (1, num_kv_heads, block_size, 2 * head_size), dtype=torch.float16
     )
+    output = torch.empty(0, num_heads, head_size, dtype=torch.float32)
 
-    result = attention_mod._try_write_and_decode_vulkan(
-        impl=impl,
-        query=torch.zeros(0, num_heads, head_size, dtype=torch.float32),
-        key=torch.zeros(0, num_kv_heads, head_size, dtype=torch.float16),
-        value=torch.zeros(0, num_kv_heads, head_size, dtype=torch.float16),
-        kv_cache=kv_cache,
-        attn_metadata=metadata,
-        output=torch.empty(0, num_heads, head_size, dtype=torch.float32),
-        num_actual_tokens=0,
-    )
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("Vulkan decode attempted on an empty batch")
 
-    assert result is False
-    # The Vulkan KV-cache-entry cache must never have been populated -
-    # confirms the function returned before doing any real work.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(VulkanAttentionBackendImpl, "_try_vulkan_decode", fail_if_called)
+        mp.setattr(CPUAttentionBackendImpl, "forward", lambda *a, **k: output)
+        impl.forward(
+            layer=None,  # type: ignore[arg-type]
+            query=torch.zeros(0, num_heads, head_size, dtype=torch.float32),
+            key=torch.zeros(0, num_kv_heads, head_size, dtype=torch.float16),
+            value=torch.zeros(0, num_kv_heads, head_size, dtype=torch.float16),
+            kv_cache=kv_cache,
+            attn_metadata=metadata,
+            output=output,
+        )
+
+    assert impl._last_vulkan_decode_used is False
+    # The Vulkan KV-cache-entry cache must never have been populated.
     assert impl._cached_kv_cache_entry is None
 
 
@@ -602,7 +655,6 @@ def test_vulkan_cache_has_sequences_is_faster_at_a_realistic_batch_size():
 
 def _make_decode_metadata(num_reqs: int = 2, seq_len: int = 1) -> CPUAttentionMetadata:
     return CPUAttentionMetadata(
-        isa="vec16",
         num_actual_tokens=num_reqs,
         max_query_len=1,
         query_start_loc=torch.arange(num_reqs + 1, dtype=torch.int32),
@@ -711,7 +763,9 @@ def test_cached_decode_support_data_recomputes_for_different_metadata_object():
     torch.testing.assert_close(result1_again[2], result1[2])
 
 
-def test_multiple_layers_sharing_attn_metadata_produce_correct_results():
+def test_multiple_layers_sharing_attn_metadata_produce_correct_results(
+    cpu_ops_stubbed,
+):
     """End-to-end regression test for the real scenario this caching
     change targets: multiple `VulkanAttentionBackendImpl` instances
     (simulating multiple decoder layers within the same KV-cache-group,
@@ -733,7 +787,6 @@ def test_multiple_layers_sharing_attn_metadata_produce_correct_results():
     scale = head_size**-0.5
 
     metadata = CPUAttentionMetadata(
-        isa="vec16",
         num_actual_tokens=num_reqs,
         max_query_len=1,
         query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
@@ -766,12 +819,13 @@ def test_multiple_layers_sharing_attn_metadata_produce_correct_results():
         key = torch.randn(num_reqs, num_kv_heads, head_size, dtype=torch.float16)
         value = torch.randn(num_reqs, num_kv_heads, head_size, dtype=torch.float16)
         kv_cache = torch.zeros(
-            (2, num_blocks, num_kv_heads, block_size, head_size),
+            (num_blocks, num_kv_heads, block_size, 2 * head_size),
             dtype=torch.float16,
         )
         output = torch.empty((num_reqs, num_heads, head_size), dtype=torch.float32)
 
         impl = make_impl()
+        _write_kv(impl, key, value, kv_cache, metadata.slot_mapping)
         result = impl.forward(
             layer=None,  # type: ignore[arg-type]
             query=query,
@@ -818,7 +872,7 @@ def test_get_kv_cache_entry_hits_instance_cache_for_same_tensor():
         kv_sharing_target_layer_name=None,
     )
     ctx = _require_vulkan_context()
-    kv_cache = torch.zeros((2, 4, 1, 16, 8), dtype=torch.float16)
+    kv_cache = torch.zeros((4, 1, 16, 16), dtype=torch.float16)
 
     entry1 = impl._get_kv_cache_entry(ctx, kv_cache)
     entry2 = impl._get_kv_cache_entry(ctx, kv_cache)
@@ -851,8 +905,8 @@ def test_get_kv_cache_entry_recomputes_for_a_different_tensor():
         kv_sharing_target_layer_name=None,
     )
     ctx = _require_vulkan_context()
-    kv_cache_1 = torch.zeros((2, 4, 1, 16, 8), dtype=torch.float16)
-    kv_cache_2 = torch.zeros((2, 4, 1, 16, 8), dtype=torch.float16)
+    kv_cache_1 = torch.zeros((4, 1, 16, 16), dtype=torch.float16)
+    kv_cache_2 = torch.zeros((4, 1, 16, 16), dtype=torch.float16)
 
     entry1 = impl._get_kv_cache_entry(ctx, kv_cache_1)
     entry2 = impl._get_kv_cache_entry(ctx, kv_cache_2)
@@ -868,7 +922,9 @@ def test_get_kv_cache_entry_recomputes_for_a_different_tensor():
     assert entry1_again is entry1
 
 
-def test_multiple_decode_steps_reuse_kv_cache_entry_and_stay_correct():
+def test_multiple_decode_steps_reuse_kv_cache_entry_and_stay_correct(
+    cpu_ops_stubbed,
+):
     """End-to-end regression test for the real scenario this caching
     change targets: several consecutive decode steps (as would happen
     across a real serving session) through the *same*
@@ -887,7 +943,7 @@ def test_multiple_decode_steps_reuse_kv_cache_entry_and_stay_correct():
     scale = head_size**-0.5
 
     kv_cache = torch.zeros(
-        (2, num_blocks, num_kv_heads, block_size, head_size),
+        (num_blocks, num_kv_heads, block_size, 2 * head_size),
         dtype=torch.float16,
     )
     impl = VulkanAttentionBackendImpl(
@@ -914,7 +970,6 @@ def test_multiple_decode_steps_reuse_kv_cache_entry_and_stay_correct():
         output = torch.empty((num_reqs, num_heads, head_size), dtype=torch.float32)
 
         metadata = CPUAttentionMetadata(
-            isa="vec16",
             num_actual_tokens=num_reqs,
             max_query_len=1,
             query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
@@ -942,6 +997,7 @@ def test_multiple_decode_steps_reuse_kv_cache_entry_and_stay_correct():
             causal=True,
         )
 
+        _write_kv(impl, key, value, kv_cache, metadata.slot_mapping)
         result = impl.forward(
             layer=None,  # type: ignore[arg-type]
             query=query,
@@ -966,3 +1022,89 @@ def test_multiple_decode_steps_reuse_kv_cache_entry_and_stay_correct():
                 "the same kv_cache tensor across decode steps must keep "
                 "reusing the identical cached entry, not re-resolve it"
             )
+
+
+def test_layers_sharing_one_buffer_get_distinct_vulkan_mirrors():
+    """vLLM allocates one buffer per `KVCacheTensor` and gives every layer
+    sharing it a view at its own offset, so all those layers report the same
+    `untyped_storage().data_ptr()` and differ only in `.data_ptr()`.
+
+    Keying the Vulkan mirror on the storage base therefore collapsed every
+    such layer onto the first one's mirror: each layer decoded against
+    another layer's K/V. Nothing raised and every kernel stayed individually
+    correct -- generation just came out as word salad. Measured on vLLM 0.29
+    with Qwen3-0.6B: 28 layers, 1 distinct storage base, 28 distinct
+    `.data_ptr()`s.
+    """
+    ctx = _require_vulkan_context()
+    num_blocks, num_kv_heads, block_size, head_size = 4, 2, 16, 8
+    layer_numel = num_blocks * num_kv_heads * block_size * 2 * head_size
+
+    # One buffer, two layer-sized views into it, exactly as vLLM lays them out.
+    buffer = torch.zeros(2 * layer_numel, dtype=torch.float16)
+    layer_0, layer_1 = (
+        buffer[i * layer_numel : (i + 1) * layer_numel].view(
+            num_blocks, num_kv_heads, block_size, 2 * head_size
+        )
+        for i in range(2)
+    )
+    assert (
+        layer_0.untyped_storage().data_ptr() == layer_1.untyped_storage().data_ptr()
+    ), "fixture must reproduce vLLM's shared-storage layout"
+
+    entry_0 = attention_mod._get_or_create_vulkan_kv_cache(ctx, layer_0)
+    entry_1 = attention_mod._get_or_create_vulkan_kv_cache(ctx, layer_1)
+
+    assert entry_0 is not entry_1, (
+        "layers sharing one buffer must not share a Vulkan mirror"
+    )
+    # And the first layer's entry must still be its own afterwards, rather
+    # than having been evicted by the second.
+    assert attention_mod._get_or_create_vulkan_kv_cache(ctx, layer_0) is entry_0
+
+
+class TestKVCacheShape:
+    """vLLM's per-layer KV cache is HND:
+    ``(num_blocks, num_kv_heads, block_size, 2 * head_size)``. The Vulkan
+    mirror is a separate GPU allocation written from the `key`/`value` token
+    tensors, so `_parse_kv_cache_shape` reading `head_size` out of the doubled
+    last dimension is the whole of what vLLM's layout contributes to it.
+    """
+
+    def test_head_size_comes_from_the_doubled_last_dimension(self):
+        assert attention_mod._parse_kv_cache_shape((4, 2, 16, 16)) == (4, 2, 16, 8)
+
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            (4, 2, 16),  # too few dimensions
+            (2, 4, 2, 16, 8),  # the pre-0.23 [K, V] pair layout
+            (4, 2, 16, 7),  # odd (un-splittable) last dimension
+        ],
+    )
+    def test_unrecognized_shapes_are_rejected(self, shape):
+        with pytest.raises(ValueError, match="expected KV cache shape"):
+            attention_mod._parse_kv_cache_shape(shape)
+
+    def test_vulkan_layout_matches_the_model_dimensions(self):
+        """The mirror's layout must describe the same model the HND cache
+        does, with `head_size` halved out of the last dimension rather than
+        taken from it whole -- getting that wrong would size every block in
+        the Vulkan cache at double, and silently corrupt every paged read.
+        """
+        ctx = _require_vulkan_context()
+        num_blocks, num_kv_heads, block_size, head_size = 4, 2, 16, 8
+
+        entry = attention_mod._get_or_create_vulkan_kv_cache(
+            ctx,
+            torch.zeros(
+                (num_blocks, num_kv_heads, block_size, 2 * head_size),
+                dtype=torch.float16,
+            ),
+        )
+
+        spec = entry.layout.layer_spec(attention_mod._PER_LAYER_KV_CACHE_INDEX)
+        assert entry.layout.num_blocks == num_blocks
+        assert spec.num_kv_heads == num_kv_heads
+        assert spec.block_size == block_size
+        assert spec.head_size == head_size
