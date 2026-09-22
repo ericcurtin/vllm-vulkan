@@ -921,6 +921,44 @@ class TestLinearMatvecDispatchThreshold:
         )
 
 
+class TestLinearDispatchBoundary:
+    """`linear()` picks a different code path either side of
+    `_MATVEC_THRESHOLD` (T<4 matvec shader, T>=4 tiled matmul) and a third
+    one at T==0. The per-path tests above each pin one T well inside their
+    own path's range; this walks T across the boundary in one sweep so a
+    dispatch condition that is off by one, or a path that only breaks at a
+    degenerate size, cannot hide between them.
+    """
+
+    @pytest.mark.parametrize("t", [0, 1, 2, 3, 4, 8, 17])
+    @pytest.mark.parametrize("bias", [False, True])
+    def test_matches_torch_reference_across_the_threshold(self, vulkan_ctx, t, bias):
+        """Gemma4-E2B's q_proj shape (2048x1536, above
+        `_MATVEC_MIN_WEIGHT_ELEMENTS`, so GPU dispatch is actually
+        exercised rather than silently falling back to CPU).
+
+        T=0 is the case this test was added for: `linear()` is called with
+        an empty batch during vLLM's warmup/profiling passes, and before
+        `linear()`'s `T == 0` guard that reached `_vulkan_matvec`, which
+        requested a zero-byte output buffer and took the whole process
+        down with SIGSEGV -- a hard crash `_wrap_linear`'s try/except
+        cannot turn into a CPU fallback.
+        """
+        out_features, in_features = 2048, 1536
+        weight = torch.randn(out_features, in_features, dtype=torch.float32)
+        b = torch.randn(out_features, dtype=torch.float32) if bias else None
+        x = torch.randn(t, in_features, dtype=torch.float32)
+
+        result = vulkan_ops.linear(x, weight, b)
+        expected = torch.nn.functional.linear(x, weight, b)
+
+        assert result.shape == expected.shape
+        # rtol=1e-2/atol=5e-2: same f16-weight-upload rationale as
+        # `test_linear_matches_torch_reference_at_realistic_hidden_size`;
+        # observed max abs error across these T on RADV/gfx1100 is ~0.035.
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=5e-2)
+
+
 class TestLinearTiledMatmulPrefillDispatch:
     """`linear()` now dispatches the tiled matmul shader (`matmul_f32_f32`,
     from shaders/mul_mm.comp — see `_vulkan_matmul`) for prefill-scale T

@@ -641,7 +641,18 @@ def linear(
 
     weight_elements = in_feat * out_feat
     available_shaders = _cached_available_shaders(ctx)
-    if (
+    if T == 0:
+        # An empty batch reaches `linear()` during vLLM's warmup/profiling
+        # passes (the same class of degenerate call `_wrap_linear`'s
+        # `weight.numel() == 0` guard already handles from the other side).
+        # It must never reach a shader dispatch: `_vulkan_matvec` computes
+        # `out_size = T * N * 4 == 0` and asks for a zero-byte output
+        # buffer, which crashes the process with SIGSEGV -- not a Python
+        # exception, so `_wrap_linear`'s try/except cannot fall back to
+        # CPU. Verified on RADV/gfx1100: T=0 at q_proj's shape
+        # (2048x1536) segfaults, while every T from 1 up is correct.
+        result = x_2d.new_empty((0, out_feat))
+    elif (
         weight_elements >= _MATVEC_MIN_WEIGHT_ELEMENTS
         and T < _MATVEC_THRESHOLD
         and "mul_mat_vec_f32_f32_f32" in available_shaders
