@@ -36,9 +36,23 @@ def _require_vulkan_context():
 
 
 def _require_shader(ctx, *shader_names: str) -> None:
+    """Skip unless at least one of `shader_names` is compiled in.
+
+    `any`, because callers pass the alternatives a dispatch picks between
+    (e.g. `paged_attn_decode_f32` or its `_coop` variant) and need only one
+    of them to run. A test asserting the choice *between* two variants
+    needs both, and must use `_require_all_shaders` instead.
+    """
     available = set(ctx.available_shaders())
     if not any(name in available for name in shader_names):
         pytest.skip(f"none of {shader_names!r} are available")
+
+
+def _require_all_shaders(ctx, *shader_names: str) -> None:
+    available = set(ctx.available_shaders())
+    missing = [name for name in shader_names if name not in available]
+    if missing:
+        pytest.skip(f"not compiled in this shader slice: {missing!r}")
 
 
 def _make_layout(dtype_size: int) -> tuple[KVCacheLayerSpec, VulkanPagedKVLayout]:
@@ -563,12 +577,18 @@ def test_select_decode_shader_prefers_block_size_matching_head_size():
     sliding-window layers) — matching BLOCK_SIZE to head_size avoids
     wasted/idle threads in the cooperative dot-product reduction (see
     paged_attn_decode_f32_coop.comp's BLOCK_SIZE comment for the measured
-    rationale). Both are real, always-available shaders in this codebase
-    (not a hypothetical), so this also implicitly confirms both compiled
-    successfully.
+    rationale).
+
+    Needs BOTH variants compiled, since it asserts which one is chosen --
+    `_require_all_shaders`, not `_require_shader`. `scripts/compile_shaders.sh`
+    deliberately omits `_coop_512` from the lean shader slice, so this skips
+    on builds that don't carry it rather than asserting the fallback is the
+    preferred variant.
     """
     ctx = _require_vulkan_context()
-    _require_shader(ctx, "paged_attn_decode_f32_coop", "paged_attn_decode_f32_coop_512")
+    _require_all_shaders(
+        ctx, "paged_attn_decode_f32_coop", "paged_attn_decode_f32_coop_512"
+    )
 
     name_256, wg_256 = _select_decode_shader(
         ctx,
