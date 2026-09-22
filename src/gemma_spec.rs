@@ -24,14 +24,21 @@
 //! `K+1` tokens (bonus + K drafts), matching its existing `[T][vocab]`
 //! contract (INC-4).
 //!
-//! NO IN-CRATE CALLER, DELIBERATELY. `spec_step` / `run_spec_decode` are the
-//! INC-5a half of a two-part increment: the accept/reject math, landed and
-//! gated on its own (the `#[cfg(test)]` module below drives it with a CPU stub
-//! drafter, covering the identity and partial-accept gates). The production
-//! caller is INC-5b, which wires the real EAGLE drafter
-//! (`gemma_assistant.rs`) into this loop. Until then these are `pub` API of the
-//! `gemma_spec` module exercised only by its own tests — which is why `cargo`
-//! raises no dead-code warning, and why they should not be read as orphaned.
+//! THE PRODUCTION CALLER IS `gemma_spec_wire`. This module was test-only
+//! through INC-5a (the accept/reject math, landed and gated on its own with a
+//! CPU stub drafter); `gemma_spec_wire::spec_decode_gemma` is INC-5b, wiring
+//! the real EAGLE drafter (`gemma_assistant.rs`) into this loop behind
+//! `VLLM_VULKAN_GEMMA_SPEC` (default OFF).
+//!
+//! Two entry points, and the difference matters:
+//!   * [`spec_step`] / [`run_spec_decode`] take a `FnMut(u32, usize, usize)`
+//!     drafter — enough for a stub, and what the INC-5a gates drive.
+//!   * [`spec_step_coupled`] / [`run_spec_decode_coupled`] hand the drafter the
+//!     TARGET and the committed stream, and return per-block acceptance. The
+//!     real drafter needs the target (its seed and its borrowed K/V come from
+//!     it) and the caller needs the acceptance (the token stream is identical
+//!     whether speculation worked or not). The first pair are adapters over
+//!     the second.
 
 use crate::model::{argmax, Gemma4Model};
 
@@ -88,7 +95,40 @@ pub fn spec_step<F>(
 where
     F: FnMut(u32, usize, usize) -> Vec<u32>,
 {
-    let draft = draft_fn(bonus, pos, k);
+    spec_step_coupled(model, |_m, _emitted, b, p, kk| draft_fn(b, p, kk), &[], bonus, pos, k)
+}
+
+/// [`spec_step`] with the TARGET handed to the drafter.
+///
+/// The extra `&mut Gemma4Model` and `emitted` arguments are what a REAL drafter
+/// needs and the closure-only form cannot express. The EAGLE drafter is not a
+/// standalone LM: per `GEMMA31B_SPEC_PLAN.md` §1.1 its step-0 `recurrent_hidden`
+/// is *the target's own hidden state that produced this block's bonus token*,
+/// and its cross-attention reads *the target's* borrowed K/V. The test stub
+/// drafters need none of that, which is exactly why the `FnMut(u32, usize,
+/// usize)` shape was enough to land INC-5a and NOT enough to wire a production
+/// caller: a closure that captures the target cannot coexist with the `&mut
+/// Gemma4Model` this function already holds.
+///
+/// So this — not `spec_step` — is the primary; `spec_step` is the adapter that
+/// discards both extra arguments, keeping every existing stub-drafter call site
+/// (and the whole INC-5a gate) compiling and behaving identically.
+///
+/// `emitted` is the committed stream SO FAR (empty on the first block). A
+/// production drafter needs it to name the token at `pos - 1`, the one whose
+/// hidden state seeds this block; see `gemma_spec_wire::recompute_seed_hidden`.
+pub fn spec_step_coupled<F>(
+    model: &mut Gemma4Model,
+    mut draft_fn: F,
+    emitted: &[u32],
+    bonus: u32,
+    pos: usize,
+    k: usize,
+) -> SpecStepResult
+where
+    F: FnMut(&mut Gemma4Model, &[u32], u32, usize, usize) -> Vec<u32>,
+{
+    let draft = draft_fn(model, emitted, bonus, pos, k);
     assert_eq!(draft.len(), k, "draft_fn must return exactly k={k} draft ids");
 
     let mut tokens = Vec::with_capacity(k + 1);
@@ -149,22 +189,103 @@ pub fn run_spec_decode<F>(
 where
     F: FnMut(u32, usize, usize) -> Vec<u32>,
 {
+    run_spec_decode_coupled(
+        model,
+        |_m, _emitted, b, p, k| draft_fn(b, p, k),
+        start_bonus, start_pos, cfg,
+    ).tokens
+}
+
+/// What one `run_spec_decode_coupled` run actually DID, not just what it
+/// emitted.
+///
+/// `run_spec_decode` returns the token stream alone, and that stream is
+/// IDENTICAL whether every draft was accepted or none was — the accept/reject
+/// math guarantees it. So a caller holding only the stream cannot tell a
+/// working speculative decoder from one that is fully disengaged, and neither
+/// can a test: `gemma_assistant`'s negative control is a run whose stream is
+/// bit-identical to the greedy baseline at ZERO acceptance. The measured
+/// quantities below are the only thing that separates the two, which is why
+/// they are part of the return value rather than something a test reconstructs
+/// by snooping block widths from inside its own `draft_fn` closure.
+#[derive(Debug, Clone, Default)]
+pub struct SpecRun {
+    /// The committed token stream — exactly what `run_spec_decode` returns.
+    pub tokens: Vec<u32>,
+    /// Draft width offered per block (`min(k, remaining - 1)`; the last block
+    /// may be narrowed, and a width-0 block is legal).
+    pub block_widths: Vec<usize>,
+    /// Accepted draft count per block (`0..=block_widths[b]`).
+    pub block_accepts: Vec<usize>,
+}
+
+impl SpecRun {
+    /// Number of draft/verify/accept blocks the run took.
+    pub fn blocks(&self) -> usize {
+        self.block_widths.len()
+    }
+    /// Total drafted tokens OFFERED to the target across the run.
+    pub fn drafted(&self) -> usize {
+        self.block_widths.iter().sum()
+    }
+    /// Total drafted tokens ACCEPTED. Zero means speculation contributed
+    /// nothing: every block fell back to committing its bonus token alone,
+    /// which is slower than plain greedy decode, not faster.
+    pub fn accepted(&self) -> usize {
+        self.block_accepts.iter().sum()
+    }
+    /// Accepted / offered. `None` when nothing was offered (`k == 0`), which is
+    /// deliberately NOT 0.0 — "no drafts offered" and "every draft rejected"
+    /// are different failures and must not read the same on a dashboard.
+    pub fn accept_rate(&self) -> Option<f32> {
+        let d = self.drafted();
+        if d == 0 { None } else { Some(self.accepted() as f32 / d as f32) }
+    }
+    /// True when speculation actually did something this run. A caller that
+    /// enabled the lever and gets `false` has a silently inert lever.
+    pub fn engaged(&self) -> bool {
+        self.accepted() > 0
+    }
+}
+
+/// [`run_spec_decode`] with the target handed to the drafter (see
+/// [`spec_step_coupled`]) and the per-block acceptance SURFACED.
+///
+/// This is the primary implementation; `run_spec_decode` is the adapter that
+/// drops both. It is what a production caller drives — `gemma_spec_wire`.
+pub fn run_spec_decode_coupled<F>(
+    model: &mut Gemma4Model,
+    mut draft_fn: F,
+    start_bonus: u32,
+    start_pos: usize,
+    cfg: &SpecConfig,
+) -> SpecRun
+where
+    F: FnMut(&mut Gemma4Model, &[u32], u32, usize, usize) -> Vec<u32>,
+{
     let mut pos = start_pos;
     let mut bonus = start_bonus;
-    let mut emitted = Vec::new();
-    while emitted.len() < cfg.max_new_tokens {
-        let remaining = cfg.max_new_tokens - emitted.len(); // >= 1 here
+    let mut run = SpecRun::default();
+    while run.tokens.len() < cfg.max_new_tokens {
+        let remaining = cfg.max_new_tokens - run.tokens.len(); // >= 1 here
         // One less than the budget: the block also commits the bonus token.
         let step_k = cfg.k.min(remaining - 1);
-        let step = spec_step(model, &mut draft_fn, bonus, pos, step_k);
+        // `draft_fn` needs the stream so far; the run's own `tokens` vec is it.
+        let emitted = std::mem::take(&mut run.tokens);
+        let step = spec_step_coupled(model, &mut draft_fn, &emitted, bonus, pos, step_k);
+        run.tokens = emitted;
         debug_assert!(!step.committed.is_empty(), "every block must commit the bonus token");
         debug_assert!(step.committed.len() <= remaining,
                       "block committed {} > remaining budget {remaining}", step.committed.len());
+        debug_assert_eq!(step.committed.len(), step.accept_len + 1,
+                      "a block commits its bonus plus its accepted drafts");
+        run.block_widths.push(step_k);
+        run.block_accepts.push(step.accept_len);
         pos += step.committed.len();
-        emitted.extend(step.committed);
+        run.tokens.extend(step.committed);
         bonus = step.new_bonus;
     }
-    emitted
+    run
 }
 
 #[cfg(test)]

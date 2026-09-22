@@ -93,6 +93,12 @@ mod gemma_forward;
 pub mod gemma_assistant;
 #[cfg(feature = "gemma")]
 pub mod gemma_spec;
+// The production caller for `gemma_spec` + `gemma_assistant` (PR #89 follow-up:
+// both were reachable only from `#[cfg(test)]` before this). Holds the
+// `VLLM_VULKAN_GEMMA_SPEC` pymethod, so it must be a sibling of `lib.rs` to see
+// `VulkanModel`'s private fields, exactly like `pyseam_gemma`.
+#[cfg(feature = "gemma")]
+pub mod gemma_spec_wire;
 // qwen35_forward holds BOTH the base Qwen3 dense GPU path (`qwen_*`, gemma) and
 // the qwen3_5 hybrid path (`qwen35_*`, qwen35) — split into two feature-gated
 // impl blocks inside. Present whenever either family is enabled.
@@ -100,6 +106,10 @@ pub mod gemma_spec;
 mod qwen35_forward;
 // The unified dense GPU layer + batched (EAGLE verify) forward operate purely
 // on the base Qwen3/Gemma4 dense path (`self.qwen`/`self.inner`) → `gemma`.
+// The shared decoder-layer BODY (dispatch sequence) that every GPU layer entry
+// point records through — see the module docs for why there is exactly one.
+#[cfg(feature = "gemma")]
+mod layer_core;
 #[cfg(feature = "gemma")]
 mod unified_layer;
 #[cfg(feature = "gemma")]
@@ -431,6 +441,14 @@ pub struct VulkanModel {
     /// as f32 and OOMs a node). Row-major [vocab, num_layers*ple_dim]; one row
     /// is converted to f32 per token. Only loaded on the PLE-owning (first) stage.
     gemma_ple_bf16: Option<Vec<u16>>,
+    /// `gemma_spec_generate`'s drafter checkpoint, kept across calls keyed by
+    /// the directory it was loaded from (a different path reloads). The
+    /// borrowed-K/V snapshot inside it is refreshed per call.
+    #[cfg(feature = "gemma")]
+    gemma_spec_drafter: Option<(String, gemma_spec_wire::SpecDrafter)>,
+    #[cfg(not(feature = "gemma"))]
+    #[allow(dead_code)]
+    gemma_spec_drafter: Option<()>,
     /// GPU-resident KV cache (roadmap #3a): per-layer persistent device buffer
     /// laid out [K-plane(max_seq×num_kv×hd)][V-plane], so GPU attention reads the
     /// KV in place instead of re-uploading the whole host cache every token
@@ -1149,6 +1167,7 @@ impl VulkanModel {
                         tp_rank: s3_tp_rank,
                         tp_size: s3_tp_size,
                         gemma_ple_bf16: None,
+            gemma_spec_drafter: None,
                         gpu_kv: HashMap::new(),
                         qres_bufs: Vec::new(),
                         qres_ready: false,
@@ -1940,6 +1959,7 @@ impl VulkanModel {
                         tp_rank: q35_tp_rank,
                         tp_size: q35_tp_size,
                         gemma_ple_bf16: None,
+            gemma_spec_drafter: None,
                         gpu_kv: std::collections::HashMap::new(),
                         gemma_kv_filled: 0,
                         qres_bufs: Vec::new(),
@@ -2480,6 +2500,7 @@ impl VulkanModel {
                         // g12b has PLE off (hidden_size_per_layer_input=0); no
                         // per-layer-embedding table to load.
                         gemma_ple_bf16: None,
+            gemma_spec_drafter: None,
                         gpu_kv: std::collections::HashMap::new(),
                         gemma_kv_filled: 0,
                         qres_bufs: Vec::new(),
@@ -2956,6 +2977,7 @@ impl VulkanModel {
                         tp_rank: g31b_tp_rank,
                         tp_size: g31b_tp_size,
                         gemma_ple_bf16: None,
+            gemma_spec_drafter: None,
                         gpu_kv: std::collections::HashMap::new(),
                         gemma_kv_filled: 0,
                         qres_bufs: Vec::new(),
@@ -3095,6 +3117,7 @@ impl VulkanModel {
                             tp_rank: 0,
                             tp_size: 1,
                             gemma_ple_bf16: None,
+            gemma_spec_drafter: None,
                             gpu_kv: std::collections::HashMap::new(),
                             gemma_kv_filled: 0,
                             qres_bufs: Vec::new(),
@@ -3187,6 +3210,7 @@ impl VulkanModel {
                         tp_rank: 0,
                         tp_size: 1,
                         gemma_ple_bf16: None,
+            gemma_spec_drafter: None,
                         gpu_kv: std::collections::HashMap::new(),
                         gemma_kv_filled: 0,
                         qres_bufs: Vec::new(),
@@ -3311,6 +3335,7 @@ impl VulkanModel {
                         tp_rank: 0,
                         tp_size: 1,
                         gemma_ple_bf16: None,
+            gemma_spec_drafter: None,
                         gpu_kv: std::collections::HashMap::new(),
                         gemma_kv_filled: 0,
                         qres_bufs: Vec::new(),
@@ -3442,6 +3467,7 @@ impl VulkanModel {
                         tp_rank: 0,
                         tp_size: 1,
                         gemma_ple_bf16: None,
+            gemma_spec_drafter: None,
                         gpu_kv: std::collections::HashMap::new(),
                         gemma_kv_filled: 0,
                         qres_bufs: Vec::new(),
@@ -3677,6 +3703,7 @@ impl VulkanModel {
                         tp_rank: nem_tp_rank,
                         tp_size: nem_tp_size,
                         gemma_ple_bf16: None,
+            gemma_spec_drafter: None,
                         gpu_kv: std::collections::HashMap::new(),
                         gemma_kv_filled: 0,
                         qres_bufs: Vec::new(),
@@ -4183,6 +4210,7 @@ impl VulkanModel {
             tp_rank,
             tp_size,
             gemma_ple_bf16,
+            gemma_spec_drafter: None,
             gpu_kv: std::collections::HashMap::new(),
             gemma_kv_filled: 0,
             qres_bufs: Vec::new(),
@@ -4295,6 +4323,7 @@ impl VulkanModel {
             tp_rank: 0,
             tp_size: 1,
             gemma_ple_bf16: None,
+            gemma_spec_drafter: None,
             gpu_kv: HashMap::new(),
             gemma_kv_filled: 0,
             qres_bufs: Vec::new(),
@@ -6523,6 +6552,9 @@ impl VulkanModel {
         // (CPU, Phase 1; GPU = forward_qwen35_gpu, Phase 2).
         #[cfg(feature = "qwen35")]
         if self.qwen35.is_some() {
+            // Both forwards below embed `token_id` unguarded; refuse an id the
+            // table cannot serve before any layer state moves.
+            self.q35_check_tokens_msg("forward", &[token_id]).map_err(gpu_error::GpuError::from)?;
             // Phase 2: GPU projections when opted in and the engine exists; else
             // the CPU reference forward. (embed/lm_head live f16 in q35_f16_host,
             // so the CPU path is forward_qwen35_cpu_ref, not Qwen35Model::forward
@@ -9171,6 +9203,7 @@ mod batched_forward_tests {
             tp_rank: 0,
             tp_size: 1,
             gemma_ple_bf16: None,
+            gemma_spec_drafter: None,
             gpu_kv: HashMap::new(),
             gemma_kv_filled: 0,
             qres_bufs: Vec::new(),
@@ -9325,7 +9358,7 @@ mod batched_forward_tests {
 // weight-source contract again should re-run the queued single-stage cluster
 // benchmark (`forward_qwen35_prefill` on a real checkpoint), not just this
 // unit suite, before trusting a fix.
-mod qwen35_prefill_tests {
+pub(crate) mod qwen35_prefill_tests {
     use super::*;
     use qwen35::{LayerType, Qwen35Config, Qwen35Model};
     use model::{ModelWeights, SimpleTensor};
@@ -9372,7 +9405,7 @@ mod qwen35_prefill_tests {
         m
     }
 
-    const H: usize = 16;
+    pub(crate) const H: usize = 16;
     const NQ: usize = 4;
     const NKV: usize = 2;
     const HD: usize = 4;
@@ -9382,7 +9415,7 @@ mod qwen35_prefill_tests {
     const VD: usize = 4;
     const KERN: usize = 3;
     const INTER: usize = 12;
-    const VOCAB: usize = 12;
+    pub(crate) const VOCAB: usize = 12;
 
     fn cfg() -> Qwen35Config {
         Qwen35Config {
@@ -9407,6 +9440,7 @@ mod qwen35_prefill_tests {
             num_experts_per_tok: 0,
             moe_intermediate_size: 0,
             shared_expert_intermediate_size: 0,
+            norm_topk_prob: true,
             layer_types: vec![LayerType::LinearAttention, LayerType::FullAttention],
         }
     }
@@ -9469,7 +9503,7 @@ mod qwen35_prefill_tests {
     /// A tiny `VulkanModel` with `qwen35: Some(..)`, `engine: None` — mirrors
     /// `batched_forward_tests::tiny_qwen_model`'s literal field-by-field style
     /// but for the qwen3_5 path.
-    fn tiny_qwen35_vulkan_model() -> VulkanModel {
+    pub(crate) fn tiny_qwen35_vulkan_model() -> VulkanModel {
         let mut weights = build_weights();
         // Mirrors the split loader: `q35_f16_host` is the ONLY source for
         // embed_tokens/lm_head (built above from the still-f32 copy), then
@@ -9500,6 +9534,7 @@ mod qwen35_prefill_tests {
             tp_rank: 0,
             tp_size: 1,
             gemma_ple_bf16: None,
+            gemma_spec_drafter: None,
             gpu_kv: HashMap::new(),
             gemma_kv_filled: 0,
             qres_bufs: Vec::new(),
@@ -9822,6 +9857,7 @@ mod kv_cache_pymethod_tests {
             num_experts_per_tok: 0,
             moe_intermediate_size: 0,
             shared_expert_intermediate_size: 0,
+            norm_topk_prob: true,
             layer_types,
         };
         let weights = model::ModelWeights { tensors: HashMap::new() };
@@ -9855,6 +9891,7 @@ mod kv_cache_pymethod_tests {
             tp_rank: 0,
             tp_size: 1,
             gemma_ple_bf16: None,
+            gemma_spec_drafter: None,
             gpu_kv: HashMap::new(),
             gemma_kv_filled: 0,
             qres_bufs: Vec::new(),

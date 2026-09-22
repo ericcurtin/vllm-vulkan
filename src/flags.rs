@@ -577,6 +577,17 @@ pub struct Flags {
     /// LUT oracle for A/B). Decode change is ~ULP-reassociative (dot4 vs scalar
     /// accumulation) -> argmax-exact; on-node perf gate on a free node/staged A/B.
     pub fp8_fast: bool,
+    /// VLLM_VULKAN_MTP_CONCAT_FLIP: swap the MTP head's `fc` input to
+    /// `[norm_hidden ; norm_embedding]`. A STEP-7 draft bisect knob, so the
+    /// harness can confirm the documented EMBEDDING-FIRST order (validated at
+    /// alpha_1=0.855) is the one that accepts. Default OFF; ANY value other
+    /// than "0" enables it (the semantics `mtp::MtpHead::fc_input` shipped
+    /// with). Read here rather than per call: `fc_input` runs once per draft
+    /// position and `head_chain_cpu` calls it `depth` times per chain, so a
+    /// `std::env::var` there takes the process-wide environment lock and
+    /// allocates a String on every draft step.
+    #[allow(dead_code)] // read only under `feature = "mtp"`
+    pub mtp_concat_flip: bool,
     /// Requant resident Nemotron shared_experts.{up,down}_proj FP8->q8_0 at load
     /// (same is_fp8 loader branch as nemotron_mamba_q8; always-on dense MLP added
     /// to every token's routed output per MoE layer). Default OFF; cluster-gated.
@@ -874,6 +885,33 @@ pub struct Flags {
     /// Engine-less builds fall back to host inside `AssistantGpu::build`
     /// regardless of this flag.
     pub assistant_gpu: bool,
+
+    /// `VLLM_VULKAN_GEMMA_SPEC` — EAGLE speculative decode for the Gemma4
+    /// target (`gemma_spec_wire.rs`), DEFAULT OFF. The whole `VLLM_VULKAN_`
+    /// prefix matters: this project has already lost real time to a lever whose
+    /// env var was read under an unprefixed name, so it read as absent on every
+    /// node and the "regression" that followed was the lever never engaging.
+    ///
+    /// OFF is not "run greedy instead" — `VulkanModel::gemma_spec_generate`
+    /// REFUSES to run with the flag off rather than silently falling back, so a
+    /// caller can never believe it measured speculation when it measured greedy
+    /// decode. Speculation is output-identical to greedy at temperature 0, so a
+    /// silent fallback would be undetectable from the token stream alone.
+    pub gemma_spec: bool,
+
+    /// `VLLM_VULKAN_GEMMA_SPEC_K` — drafted tokens per block (block size is
+    /// `k + 1`, counting the bonus token). Default 4, per
+    /// `GEMMA31B_SPEC_PLAN.md` §INC-5. `0` is legal and means "verify the bonus
+    /// alone", i.e. greedy decode through the verify path — useful as an A/B
+    /// reference, and reported as `accept_rate = None` rather than 0.0 so it
+    /// cannot be mistaken for a collapsed acceptance.
+    pub gemma_spec_k: usize,
+
+    /// `VLLM_VULKAN_GEMMA_SPEC_ASSISTANT_DIR` — directory holding the drafter's
+    /// `model.safetensors` (`gemma-4-31B-it-assistant`). No default path, on
+    /// purpose: a default that exists on one developer machine turns a missing
+    /// checkpoint into a silent skip everywhere else.
+    pub gemma_spec_assistant_dir: Option<String>,
 }
 
 impl Flags {
@@ -909,6 +947,15 @@ impl Flags {
             gemma_lmhead_q4: b1("VLLM_VULKAN_GEMMA_LMHEAD_Q4"), // default OFF; H2 (lm_head f16->4bit requant); see field doc
             gemma_prefill_cols: bdef1("VLLM_VULKAN_GEMMA_PREFILL_COLS"), // default ON (on-node GO n75 2026-08-03: argmax-exact + net-positive prefill, stacks w/ ring); =0 reverts to serial per-row prefill. See field doc.
             assistant_gpu: bdef1("VLLM_VULKAN_ASSISTANT_GPU"), // default ON; =0 selects the bit-exact host-f32 drafter. See field doc.
+            gemma_spec: b1("VLLM_VULKAN_GEMMA_SPEC"), // default OFF; EAGLE spec-decode production seam. See field doc.
+            // A malformed VLLM_VULKAN_GEMMA_SPEC_K falls back to the plan's k=4
+            // rather than to 0: 0 is a MEANINGFUL value here (no drafts at all),
+            // so silently turning a typo into it would disengage speculation
+            // while leaving the flag looking enabled.
+            gemma_spec_k: std::env::var("VLLM_VULKAN_GEMMA_SPEC_K").ok()
+                .and_then(|v| v.parse().ok()).unwrap_or(4),
+            gemma_spec_assistant_dir: std::env::var("VLLM_VULKAN_GEMMA_SPEC_ASSISTANT_DIR").ok()
+                .filter(|s| !s.is_empty()),
             qwen35_gpu: b1("VLLM_VULKAN_QWEN35_GPU"),
             q35_gpu_attn: b1("VLLM_VULKAN_Q35_GPU_ATTN"), // default OFF; see field doc
             q35_kv_f16: b1("VLLM_VULKAN_Q35_KV_F16"), // default OFF; RESERVED, not yet wired — see field doc
@@ -975,6 +1022,8 @@ impl Flags {
             nemotron_tp_ring: b1("VLLM_VULKAN_NEMOTRON_TP_RING"), // default OFF; cluster-gated
             nemotron_mamba_q8: b1("VLLM_VULKAN_NEMOTRON_MAMBA_Q8"), // default OFF; cluster-gated
             fp8_fast: bdef1("VLLM_VULKAN_FP8_FAST"), // default ON (address-gen cure: arithmetic E4M3 decode + vec4 word loads replace the const-LUT cascade + per-element word reloads; bit-exact decode, ~ULP dot4 reassoc); =0 reverts to the mul_mat_vec_fp8 LUT oracle
+            // Default OFF, but ANY non-"0" value enables — neither b1 nor bdef1.
+            mtp_concat_flip: std::env::var("VLLM_VULKAN_MTP_CONCAT_FLIP").map(|v| v != "0").unwrap_or(false),
             nemotron_shared_q8: b1("VLLM_VULKAN_NEMOTRON_SHARED_Q8"), // default OFF; cluster-gated
             laguna_embed_f16: b1("VLLM_VULKAN_LAGUNA_EMBED_F16"), // default OFF; footprint/load-OOM lever, cluster-gated
             laguna_pread_load: b1("VLLM_VULKAN_LAGUNA_PREAD_LOAD"), // default OFF; footprint/load-OOM lever, cluster-gated

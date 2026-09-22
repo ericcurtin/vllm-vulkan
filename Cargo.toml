@@ -28,7 +28,7 @@ crate-type = ["cdylib"]
 #   * kimi / ling are independent of each other.
 # -----------------------------------------------------------------------------
 [features]
-default = ["multiple-pymethods", "gemma"]
+default = ["multiple-pymethods", "gemma", "qwen35", "mtp"]
 
 # `multiple-pymethods` is exposed as a CRATE feature (forwarding to pyo3's own
 # `multiple-pymethods`) so the minimal foundation build can request it

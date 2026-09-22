@@ -92,7 +92,14 @@ jobs:
     - name: Run foundation-slice Rust tests
       run: |
         # The test binary embeds the interpreter; point it at the system Python.
-        export PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
+        # `export VAR=$(cmd)` MASKS a failing lookup: `export`'s own exit status
+        # is 0, so `bash -e` does not stop and the job runs with an EMPTY
+        # PYTHONHOME. The symptom is `ModuleNotFoundError: No module named
+        # 'encodings'` from the embedded interpreter, which reads as a test
+        # failure rather than a missing python3.12. Assign, check, then export.
+        PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
+        test -n "$PYTHONHOME" || { echo "python3.12 reported no base_prefix" >&2; exit 1; }
+        export PYTHONHOME
         cargo test --no-default-features --features "multiple-pymethods" --lib
 
     # lavapipe is Mesa's CPU Vulkan driver. With it selected the kernel
@@ -124,7 +131,9 @@ jobs:
         RUST_BACKTRACE: '1'
       run: |
         # VK_ICD_FILENAMES comes from the discovery step above via GITHUB_ENV.
-        export PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
+        PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
+        test -n "$PYTHONHOME" || { echo "python3.12 reported no base_prefix" >&2; exit 1; }
+        export PYTHONHOME
         cargo test --no-default-features --features "multiple-pymethods" --lib -- --nocapture
 
     # Structural validation of every compiled module. Complements the Rust
@@ -157,8 +166,15 @@ jobs:
   # of the gemma/qwen3-dense code, so every `#[cfg(test)]` module in
   # gemma_forward / gemma_assistant / gemma_spec / unified_layer /
   # batched_forward / pyseam_gemma was invisible to CI: green did not mean
-  # tested. On this branch the foundation slice runs 131 tests and the gemma
-  # slice runs 142 (11 tests CI never executed).
+  # tested. As of this branch the foundation slice runs 134 tests and the gemma
+  # slice 178, so 44 tests run only here.
+  #
+  # Five of those are the checkpoint-free gemma_assistant gates. The EAGLE
+  # drafter's golden tests need a 939MB checkpoint via
+  # VLLM_TEST_GEMMA31B_ASSISTANT_DIR and print SKIP without it, which in CI is
+  # always -- so the whole drafter path was green-but-unrun. The synthetic
+  # fixture in `gemma_assistant.rs` is the unconditional twin; it must stay
+  # ungated by any env var or feature this job does not set.
   #
   # This also builds the standalone configuration the PR advertises
   # (`--features multiple-pymethods,gemma`, i.e. gemma WITHOUT qwen35), which
@@ -198,8 +214,75 @@ jobs:
         RUST_BACKTRACE: '1'
       run: |
         # The test binary embeds the interpreter; point it at the system Python.
-        export PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
+        PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
+        test -n "$PYTHONHOME" || { echo "python3.12 reported no base_prefix" >&2; exit 1; }
+        export PYTHONHOME
         # Single-threaded: two GEMM-picker tests race on a process-global
         # env/OnceLock snapshot under the parallel runner.
         cargo test --no-default-features --features "multiple-pymethods,gemma" --lib \
+          -- --test-threads=1 --nocapture
+
+  # The qwen35 slice. `rust-test-gemma` above cannot cover it: the
+  # `push_constants::dispatch_tests` module is `#[cfg(all(test, feature =
+  # "qwen35"))]`, so ~70 dispatch/picker tests — the matvec kernel-routing
+  # contract — compile out of every job that does not enable `qwen35`. This
+  # job is what executes them.
+  #
+  # It builds the stacked configuration the PR advertises (gemma + qwen35),
+  # because `qwen35` stacks on `model-gemma` and must not regress it.
+  rust-test-qwen35:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v6
+      with:
+        submodules: recursive
+        # No job needs git credentials after checkout, so do not leave the
+        # job's GITHUB_TOKEN in .git/config where the shader compiler and
+        # cargo build scripts this job runs could read it.
+        persist-credentials: false
+
+    - name: Install build + link deps
+      run: |
+        # Same deps as rust-test-foundation: glslang via the project's own
+        # installer (build.rs runs scripts/compile_shaders.sh), libvulkan for
+        # the -lvulkan link, libpython for the pyo3 test binary.
+        source scripts/lib.sh
+        ensure_vulkan
+        sudo apt-get install -y libvulkan-dev libpython3.12-dev
+
+    - name: Build the stacked gemma+qwen35 slice
+      run: |
+        cargo build --no-default-features --features "multiple-pymethods,gemma,qwen35"
+
+    - name: Run qwen35-slice Rust tests
+      env:
+        RUST_BACKTRACE: '1'
+      run: |
+        # The test binary embeds the interpreter; point it at the system Python.
+        PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
+        test -n "$PYTHONHOME" || { echo "python3.12 reported no base_prefix" >&2; exit 1; }
+        export PYTHONHOME
+        # Single-threaded: two GEMM-picker tests race on a process-global
+        # env/OnceLock snapshot under the parallel runner.
+        cargo test --no-default-features --features "multiple-pymethods,gemma,qwen35" --lib \
+          -- --test-threads=1 --nocapture
+
+    # `mtp` ships in `default` (Cargo.toml), but every job above runs
+    # `--no-default-features`, so `src/mtp.rs` did not COMPILE anywhere in CI —
+    # its `#[cfg(test)]` parity gates included. `mtp` stacks on `qwen35`
+    # (the feature edge), so this is its cheapest home. Kept as a SEPARATE
+    # step rather than folded into the feature list above, so the stacked
+    # gemma+qwen35 configuration this PR advertises still gets built and
+    # tested on its own.
+    - name: Run the qwen35+mtp slice (adds src/mtp.rs and its parity gates)
+      env:
+        RUST_BACKTRACE: '1'
+      run: |
+        PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
+        test -n "$PYTHONHOME" || { echo "python3.12 reported no base_prefix" >&2; exit 1; }
+        export PYTHONHOME
+        cargo test --no-default-features --features "multiple-pymethods,gemma,qwen35,mtp" --lib \
           -- --test-threads=1 --nocapture
