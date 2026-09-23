@@ -3580,7 +3580,9 @@ impl VulkanModel {
                         // tensors. Hard-errors without a device (no host fallback
                         // is the point — the f32 fallback is what OOMs).
                         let fp = nemotron_loader::resident_footprint(
-                            &cfg, nem_start, nem_end, nem_first, nem_last);
+                            &cfg, nem_start, nem_end, nem_first, nem_last,
+                            nem_tp_size, nem_flags.nvfp4_e4m3_scales,
+                            nem_flags.nemotron_mamba_q8);
                         log::info!(
                             "Nemotron-H-Puzzle RESIDENT [{nem_start},{nem_end}): projected \
                              {:.2}GB GTT (nvfp4-experts {:.2} + fp8 {:.2} + f16 {:.2}) + \

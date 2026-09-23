@@ -1,0 +1,47 @@
+#version 450
+
+// Nemotron-H Mamba2 decode-step depthwise causal conv1d + SiLU (R2 GPU SSD
+// scan). One thread per channel `c` of conv_dim. Mirrors the CPU reference
+// `conv1d_silu_step` (src/nemotron.rs) EXACTLY, including the state layout:
+// the per-channel window `conv_state[c, 0..kern)` is a FULL kern-wide row
+// (unlike the qwen3.6 GDN template, which keeps only the kern-1 old slots
+// separate from the current token) — roll left by one, write the new token
+// into the LAST slot, THEN dot the whole (now causal) row against the
+// per-channel kernel:
+//   win[0..kern-1] = win[1..kern]; win[kern-1] = proj[x_off + c]
+//   acc = sum_{t<kern} win[t] * conv_w[c, t] (+ conv_bias[c])
+//   conv_out[c] = silu(acc)
+// (the only non-bit-exact op vs libm is exp() in the SiLU.)
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint conv_dim;
+    uint kern;
+    uint x_off;
+};
+
+layout(binding = 0) readonly buffer WBuf { float conv_w[]; };       // [conv_dim, kern]
+layout(binding = 1) readonly buffer PBuf { float proj[]; };         // [in_proj_out]; raw_bc at proj[x_off..]
+layout(binding = 2) readonly buffer BiasBuf { float conv_bias[]; }; // [conv_dim]
+layout(binding = 3) buffer SBuf { float conv_state[]; };            // [conv_dim, kern]
+layout(binding = 4) writeonly buffer OBuf { float conv_out[]; };    // [conv_dim]
+
+void main() {
+    const uint c = gl_GlobalInvocationID.x;
+    if (c >= conv_dim) {
+        return;
+    }
+    const uint base = c * kern;
+    const float raw = proj[x_off + c];
+    for (uint t = 0u; t + 1u < kern; t++) {
+        conv_state[base + t] = conv_state[base + t + 1u];
+    }
+    conv_state[base + kern - 1u] = raw;
+    float acc = 0.0;
+    for (uint t = 0u; t < kern; t++) {
+        acc += conv_state[base + t] * conv_w[base + t];
+    }
+    acc += conv_bias[c];
+    conv_out[c] = acc / (1.0 + exp(-acc)); // silu
+}
