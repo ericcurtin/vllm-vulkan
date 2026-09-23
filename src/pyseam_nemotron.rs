@@ -65,7 +65,17 @@ impl VulkanModel {
         if seq == 0 {
             return Err(PyRuntimeError::new_err("forward_pp_nemotron_prefill: empty prompt"));
         }
-        if !first && hidden_in.len() != seq * h {
+        if first {
+            // The first stage indexes `tokens[pos]` for pos in 0..seq. A short
+            // list panicked mid-loop with the earlier positions already applied
+            // to the resident state; the non-first stages had their length
+            // checked here all along.
+            if tokens.len() != seq {
+                return Err(PyRuntimeError::new_err(format!(
+                    "forward_pp_nemotron_prefill: tokens.len()={} != seq={seq} \
+                     (the first stage embeds one token per position)", tokens.len())));
+            }
+        } else if hidden_in.len() != seq * h {
             return Err(PyRuntimeError::new_err(format!(
                 "forward_pp_nemotron_prefill: hidden_in.len()={} != seq*H={}",
                 hidden_in.len(), seq * h)));
@@ -356,18 +366,35 @@ impl VulkanModel {
     /// item (takes `&[f32]`, not a PyO3-representable borrow) — kept in this
     /// plain `impl` block deliberately.
     fn nem_mtp_draft_impl(&mut self, hidden_pre: &[f32], token_next: u32, depth: usize) -> PyResult<Vec<u32>> {
-        let (lm_ptr, lm_len) = {
-            let m = self.nemotron.as_ref().ok_or_else(|| PyRuntimeError::new_err(
-                "nem_mtp_draft needs a nemotron_h_puzzle model"))?;
-            let w = m.weights.f32_slice(&m.lm_head_name);
-            (w.as_ptr(), w.len())
-        };
-        let lm_head_weight: &[f32] = unsafe { std::slice::from_raw_parts(lm_ptr, lm_len) };
-        let head = self.nemotron_mtp_head.as_mut().ok_or_else(|| PyRuntimeError::new_err(
+        // DISJOINT FIELD BORROWS: destructure `self` so the shared borrow of
+        // `nemotron` (for the 2.1GB lm_head slice, never cloned) and the mutable
+        // borrow of `nemotron_mtp_head` are two different fields. This is what
+        // the raw-pointer + `from_raw_parts` dance was working around; the
+        // borrow checker accepts it directly, so the `unsafe` is gone.
+        let Self { nemotron, nemotron_mtp_head, .. } = self;
+        let m = nemotron.as_ref().ok_or_else(|| PyRuntimeError::new_err(
+            "nem_mtp_draft needs a nemotron_h_puzzle model"))?;
+        // `f32_slice` PANICS on a miss. The resident loader uploads lm_head
+        // f16-resident and keeps a host f32 copy ONLY when the MTP flag is set,
+        // so probe rather than assume.
+        if !m.weights.contains(&m.lm_head_name) {
+            return Err(PyRuntimeError::new_err(format!(
+                "nem_mtp_draft: '{}' is not resident as host f32. The GPU-resident \
+                 loader keeps it only when VLLM_VULKAN_NEMOTRON_MTP=1 is set at LOAD \
+                 time (the draft head projects logits on the CPU).", m.lm_head_name)));
+        }
+        let lm_head_weight: &[f32] = m.weights.f32_slice(&m.lm_head_name);
+        let head = nemotron_mtp_head.as_mut().ok_or_else(|| PyRuntimeError::new_err(
             "nem_mtp_draft: no MTP head loaded (set VLLM_VULKAN_NEMOTRON_MTP=1 on the LAST PP stage)"))?;
+        if token_next as usize >= head.vocab {
+            return Err(PyRuntimeError::new_err(format!(
+                "nem_mtp_draft: token id {token_next} is out of range for vocab {} \
+                 (the embed lookup would read past the table)", head.vocab)));
+        }
         head.reset();
         let first_embed = head.embed(token_next);
-        Ok(head.head_chain_cpu(&first_embed, hidden_pre, depth, lm_head_weight))
+        head.head_chain_cpu(&first_embed, hidden_pre, depth, lm_head_weight)
+            .map_err(PyRuntimeError::new_err)
     }
 
 

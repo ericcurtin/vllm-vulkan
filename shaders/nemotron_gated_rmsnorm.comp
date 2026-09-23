@@ -25,7 +25,12 @@ layout(binding = 0) readonly buffer GatedBuf { float gated[]; };   // [n_groups 
 layout(binding = 1) readonly buffer NormWBuf { float norm_w[]; };  // [n_groups * group_size]
 layout(binding = 2) writeonly buffer ScanBuf { float scan[]; };    // [n_groups * group_size]
 
-shared float sh_gated[1024];
+// Only the scale crosses threads. The staging copy of `gated` that used to live
+// here was a FIXED `shared float[1024]`, which silently capped `group_size` at
+// 1024 — a larger head would have read past it. Thread 0 reads `gated[]`
+// straight from the buffer instead: the accumulation is the same sequential
+// order (so the sum is bit-identical), and the output loop re-reads the same
+// values, which are already in L2 from that pass.
 shared float sh_scale;
 
 void main() {
@@ -33,15 +38,10 @@ void main() {
     const uint tid = gl_LocalInvocationID.x;
     const uint base = gi * group_size;
 
-    for (uint i = tid; i < group_size; i += 256u) {
-        sh_gated[i] = gated[base + i];
-    }
-    barrier();
-
     if (tid == 0u) {
         float ss = 0.0;
         for (uint i = 0u; i < group_size; i++) {
-            const float v = sh_gated[i];
+            const float v = gated[base + i];
             ss += v * v;
         }
         sh_scale = 1.0 / sqrt(ss / float(group_size) + eps);
@@ -49,6 +49,6 @@ void main() {
     barrier();
 
     for (uint i = tid; i < group_size; i += 256u) {
-        scan[base + i] = sh_gated[i] * sh_scale * norm_w[base + i];
+        scan[base + i] = gated[base + i] * sh_scale * norm_w[base + i];
     }
 }

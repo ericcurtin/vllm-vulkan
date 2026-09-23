@@ -424,6 +424,8 @@ use crate::nemotron::NemotronConfig;
 /// meaningless — each expert is one atomic byte-slice).
 #[allow(dead_code)] // consumed by the resident loader's EP=2 streaming (Increment 4)
 pub(crate) fn expert_owned_range(ne: usize, r: usize, n: usize) -> (usize, usize) {
+    assert!(n > 0, "EP: tp_size must be 1 or more");
+    assert!(r < n, "EP: rank {r} is out of range for tp_size {n}");
     assert_eq!(ne % n, 0, "EP: n_routed_experts {ne} not divisible by n {n}");
     let per = ne / n;
     (r * per, per)
@@ -431,10 +433,11 @@ pub(crate) fn expert_owned_range(ne: usize, r: usize, n: usize) -> (usize, usize
 
 /// Local (per-rank) `(out_features, in_features)` of a nemotron matmul weight
 /// after the TP shard, so the resident loader can record the sharded matvec
-/// with the right dims. Column-parallel (q/k/v, mamba in_proj gate/x/dt +
-/// conv/head segments, shared up) shrink `out`; row-parallel (o_proj, mamba
-/// out_proj, shared down) shrink `in`; replicated weights are unchanged. Mirrors
-/// exactly the partition [`nem_tp_shard_full`] applies.
+/// with the right dims. What is actually sharded on this path: the SHARED-expert
+/// projections only — `up_proj` shrinks `out` (column-parallel) and `down_proj`
+/// shrinks `in` (row-parallel). Attention (q/k/v/o) and the mamba mixer are
+/// REPLICATED, as are fc1/fc2 and lm_head. Mirrors exactly the partition
+/// [`nem_tp_shard_full`] applies.
 #[allow(dead_code)] // consumed by the resident TP loader wiring (Increment 4, cluster)
 pub(crate) fn nem_tp_local_shape(
     name: &str, out_f: usize, in_f: usize, cfg: &NemotronConfig, n: usize,
@@ -503,6 +506,30 @@ pub(crate) fn nem_tp_shard_full(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// `expert_owned_range` must reject a rank outside the group instead of
+    /// returning an offset past the expert table (which the loader would then
+    /// use as a write base).
+    #[test]
+    #[should_panic(expected = "rank 2 is out of range")]
+    fn expert_owned_range_rejects_an_out_of_range_rank() {
+        let _ = expert_owned_range(8, 2, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "tp_size must be 1 or more")]
+    fn expert_owned_range_rejects_a_zero_group() {
+        let _ = expert_owned_range(8, 0, 0);
+    }
+
+    #[test]
+    fn expert_owned_range_partitions_evenly() {
+        assert_eq!(expert_owned_range(8, 0, 2), (0, 4));
+        assert_eq!(expert_owned_range(8, 1, 2), (4, 4));
+        assert_eq!(expert_owned_range(8, 0, 1), (0, 8));
+    }
+
     use super::*;
     use crate::model::cpu_matmul;
     use crate::nemotron::{

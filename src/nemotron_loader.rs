@@ -279,13 +279,13 @@ pub fn load_nemotron_weights(
                 let global_view = st
                     .tensor(&format!("{base}.weight_scale_2"))
                     .map_err(|e| format!("{name}: missing weight_scale_2 sibling: {e}"))?;
+                let (out_features, in_features) =
+                    nvfp4_shape_check(&name, view.shape(), global_view.data().len())?;
                 let global = f32::from_le_bytes(
                     global_view.data()[..4]
                         .try_into()
                         .map_err(|_| format!("{name}: weight_scale_2 too short"))?,
                 );
-                let out_features = view.shape()[0];
-                let in_features = view.shape()[1] * 2; // 2 nibbles/byte
                 let groups = (wscale_view.data().len() / out_features).max(1);
                 let group_size = in_features / groups;
                 stats.nvfp4_tensors += 1;
@@ -375,8 +375,16 @@ pub fn resident_footprint(
     end: usize,
     keep_embed: bool,
     keep_lm: bool,
+    // RUNTIME state the loader's own accounting depends on. Passing it keeps the
+    // projection honest: without these the log reported the SHIP-configuration
+    // bytes while the loader allocated something else, which is worse than no
+    // projection on a node where the whole point is a fit decision.
+    tp_size: usize,
+    nvfp4_e4m3: bool,
+    mamba_q8: bool,
 ) -> ResidentFootprint {
     let gs = NVFP4_MOE_GROUP_SIZE as u64;
+    let tp = tp_size.max(1) as u64;
     let hidden = config.hidden_size as u64;
     let ne = config.n_routed_experts as u64;
     let latent = config.moe_latent_size as u64;
@@ -388,10 +396,16 @@ pub fn resident_footprint(
     let q_dim = (config.num_attention_heads * config.head_dim) as u64;
     let kv_dim = (config.num_key_value_heads * config.head_dim) as u64;
 
-    // NVFP4 packed = params/2 bytes; folded scales = (params/group_size)*4 bytes.
-    let nvfp4 = |out: u64, in_: u64| out * (in_ / 2) + out * (in_ / gs) * 4;
-    // FP8 = params bytes + one f32 scalar scale.
+    // NVFP4 packed = params/2 bytes; scales are 1 byte/group when the e4m3-
+    // resident path keeps the raw on-disk bytes, 4 bytes/group when they are
+    // folded to f32 (`VLLM_VULKAN_NVFP4_E4M3_SCALES`).
+    let sbpg: u64 = if nvfp4_e4m3 { 1 } else { 4 };
+    let nvfp4 = |out: u64, in_: u64| out * (in_ / 2) + out * (in_ / gs) * sbpg;
+    // FP8 = params bytes + one f32 scalar scale. Under the q8_0 requant the same
+    // weight ships as GGUF q8_0 blocks: 32 weights per 34-byte block (one f16
+    // scale in-block, no side buffer).
     let fp8 = |out: u64, in_: u64| out * in_ + 4;
+    let q8_0 = |out: u64, in_: u64| (out * in_ / 32) * 34;
     // f16 = params*2 bytes.
     let f16 = |out: u64, in_: u64| out * in_ * 2;
 
@@ -399,8 +413,16 @@ pub fn resident_footprint(
     for g in start..end {
         match config.block_specs[g] {
             BlockSpec::Mamba => {
-                // in_proj [in_proj_out, hidden] + out_proj [hidden, inter] FP8.
-                fp.fp8_bytes += fp8(in_proj_out, hidden) + fp8(hidden, inter);
+                // in_proj [in_proj_out, hidden] + out_proj [hidden, inter].
+                // REPLICATED under TP (the mamba mixer is not sharded), and
+                // requanted to q8_0 only when VLLM_VULKAN_NEMOTRON_MAMBA_Q8 is
+                // set — the TP-forced requant applies to the SHARED-expert
+                // projections, not to these.
+                if mamba_q8 {
+                    fp.fp8_bytes += q8_0(in_proj_out, hidden) + q8_0(hidden, inter);
+                } else {
+                    fp.fp8_bytes += fp8(in_proj_out, hidden) + fp8(hidden, inter);
+                }
                 // conv1d [conv_dim, kernel] + A_log/D/dt_bias [nh] + norm [inter]
                 // + layer norm [hidden] → f32 host.
                 fp.host_f32_bytes += (conv_dim * config.conv_kernel as u64
@@ -418,10 +440,23 @@ pub fn resident_footprint(
             BlockSpec::Moe { moe_intermediate_size, .. } => {
                 let mi = moe_intermediate_size as u64;
                 let shared_inter = config.moe_shared_expert_intermediate_size as u64;
-                // Routed experts up [mi, latent] + down [latent, mi] × ne, NVFP4.
-                fp.nvfp4_expert_bytes += ne * (nvfp4(mi, latent) + nvfp4(latent, mi));
-                // Shared experts up [shared_inter, hidden] + down [hidden, shared_inter] FP8.
-                fp.fp8_bytes += fp8(shared_inter, hidden) + fp8(hidden, shared_inter);
+                // Routed experts up [mi, latent] + down [latent, mi]. Under EP
+                // this rank allocates only its OWN ne/tp experts.
+                // Same partition as `nemotron_tp::expert_owned_range` (per = ne / n),
+                // which requires an even split; a config that does not divide is
+                // rejected there when the loader actually runs.
+                let ne_local = ne / tp;
+                fp.nvfp4_expert_bytes += ne_local * (nvfp4(mi, latent) + nvfp4(latent, mi));
+                // Shared experts up [shared_inter, hidden] + down [hidden, shared_inter].
+                // Column/row sharded under TP, and the loader FORCES the fp8 ->
+                // q8_0 requant on them when sharded (the per-tensor fp8 scale is
+                // not valid for a row slice).
+                let (si_l, h_in_l) = (shared_inter / tp, shared_inter / tp);
+                if tp > 1 {
+                    fp.fp8_bytes += q8_0(si_l, hidden) + q8_0(hidden, h_in_l);
+                } else {
+                    fp.fp8_bytes += fp8(shared_inter, hidden) + fp8(hidden, shared_inter);
+                }
                 // fc1 [latent, hidden] + fc2 [hidden, latent] BF16 → f16.
                 fp.f16_bytes += f16(latent, hidden) + f16(hidden, latent);
                 // gate [ne, hidden] + e_score_bias [ne] + layer norm [hidden] → f32 host.
@@ -502,13 +537,39 @@ fn upload(engine: &mut ComputeEngine, bytes: &[u8]) -> Result<Buffer, String> {
     Ok(buf)
 }
 
+/// Validate an NVFP4 `.weight` / `.weight_scale_2` pair before any indexing.
+/// The packed weight must be rank-2 (`[out, in/2]`) with a non-zero `out` (it is
+/// a divisor below), and the global scale must hold a whole f32. Returns
+/// `(out_features, in_features)`. A malformed tensor is an Err here rather than
+/// a panic (`[..4]` slice / divide-by-zero) three lines later.
+fn nvfp4_shape_check(
+    name: &str, shape: &[usize], global_len: usize,
+) -> Result<(usize, usize), String> {
+    if shape.len() != 2 {
+        return Err(format!(
+            "{name}: NVFP4 weight must be rank-2 [out, in/2], got rank {} {shape:?}",
+            shape.len()));
+    }
+    if shape[0] == 0 || shape[1] == 0 {
+        return Err(format!("{name}: NVFP4 weight has a zero dimension {shape:?}"));
+    }
+    if global_len < 4 {
+        return Err(format!(
+            "{name}: weight_scale_2 is {global_len} bytes, need 4 (one f32)"));
+    }
+    Ok((shape[0], shape[1] * 2)) // 2 nibbles/byte
+}
+
 /// Copy `bytes` into an already-allocated host-coherent buffer at `byte_off`
 /// (used to fill a per-layer concatenated expert buffer one expert at a time).
-fn write_at(buf: &Buffer, byte_off: usize, bytes: &[u8]) {
-    let ptr = buf.mapped_ptr.expect("host-coherent buffer is mapped") as *mut u8;
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(byte_off), bytes.len());
-    }
+///
+/// Delegates to `Buffer::write_at`, which BOUNDS-CHECKS the destination. The
+/// earlier raw `copy_nonoverlapping` here trusted the caller's offset
+/// arithmetic: a checkpoint whose expert shapes disagreed with the
+/// pre-allocated concat buffer wrote past the mapping instead of failing.
+fn write_at(buf: &Buffer, byte_off: usize, bytes: &[u8], what: &str) -> Result<(), String> {
+    buf.write_at(byte_off as u64, bytes)
+        .map_err(|e| format!("{what}: {e}"))
 }
 
 /// GPU-RESIDENT streaming loader (the 75B OOM fix). Keeps every matmul weight
@@ -689,20 +750,31 @@ pub fn load_nemotron_resident(
                 if tp_shard && (e < owned_lo || e >= owned_lo + ne_local) {
                     continue;
                 }
+                // An expert id outside this rank's window is a malformed
+                // checkpoint, NOT a skip: unsharded it would index past the
+                // concat buffer, and sharded the subtraction below would wrap.
+                // Checked for BOTH cases before any offset arithmetic.
+                if e < owned_lo || e - owned_lo >= ne_local {
+                    return Err(format!(
+                        "{name}: expert id {e} is outside this rank's owned range \
+                         [{owned_lo}, {}) (ne_local {ne_local})",
+                        owned_lo + ne_local));
+                }
                 let e = e - owned_lo; // local expert id (owned_lo=0 when tp_size==1)
                 let base = base.unwrap();
                 let wscale = st
                     .tensor(&format!("{base}.weight_scale"))
                     .map_err(|e| format!("{name}: missing weight_scale: {e}"))?;
+                let global_view = st
+                    .tensor(&format!("{base}.weight_scale_2"))
+                    .map_err(|e| format!("{name}: missing weight_scale_2: {e}"))?;
+                let (out_f, in_f) =
+                    nvfp4_shape_check(&name, view.shape(), global_view.data().len())?;
                 let global = f32::from_le_bytes(
-                    st.tensor(&format!("{base}.weight_scale_2"))
-                        .map_err(|e| format!("{name}: missing weight_scale_2: {e}"))?
-                        .data()[..4]
+                    global_view.data()[..4]
                         .try_into()
                         .map_err(|_| format!("{name}: weight_scale_2 too short"))?,
                 );
-                let out_f = view.shape()[0];
-                let in_f = view.shape()[1] * 2; // 2 nibbles/byte
                 let groups = (wscale.data().len() / out_f).max(1);
                 if in_f / groups != gs {
                     return Err(format!(
@@ -718,9 +790,16 @@ pub fn load_nemotron_resident(
                 } else {
                     (&ex.down, &ex.down_scales, ex.down_out, ex.down_in)
                 };
-                debug_assert_eq!((out_f, in_f), (off_out, off_in), "{name}: expert shape");
+                // Runtime check, not debug_assert: a release build must not
+                // compute offsets from shapes that disagree with the buffer the
+                // allocator sized from the config.
+                if (out_f, in_f) != (off_out, off_in) {
+                    return Err(format!(
+                        "{name}: expert shape ({out_f}, {in_f}) does not match the \
+                         pre-allocated concat buffer ({off_out}, {off_in}) for layer {layer}"));
+                }
                 let packed_byte_off = e * out_f * (in_f / 2);
-                write_at(wbuf, packed_byte_off, view.data());
+                write_at(wbuf, packed_byte_off, view.data(), &format!("{name} packed"))?;
                 // Scale residency: e4m3-resident stores the RAW on-disk e4m3
                 // `.weight_scale` bytes VERBATIM (1 byte/group) + carries the
                 // per-tensor `.weight_scale_2` global separately; f32-fold folds
@@ -729,11 +808,13 @@ pub fn load_nemotron_resident(
                 // since e4m3 is 1 byte where fold is 1 f32).
                 if nvfp4_e4m3 {
                     let scale_byte_off = e * out_f * (in_f / gs); // 1 byte/group
-                    write_at(sbuf, scale_byte_off, wscale.data());
+                    write_at(sbuf, scale_byte_off, wscale.data(), &format!("{name} e4m3 scales"))?;
                 } else {
                     let folded = nvfp4_fold_scales(wscale.data(), global); // [out*groups] f32
                     let scale_byte_off = e * out_f * (in_f / gs) * 4;
-                    write_at(sbuf, scale_byte_off, &crate::push_constants::f32_slice_to_bytes(&folded));
+                    write_at(sbuf, scale_byte_off,
+                             &crate::push_constants::f32_slice_to_bytes(&folded),
+                             &format!("{name} folded scales"))?;
                 }
                 // Record this expert's per-tensor global (used only by the e4m3
                 // dispatch; harmless 1.0-overwrite on the fold path). Separate
@@ -777,9 +858,11 @@ pub fn load_nemotron_resident(
                     // up in_f=4096 (=128x32) / down in_f=5376 (=168x32)), so
                     // the parallel output is byte-identical to serial.
                     let deq = crate::model::dequantize_fp8(view.data(), &scale, out_f, in_f);
-                    // TP=2×PP: shard the DEQUANTIZED f32 (mamba in_proj 5-seg
-                    // col-shard / out_proj row-shard / shared up col / down row),
-                    // then requant per LOCAL row. Row-parallel weights shrink the
+                    // TP=2×PP: shard the DEQUANTIZED f32, then requant per LOCAL
+                    // row. Only the SHARED-expert projections are sharded on this
+                    // path (up column-parallel, down row-parallel); the mamba
+                    // in_proj/out_proj are REPLICATED — `nem_tp_shard_full`
+                    // returns them unchanged. Row-parallel weights shrink the
                     // contraction dim → assert it stays q8_0-block(32)-aligned.
                     let (deq, out_l, in_l) = if tp_shard {
                         let s = crate::nemotron_tp::nem_tp_shard_full(&name, deq, config, tp_rank, tp_size);
@@ -833,8 +916,11 @@ pub fn load_nemotron_resident(
                 let f32w = decode_plain(&view)?;
                 let out_f0 = view.shape()[0];
                 let in_f0 = *view.shape().get(1).unwrap_or(&1);
-                // TP=2×PP: shard the f32 (attn q/k/v col by head + o row; fc1/fc2
-                // + lm_head replicated) BEFORE the f16 re-encode. Column-parallel
+                // TP=2×PP: the BF16-resident matmuls on this branch — attention
+                // q/k/v/o, the latent fc1/fc2 and lm_head — are ALL REPLICATED
+                // under this TP scope (`nem_tp_shard_full` returns them
+                // unchanged); the shard call below is kept so a future scope that
+                // does partition them needs no new plumbing. Column-parallel
                 // shrinks out, row-parallel shrinks in; nem_tp_local_shape mirrors
                 // it. lm_head/fc1/fc2 return unchanged (replicated).
                 let (f32w, out_l, in_l) = if tp_shard {
@@ -864,7 +950,24 @@ pub fn load_nemotron_resident(
                         }
                     }
                 }
-                drop(f32w); // free the f32 staging before recording the weight
+                // MTP: the draft head runs its lm_head projection on the CPU and
+                // needs `lm_head.weight` as host f32. This branch otherwise
+                // uploads it f16-resident and keeps NO host copy, so
+                // `nem_mtp_draft` would PANIC in `ModelWeights::f32_slice` (a
+                // miss panics). Retain it only when the MTP flag is on — it is
+                // ~2.1 GB, which is exactly what the resident path exists to
+                // avoid, so it is never kept by default. Moved (not cloned) into
+                // `host`, so the retention costs nothing beyond the staging that
+                // already existed.
+                if name == "lm_head.weight" && crate::flags::flags_global().nemotron_mtp {
+                    stats.host_bytes += (f32w.len() * 4) as u64;
+                    stats.host_tensors += 1;
+                    plog!("host {name}: +{} MB f32 retained for the MTP draft head \
+                           (VLLM_VULKAN_NEMOTRON_MTP=1)", (f32w.len() * 4) >> 20);
+                    host.insert(name.clone(), SimpleTensor { data: f32w, shape: vec![] });
+                } else {
+                    drop(f32w); // free the f32 staging before recording the weight
+                }
                 stats.gpu_resident_bytes += nbytes as u64;
                 stats.f16_tensors += 1;
                 if nbytes >= (16 << 20) {
@@ -902,6 +1005,22 @@ pub fn load_nemotron_resident(
                 host.insert(name.clone(), SimpleTensor { data, shape: vec![] });
             }
         }
+    }
+    // COMPLETENESS: every owned expert slot must have been written. A shard set
+    // that is missing files (or a name pattern this parser does not recognise)
+    // otherwise leaves zeroed slices in the concat buffer and decodes to silent
+    // garbage at the first routed token. Two tensors (up, down) per owned expert
+    // per MoE layer in this rank's window.
+    let expected_expert_tensors: usize = (layer_start..layer_end)
+        .filter(|g| matches!(config.block_specs[*g], BlockSpec::Moe { .. }))
+        .count() * ne_local * 2;
+    if stats.nvfp4_expert_tensors != expected_expert_tensors {
+        return Err(format!(
+            "resident loader: wrote {} routed-expert tensors, expected {} \
+             ({} MoE layers in [{}, {}) x {ne_local} owned experts x 2). The \
+             concat buffers would hold zeroed expert slices.",
+            stats.nvfp4_expert_tensors, expected_expert_tensors,
+            expected_expert_tensors / (ne_local * 2).max(1), layer_start, layer_end));
     }
     plog!(
         "DONE resident GTT {} MB ({} nvfp4-expert + {} fp8 + {} f16), host {} MB ({} tensors)",
@@ -955,9 +1074,44 @@ mod tests {
     /// GPU-resident bytes are a small fraction of what the f32-host loader
     /// (params×4) would materialize — the OOM lever.
     #[test]
+    /// The NVFP4 pre-flight rejects a malformed tensor instead of panicking on
+    /// the `[..4]` slice or the divide-by-`out_features` a few lines later.
+    #[test]
+    fn nvfp4_shape_check_rejects_malformed_tensors() {
+        assert!(nvfp4_shape_check("w", &[8, 4], 4).is_ok());
+        let e = nvfp4_shape_check("w", &[8, 4, 2], 4).unwrap_err();
+        assert!(e.contains("rank-2"), "{e}");
+        let e = nvfp4_shape_check("w", &[0, 4], 4).unwrap_err();
+        assert!(e.contains("zero dimension"), "{e}");
+        let e = nvfp4_shape_check("w", &[8, 4], 2).unwrap_err();
+        assert!(e.contains("weight_scale_2"), "{e}");
+        // in_features is the packed dim doubled (2 nibbles/byte)
+        assert_eq!(nvfp4_shape_check("w", &[8, 16], 4).unwrap(), (8, 32));
+    }
+
+    /// The footprint projection must follow the runtime knobs the loader reads,
+    /// or the fit decision it exists to inform is made on the wrong number.
+    #[test]
+    fn resident_footprint_follows_the_runtime_knobs() {
+        let cfg = tiny_cfg();
+        let base = resident_footprint(&cfg, 0, 3, true, true, 1, false, false);
+        // e4m3-resident scales are 1 byte/group instead of 4 -> strictly smaller.
+        let e4m3 = resident_footprint(&cfg, 0, 3, true, true, 1, true, false);
+        assert!(e4m3.nvfp4_expert_bytes < base.nvfp4_expert_bytes,
+            "e4m3 {} should be under fold {}", e4m3.nvfp4_expert_bytes, base.nvfp4_expert_bytes);
+        // Under EP a rank allocates only its own `ne / tp` experts. tiny_cfg has
+        // 3 routed experts, and `expert_owned_range` requires an even split, so
+        // tp=3 is the valid group size here: one expert per rank = base/3.
+        let ep3 = resident_footprint(&cfg, 0, 3, true, true, 3, false, false);
+        assert_eq!(ep3.nvfp4_expert_bytes, base.nvfp4_expert_bytes / 3);
+        // The mamba q8_0 requant changes the fp8 bucket.
+        let q8 = resident_footprint(&cfg, 0, 3, true, true, 1, false, true);
+        assert_ne!(q8.fp8_bytes, base.fp8_bytes);
+    }
+
     fn resident_footprint_is_byte_exact_and_compresses() {
         let cfg = tiny_cfg();
-        let fp = resident_footprint(&cfg, 0, 3, true, true);
+        let fp = resident_footprint(&cfg, 0, 3, true, true, 1, false, false);
         assert_eq!(fp.nvfp4_expert_bytes, 2304, "nvfp4 experts");
         assert_eq!(fp.fp8_bytes, 4176, "fp8 mamba+shared");
         assert_eq!(fp.f16_bytes, 7168, "f16 attn+fc+lm");

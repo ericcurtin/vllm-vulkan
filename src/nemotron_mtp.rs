@@ -114,6 +114,16 @@ fn dequant_bf16_slice(bits: &[u16]) -> Vec<f32> {
     bits.iter().map(|&b| bf16_to_f32(b)).collect()
 }
 
+/// In-place twin of `dequant_bf16_slice` for hot loops that can reuse a buffer
+/// (the routed-expert dequant runs top-k times per token, two tensors each).
+/// Same per-element conversion, so the output is bit-identical.
+fn dequant_bf16_into(bits: &[u16], out: &mut [f32]) {
+    debug_assert_eq!(bits.len(), out.len());
+    for (o, &b) in out.iter_mut().zip(bits) {
+        *o = bf16_to_f32(b);
+    }
+}
+
 /// The Nemotron-75B MTP draft head (Phase 1, CPU/host-only — see module doc
 /// for why: no NVFP4 in this checkpoint's `mtp.*`, and the resident-GPU path
 /// is out of scope for this phase). Holds its own small tensors as f32, the
@@ -312,13 +322,42 @@ impl NemMtpHead {
             embed_bits,
             kv: KvCache::new(8, nkv, hd), // depth<=4, reset every cycle; 8 is a generous cap
         };
-        // shape sanity (catches an eh_proj/attn transposition early).
-        if head.eh_proj.len() != h * 2 * h {
-            return Err(format!("eh_proj: {} elems, expected h*2h={}", head.eh_proj.len(), h * 2 * h));
-        }
-        if head.q_proj.len() != nq * hd * h {
-            return Err(format!("mtp q_proj: {} elems, expected nq*hd*h={}", head.q_proj.len(), nq * hd * h));
-        }
+        // SHAPE VALIDATION for every tensor the forward reads. The two checks
+        // that used to live here (eh_proj, q_proj) caught a transposition; the
+        // rest reached an indexing panic inside `cpu_matmul` / the expert slice
+        // arithmetic instead. Each expected length is derived from the base
+        // `NemotronConfig` dims, so a head built against a different config is
+        // rejected at LOAD, before any draft runs.
+        let ck = |what: &str, got: usize, want: usize| -> Result<(), String> {
+            if got != want {
+                return Err(format!(
+                    "MTP head '{what}': {got} elems, expected {want} (from the base \
+                     config: h={h}, nq={nq}, nkv={nkv}, hd={hd}, lat={lat}, \
+                     inter={inter}, shared_inter={shared_inter}, vocab={}, ne={ne})", head.vocab));
+            }
+            Ok(())
+        };
+        let q_dim = nq * hd;
+        let kv_dim = nkv * hd;
+        ck("eh_proj", head.eh_proj.len(), h * 2 * h)?;
+        ck("enorm", head.enorm.len(), h)?;
+        ck("hnorm", head.hnorm.len(), h)?;
+        ck("norm (pre-attn)", head.attn_norm.len(), h)?;
+        ck("q_proj", head.q_proj.len(), q_dim * h)?;
+        ck("k_proj", head.k_proj.len(), kv_dim * h)?;
+        ck("v_proj", head.v_proj.len(), kv_dim * h)?;
+        ck("o_proj", head.o_proj.len(), q_dim * h)?;
+        ck("norm (pre-moe)", head.moe_norm.len(), h)?;
+        ck("gate.weight", head.gate_weight.len(), ne * h)?;
+        ck("gate.e_score_correction_bias", head.e_score_correction_bias.len(), ne)?;
+        ck("fc1_latent_proj", head.fc1_latent_proj.len(), lat * h)?;
+        ck("fc2_latent_proj", head.fc2_latent_proj.len(), h * lat)?;
+        ck("shared_experts.up_proj", head.shared_up.len(), shared_inter * h)?;
+        ck("shared_experts.down_proj", head.shared_down.len(), h * shared_inter)?;
+        ck("final_layernorm", head.final_norm.len(), h)?;
+        ck("routed expert up_proj (all)", head.expert_up_bits.len(), ne * inter * lat)?;
+        ck("routed expert down_proj (all)", head.expert_down_bits.len(), ne * lat * inter)?;
+        ck("embed_tokens", head.embed_bits.len(), head.vocab * h)?;
         Ok(head)
     }
 
@@ -400,11 +439,17 @@ impl NemMtpHead {
         let up_stride = self.inter * self.lat;
         let down_stride = self.lat * self.inter;
         let mut routed = vec![0.0f32; self.lat];
+        // Dequant scratch allocated ONCE for the whole top-k loop: the per-expert
+        // `Vec`s were two allocations of `inter*lat` + `lat*inter` floats each
+        // iteration (the 75B: ~1.5M floats per expert, top-k of them per token).
+        // `dequant_bf16_into` writes in place; the math is unchanged.
+        let mut up = vec![0.0f32; up_stride];
+        let mut down = vec![0.0f32; down_stride];
         for (k, &e) in indices.iter().enumerate() {
             let up_bits = &self.expert_up_bits[e * up_stride..(e + 1) * up_stride];
             let down_bits = &self.expert_down_bits[e * down_stride..(e + 1) * down_stride];
-            let up = dequant_bf16_slice(up_bits);
-            let down = dequant_bf16_slice(down_bits);
+            dequant_bf16_into(up_bits, &mut up);
+            dequant_bf16_into(down_bits, &mut down);
             let eout = mlp_relu2(&latent, &up, &down, self.lat, self.inter);
             let wk = weights[k];
             for (r, &o) in routed.iter_mut().zip(&eout) {
@@ -447,7 +492,34 @@ impl NemMtpHead {
         first_hidden: &[f32],
         depth: usize,
         lm_head_weight: &[f32],
-    ) -> Vec<u32> {
+    ) -> Result<Vec<u32>, String> {
+        // Validate every caller-supplied length BEFORE the first forward. Each
+        // of these used to reach an indexing panic several frames deeper: a
+        // short `hidden` sliced past its end in the residual add, a `depth`
+        // over the KV capacity overran the cache append, and a truncated
+        // `lm_head_weight` read past the row the argmax projects.
+        if first_embed.len() != self.h {
+            return Err(format!(
+                "MTP head: embed vector is {} floats, expected hidden_size {}",
+                first_embed.len(), self.h));
+        }
+        if first_hidden.len() != self.h {
+            return Err(format!(
+                "MTP head: hidden vector is {} floats, expected hidden_size {}",
+                first_hidden.len(), self.h));
+        }
+        if depth > self.kv.max_seq_len {
+            return Err(format!(
+                "MTP head: depth {depth} exceeds the draft KV capacity {} \
+                 (the head's cache is sized for the chain, not the sequence)",
+                self.kv.max_seq_len));
+        }
+        let want = self.vocab.saturating_mul(self.h);
+        if lm_head_weight.len() < want {
+            return Err(format!(
+                "MTP head: lm_head weight is {} floats, need vocab {} x hidden {} = {want}",
+                lm_head_weight.len(), self.vocab, self.h));
+        }
         let mut drafts = Vec::with_capacity(depth);
         let mut embed = first_embed.to_vec();
         let mut hidden = first_hidden.to_vec();
@@ -458,7 +530,7 @@ impl NemMtpHead {
             hidden = residual;
             drafts.push(tok);
         }
-        drafts
+        Ok(drafts)
     }
 }
 
@@ -608,7 +680,7 @@ mod tests {
         };
 
         let mut head1 = tiny_head(&cfg);
-        let d1 = head1.head_chain_cpu(&e0, &hp0, 4, &lm_head);
+        let d1 = head1.head_chain_cpu(&e0, &hp0, 4, &lm_head).expect("chain");
         assert_eq!(d1.len(), 4);
         assert_eq!(head1.kv.seq_len, 4, "chain of depth 4 advances KV by 4");
 
@@ -616,7 +688,7 @@ mod tests {
         // head, same weights, KV reset by construction) must reproduce the
         // exact same draft sequence.
         let mut head2 = tiny_head(&cfg);
-        let d2 = head2.head_chain_cpu(&e0, &hp0, 4, &lm_head);
+        let d2 = head2.head_chain_cpu(&e0, &hp0, 4, &lm_head).expect("chain");
         assert_eq!(d1, d2, "greedy chain must be deterministic");
     }
 

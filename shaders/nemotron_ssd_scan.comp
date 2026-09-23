@@ -38,10 +38,6 @@ layout(binding = 4) writeonly buffer GBuf { float gated[]; };     // [inter]
 
 void main() {
     const uint h = gl_WorkGroupID.x;
-    const uint di = gl_LocalInvocationID.x;
-    if (di >= hd) {
-        return;
-    }
 
     const float a_log = params[h];
     const float d_skip = params[nh + h];
@@ -58,18 +54,27 @@ void main() {
     const float da = exp(dt_h * a);
 
     const uint g = h / heads_per_group;
-    const float x = conv_out[h * hd + di];
-    const uint base = h * hd * ss + di * ss;
     const uint b_off = inter + g * ss;
     const uint c_off = inter + ng_ss + g * ss;
 
-    float acc = 0.0;
-    for (uint n = 0u; n < ss; n++) {
-        const float s = ssm_state[base + n] * da + dt_h * conv_out[b_off + n] * x;
-        ssm_state[base + n] = s;
-        acc += s * conv_out[c_off + n];
+    // STRIDE over the head's columns instead of one column per thread. The
+    // workgroup is 64 wide, so the old `if (di >= hd) return;` silently dropped
+    // every column past 63 on a head whose `hd` exceeds the workgroup size —
+    // those `gated[]` entries were never written and the matching `ssm_state`
+    // rows never advanced. Each iteration keeps its own state update and gated
+    // write, so the per-column math is unchanged.
+    for (uint di = gl_LocalInvocationID.x; di < hd; di += gl_WorkGroupSize.x) {
+        const float x = conv_out[h * hd + di];
+        const uint base = h * hd * ss + di * ss;
+
+        float acc = 0.0;
+        for (uint n = 0u; n < ss; n++) {
+            const float s = ssm_state[base + n] * da + dt_h * conv_out[b_off + n] * x;
+            ssm_state[base + n] = s;
+            acc += s * conv_out[c_off + n];
+        }
+        const float y = acc + x * d_skip;
+        const float gate = proj[h * hd + di];
+        gated[h * hd + di] = y * (gate / (1.0 + exp(-gate))); // * silu(gate)
     }
-    const float y = acc + x * d_skip;
-    const float gate = proj[h * hd + di];
-    gated[h * hd + di] = y * (gate / (1.0 + exp(-gate))); // * silu(gate)
 }
