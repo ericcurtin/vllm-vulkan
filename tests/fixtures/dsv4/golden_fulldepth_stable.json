@@ -1,0 +1,57 @@
+{
+  "checkpoint": "mlx-community/DeepSeek-V4-Flash-0731-2.4bit-mixed",
+  "model_dir": "/Volumes/Shared_Drive/models/DeepSeek-V4-Flash-0731-2.4bit-mixed",
+  "method": "streaming transformers-5.8.1 deepseek_v4 reference forward, MLX-affine per-layer dequant, MTP dropped, float32",
+  "prompt": "The capital of France is",
+  "input_ids_bos_templated": [
+    671,
+    6102,
+    294,
+    8760,
+    344
+  ],
+  "input_decoded": [
+    "The",
+    " capital",
+    " of",
+    " France",
+    " is"
+  ],
+  "templating_fixed_L32_nan": true,
+  "golden_kind": "full-depth",
+  "golden_depth_layers": 43,
+  "total_layers": 43,
+  "mtp_dropped": true,
+  "golden_last_position_argmax_id": 11111,
+  "golden_last_position_token": " Paris",
+  "top10_ids": [
+    11111,
+    34837,
+    4588,
+    1204,
+    2619,
+    818,
+    17678,
+    1383,
+    680,
+    114715
+  ],
+  "top10_tokens": [
+    " Paris",
+    " PAR",
+    " ...",
+    " .",
+    " **",
+    " <",
+    " {{",
+    " par",
+    " {",
+    " Strasbourg"
+  ],
+  "wall_seconds": 1159.6,
+  "repro": "DSV4_HC_DEBUG=1 python3 scripts/dsv4/golden.py --close --stable --token_ids 671,6102,294,8760,344 --model_dir /Volumes/Shared_Drive/models/DeepSeek-V4-Flash-0731-2.4bit-mixed",
+  "stability_fix": "patch_hc_stable(): sanitize non-finite -> 0 + max-factored RMSNorm at every norm/HC boundary (identity on finite input, proven cos=1.0) AND the mHC mix projection (flat @ fn) + Sinkhorn computed in float64.",
+  "L32_nan_root_cause": "the fp32 mHC mix projection (flat@fn, a 16384-wide reduction) is non-finite at L32 under the depth-grown residual. PROOF: HC#66 (L32 ffn_hc) input is byte-identical across the f32 run and the f64 run (streams|max=5.108e+02, flat|max=2.415e+01), but comb_logits = NaN under f32 vs 12.57 under f64. This supersedes the two earlier diagnoses (Phase-1 'Sinkhorn degenerates'; Phase-2b 'residual overflow poisons RMSNorm') — the failing op is UPSTREAM of Sinkhorn (which is why --stable_hc's f64-Sinkhorn never fixed it) and the RMSNorm output (flat) is itself finite.",
+  "reference_parity": "hs.norm trajectory identical to the reference through L31 (L31=7013.6167, matching the documented reference value) => cos=1.0 where the reference is finite; past L32 the reference NaNs so this golden is the trusted one. Full-depth top-1 ' Paris' is a CLEAN #1 (the L31 reduced-depth golden had Paris at #2/#3/#7 with a corrupted top-1).",
+  "transformers_version": "5.8.1"
+}
