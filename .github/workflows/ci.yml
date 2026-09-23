@@ -340,3 +340,55 @@ jobs:
         cargo test --no-default-features \
           --features "multiple-pymethods,gemma,qwen35,mtp,nemotron" --lib \
           -- --test-threads=1 --nocapture
+
+  # Laguna stacks on nemotron (`laguna = ["nemotron"]` in Cargo.toml: it reuses
+  # nemotron's MoE `router_forward`/`RouterDims` and its `NemGpuWeight`/`NemQuant`
+  # quant types), and adds six shaders of its own plus an e4m3 expert matvec.
+  # Both configurations for the same reason as the nemotron job.
+  rust-test-laguna:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v6
+      with:
+        submodules: recursive
+        # No job needs git credentials after checkout, so do not leave the
+        # job's GITHUB_TOKEN in .git/config where the shader compiler and
+        # cargo build scripts this job runs could read it.
+        persist-credentials: false
+
+    - name: Install build + link deps
+      run: |
+        source scripts/lib.sh
+        ensure_vulkan
+        sudo apt-get install -y libvulkan-dev libpython3.12-dev
+
+    - name: Build the standalone laguna slice (pulls nemotron via the feature edge)
+      run: |
+        cargo build --no-default-features --features "multiple-pymethods,laguna"
+
+    - name: Run laguna-slice Rust tests (standalone)
+      env:
+        RUST_BACKTRACE: '1'
+      run: |
+        # The test binary embeds the interpreter; point it at the system Python.
+        PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
+        test -n "$PYTHONHOME" || { echo "python3.12 reported no base_prefix" >&2; exit 1; }
+        export PYTHONHOME
+        # Single-threaded: two GEMM-picker tests race on a process-global
+        # env/OnceLock snapshot under the parallel runner.
+        cargo test --no-default-features --features "multiple-pymethods,laguna" --lib \
+          -- --test-threads=1 --nocapture
+
+    - name: Run the stacked gemma+qwen35+mtp+nemotron+laguna slice
+      env:
+        RUST_BACKTRACE: '1'
+      run: |
+        PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
+        test -n "$PYTHONHOME" || { echo "python3.12 reported no base_prefix" >&2; exit 1; }
+        export PYTHONHOME
+        cargo test --no-default-features \
+          --features "multiple-pymethods,gemma,qwen35,mtp,nemotron,laguna" --lib \
+          -- --test-threads=1 --nocapture
