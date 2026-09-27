@@ -846,7 +846,15 @@ pub fn router_forward(
         if group_selected[e / per_group] {
             choice[e]
         } else {
-            0.0
+            // NEG_INFINITY, not 0.0. `choice[e]` is `sigmoid(logit) +
+            // e_score_correction_bias`, and the learned bias can be negative
+            // enough to make a SELECTED expert's corrected score negative. With
+            // 0.0 as the mask, those unselected experts sorted AHEAD of selected
+            // ones and could enter top_k, violating the group mask outright
+            // (PR #93 review). NEG_INFINITY puts every masked expert last, which
+            // is the intended semantics and is identical to 0.0 whenever all
+            // selected scores are positive.
+            f32::NEG_INFINITY
         }
     };
     order.sort_by(|&a, &b| {
@@ -1123,13 +1131,34 @@ impl NemotronModel {
         }
     }
 
+    /// Reject an unsupported TP degree. Called by `set_tp` AND by the model
+    /// constructor BEFORE the resident load, so a bad `VLLM_VULKAN_TP_SIZE` fails
+    /// in seconds rather than after the multi-minute weight stream.
+    pub fn validate_tp_size(tp_size: usize) -> Result<(), String> {
+        if tp_size > 2 {
+            return Err(format!(
+                "nemotron TP={tp_size} is not implemented: the per-layer MoE all-reduce \
+                 is a TP=2 pairwise exchange (nem_tp_reduce_mix). Use TP=1 or TP=2, or \
+                 implement an N-rank reduction."));
+        }
+        Ok(())
+    }
+
     /// Set the Megatron TP grid position for this stage's rank (called from the
     /// model constructor once `VLLM_VULKAN_TP_RANK`/`_SIZE` are read). Shards are
     /// applied at LOAD time (`load_nemotron_resident` with the same rank/size),
     /// so this only records the forward-side reduce parameters.
-    pub fn set_tp(&mut self, tp_rank: usize, tp_size: usize) {
-        self.tp_size = tp_size.max(1);
+    /// `Err` on an unsupported TP degree. The forward-side all-reduce
+    /// (`nem_tp_reduce_mix`) is a TP=2 pairwise exchange and asserts that size,
+    /// so `VLLM_VULKAN_TP_SIZE=3` used to construct and shard cleanly and then
+    /// PANIC on the first MoE all-reduce, after a multi-minute load (PR #93
+    /// review). Reject it here, where the caller can still report it.
+    pub fn set_tp(&mut self, tp_rank: usize, tp_size: usize) -> Result<(), String> {
+        let tp_size = tp_size.max(1);
+        Self::validate_tp_size(tp_size)?;
+        self.tp_size = tp_size;
         self.tp_rank = tp_rank.min(self.tp_size - 1);
+        Ok(())
     }
 
     /// Wire the flat vCCL comm + this rank's TP-peer GLOBAL rank for the
@@ -1195,8 +1224,8 @@ impl NemotronModel {
         if self.tp_size <= 1 {
             return Some(());
         }
-        assert_eq!(self.tp_size, 2,
-            "nemotron TP all-reduce is TP=2 pairwise only; TP>2 needs a sub-communicator");
+        debug_assert_eq!(self.tp_size, 2,
+            "nemotron TP all-reduce is TP=2 pairwise only; `set_tp` rejects TP>2 at load");
         let comm = self.collective_comm as *mut std::os::raw::c_void;
         if comm.is_null() || self.tp_peer < 0 {
             log::error!("nemotron TP reduce: comm/peer not wired (comm={:?} peer={})",
@@ -1620,6 +1649,23 @@ impl NemotronModel {
                 return out;
             }
         }
+
+        // F6 (PR #93 review): past this point the TP-aware resident path did NOT
+        // run — either a readiness probe missed, or this is a multi-token call
+        // (`n_tokens > 1`, i.e. batched prefill), which the resident path does not
+        // serve. The per-layer path below addresses the expert buffers with GLOBAL
+        // ids and full shared-expert dims, so under EP sharding it would read past
+        // this rank's half-sized allocation. Fail with the reason instead of
+        // returning plausible garbage; load-time already refuses TP without the
+        // 1CB flag, so what remains here is the probe-miss and the prefill batch.
+        assert!(
+            self.tp_size <= 1,
+            "nemotron TP={} reached the non-TP-aware forward (n_tokens={}, \
+             start={start}, end={end}, pp=[{},{}), engine={}). Expert-parallel \
+             sharding is only addressable by `nem_forward_range_resident`, which \
+             serves single-token decode over this stage's full range. Batched \
+             prefill under TP is not implemented.",
+            self.tp_size, n_tokens, self.pp_start, self.pp_end, self.engine.is_some());
 
         let mut hidden = hidden_in.to_vec();
         for layer_idx in start..end {
@@ -3858,6 +3904,65 @@ fn dims_uses_conv_bias(cfg: &NemotronConfig) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// The group mask must be absolute: a masked expert can never enter top_k,
+    /// even when every SELECTED expert has a negative corrected score.
+    ///
+    /// `choice[e]` is `sigmoid(logit) + e_score_correction_bias`, and the learned
+    /// bias may be negative enough to push a selected expert below zero. The mask
+    /// used to substitute `0.0`, which then sorted AHEAD of those selected
+    /// experts and let them into top_k, violating the group constraint outright
+    /// (PR #93 review). NEG_INFINITY is the fix, and this pins it.
+    #[test]
+    fn group_mask_holds_when_every_selected_score_is_negative() {
+        let (hidden_size, ne) = (4usize, 8usize);
+        let cfg = RouterDims {
+            n_routed_experts: ne,
+            top_k: 2,
+            routed_scaling_factor: 1.0,
+            n_group: 2,
+            topk_group: 1,
+            norm_topk_prob: false,
+        };
+        let hidden = vec![1.0f32; hidden_size];
+        // Group 0 = experts 0..4, group 1 = experts 4..8. Give group 0 the larger
+        // gate logits so it wins the group selection...
+        let mut gate = vec![0.0f32; ne * hidden_size];
+        for e in 0..ne {
+            let v = if e < 4 { 2.0 } else { -2.0 };
+            for d in 0..hidden_size {
+                gate[e * hidden_size + d] = v / hidden_size as f32;
+            }
+        }
+        // ...then push EVERY corrected score negative with the bias. sigmoid is in
+        // (0, 1), so -1.5 makes every `choice[e]` negative.
+        let bias = vec![-1.5f32; ne];
+        let (indices, _w) = router_forward(&hidden, &gate, &bias, &cfg);
+        assert_eq!(indices.len(), cfg.top_k);
+        for &e in &indices {
+            assert!(e < 4,
+                "expert {e} is in the UNSELECTED group but entered top_k {indices:?} — \
+                 the group mask was not enforced");
+        }
+    }
+
+    /// An unsupported TP degree must be refused where it is set, not asserted
+    /// later inside the all-reduce after a multi-minute load (PR #93 review).
+    #[test]
+    fn set_tp_rejects_unsupported_degrees() {
+        let cfg = tiny_nem_config(&["mamba", "attention", "moe"]);
+        let mut m = fixture_model(&cfg, 0, 3);
+        assert!(m.set_tp(0, 1).is_ok(), "TP=1 is the ship path");
+        assert!(m.set_tp(1, 2).is_ok(), "TP=2 is the implemented pairwise reduce");
+        let e = m.set_tp(0, 3).unwrap_err();
+        assert!(e.contains("TP=3") && e.contains("not implemented"),
+            "unexpected error text: {e}");
+        // A rejected degree must not leave the model half-configured.
+        assert_eq!(m.tp_size, 2, "a refused set_tp must not change tp_size");
+        // And the rank is always clamped inside the group.
+        m.set_tp(9, 2).unwrap();
+        assert_eq!(m.tp_rank, 1);
+    }
+
     use super::*;
     use serde_json::Value;
 

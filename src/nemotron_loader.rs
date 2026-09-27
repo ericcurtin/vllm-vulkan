@@ -382,6 +382,13 @@ pub fn resident_footprint(
     tp_size: usize,
     nvfp4_e4m3: bool,
     mamba_q8: bool,
+    // `VLLM_VULKAN_NEMOTRON_SHARED_Q8`. The loader's `requant_q8` branch fires
+    // for the shared-expert projections under this flag exactly as it does for
+    // the mamba projections under `mamba_q8`; without it here the projection
+    // reported those tensors as fp8 while the loader allocated q8_0, which is
+    // LARGER — so the fit estimate came out under the real allocation on a flag
+    // whose whole purpose is a fit decision (PR #93 review).
+    shared_q8: bool,
 ) -> ResidentFootprint {
     let gs = NVFP4_MOE_GROUP_SIZE as u64;
     let tp = tp_size.max(1) as u64;
@@ -424,8 +431,14 @@ pub fn resident_footprint(
                     fp.fp8_bytes += fp8(in_proj_out, hidden) + fp8(hidden, inter);
                 }
                 // conv1d [conv_dim, kernel] + A_log/D/dt_bias [nh] + norm [inter]
-                // + layer norm [hidden] → f32 host.
+                // + layer norm [hidden] → f32 host. PLUS conv1d.bias [conv_dim]
+                // when the config enables it: the resident loader's keep-predicate
+                // matches every `conv1d*` suffix, so the bias stays host-f32, and
+                // omitting it made the reported fit low by `conv_dim * 4` per
+                // Mamba layer — enough to admit a stage over the budget on a
+                // config with many Mamba blocks (PR #93 review).
                 fp.host_f32_bytes += (conv_dim * config.conv_kernel as u64
+                    + if config.use_conv_bias { conv_dim } else { 0 }
                     + 3 * nh_mamba
                     + inter
                     + hidden)
@@ -454,6 +467,9 @@ pub fn resident_footprint(
                 let (si_l, h_in_l) = (shared_inter / tp, shared_inter / tp);
                 if tp > 1 {
                     fp.fp8_bytes += q8_0(si_l, hidden) + q8_0(hidden, h_in_l);
+                } else if shared_q8 {
+                    // VLLM_VULKAN_NEMOTRON_SHARED_Q8 requants these at TP=1 too.
+                    fp.fp8_bytes += q8_0(shared_inter, hidden) + q8_0(hidden, shared_inter);
                 } else {
                     fp.fp8_bytes += fp8(shared_inter, hidden) + fp8(hidden, shared_inter);
                 }
@@ -560,6 +576,20 @@ fn nvfp4_shape_check(
     Ok((shape[0], shape[1] * 2)) // 2 nibbles/byte
 }
 
+/// `.weight_scale` must hold exactly `out * in / gs` groups (one byte per group
+/// on disk). A partial trailing row would otherwise be written into the next
+/// expert's slot of the concat buffer.
+fn nvfp4_scale_len_check(
+    name: &str, scale_len: usize, out_f: usize, in_f: usize, gs: usize,
+) -> Result<(), String> {
+    let want = out_f * (in_f / gs);
+    if scale_len != want {
+        return Err(format!(
+            "{name}: weight_scale is {scale_len} bytes, expected out*in/gs = {want}"));
+    }
+    Ok(())
+}
+
 /// Copy `bytes` into an already-allocated host-coherent buffer at `byte_off`
 /// (used to fill a per-layer concatenated expert buffer one expert at a time).
 ///
@@ -603,6 +633,12 @@ pub fn load_nemotron_resident(
     use std::fs::File;
 
     let mut stats = NemotronResidentStats::default();
+    // Which owned expert slots were actually written, as (layer, local_e, is_up).
+    // The aggregate tensor COUNT below cannot tell a complete set from one where
+    // a duplicate masks an omission (PR #93 review), and a zeroed expert slice
+    // decodes to silent garbage at the first routed token.
+    let mut expert_slots_written: std::collections::HashSet<(usize, usize, bool)> =
+        std::collections::HashSet::new();
     let gs = NVFP4_MOE_GROUP_SIZE;
     let latent = config.moe_latent_size;
     let ne = config.n_routed_experts;
@@ -616,6 +652,22 @@ pub fn load_nemotron_resident(
         (0, ne)
     };
     let tp_shard = tp_size > 1;
+    // F6 (PR #93 review): sharding the expert buffers is only SAFE if the forward
+    // that reads them is TP-aware. The global->local expert remap and the
+    // shared-expert partial reduction live ONLY in `nem_forward_range_resident`,
+    // which is gated by VLLM_VULKAN_NEMOTRON_1CB. With the flag off, the ordinary
+    // MoE path indexes these half-sized buffers with GLOBAL expert ids and uses
+    // full shared-expert dimensions — reading past rank 1's allocation. Refuse the
+    // combination at load time rather than shard weights that the live forward
+    // cannot address.
+    if tp_shard && !crate::nemotron_1cb_enabled() {
+        return Err(format!(
+            "nemotron TP={tp_size} requires VLLM_VULKAN_NEMOTRON_1CB=1: expert-parallel \
+             sharding halves the resident expert buffers, and only the 1CB resident \
+             forward remaps global expert ids to this rank's local range and reduces \
+             the shared-expert partials. Without it the MoE path would index past \
+             this rank's allocation."));
+    }
 
     // Opt-in per-(pp,tp) per-tensor-class LOAD PROGRESS trace
     // (`VLLM_VULKAN_NEMOTRON_LOAD_PROGRESS=1`). Emits a FLUSHED stderr line at
@@ -745,6 +797,19 @@ pub fn load_nemotron_resident(
                 let (layer, e, is_up) = parse_expert(&name).ok_or_else(|| {
                     format!("NVFP4 tensor '{name}' is not a routed expert up/down_proj")
                 })?;
+                // VALIDATE THE GLOBAL ID FIRST, then apply the ownership filter
+                // (PR #93 review). The other order let a malformed checkpoint
+                // slip an out-of-range expert past every check under TP: on rank
+                // 0 of TP=2, `experts.256` of a 256-expert config satisfies
+                // `e >= owned_lo + ne_local`, so it was silently skipped as
+                // "peer-owned" — and if the checkpoint also omitted expert 0 the
+                // aggregate tensor count still balanced, leaving expert 0's slot
+                // zero-initialized with nothing reported.
+                if e >= ne {
+                    return Err(format!(
+                        "{name}: expert id {e} is out of range for n_routed_experts {ne} \
+                         (malformed checkpoint — this is not a peer-owned expert to skip)"));
+                }
                 // EP=2: skip experts owned by the peer; write owned ones at the
                 // LOCAL index into this rank's half-sized concat buffer.
                 if tp_shard && (e < owned_lo || e >= owned_lo + ne_local) {
@@ -782,6 +847,11 @@ pub fn load_nemotron_resident(
                         in_f / groups
                     ));
                 }
+                // `groups` above rounds down, so a `.weight_scale` with a partial
+                // trailing row passes the group-size check; the scale write below
+                // would then spill into the next expert's slot, which
+                // `Buffer::write_at` cannot see (it only bounds the whole buffer).
+                nvfp4_scale_len_check(&name, wscale.data().len(), out_f, in_f, gs)?;
                 let ex = gpu_experts
                     .get(&layer)
                     .ok_or_else(|| format!("{name}: no pre-allocated experts for layer {layer}"))?;
@@ -824,6 +894,13 @@ pub fn load_nemotron_resident(
                         .get_mut(&layer)
                         .ok_or_else(|| format!("{name}: no experts for layer {layer}"))?;
                     if is_up { exm.up_globals[e] = global } else { exm.down_globals[e] = global }
+                }
+                if !expert_slots_written.insert((layer, e, is_up)) {
+                    return Err(format!(
+                        "{name}: duplicate tensor for layer {layer} local expert {e} \
+                         ({}) — a duplicate can mask an omitted expert and still \
+                         satisfy the aggregate count",
+                        if is_up { "up_proj" } else { "down_proj" }));
                 }
                 stats.nvfp4_expert_tensors += 1;
             } else if is_fp8 {
@@ -1022,6 +1099,25 @@ pub fn load_nemotron_resident(
             stats.nvfp4_expert_tensors, expected_expert_tensors,
             expected_expert_tensors / (ne_local * 2).max(1), layer_start, layer_end));
     }
+    // ...and name the first slot that is actually missing. The count matching is
+    // necessary but not sufficient: duplicates are rejected at the write site, so
+    // together these two make "count is right" mean "every slot was written".
+    for g in layer_start..layer_end {
+        if !matches!(config.block_specs[g], BlockSpec::Moe { .. }) {
+            continue;
+        }
+        for e in 0..ne_local {
+            for is_up in [true, false] {
+                if !expert_slots_written.contains(&(g, e, is_up)) {
+                    return Err(format!(
+                        "resident loader: layer {g} local expert {e} has no {} tensor \
+                         (global expert {}); its concat slice would stay zeroed.",
+                        if is_up { "up_proj" } else { "down_proj" },
+                        owned_lo + e));
+                }
+            }
+        }
+    }
     plog!(
         "DONE resident GTT {} MB ({} nvfp4-expert + {} fp8 + {} f16), host {} MB ({} tensors)",
         stats.gpu_resident_bytes >> 20, stats.nvfp4_expert_tensors, stats.fp8_tensors,
@@ -1089,35 +1185,62 @@ mod tests {
         assert_eq!(nvfp4_shape_check("w", &[8, 16], 4).unwrap(), (8, 32));
     }
 
+    #[test]
+    fn nvfp4_scale_len_check_rejects_partial_rows() {
+        // out=8, in=32, gs=16 -> 16 scale bytes exactly
+        assert!(nvfp4_scale_len_check("w", 16, 8, 32, 16).is_ok());
+        let e = nvfp4_scale_len_check("w", 20, 8, 32, 16).unwrap_err();
+        assert!(e.contains("expected out*in/gs = 16"), "{e}");
+        assert!(nvfp4_scale_len_check("w", 15, 8, 32, 16).is_err());
+    }
+
     /// The footprint projection must follow the runtime knobs the loader reads,
     /// or the fit decision it exists to inform is made on the wrong number.
     #[test]
     fn resident_footprint_follows_the_runtime_knobs() {
         let cfg = tiny_cfg();
-        let base = resident_footprint(&cfg, 0, 3, true, true, 1, false, false);
+        let base = resident_footprint(&cfg, 0, 3, true, true, 1, false, false, false);
         // e4m3-resident scales are 1 byte/group instead of 4 -> strictly smaller.
-        let e4m3 = resident_footprint(&cfg, 0, 3, true, true, 1, true, false);
+        let e4m3 = resident_footprint(&cfg, 0, 3, true, true, 1, true, false, false);
         assert!(e4m3.nvfp4_expert_bytes < base.nvfp4_expert_bytes,
             "e4m3 {} should be under fold {}", e4m3.nvfp4_expert_bytes, base.nvfp4_expert_bytes);
         // Under EP a rank allocates only its own `ne / tp` experts. tiny_cfg has
         // 3 routed experts, and `expert_owned_range` requires an even split, so
         // tp=3 is the valid group size here: one expert per rank = base/3.
-        let ep3 = resident_footprint(&cfg, 0, 3, true, true, 3, false, false);
+        let ep3 = resident_footprint(&cfg, 0, 3, true, true, 3, false, false, false);
         assert_eq!(ep3.nvfp4_expert_bytes, base.nvfp4_expert_bytes / 3);
         // The mamba q8_0 requant changes the fp8 bucket.
-        let q8 = resident_footprint(&cfg, 0, 3, true, true, 1, false, true);
+        let q8 = resident_footprint(&cfg, 0, 3, true, true, 1, false, true, false);
         assert_ne!(q8.fp8_bytes, base.fp8_bytes);
     }
 
+    /// ★ This gate had no `#[test]` and therefore never ran: the attribute above
+    /// belonged to the preceding test, and the doc comment between them hid it.
+    /// A sizing regression would have gone unnoticed (PR #93 review).
+    #[test]
     fn resident_footprint_is_byte_exact_and_compresses() {
         let cfg = tiny_cfg();
-        let fp = resident_footprint(&cfg, 0, 3, true, true, 1, false, false);
+        let fp = resident_footprint(&cfg, 0, 3, true, true, 1, false, false, false);
         assert_eq!(fp.nvfp4_expert_bytes, 2304, "nvfp4 experts");
         assert_eq!(fp.fp8_bytes, 4176, "fp8 mamba+shared");
         assert_eq!(fp.f16_bytes, 7168, "f16 attn+fc+lm");
-        assert_eq!(fp.host_f32_bytes, 5612, "host f32 (incl embed+norm_f)");
+        // 5612 + conv_dim*4 = 5740: the host f32 bucket now includes
+        // `mixer.conv1d.bias` ([conv_dim] f32, one Mamba layer here, conv_dim=32),
+        // which the loader keeps whenever `use_conv_bias` is set and which this
+        // projection used to omit. The first run of this gate after it was given
+        // its missing `#[test]` caught exactly that 128-byte shortfall (PR #93
+        // review). GPU-resident is unchanged — the bias is host-side.
+        assert_eq!(fp.host_f32_bytes, 5740, "host f32 (incl embed+norm_f+conv bias)");
         assert_eq!(fp.gpu_resident_bytes(), 13648);
-        assert_eq!(fp.total_bytes(), 19260);
+        assert_eq!(fp.total_bytes(), 19388);
+        // And the bias really is the difference: flipping the config knob off
+        // must give back exactly conv_dim * 4 bytes for the single Mamba layer.
+        let mut no_bias = tiny_cfg();
+        no_bias.use_conv_bias = false;
+        let nb = resident_footprint(&no_bias, 0, 3, true, true, 1, false, false, false);
+        assert_eq!(fp.host_f32_bytes - nb.host_f32_bytes,
+            no_bias.mamba_dims().conv_dim() as u64 * 4,
+            "the conv1d.bias term must be exactly conv_dim f32 per Mamba layer");
 
         // f32-host baseline = every resident matmul weight ×4 (what the OOM'd
         // loader stored). Resident keeps them 4-bit/8-bit/f16 → well under half.
