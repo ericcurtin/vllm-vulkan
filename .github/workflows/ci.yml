@@ -286,3 +286,57 @@ jobs:
         export PYTHONHOME
         cargo test --no-default-features --features "multiple-pymethods,gemma,qwen35,mtp" --lib \
           -- --test-threads=1 --nocapture
+
+  # Nemotron-H ships its own kernels (SSD scan, SSM conv step, gated RMSNorm,
+  # MoE accum) and four Rust modules whose `#[cfg(test)]` parity gates compile
+  # ONLY under `--features nemotron`. Build it BOTH ways: standalone (the
+  # smallest configuration that must keep working on its own) and stacked on the
+  # gemma+qwen35+mtp set that `default` now carries, so a cross-model regression
+  # in the shared foundation files shows up here and not on a user's fleet.
+  rust-test-nemotron:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v6
+      with:
+        submodules: recursive
+        # No job needs git credentials after checkout, so do not leave the
+        # job's GITHUB_TOKEN in .git/config where the shader compiler and
+        # cargo build scripts this job runs could read it.
+        persist-credentials: false
+
+    - name: Install build + link deps
+      run: |
+        source scripts/lib.sh
+        ensure_vulkan
+        sudo apt-get install -y libvulkan-dev libpython3.12-dev
+
+    - name: Build the standalone nemotron slice
+      run: |
+        cargo build --no-default-features --features "multiple-pymethods,nemotron"
+
+    - name: Run nemotron-slice Rust tests (standalone)
+      env:
+        RUST_BACKTRACE: '1'
+      run: |
+        # The test binary embeds the interpreter; point it at the system Python.
+        PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
+        test -n "$PYTHONHOME" || { echo "python3.12 reported no base_prefix" >&2; exit 1; }
+        export PYTHONHOME
+        # Single-threaded: two GEMM-picker tests race on a process-global
+        # env/OnceLock snapshot under the parallel runner.
+        cargo test --no-default-features --features "multiple-pymethods,nemotron" --lib \
+          -- --test-threads=1 --nocapture
+
+    - name: Run the stacked gemma+qwen35+mtp+nemotron slice
+      env:
+        RUST_BACKTRACE: '1'
+      run: |
+        PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
+        test -n "$PYTHONHOME" || { echo "python3.12 reported no base_prefix" >&2; exit 1; }
+        export PYTHONHOME
+        cargo test --no-default-features \
+          --features "multiple-pymethods,gemma,qwen35,mtp,nemotron" --lib \
+          -- --test-threads=1 --nocapture

@@ -3558,6 +3558,9 @@ impl VulkanModel {
                         .and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).max(1);
                     let nem_tp_rank = std::env::var("VLLM_VULKAN_TP_RANK").ok()
                         .and_then(|v| v.parse::<usize>().ok()).unwrap_or(0).min(nem_tp_size - 1);
+                    // Fail BEFORE the multi-minute resident load, not after it.
+                    nemotron::NemotronModel::validate_tp_size(nem_tp_size)
+                        .map_err(PyRuntimeError::new_err)?;
                     if nem_tp_size > 1 {
                         log::info!("Nemotron TP=2×PP: rank {nem_tp_rank}/{nem_tp_size} \
                             (shard attn q/k/v/o + shared-expert + EP experts; mamba replicated)");
@@ -3580,7 +3583,10 @@ impl VulkanModel {
                         // tensors. Hard-errors without a device (no host fallback
                         // is the point — the f32 fallback is what OOMs).
                         let fp = nemotron_loader::resident_footprint(
-                            &cfg, nem_start, nem_end, nem_first, nem_last);
+                            &cfg, nem_start, nem_end, nem_first, nem_last,
+                            nem_tp_size, nem_flags.nvfp4_e4m3_scales,
+                            nem_flags.nemotron_mamba_q8,
+                            nem_flags.nemotron_shared_q8);
                         log::info!(
                             "Nemotron-H-Puzzle RESIDENT [{nem_start},{nem_end}): projected \
                              {:.2}GB GTT (nvfp4-experts {:.2} + fp8 {:.2} + f16 {:.2}) + \
@@ -3604,7 +3610,8 @@ impl VulkanModel {
                         ).map_err(|e| PyRuntimeError::new_err(
                             format!("nemotron resident loader failed: {e}")))?;
                         nem_model.engine = Some(engine);
-                        nem_model.set_tp(nem_tp_rank, nem_tp_size);
+                        nem_model.set_tp(nem_tp_rank, nem_tp_size)
+                            .map_err(PyRuntimeError::new_err)?;
                         log::info!(
                             "Nemotron-H-Puzzle RESIDENT loaded: {} nvfp4-expert + {} fp8 + \
                              {} f16 tensors ({:.2}GB GTT), {} host ({:.2}GB)",
@@ -4428,6 +4435,30 @@ impl VulkanModel {
             }
             ring.handle = 0;
             ring.buf.clear();
+        }
+        // F7/F8 (PR #93 review): nemotron's PP-hop send/recv scratches are pinned
+        // lazily against whatever comm was live at first use, and their handles
+        // were the ONLY registrations this setter did not drop. After a comm
+        // change the nonzero handle was reused on the NEW comm while its
+        // registration still belonged to the old one — a send or recv through an
+        // invalid MR. Deregister against the OLD comm and zero both, so the next
+        // `pp_step_nemotron` re-pins them against the new one (its guards are
+        // `handle == 0`).
+        #[cfg(feature = "nemotron")]
+        {
+            let cur = self.collective_comm;
+            if let Some(nem) = self.nemotron.as_mut() {
+                for (h, buf) in [
+                    (&mut nem.pp_recv_handle, &mut nem.pp_recv_scratch),
+                    (&mut nem.pp_send_handle, &mut nem.pp_send_scratch),
+                ] {
+                    if *h != 0 && cur != 0 {
+                        let _ = vccl_ffi::comm_deregister(cur as *mut std::os::raw::c_void, *h);
+                    }
+                    *h = 0;
+                    buf.clear();
+                }
+            }
         }
         self.collective_comm = handle;
         // TP=2×PP: nemotron's per-layer TP all-reduce uses the SAME flat comm.
@@ -5741,6 +5772,18 @@ impl VulkanModel {
                 let _ = l.conv_state.write(&vec![0u8; l.conv_state.size as usize]);
                 let _ = l.state.write(&vec![0u8; l.state.size as usize]);
             }
+            return;
+        }
+        // Nemotron-H: per-request Mamba2 recurrence (conv + ssm state, host AND
+        // the GPU-resident scan state) plus the NoPE-attention KV. Without this
+        // branch an OP_RESET fell through to the dense `inner` model below, which
+        // on a nemotron load is an empty placeholder — so the next request reused
+        // the previous one's recurrent state and produced history-dependent
+        // output. `NemotronModel::reset` already zeroed both halves; nothing
+        // called it (PR #93 review).
+        #[cfg(feature = "nemotron")]
+        if let Some(m) = self.nemotron.as_mut() {
+            m.reset();
             return;
         }
         #[cfg(feature = "gemma")]
