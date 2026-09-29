@@ -1653,6 +1653,17 @@ impl LagunaGpuModel {
             bbuf.write(&f32_slice_to_bytes(&bias)).unwrap();
             self.gpu_router.insert(layer_idx, (gbuf, bbuf));
         }
+        // The shader's shared s_score/s_choice are fixed [256] and its selection
+        // loop masks one expert per pick, so `ne` must fit the arrays and `top_k`
+        // must not exceed `ne`. Both are config-derived, so a bad config would
+        // otherwise read past shared memory (ne > 256) or exhaust every candidate
+        // mid-selection (top_k > ne) — see the seeding comment in
+        // shaders/laguna_router.comp. Assert here, where the config is in hand.
+        assert!(
+            ne <= 256 && top_k <= ne && top_k > 0,
+            "laguna_router: ne={ne} must be <= 256 and 0 < top_k={top_k} <= ne \
+             (shared s_choice/s_score are [256] and each pick masks one expert)"
+        );
         let pc = laguna_router_pc(ne, hs, top_k, dims.routed_scaling_factor, dims.norm_topk_prob);
         let eng = self.engine.as_mut().unwrap();
         let inp = eng.alloc_host_coherent_storage((hs * 4) as u64).unwrap();

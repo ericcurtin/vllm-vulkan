@@ -402,10 +402,28 @@ fn handle_laguna_tensor(
             1 => &ex.up,
             _ => &ex.down,
         };
-        debug_assert_eq!((out_f, in_f), (projp.out_features, projp.in_features), "{name}: expert shape");
-        write_at(&projp.packed, expert_packed_off(e, out_f, in_f), view.data());
+        // Validate the CHECKPOINT-derived expert id and shape against the
+        // CONFIG-derived allocation BEFORE writing a single byte. The old
+        // `debug_assert_eq!` vanished in release, and `projm.globals[e]` below
+        // only panics AFTER the write has already corrupted memory, so neither
+        // was a guard (PR #94 review).
+        if e >= ex.n_experts {
+            return Err(format!(
+                "{name}: expert id {e} is out of range for n_experts {} — malformed \
+                 checkpoint (the write would land past the resident expert buffer)",
+                ex.n_experts));
+        }
+        if (out_f, in_f) != (projp.out_features, projp.in_features) {
+            return Err(format!(
+                "{name}: expert {e} shape [{out_f},{in_f}] != the resident allocation \
+                 [{},{}] derived from the config — refusing to write",
+                projp.out_features, projp.in_features));
+        }
+        write_at(&projp.packed, expert_packed_off(e, out_f, in_f), view.data(),
+                 &format!("{name} packed"))?;
         let sbytes = expert_scale_bytes(&wscale, global, e4m3);
-        write_at(&projp.scales, expert_scale_off(e, out_f, in_f, gs, e4m3), &sbytes);
+        write_at(&projp.scales, expert_scale_off(e, out_f, in_f, gs, e4m3), &sbytes,
+                 &format!("{name} scales"))?;
         if e4m3 {
             let exm = gpu_experts.get_mut(&layer).unwrap();
             let projm = match proj {
@@ -643,11 +661,20 @@ pub struct LagunaResidentStats {
     pub host_bytes: u64,
 }
 
-fn write_at(buf: &Buffer, byte_off: usize, bytes: &[u8]) {
-    let ptr = buf.mapped_ptr.expect("host-coherent buffer is mapped") as *mut u8;
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(byte_off), bytes.len());
-    }
+/// Bounds-CHECKED write into a mapped resident buffer.
+///
+/// This was a raw `copy_nonoverlapping` with no bounds check, in a safe function.
+/// The expert buffers are sized from the CONFIG (`ne`, `moe_inter`, `hidden`)
+/// while the offset and length come from the CHECKPOINT (`e` parsed out of the
+/// tensor name, `out_f`/`in_f` and the data length from the tensor), so a
+/// checkpoint with more experts than `num_experts`, or a projection shape that
+/// differs from the config, wrote PAST the mapped allocation — undefined
+/// behaviour, and in release builds the only guard (`debug_assert_eq!`) was
+/// compiled out. `compute::Buffer::write_at` already validates
+/// `offset + len <= size`, so delegate and return the error (PR #94 review).
+fn write_at(buf: &Buffer, byte_off: usize, bytes: &[u8], what: &str) -> Result<(), String> {
+    buf.write_at(byte_off as u64, bytes)
+        .map_err(|e| format!("{what}: {e}"))
 }
 
 fn alloc_proj(

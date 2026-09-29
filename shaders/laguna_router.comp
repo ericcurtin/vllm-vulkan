@@ -66,9 +66,22 @@ void main() {
         for (uint k = 0u; k < top_k; ++k) {
             // argmax over choice; strict `>` keeps the LOWEST index on a tie
             // (first-seen wins) == host `partial_cmp(...).then(a.cmp(&b))`.
-            int best = -1;
-            float bestval = -1.0 / 0.0;   // -inf
-            for (uint e2 = 0u; e2 < ne; ++e2) {
+            // SEED from expert 0 rather than from (-1, -inf). With the old seed
+            // `best` stayed -1 whenever nothing compared greater than -inf —
+            // every `s_choice` being NaN (strict `>` is false for NaN), or
+            // `top_k > ne` leaving every entry already masked to -inf — and the
+            // reads below then indexed s_score[-1] / s_choice[-1], out of bounds
+            // in shared memory, and emitted index -1.0 which the host's
+            // `f as usize` cast turns into expert 0 anyway.
+            //
+            // Seeding at 0 and comparing from 1 keeps the tie rule EXACTLY as it
+            // was (strict `>` ⇒ the lowest index wins a tie, matching the host's
+            // `partial_cmp(..).then(a.cmp(&b))`) while making `best` always a
+            // valid index. `top_k <= ne` is enforced on the host, so the
+            // all-masked case cannot arise here.
+            int best = 0;
+            float bestval = s_choice[0];
+            for (uint e2 = 1u; e2 < ne; ++e2) {
                 float v = s_choice[e2];
                 if (v > bestval) {
                     bestval = v;
