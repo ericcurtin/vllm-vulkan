@@ -4460,6 +4460,29 @@ impl VulkanModel {
                 }
             }
         }
+        // PR #94 review: the resident Laguna model pins FOUR scratches lazily the
+        // same way (PP hidden recv/send, the [vocab] serving ring-back, the top-K
+        // ring-back) and this setter dropped none of them — the nemotron defect
+        // above, again. Deregister against the OLD comm and zero them so the next
+        // `pp_step_laguna*` call re-pins against the new one (guards: handle == 0).
+        #[cfg(feature = "laguna")]
+        {
+            let cur = self.collective_comm;
+            if let Some(g) = self.laguna_gpu.as_mut() {
+                for (h, buf) in [
+                    (&mut g.pp_recv_handle, &mut g.pp_recv_scratch),
+                    (&mut g.pp_send_handle, &mut g.pp_send_scratch),
+                    (&mut g.pp_vocab_handle, &mut g.pp_vocab_scratch),
+                    (&mut g.pp_topk_handle, &mut g.pp_topk_scratch),
+                ] {
+                    if *h != 0 && cur != 0 {
+                        let _ = vccl_ffi::comm_deregister(cur as *mut std::os::raw::c_void, *h);
+                    }
+                    *h = 0;
+                    buf.clear();
+                }
+            }
+        }
         self.collective_comm = handle;
         // TP=2×PP: nemotron's per-layer TP all-reduce uses the SAME flat comm.
         // Forward the handle (the TP-peer global rank is wired via set_tp_peer).

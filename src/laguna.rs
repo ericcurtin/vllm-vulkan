@@ -1247,6 +1247,34 @@ mod tests {
         }
     }
 
+    /// PR #94 review: `laguna_softplus_gate.comp` must keep the far negative tail.
+    /// Mirrors the shader's formula in f32 (host exp/log stand in for the GPU
+    /// intrinsics; the on-node twin is `debug_laguna_softplus_tail`). The OLD
+    /// shader form `log(1 + exp(-|x|))` returns exactly 0 at x = -20.
+    #[test]
+    fn softplus_shader_formula_keeps_negative_tail() {
+        fn shader(x: f32) -> f32 {
+            let t = (-x.abs()).exp();
+            let l1p = if t < 0.03125 {
+                t * (1.0 - t * (0.5 - t * (0.333_333_34 - 0.25 * t)))
+            } else {
+                (1.0 + t).ln()
+            };
+            x.max(0.0) + l1p
+        }
+        let old = |x: f32| x.max(0.0) + (1.0 + (-x.abs()).exp()).ln();
+        assert_eq!(old(-20.0), 0.0, "precondition: the old form underflows the tail");
+        let mut worst = 0.0f64;
+        for i in 0..=1080 {
+            let x = -88.0 + i as f32 * 0.1; // [-88, 20]
+            let h = softplus(x) as f64;
+            let rel = ((shader(x) as f64 - h) / h).abs();
+            worst = worst.max(rel);
+        }
+        assert!(worst < 1e-6, "worst relative error {worst:e}");
+        assert!(shader(-20.0) > 0.0);
+    }
+
     // ─── Per-head softplus gate broadcast ────────────────────────────────────
     #[test]
     fn softplus_gate_broadcast() {

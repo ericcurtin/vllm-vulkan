@@ -10,8 +10,9 @@
 // (`laguna::softplus` / `laguna_gpu::softplus`:
 //   x.max(0.0) + (-x.abs()).exp().ln_1p()  ==  max(x,0) + log(1 + e^-|x|)),
 // which collapses to `x` for large positive x and to `e^x` for large negative x,
-// so it never overflows. Being elementwise, the GPU result differs from the host
-// libm result only in the last ulp of exp/log.
+// so it never overflows. GLSL has no log1p, so the small-t tail is a series (see
+// main). The GPU result differs from the host libm result only in the last ulps
+// of exp/log, including in the far negative tail.
 //
 // Dispatch ((nq*hd + 255)/256, 1, 1).
 //   binding 0 = g[nq]      (gate projection g_proj(h), read-only)
@@ -35,6 +36,18 @@ void main() {
     }
     const uint h = idx / hd;                 // head index for this element
     const float x = g[h];
-    const float sp = max(x, 0.0) + log(1.0 + exp(-abs(x)));
+    // log1p(t) for t = e^-|x| in (0, 1]. `log(1.0 + t)` alone is NOT enough in
+    // f32: once t < 2^-24 (x < ~-16.6), 1.0 + t rounds to exactly 1.0 and the gate
+    // becomes 0 where the host returns e^x (PR #94 review: x = -20 gave 0 vs
+    // 2.06e-9, zeroing a head). For small t it is also inaccurate: the rounding
+    // of 1 + t and the GPU log's ~2^-21 absolute error near 1 are large RELATIVE
+    // to t. So below t = 2^-5 use the series t - t^2/2 + t^3/3 - t^4/4 (Horner);
+    // its truncation error is under t^4/5 <= 2e-7 relative. Above, log(1 + t) is
+    // >= 0.03 and its error is <= ~5e-5 relative.
+    const float t = exp(-abs(x));
+    const float l1p = (t < 0.03125)
+        ? t * (1.0 - t * (0.5 - t * (0.33333334 - 0.25 * t)))
+        : log(1.0 + t);
+    const float sp = max(x, 0.0) + l1p;
     attn[idx] *= sp;
 }

@@ -597,7 +597,8 @@ fn nvfp4_scale_len_check(
 /// earlier raw `copy_nonoverlapping` here trusted the caller's offset
 /// arithmetic: a checkpoint whose expert shapes disagreed with the
 /// pre-allocated concat buffer wrote past the mapping instead of failing.
-fn write_at(buf: &Buffer, byte_off: usize, bytes: &[u8], what: &str) -> Result<(), String> {
+/// Shared with `laguna_loader`.
+pub(crate) fn write_at(buf: &Buffer, byte_off: usize, bytes: &[u8], what: &str) -> Result<(), String> {
     buf.write_at(byte_off as u64, bytes)
         .map_err(|e| format!("{what}: {e}"))
 }

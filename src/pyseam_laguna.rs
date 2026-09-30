@@ -134,6 +134,10 @@ impl VulkanModel {
     /// is `[seq*hidden]` at every step. Exercises BOTH layer types when the
     /// window spans a full/sliding mix (e.g. `[0,8)`).
     fn debug_laguna_kvcache(&mut self, prefill_seq: usize, steps: usize) -> PyResult<(f64, f64, bool)> {
+        if prefill_seq == 0 {
+            // The last-prefill-position compare below indexes `prefill_seq - 1`.
+            return Err(PyRuntimeError::new_err("debug_laguna_kvcache: prefill_seq must be >= 1"));
+        }
         let (_dir, cfg) = laguna_gpu_dir_cfg(self)?;
         let hs = cfg.hidden_size;
         let total = prefill_seq + steps;
@@ -187,6 +191,10 @@ impl VulkanModel {
     /// step, cos≥0.999 (the only numeric delta is `swiglu_f32` silu vs host
     /// libm). Requires a MID window (no lm_head) so output is `[seq*hidden]`.
     fn debug_laguna_1cb(&mut self, prefill_seq: usize, steps: usize) -> PyResult<(f64, f64, bool)> {
+        if prefill_seq == 0 {
+            // The last-prefill-position compare below indexes `prefill_seq - 1`.
+            return Err(PyRuntimeError::new_err("debug_laguna_1cb: prefill_seq must be >= 1"));
+        }
         let (_dir, cfg) = laguna_gpu_dir_cfg(self)?;
         let hs = cfg.hidden_size;
         let total = prefill_seq + steps;
@@ -452,6 +460,22 @@ impl VulkanModel {
         let (cos, maxd, _argmax) = laguna_cos_maxdiff(&gpu, &host);
         let bit_exact = gpu.iter().zip(&host).all(|(&a, &b)| a.to_bits() == b.to_bits());
         Ok((cos, maxd, bit_exact))
+    }
+
+    /// Far-negative-tail companion to `debug_laguna_softplus`: the worst RELATIVE
+    /// error of the shader vs the host over x in [-88, -10]. Absolute error and
+    /// cosine cannot see this tail (the values are < 5e-5), which is how a shader
+    /// that returned exactly 0 there passed the gate above (PR #94 review).
+    /// Expect ~1e-6 (last-ulp exp noise); a 0 gate shows as 1.0.
+    fn debug_laguna_softplus_tail(&mut self) -> PyResult<f64> {
+        let g = self.laguna_gpu.as_mut().ok_or_else(|| PyRuntimeError::new_err("not resident"))?;
+        let xs: Vec<f32> = (0..=780).map(|i| -88.0 + (i as f32) * 0.1).collect();
+        let gpu = g.softplus_gpu(&xs);
+        let worst = xs.iter().zip(&gpu).map(|(&x, &y)| {
+            let h = x.max(0.0) + (-x.abs()).exp().ln_1p();
+            ((y as f64 - h as f64) / h as f64).abs()
+        }).fold(0.0f64, f64::max);
+        Ok(worst)
     }
 
 

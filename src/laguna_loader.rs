@@ -75,6 +75,8 @@ use crate::compute::{Buffer, ComputeEngine};
 use crate::laguna::LagunaConfig;
 use crate::model::{discover_shards, SimpleTensor};
 use crate::nemotron::{NemGpuWeight, NemQuant};
+// Shared bounds-checked resident write (PR #94 review: de-duplicated).
+use crate::nemotron_loader::write_at;
 use crate::push_constants::nvfp4_fold_scales;
 
 /// NVFP4 group size for the Laguna routed experts (`group_size: 16` from the
@@ -362,6 +364,54 @@ fn pread_entry(files: &[std::fs::File], e: &PreadEntry) -> Result<Vec<u8>, Strin
 /// a co-tensor's RAW bytes (the NVFP4 `weight_scale` / `weight_global_scale`),
 /// from the same `SafeTensors` (mmap) or via `pread` (pread source).
 #[allow(clippy::too_many_arguments)]
+/// A sibling tensor's bytes for the whole-shard mmap source: from the current
+/// shard when it is there, else by exact byte range from whichever shard the
+/// checkpoint-wide header index places it in (PR #94 review — safetensors
+/// sharding does not keep `weight_scale` next to its `weight_packed`).
+fn sibling_bytes(
+    st: &safetensors::SafeTensors,
+    idx_files: &[std::fs::File],
+    idx_entries: &HashMap<String, PreadEntry>,
+    name: &str,
+    sib: &str,
+) -> Result<Vec<u8>, String> {
+    if let Ok(t) = st.tensor(sib) {
+        return Ok(t.data().to_vec());
+    }
+    let se = idx_entries
+        .get(sib)
+        .ok_or_else(|| format!("{name}: sibling {sib} not in any shard"))?;
+    pread_entry(idx_files, se)
+}
+
+/// Every routed-expert projection of every resident MoE layer must have been
+/// written exactly once (`handle_laguna_tensor` rejects a second write, so a
+/// full count here is a full set). The buffers are preallocated, so without
+/// this a missing shard or tensor silently leaves garbage weights.
+fn check_experts_complete(
+    seen: &std::collections::HashSet<(usize, usize, u8)>,
+    moe_layers: &[usize],
+    ne: usize,
+    layer_start: usize,
+    layer_end: usize,
+) -> Result<(), String> {
+    let expected = moe_layers.len() * ne * 3;
+    if seen.len() == expected {
+        return Ok(());
+    }
+    let missing = moe_layers
+        .iter()
+        .flat_map(|&l| (0..ne).flat_map(move |e| (0..3u8).map(move |p| (l, e, p))))
+        .filter(|k| !seen.contains(k))
+        .take(5)
+        .collect::<Vec<_>>();
+    Err(format!(
+        "laguna loader: {} of {expected} routed-expert projections loaded for layers \
+         [{layer_start},{layer_end}); first missing (layer, expert, proj): {missing:?}",
+        seen.len()
+    ))
+}
+
 fn handle_laguna_tensor(
     name: &str,
     view: &safetensors::tensor::TensorView,
@@ -371,6 +421,7 @@ fn handle_laguna_tensor(
     gpu_experts: &mut HashMap<usize, LagunaMoeExperts>,
     host: &mut HashMap<String, SimpleTensor>,
     stats: &mut LagunaResidentStats,
+    seen: &mut std::collections::HashSet<(usize, usize, u8)>,
     e4m3: bool,
     embed_f16: bool,
     gs: usize,
@@ -418,6 +469,11 @@ fn handle_laguna_tensor(
                 "{name}: expert {e} shape [{out_f},{in_f}] != the resident allocation \
                  [{},{}] derived from the config — refusing to write",
                 projp.out_features, projp.in_features));
+        }
+        // Exactly once per (layer, expert, projection). A duplicate would let an
+        // omission elsewhere pass a count-only completeness check (PR #93 lesson).
+        if !seen.insert((layer, e, proj)) {
+            return Err(format!("{name}: expert {e} proj {proj} of layer {layer} loaded twice"));
         }
         write_at(&projp.packed, expert_packed_off(e, out_f, in_f), view.data(),
                  &format!("{name} packed"))?;
@@ -661,22 +717,6 @@ pub struct LagunaResidentStats {
     pub host_bytes: u64,
 }
 
-/// Bounds-CHECKED write into a mapped resident buffer.
-///
-/// This was a raw `copy_nonoverlapping` with no bounds check, in a safe function.
-/// The expert buffers are sized from the CONFIG (`ne`, `moe_inter`, `hidden`)
-/// while the offset and length come from the CHECKPOINT (`e` parsed out of the
-/// tensor name, `out_f`/`in_f` and the data length from the tensor), so a
-/// checkpoint with more experts than `num_experts`, or a projection shape that
-/// differs from the config, wrote PAST the mapped allocation — undefined
-/// behaviour, and in release builds the only guard (`debug_assert_eq!`) was
-/// compiled out. `compute::Buffer::write_at` already validates
-/// `offset + len <= size`, so delegate and return the error (PR #94 review).
-fn write_at(buf: &Buffer, byte_off: usize, bytes: &[u8], what: &str) -> Result<(), String> {
-    buf.write_at(byte_off as u64, bytes)
-        .map_err(|e| format!("{what}: {e}"))
-}
-
 fn alloc_proj(
     engine: &mut ComputeEngine,
     ne: usize,
@@ -786,6 +826,9 @@ pub fn load_laguna_resident(
         }
     };
 
+    // Every (layer, expert, projection) written; checked complete after loading.
+    let mut seen = std::collections::HashSet::new();
+
     if pread {
         // pread source: parse headers once, then pread each KEPT tensor's exact
         // byte range on demand (siblings via the global index). No whole-shard
@@ -806,10 +849,15 @@ pub fn load_laguna_resident(
             };
             handle_laguna_tensor(
                 name, &view, &mut get_sibling, engine, gpu_weights, gpu_experts, host,
-                &mut stats, e4m3, embed_f16, gs,
+                &mut stats, &mut seen, e4m3, embed_f16, gs,
             )?;
         }
     } else {
+        // Safetensors sharding does not keep a tensor's siblings in its shard, so a
+        // `weight_scale` / `weight_global_scale` in ANOTHER shard must still
+        // resolve (PR #94 review). Headers only — no data is read here; a sibling
+        // outside the current shard is fetched by exact byte range, like pread.
+        let (idx_files, idx_entries, _) = parse_shard_headers(&shards)?;
         for shard in &shards {
             let file = File::open(shard).map_err(|e| format!("open {}: {e}", shard.display()))?;
             let mmap = unsafe { Mmap::map(&file) }.map_err(|e| format!("mmap: {e}"))?;
@@ -818,17 +866,20 @@ pub fn load_laguna_resident(
                 if !keep(&name) || is_laguna_aux_scale(&name) {
                     continue;
                 }
-                let mut get_sibling = |sib: &str| -> Result<Vec<u8>, String> {
-                    st.tensor(sib).map(|t| t.data().to_vec())
-                        .map_err(|e| format!("{name}: sibling {sib}: {e}"))
-                };
+                let mut get_sibling = |sib: &str| sibling_bytes(&st, &idx_files, &idx_entries, &name, sib);
                 handle_laguna_tensor(
                     &name, &view, &mut get_sibling, engine, gpu_weights, gpu_experts, host,
-                    &mut stats, e4m3, embed_f16, gs,
+                    &mut stats, &mut seen, e4m3, embed_f16, gs,
                 )?;
             }
         }
     }
+    // PR #94 review: the expert buffers are preallocated, so a missing shard or
+    // `weight_packed` tensor left a slice unwritten and nothing failed later.
+    let moe_layers: Vec<usize> = (layer_start..layer_end)
+        .filter(|g| !cfg.mlp_only_layers.contains(g))
+        .collect();
+    check_experts_complete(&seen, &moe_layers, ne, layer_start, layer_end)?;
     plog!(
         "DONE resident GTT {} MB ({} nvfp4-expert + {} f16 + {} int8/q8), host {} MB ({} tensors)",
         stats.gpu_resident_bytes >> 20, stats.nvfp4_expert_tensors, stats.f16_tensors,
@@ -894,6 +945,56 @@ mod tests {
             }
         });
         LagunaConfig::from_json(&json).expect("tiny cfg")
+    }
+
+    /// PR #94 review: a missing expert projection is an error naming it; a full
+    /// set passes. (Duplicates are refused at write time, so count == set.)
+    #[test]
+    fn expert_completeness_names_the_missing_projection() {
+        let mut seen = std::collections::HashSet::new();
+        for l in [1usize, 2] {
+            for e in 0..4 {
+                for p in 0..3u8 {
+                    seen.insert((l, e, p));
+                }
+            }
+        }
+        assert!(check_experts_complete(&seen, &[1, 2], 4, 0, 3).is_ok());
+        seen.remove(&(2, 3, 1));
+        let err = check_experts_complete(&seen, &[1, 2], 4, 0, 3).unwrap_err();
+        assert!(err.contains("23 of 24") && err.contains("(2, 3, 1)"), "{err}");
+        // A layer with no experts at all (e.g. its shard missing) is caught too.
+        assert!(check_experts_complete(&seen, &[1, 2, 5], 4, 0, 6).is_err());
+    }
+
+    /// PR #94 review: the mmap source resolves a sibling that lives in ANOTHER
+    /// shard through the header index, byte-exact; a sibling in no shard errors.
+    #[test]
+    fn mmap_sibling_resolves_across_shards() {
+        use safetensors::{serialize_to_file, tensor::TensorView, Dtype, SafeTensors};
+        let dir = std::env::temp_dir().join(format!("laguna_sib_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("model-00001-of-00002.safetensors"), dir.join("model-00002-of-00002.safetensors"));
+        let packed = vec![7u8; 8];
+        let scale: Vec<u8> = (0u8..4).collect();
+        let base = "model.layers.1.mlp.experts.0.gate_proj";
+        let m1 = std::collections::BTreeMap::from([(format!("{base}.weight_packed"),
+            TensorView::new(Dtype::U8, vec![2, 4], &packed).unwrap())]);
+        let m2 = std::collections::BTreeMap::from([(format!("{base}.weight_scale"),
+            TensorView::new(Dtype::U8, vec![1, 4], &scale).unwrap())]);
+        serialize_to_file(m1, &None, &a).unwrap();
+        serialize_to_file(m2, &None, &b).unwrap();
+        let shards = vec![a.clone(), b.clone()];
+        let (files, entries, _) = parse_shard_headers(&shards).unwrap();
+        let bytes = std::fs::read(&a).unwrap();
+        let st = SafeTensors::deserialize(&bytes).unwrap();
+        let name = format!("{base}.weight_packed");
+        // Old behaviour: the current shard alone cannot see it.
+        assert!(st.tensor(&format!("{base}.weight_scale")).is_err());
+        let got = sibling_bytes(&st, &files, &entries, &name, &format!("{base}.weight_scale")).unwrap();
+        assert_eq!(got, scale);
+        assert!(sibling_bytes(&st, &files, &entries, &name, &format!("{base}.weight_global_scale")).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The footprint formula is byte-exact vs hand-rolled per-tensor sizing on a
