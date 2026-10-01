@@ -463,18 +463,26 @@ impl VulkanModel {
     }
 
     /// Far-negative-tail companion to `debug_laguna_softplus`: the worst RELATIVE
-    /// error of the shader vs the host over x in [-88, -10]. Absolute error and
-    /// cosine cannot see this tail (the values are < 5e-5), which is how a shader
-    /// that returned exactly 0 there passed the gate above (PR #94 review).
-    /// Expect ~1e-6 (last-ulp exp noise); a 0 gate shows as 1.0.
-    fn debug_laguna_softplus_tail(&mut self) -> PyResult<f64> {
+    /// error of the shader vs the host over x in `[lo, hi]` (step 0.1), and the x
+    /// where it occurs. Absolute error and cosine cannot see this tail (values
+    /// < 5e-5), which is how a shader that returned exactly 0 there passed the
+    /// gate above (PR #94 review). Default range stops at -87: below that e^x is
+    /// an f32 SUBNORMAL, which the GPU flushes to zero, so a 0 there is the
+    /// hardware's denormal mode, not the formula. Expect ~1e-6; a 0 gate is 1.0.
+    #[pyo3(signature = (lo = -87.0, hi = -10.0))]
+    fn debug_laguna_softplus_tail(&mut self, lo: f32, hi: f32) -> PyResult<(f64, f32)> {
         let g = self.laguna_gpu.as_mut().ok_or_else(|| PyRuntimeError::new_err("not resident"))?;
-        let xs: Vec<f32> = (0..=780).map(|i| -88.0 + (i as f32) * 0.1).collect();
+        let n = (((hi - lo) / 0.1).round() as usize).max(0);
+        let xs: Vec<f32> = (0..=n).map(|i| lo + (i as f32) * 0.1).collect();
         let gpu = g.softplus_gpu(&xs);
-        let worst = xs.iter().zip(&gpu).map(|(&x, &y)| {
+        let mut worst = (0.0f64, lo);
+        for (&x, &y) in xs.iter().zip(&gpu) {
             let h = x.max(0.0) + (-x.abs()).exp().ln_1p();
-            ((y as f64 - h as f64) / h as f64).abs()
-        }).fold(0.0f64, f64::max);
+            let rel = ((y as f64 - h as f64) / h as f64).abs();
+            if rel > worst.0 {
+                worst = (rel, x);
+            }
+        }
         Ok(worst)
     }
 
