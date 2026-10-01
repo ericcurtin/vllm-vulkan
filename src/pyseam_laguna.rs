@@ -471,9 +471,12 @@ impl VulkanModel {
     /// hardware's denormal mode, not the formula. Expect ~1e-6; a 0 gate is 1.0.
     #[pyo3(signature = (lo = -87.0, hi = -10.0))]
     fn debug_laguna_softplus_tail(&mut self, lo: f32, hi: f32) -> PyResult<(f64, f32)> {
+        if !(lo.is_finite() && hi.is_finite() && lo <= hi) {
+            return Err(PyRuntimeError::new_err(format!(
+                "debug_laguna_softplus_tail: need finite lo <= hi, got [{lo}, {hi}]")));
+        }
         let g = self.laguna_gpu.as_mut().ok_or_else(|| PyRuntimeError::new_err("not resident"))?;
-        let n = (((hi - lo) / 0.1).round() as usize).max(0);
-        let xs: Vec<f32> = (0..=n).map(|i| lo + (i as f32) * 0.1).collect();
+        let xs = softplus_tail_samples(lo, hi);
         let gpu = g.softplus_gpu(&xs);
         let mut worst = (0.0f64, lo);
         for (&x, &y) in xs.iter().zip(&gpu) {
@@ -1273,11 +1276,17 @@ impl VulkanModel {
         if k == 0 {
             return Err(PyRuntimeError::new_err("pp_step_laguna_topk: k must be >= 1"));
         }
-        let h = {
+        let (h, vocab) = {
             let g = self.laguna_gpu.as_ref().ok_or_else(|| PyRuntimeError::new_err(
                 "pp_step_laguna_topk needs a resident Laguna model (VLLM_VULKAN_LAGUNA_RESIDENT=1)"))?;
-            g.config.hidden_size
+            (g.config.hidden_size, g.config.vocab_size)
         };
+        // Clamp to the vocabulary, as `topk_select` already does on the standalone
+        // path. Without it the distributed path sends `2*k` slots and rank 0 unpacks
+        // the zero padding as duplicate token-0 candidates that were never selected,
+        // and the two paths return different lengths (PR #94 review). Every rank
+        // reads the same config, so every rank agrees on the clamped `k`.
+        let k = k.min(vocab);
         let comm = self.collective_comm as *mut std::os::raw::c_void;
         let (do_recv, is_last) = pp_step_role(recv_from, send_to);
         let is_first = recv_from < 0;
@@ -1410,4 +1419,40 @@ impl VulkanModel {
     }
 
 
+}
+
+
+/// Sample points for `debug_laguna_softplus_tail`: `lo, lo+0.1, …` up to and
+/// INCLUDING `hi`, never past it. `round()` used to add a step beyond `hi`
+/// (`[0, 0.06]` evaluated x = 0.1, PR #94 review); counting only full steps and
+/// then appending `hi` keeps every sample — and so the reported worst x — inside
+/// the requested range.
+fn softplus_tail_samples(lo: f32, hi: f32) -> Vec<f32> {
+    const STEP: f32 = 0.1;
+    // The tiny slack absorbs f32 rounding of (hi - lo) / STEP (e.g. 76.99999).
+    let n = ((hi - lo) / STEP + 1e-3).floor().max(0.0) as usize;
+    let mut xs: Vec<f32> = (0..=n).map(|i| lo + (i as f32) * STEP).filter(|&x| x <= hi).collect();
+    if xs.last().map_or(true, |&x| x < hi) {
+        xs.push(hi);
+    }
+    xs
+}
+
+#[cfg(test)]
+mod softplus_tail_sample_tests {
+    use super::softplus_tail_samples;
+
+    #[test]
+    fn samples_never_leave_the_requested_range() {
+        for (lo, hi) in [(0.0f32, 0.06f32), (-87.0, -10.0), (-1.0, -1.0), (-0.95, 0.0), (-20.0, -19.91)] {
+            let xs = softplus_tail_samples(lo, hi);
+            assert!(xs.iter().all(|&x| x >= lo && x <= hi), "[{lo},{hi}] -> {xs:?}");
+            assert_eq!(*xs.first().unwrap(), lo);
+            assert_eq!(*xs.last().unwrap(), hi);
+        }
+        // The reported case: round(0.6) = 1 used to add x = 0.1.
+        assert_eq!(softplus_tail_samples(0.0, 0.06), vec![0.0, 0.06]);
+        // The default range keeps its 771 grid points (-87.0 ..= -10.0).
+        assert_eq!(softplus_tail_samples(-87.0, -10.0).len(), 771);
+    }
 }

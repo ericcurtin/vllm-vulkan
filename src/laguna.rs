@@ -135,20 +135,40 @@ impl LagunaConfig {
         let sliding_window = get_usize(v, "sliding_window").unwrap_or(512);
         let max_position_embeddings = get_usize(v, "max_position_embeddings").unwrap_or(8192);
 
-        let mlp_only_layers: Vec<usize> = v
-            .get("mlp_only_layers")
-            .and_then(|x| x.as_array())
-            .map(|a| a.iter().filter_map(|e| e.as_u64().map(|n| n as usize)).collect())
-            .unwrap_or_default();
+        // A non-integer or out-of-range entry used to be dropped silently, turning
+        // that layer's dense MLP into an MoE lookup (PR #94 review, sibling of the
+        // layer_types finding below).
+        let mlp_only_layers: Vec<usize> = match v.get("mlp_only_layers") {
+            None => Vec::new(),
+            Some(x) => x
+                .as_array()
+                .ok_or("config: 'mlp_only_layers' is not an array")?
+                .iter()
+                .map(|e| match e.as_u64() {
+                    Some(n) if (n as usize) < num_hidden_layers => Ok(n as usize),
+                    _ => Err(format!(
+                        "config: mlp_only_layers entry {e} is not a layer index in 0..{num_hidden_layers}")),
+                })
+                .collect::<Result<_, _>>()?,
+        };
 
         let layer_types = v
             .get("layer_types")
             .and_then(|x| x.as_array())
             .ok_or("config: missing 'layer_types'")?;
+        // Exactly the two Laguna layer kinds. Anything else (a typo, a non-string)
+        // used to fall through to sliding attention and silently pick different
+        // RoPE, head geometry, KV capacity and attention (PR #94 review).
         let layer_is_full: Vec<bool> = layer_types
             .iter()
-            .map(|t| t.as_str() == Some("full_attention"))
-            .collect();
+            .enumerate()
+            .map(|(i, t)| match t.as_str() {
+                Some("full_attention") => Ok(true),
+                Some("sliding_attention") => Ok(false),
+                _ => Err(format!(
+                    "config: layer_types[{i}] = {t} — expected \"full_attention\" or \"sliding_attention\"")),
+            })
+            .collect::<Result<_, _>>()?;
         if layer_is_full.len() != num_hidden_layers {
             return Err(format!(
                 "config: layer_types len {} != num_hidden_layers {num_hidden_layers}",
@@ -1570,6 +1590,45 @@ mod tests {
         let logits = w2.forward(&tokens, &cfg);
         assert_eq!(logits.len(), cfg.vocab_size, "logits shape [vocab]");
         assert!(logits.iter().all(|v| v.is_finite()));
+    }
+
+    // ─── strict layer_types / mlp_only_layers (PR #94 review) ─────────────────
+    fn tiny_cfg_json() -> Value {
+        serde_json::json!({
+            "model_type": "laguna", "hidden_size": 64, "num_hidden_layers": 4,
+            "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 16,
+            "vocab_size": 32, "intermediate_size": 128, "moe_intermediate_size": 32,
+            "num_experts": 4, "num_experts_per_tok": 2,
+            "mlp_only_layers": [0],
+            "layer_types": ["full_attention", "sliding_attention", "sliding_attention", "sliding_attention"],
+            "rope_parameters": {
+                "full_attention": {"rope_theta": 500000.0, "rope_type": "yarn", "factor": 32.0,
+                    "original_max_position_embeddings": 8192, "beta_slow": 1.0, "beta_fast": 32.0,
+                    "attention_factor": 1.3465735902799727, "partial_rotary_factor": 0.5},
+                "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 1.0}
+            }
+        })
+    }
+
+    #[test]
+    fn from_json_rejects_unknown_layer_types_and_bad_mlp_only_layers() {
+        let good = LagunaConfig::from_json(&tiny_cfg_json()).expect("the tiny config parses");
+        assert_eq!(good.layer_is_full, vec![true, false, false, false]);
+        assert_eq!(good.mlp_only_layers, vec![0]);
+        for bad_type in [serde_json::json!("sliding"), serde_json::json!("linear_attention"), serde_json::json!(7)] {
+            let mut v = tiny_cfg_json();
+            v["layer_types"][2] = bad_type.clone();
+            let e = LagunaConfig::from_json(&v).expect_err("unknown layer type must be refused");
+            assert!(e.contains("layer_types[2]"), "{bad_type}: {e}");
+        }
+        for bad_idx in [serde_json::json!("0"), serde_json::json!(4), serde_json::json!(-1)] {
+            let mut v = tiny_cfg_json();
+            v["mlp_only_layers"] = serde_json::json!([bad_idx.clone()]);
+            assert!(LagunaConfig::from_json(&v).is_err(), "mlp_only_layers {bad_idx} must be refused");
+        }
+        let mut v = tiny_cfg_json();
+        v.as_object_mut().unwrap().remove("mlp_only_layers");
+        assert!(LagunaConfig::from_json(&v).unwrap().mlp_only_layers.is_empty());
     }
 
     // ─── from_json against the real Laguna config.json (if present) ──────────
