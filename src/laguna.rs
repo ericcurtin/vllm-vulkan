@@ -33,16 +33,10 @@ use crate::model::{cpu_matmul, cpu_rms_norm, cpu_rms_norm_inplace, cpu_rope, cpu
 use crate::nemotron::{router_forward, RouterDims};
 use serde_json::Value;
 
-#[inline]
-fn silu(x: f32) -> f32 {
-    x / (1.0 + (-x).exp())
-}
-#[inline]
-fn softplus(x: f32) -> f32 {
-    // numerically stable log(1 + exp(x)) == max(x,0) + log1p(exp(-|x|)),
-    // matching torch.nn.functional.softplus.
-    x.max(0.0) + (-x.abs()).exp().ln_1p()
-}
+// silu / softplus: the same expressions nemotron uses (torch-matching, stable
+// softplus form); one copy for laguna.rs, laguna_gpu.rs and nemotron.rs (PR #94
+// review de-dup).
+pub(crate) use crate::nemotron::{silu, softplus};
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -113,6 +107,11 @@ impl LagunaConfig {
         let num_hidden_layers = get_usize(v, "num_hidden_layers")?;
         let num_attention_heads = get_usize(v, "num_attention_heads")?;
         let num_key_value_heads = get_usize(v, "num_key_value_heads")?;
+        if num_attention_heads == 0 || num_key_value_heads == 0 {
+            return Err(format!(
+                "config: num_attention_heads {num_attention_heads} and num_key_value_heads \
+                 {num_key_value_heads} must be > 0"));
+        }
         let head_dim = v
             .get("head_dim")
             .and_then(|x| x.as_u64())
@@ -176,11 +175,27 @@ impl LagunaConfig {
             ));
         }
 
-        let num_attention_heads_per_layer: Vec<usize> = v
-            .get("num_attention_heads_per_layer")
-            .and_then(|x| x.as_array())
-            .map(|a| a.iter().filter_map(|e| e.as_u64().map(|n| n as usize)).collect())
-            .unwrap_or_else(|| vec![num_attention_heads; num_hidden_layers]);
+        // Parse EVERY indexed entry: `filter_map` used to drop a non-integer entry,
+        // so `[48, "bad", 72]` became `[48, 72]` and silently shifted every later
+        // layer's head count. Each entry (the all-layers default included) must also
+        // be a positive multiple of the KV head count (GQA) (PR #94 review).
+        let heads_raw: Vec<Value> = match v.get("num_attention_heads_per_layer") {
+            None => vec![Value::from(num_attention_heads as u64); num_hidden_layers],
+            Some(x) => x
+                .as_array()
+                .ok_or("config: 'num_attention_heads_per_layer' is not an array")?
+                .clone(),
+        };
+        let num_attention_heads_per_layer: Vec<usize> = heads_raw
+            .iter()
+            .enumerate()
+            .map(|(i, e)| match e.as_u64() {
+                Some(n) if n > 0 && (n as usize) % num_key_value_heads == 0 => Ok(n as usize),
+                _ => Err(format!(
+                    "config: num_attention_heads_per_layer[{i}] = {e} is not a positive multiple of \
+                     num_key_value_heads {num_key_value_heads}")),
+            })
+            .collect::<Result<_, _>>()?;
         if num_attention_heads_per_layer.len() != num_hidden_layers {
             return Err(format!(
                 "config: num_attention_heads_per_layer len {} != num_hidden_layers {num_hidden_layers}",
@@ -879,7 +894,7 @@ pub fn load_laguna_weights_cpu(
                 );
                 f32s.insert(name.clone(), vec![g]);
             } else {
-                f32s.insert(name.clone(), decode_bf16_f32(&view)?);
+                f32s.insert(name.clone(), crate::nemotron_loader::decode_plain(&view)?);
             }
         }
     }
@@ -1026,7 +1041,7 @@ pub fn load_owned_layer_cpu(
             {
                 // W4A16 activation scales — ignored (see loader).
             } else {
-                f32s.insert(name.clone(), decode_bf16_f32(&view)?);
+                f32s.insert(name.clone(), crate::nemotron_loader::decode_plain(&view)?);
             }
         }
     }
@@ -1095,25 +1110,6 @@ pub fn load_owned_layer_cpu(
         post_ln: take(&mut f32s, &format!("{p}.post_attention_layernorm.weight"))?,
         attn,
         mlp,
-    })
-}
-
-fn decode_bf16_f32(view: &safetensors::tensor::TensorView) -> Result<Vec<f32>, String> {
-    let d = view.data();
-    Ok(match view.dtype() {
-        safetensors::Dtype::BF16 => d
-            .chunks_exact(2)
-            .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
-            .collect(),
-        safetensors::Dtype::F16 => d
-            .chunks_exact(2)
-            .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
-            .collect(),
-        safetensors::Dtype::F32 => d
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect(),
-        other => return Err(format!("unsupported plain dtype {other:?} in Laguna loader")),
     })
 }
 
@@ -1629,6 +1625,37 @@ mod tests {
         let mut v = tiny_cfg_json();
         v.as_object_mut().unwrap().remove("mlp_only_layers");
         assert!(LagunaConfig::from_json(&v).unwrap().mlp_only_layers.is_empty());
+    }
+
+    #[test]
+    fn from_json_rejects_bad_num_attention_heads_per_layer() {
+        let mut v = tiny_cfg_json();
+        v["num_attention_heads_per_layer"] = serde_json::json!([4, 6, 4, 6]);
+        let ok = LagunaConfig::from_json(&v).expect("multiples of num_key_value_heads (2) parse");
+        assert_eq!(ok.num_attention_heads_per_layer, vec![4, 6, 4, 6]);
+        // A non-integer entry used to be dropped (shifting later layers); zero and
+        // non-multiples of the KV head count are refused too.
+        for bad in [
+            serde_json::json!([4, "bad", 4, 6]),
+            serde_json::json!([4, 0, 4, 6]),
+            serde_json::json!([4, 5, 4, 6]),
+            serde_json::json!([4, 6, 4, -2]),
+        ] {
+            let mut v = tiny_cfg_json();
+            v["num_attention_heads_per_layer"] = bad.clone();
+            let e = LagunaConfig::from_json(&v).expect_err("bad per-layer heads must be refused");
+            assert!(e.contains("num_attention_heads_per_layer["), "{bad}: {e}");
+        }
+        let mut v = tiny_cfg_json();
+        v["num_attention_heads_per_layer"] = serde_json::json!("48");
+        assert!(LagunaConfig::from_json(&v).is_err(), "a non-array must be refused");
+        let mut v = tiny_cfg_json();
+        v["num_key_value_heads"] = serde_json::json!(0);
+        assert!(LagunaConfig::from_json(&v).is_err(), "zero KV heads must be refused, not divide by zero");
+        // The all-layers default is checked too (4 heads is not a multiple of 3 KV heads).
+        let mut v = tiny_cfg_json();
+        v["num_key_value_heads"] = serde_json::json!(3);
+        assert!(LagunaConfig::from_json(&v).is_err());
     }
 
     // ─── from_json against the real Laguna config.json (if present) ──────────

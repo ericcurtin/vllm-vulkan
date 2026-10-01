@@ -235,31 +235,13 @@ pub fn parse_expert_packed(name: &str) -> Option<(usize, usize, u8)> {
     Some((layer, e, proj))
 }
 
-/// GLOBAL layer index of a `model.layers.{i}.*` tensor, else `None`.
+/// GLOBAL layer index of a `model.layers.{i}.*` tensor, else `None` (the shared
+/// nemotron parser with Laguna's prefix).
 fn layer_of(name: &str) -> Option<usize> {
-    name.strip_prefix("model.layers.")
-        .and_then(|rest| rest.split('.').next())
-        .and_then(|s| s.parse::<usize>().ok())
+    crate::nemotron_loader::layer_index(name, "model.layers.")
 }
 
-fn decode_plain(view: &safetensors::tensor::TensorView) -> Result<Vec<f32>, String> {
-    let d = view.data();
-    Ok(match view.dtype() {
-        safetensors::Dtype::BF16 => d
-            .chunks_exact(2)
-            .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
-            .collect(),
-        safetensors::Dtype::F16 => d
-            .chunks_exact(2)
-            .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
-            .collect(),
-        safetensors::Dtype::F32 => d
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect(),
-        other => return Err(format!("unsupported plain dtype {other:?} in Laguna loader")),
-    })
-}
+use crate::nemotron_loader::decode_plain;
 
 // ─── pread source (VLLM_VULKAN_LAGUNA_PREAD_LOAD) ─────────────────────────────
 // Header-parse + per-tensor `pread` instead of whole-shard `Mmap::map`. Two
@@ -441,8 +423,7 @@ fn handle_laguna_tensor(
         let global = 1.0 / raw_global;
         let out_f = view.shape()[0];
         let in_f = view.shape()[1] * 2; // 2 nibbles/byte
-        let groups = nvfp4_scale_groups(wscale.len(), out_f, in_f, gs)
-            .map_err(|e| format!("{name}: {e}"))?;
+        let groups = crate::nemotron_loader::nvfp4_scale_len_check(name, wscale.len(), out_f, in_f, gs)?;
         let ex = gpu_experts
             .get(&layer)
             .ok_or_else(|| format!("{name}: no pre-allocated experts for layer {layer}"))?;
@@ -1196,40 +1177,3 @@ mod tests {
 }
 
 
-/// Groups per row of an NVFP4 `weight_scale` (one e4m3 byte per `gs`-wide group),
-/// checked EXACTLY against `[out_f, in_f / gs]`. Deriving the count by integer
-/// division let a truncated tensor pass: `out_f * 192 - 1` bytes gives 191 groups
-/// and `3072 / 191 == 16`, so part of every expert-scale slice stayed unwritten
-/// while the completeness check still marked the projection loaded (PR #94 review).
-fn nvfp4_scale_groups(scale_len: usize, out_f: usize, in_f: usize, gs: usize) -> Result<usize, String> {
-    if gs == 0 || out_f == 0 || in_f % gs != 0 {
-        return Err(format!("NVFP4 shape [{out_f},{in_f}] does not tile into group_size {gs}"));
-    }
-    let groups = in_f / gs;
-    if scale_len != out_f * groups {
-        return Err(format!(
-            "NVFP4 weight_scale has {scale_len} entries, want exactly {out_f} x {groups} = {} \
-             for [{out_f},{in_f}] at group_size {gs}",
-            out_f * groups));
-    }
-    Ok(groups)
-}
-
-#[cfg(test)]
-mod nvfp4_scale_group_tests {
-    use super::nvfp4_scale_groups;
-
-    #[test]
-    fn exact_scale_length_is_required() {
-        // The real Laguna expert: [out_f, 3072] at gs 16 -> 192 groups.
-        assert_eq!(nvfp4_scale_groups(512 * 192, 512, 3072, 16), Ok(192));
-        // The reported truncation: one byte short. The old `len / out_f` gave 191
-        // groups and `3072 / 191 == 16`, so it passed.
-        assert_eq!(3072 / ((512 * 192 - 1) / 512), 16, "the old check would have accepted it");
-        assert!(nvfp4_scale_groups(512 * 192 - 1, 512, 3072, 16).is_err());
-        assert!(nvfp4_scale_groups(512 * 192 + 1, 512, 3072, 16).is_err());
-        assert!(nvfp4_scale_groups(512 * 191, 512, 3072, 16).is_err());
-        assert!(nvfp4_scale_groups(512 * 192, 512, 3072, 0).is_err());
-        assert!(nvfp4_scale_groups(512 * 192, 512, 3070, 16).is_err());
-    }
-}

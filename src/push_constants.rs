@@ -1042,6 +1042,21 @@ pub(crate) fn matvec_nvfp4_e4m3_pc_off(
     v
 }
 
+/// Shader for an E4M3-RESIDENT NVFP4 routed-expert matvec: the address-gen-free
+/// REPACK kernel when the flag is on and the shape passes `nvfp4_repack_shape_ok`
+/// (bs64/r4, the mlx4/nvfp4-repack default), else the v1 `mul_mat_vec_nvfp4_e4m3`
+/// oracle. The repack threads `packed_off`/`sb_off` + the per-tensor `global`
+/// through the same push block (`matvec_nvfp4_e4m3_pc[_off]`), so callers change
+/// only the name; repack == f32-fold (single IEEE mul) -> argmax-exact vs v1.
+/// Shared by nemotron (`nem_e4m3_expert_shader`) and Laguna
+/// (`laguna_e4m3_expert_shader`), which carried identical copies (PR #94 review).
+pub(crate) fn nvfp4_e4m3_expert_shader(k: usize, n: usize, gs: usize) -> (String, u32) {
+    if laguna_expert_repack_flag() && nvfp4_repack_shape_ok(k, n, gs) {
+        return ("mul_mat_vec_nvfp4_e4m3repack_f32_f32_bs64_r4".to_string(), 4);
+    }
+    matvec_nvfp4_e4m3_variant(n)
+}
+
 /// Format-route an NVFP4 matvec dispatch to either the E4M3-resident kernel
 /// (raw e4m3 scale bytes + `global` push constant) or the default f32-fold
 /// kernel, returning `(shader, rows_per_workgroup, push_constants)`. Both

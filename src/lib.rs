@@ -5809,6 +5809,19 @@ impl VulkanModel {
             m.reset();
             return;
         }
+        // Laguna: the only per-sequence state is the resident model's K/V — the
+        // host `kv` map (per-op path) AND the device `kv_res` planes (1-CB path,
+        // VLLM_VULKAN_LAGUNA_1CB). `reset_kv` zeroes both counters. Without this
+        // branch an OP_RESET fell through to the dense `inner` placeholder and the
+        // next request decoded on top of the previous one's KV, unless the caller
+        // happened to run the self-resetting PP prefill first (PR #94 review; same
+        // gap #93 closed for nemotron). The CPU `LagunaModel` reference holds no
+        // per-sequence state.
+        #[cfg(feature = "laguna")]
+        if let Some(g) = self.laguna_gpu.as_mut() {
+            g.reset_kv();
+            return;
+        }
         #[cfg(feature = "gemma")]
         self.cpu_model_mut().reset_kv_cache();
     }

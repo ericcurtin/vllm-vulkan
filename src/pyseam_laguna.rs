@@ -475,6 +475,15 @@ impl VulkanModel {
             return Err(PyRuntimeError::new_err(format!(
                 "debug_laguna_softplus_tail: need finite lo <= hi, got [{lo}, {hi}]")));
         }
+        // Bound the grid BEFORE allocating it: the span is taken in f64 (f32
+        // `hi - lo` overflows to inf for e.g. [-3e38, 3e38]) and a huge range would
+        // otherwise try to collect billions of samples (PR #94 review).
+        let n_samples = (hi as f64 - lo as f64) / 0.1;
+        if n_samples > SOFTPLUS_TAIL_MAX_SAMPLES as f64 {
+            return Err(PyRuntimeError::new_err(format!(
+                "debug_laguna_softplus_tail: [{lo}, {hi}] needs ~{n_samples:.0} samples at step 0.1, \
+                 max {SOFTPLUS_TAIL_MAX_SAMPLES}")));
+        }
         let g = self.laguna_gpu.as_mut().ok_or_else(|| PyRuntimeError::new_err("not resident"))?;
         let xs = softplus_tail_samples(lo, hi);
         let gpu = g.softplus_gpu(&xs);
@@ -829,6 +838,8 @@ impl VulkanModel {
         hidden_in: Vec<f32>,
         seq: usize,
     ) -> PyResult<Vec<f32>> {
+        self.laguna_check_tokens(&tokens, true)?;
+        self.laguna_check_stage_input(&tokens, &hidden_in, seq, false)?;
         let g = self.laguna_gpu.as_mut().ok_or_else(|| {
             PyRuntimeError::new_err(
                 "forward_pp_laguna needs a resident Laguna model (set VLLM_VULKAN_LAGUNA_RESIDENT=1)",
@@ -857,6 +868,8 @@ impl VulkanModel {
         hidden_in: Vec<f32>,
         seq: usize,
     ) -> PyResult<Vec<f32>> {
+        self.laguna_check_tokens(&tokens, true)?;
+        self.laguna_check_stage_input(&tokens, &hidden_in, seq, false)?;
         let g = self.laguna_gpu.as_mut().ok_or_else(|| {
             PyRuntimeError::new_err(
                 "forward_pp_laguna_prefill needs a resident Laguna model (VLLM_VULKAN_LAGUNA_RESIDENT=1)",
@@ -891,6 +904,8 @@ impl VulkanModel {
         new_tok: u32,
         hidden_in: Vec<f32>,
     ) -> PyResult<Vec<f32>> {
+        self.laguna_check_tokens(&[new_tok], true)?;
+        self.laguna_check_stage_input(&[new_tok], &hidden_in, 1, true)?;
         let g = self.laguna_gpu.as_mut().ok_or_else(|| {
             PyRuntimeError::new_err(
                 "forward_pp_laguna_decode needs a resident Laguna model (VLLM_VULKAN_LAGUNA_RESIDENT=1)",
@@ -965,6 +980,8 @@ impl VulkanModel {
         recv_from: i32,
         send_to: i32,
     ) -> PyResult<Option<(u32, f32)>> {
+        // Only the FIRST stage embeds `token_id`; later stages ignore it.
+        self.laguna_check_tokens(&[token_id], recv_from < 0)?;
         if !self.native_comm_enabled() {
             return Err(PyRuntimeError::new_err(
                 "pp_step_laguna: native comm not enabled (set_collective_comm + VLLM_VULKAN_NATIVE_COMM!=0)"));
@@ -1098,6 +1115,8 @@ impl VulkanModel {
         send_to: i32,
         last_rank: i32,
     ) -> PyResult<Option<Vec<f32>>> {
+        // Only the FIRST stage embeds `token_id`; later stages ignore it.
+        self.laguna_check_tokens(&[token_id], recv_from < 0)?;
         if !self.native_comm_enabled() {
             return Err(PyRuntimeError::new_err(
                 "pp_step_laguna_logits: native comm not enabled (set_collective_comm + VLLM_VULKAN_NATIVE_COMM!=0)"));
@@ -1269,6 +1288,8 @@ impl VulkanModel {
         last_rank: i32,
         k: usize,
     ) -> PyResult<Option<Vec<(u32, f32)>>> {
+        // Only the FIRST stage embeds `token_id`; later stages ignore it.
+        self.laguna_check_tokens(&[token_id], recv_from < 0)?;
         if !self.native_comm_enabled() {
             return Err(PyRuntimeError::new_err(
                 "pp_step_laguna_topk: native comm not enabled (set_collective_comm + VLLM_VULKAN_NATIVE_COMM!=0)"));
@@ -1422,6 +1443,9 @@ impl VulkanModel {
 }
 
 
+/// Upper bound on the softplus-tail grid (the default range is 771 points).
+const SOFTPLUS_TAIL_MAX_SAMPLES: usize = 100_000;
+
 /// Sample points for `debug_laguna_softplus_tail`: `lo, lo+0.1, …` up to and
 /// INCLUDING `hi`, never past it. `round()` used to add a step beyond `hi`
 /// (`[0, 0.06]` evaluated x = 0.1, PR #94 review); counting only full steps and
@@ -1454,5 +1478,116 @@ mod softplus_tail_sample_tests {
         assert_eq!(softplus_tail_samples(0.0, 0.06), vec![0.0, 0.06]);
         // The default range keeps its 771 grid points (-87.0 ..= -10.0).
         assert_eq!(softplus_tail_samples(-87.0, -10.0).len(), 771);
+    }
+}
+
+
+impl VulkanModel {
+    /// Refuse token ids outside the vocabulary before they reach the embedding.
+    /// The f16-resident `embed_row` reads the table through a raw pointer, so an id
+    /// >= vocab_size was an out-of-bounds read rather than an error (PR #94
+    /// review). `used` is false on PP stages that ignore the token (they receive a
+    /// hidden state instead), so a placeholder id there is not an error.
+    fn laguna_check_tokens(&self, tokens: &[u32], used: bool) -> PyResult<()> {
+        let g = match self.laguna_gpu.as_ref() {
+            Some(g) => g,
+            None => return Ok(()), // the callers report the missing model themselves
+        };
+        if !used || !g.pp_first {
+            return Ok(());
+        }
+        laguna_tokens_in_vocab(tokens, g.config.vocab_size).map_err(PyRuntimeError::new_err)
+    }
+}
+
+impl VulkanModel {
+    /// Shape-check what a Python-facing PP entry point hands the resident stage,
+    /// before anything indexes it. An empty prefix reached `finalize` and
+    /// underflowed `(seq - 1) * hidden`; a `hidden_in` of the wrong length either
+    /// sliced out of range or was silently truncated by the zip-based residual ops
+    /// (PR #94 review). `decode` = a single new token / a `[1*hidden]` hop.
+    fn laguna_check_stage_input(
+        &self, tokens: &[u32], hidden_in: &[f32], seq: usize, decode: bool,
+    ) -> PyResult<()> {
+        let g = match self.laguna_gpu.as_ref() {
+            Some(g) => g,
+            None => return Ok(()), // the callers report the missing model themselves
+        };
+        laguna_stage_input_ok(g.pp_first, tokens.len(), hidden_in.len(), seq, g.config.hidden_size, decode)
+            .map_err(PyRuntimeError::new_err)
+    }
+}
+
+/// Pure shape rule behind [`VulkanModel::laguna_check_stage_input`].
+fn laguna_stage_input_ok(
+    pp_first: bool, n_tokens: usize, n_hidden: usize, seq: usize, hs: usize, decode: bool,
+) -> Result<(), String> {
+    if decode {
+        // First stage embeds the single new token (the caller passes it as a
+        // one-element slice); later stages take exactly one [hidden] vector.
+        return if pp_first || n_hidden == hs {
+            Ok(())
+        } else {
+            Err(format!("hidden_in has {n_hidden} floats, a decode hop carries exactly hidden_size {hs}"))
+        };
+    }
+    if pp_first {
+        return if n_tokens > 0 { Ok(()) } else { Err("empty token sequence".to_string()) };
+    }
+    if seq == 0 {
+        return Err("seq must be > 0".to_string());
+    }
+    match seq.checked_mul(hs) {
+        Some(want) if want == n_hidden => Ok(()),
+        _ => Err(format!("hidden_in has {n_hidden} floats, expected seq {seq} * hidden_size {hs}")),
+    }
+}
+
+#[cfg(test)]
+mod laguna_stage_input_tests {
+    use super::laguna_stage_input_ok;
+
+    #[test]
+    fn prefill_and_full_forward_shapes() {
+        // First stage: tokens only; empty is refused (it used to underflow in finalize).
+        assert!(laguna_stage_input_ok(true, 3, 0, 0, 8, false).is_ok());
+        assert!(laguna_stage_input_ok(true, 0, 0, 0, 8, false).is_err());
+        // Mid/last stage: hidden_in must be exactly seq * hidden_size, seq > 0.
+        assert!(laguna_stage_input_ok(false, 0, 24, 3, 8, false).is_ok());
+        assert!(laguna_stage_input_ok(false, 0, 0, 0, 8, false).is_err());
+        assert!(laguna_stage_input_ok(false, 0, 23, 3, 8, false).is_err());
+        assert!(laguna_stage_input_ok(false, 0, 25, 3, 8, false).is_err());
+        assert!(laguna_stage_input_ok(false, 0, 8, usize::MAX, 8, false).is_err(), "seq * hs must not overflow");
+    }
+
+    #[test]
+    fn decode_hop_is_exactly_one_hidden_vector() {
+        assert!(laguna_stage_input_ok(true, 1, 0, 1, 8, true).is_ok());
+        assert!(laguna_stage_input_ok(false, 0, 8, 1, 8, true).is_ok());
+        assert!(laguna_stage_input_ok(false, 0, 0, 1, 8, true).is_err());
+        assert!(laguna_stage_input_ok(false, 0, 7, 1, 8, true).is_err());
+        assert!(laguna_stage_input_ok(false, 0, 16, 1, 8, true).is_err());
+    }
+}
+
+/// `Err` naming the first id that is not `< vocab`.
+fn laguna_tokens_in_vocab(tokens: &[u32], vocab: usize) -> Result<(), String> {
+    match tokens.iter().enumerate().find(|(_, &t)| t as usize >= vocab) {
+        Some((i, &t)) => Err(format!("token id {t} at position {i} is outside the vocabulary (vocab_size {vocab})")),
+        None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod laguna_token_check_tests {
+    use super::laguna_tokens_in_vocab;
+
+    #[test]
+    fn ids_must_be_below_vocab_size() {
+        assert!(laguna_tokens_in_vocab(&[0, 5, 99], 100).is_ok());
+        let e = laguna_tokens_in_vocab(&[0, 100, 3], 100).unwrap_err();
+        assert!(e.contains("100") && e.contains("position 1"), "{e}");
+        assert!(laguna_tokens_in_vocab(&[u32::MAX], 100).is_err());
+        assert!(laguna_tokens_in_vocab(&[], 100).is_ok());
     }
 }

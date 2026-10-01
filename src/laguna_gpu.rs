@@ -44,10 +44,10 @@ use crate::model::{cpu_matmul, cpu_rms_norm, cpu_rms_norm_inplace, cpu_rope, cpu
 use crate::nemotron::{router_forward, NemGpuWeight, NemQuant};
 use crate::push_constants::{
     f32_slice_to_bytes, glu_split_pc, laguna_expb_e4m3_pc, laguna_expb_e4m3_variant,
-    laguna_expert_repack_flag, laguna_gpu_sdpa_pc, laguna_moe_accum_pc, laguna_router_pc,
+    laguna_gpu_sdpa_pc, laguna_moe_accum_pc, laguna_router_pc,
     laguna_softplus_gate_pc, matvec_f16_variant_k, matvec_mlx4_pc_off, matvec_nvfp4_e4m3_pc_off,
-    matvec_nvfp4_e4m3_variant, matvec_nvfp4_variant_k, matvec_pc13, matvec_q8_0_variant_k,
-    nvfp4_repack_shape_ok, read_f32_buf, rmsnorm_pc, rope_neox_pc, rope_neox_yarn_pc,
+    matvec_nvfp4_variant_k, matvec_pc13, matvec_q8_0_variant_k,
+    read_f32_buf, rmsnorm_pc, rope_neox_pc, rope_neox_yarn_pc,
 };
 
 /// Pick the routed-expert e4m3 NVFP4 matvec shader + rows-per-workgroup. When
@@ -60,21 +60,10 @@ use crate::push_constants::{
 /// per-expert slice offsets pass straight through `matvec_nvfp4_e4m3_pc_off` — NO
 /// push-constant change. argmax-exact vs v1 (repack == f32-fold, single IEEE mul).
 fn laguna_e4m3_expert_shader(k: usize, n: usize, gs: usize) -> (String, u32) {
-    if laguna_expert_repack_flag() && nvfp4_repack_shape_ok(k, n, gs) {
-        return ("mul_mat_vec_nvfp4_e4m3repack_f32_f32_bs64_r4".to_string(), 4);
-    }
-    matvec_nvfp4_e4m3_variant(n)
+    crate::push_constants::nvfp4_e4m3_expert_shader(k, n, gs)
 }
 
-#[inline]
-fn silu(x: f32) -> f32 {
-    x / (1.0 + (-x).exp())
-}
-#[inline]
-fn softplus(x: f32) -> f32 {
-    // torch.nn.functional.softplus, numerically stable (matches laguna.rs).
-    x.max(0.0) + (-x.abs()).exp().ln_1p()
-}
+use crate::nemotron::{silu, softplus};
 
 /// Device-resident post-rope K/V planes for ONE attention layer — the arena the
 /// GPU span fold consumes (PIECE 3 of 3). On the BC-250's UMA fabric a
@@ -606,6 +595,7 @@ impl LagunaGpuModel {
         layer_end: usize,
         max_seq: usize,
     ) -> Result<Self, String> {
+        check_sdpa_head_dim(cfg.head_dim)?;
         // `weights_path` is a checkpoint FILE (any shard); `discover_shards`
         // globs its PARENT dir, which is the checkpoint dir the oracle also uses.
         let dir = weights_path.parent().unwrap_or_else(|| std::path::Path::new("."));
@@ -1053,6 +1043,14 @@ impl LagunaGpuModel {
     /// Embedding row for `tok` (first stage). f16-resident (widen) or host f32.
     fn embed_row(&self, tok: u32) -> Vec<f32> {
         let hs = self.config.hidden_size;
+        // Backstop for the Python-side `laguna_check_tokens`: the f16 arm below
+        // reads through a raw pointer, so an id >= vocab_size must stop HERE (a
+        // panic surfaces as a Python exception) rather than read out of bounds.
+        assert!(
+            (tok as usize) < self.config.vocab_size,
+            "embed_row: token id {tok} >= vocab_size {}",
+            self.config.vocab_size
+        );
         if let Some(w) = self.gpu_weights.get("model.embed_tokens.weight") {
             let ptr = w.buffer.mapped_ptr.expect("embed buffer mapped") as *const u8;
             let mut row = vec![0.0f32; hs];
@@ -3177,12 +3175,34 @@ impl crate::kv_prefix::KvPrefixExport for LagunaGpuModel {
         let is_full = cfg.layer_is_full[layer];
         let head_dim = cfg.head_dim;
         let (base, n_rows) = crate::model::tile_row_range(is_full, upto, cfg.sliding_window);
-        // Prefer the resident plane when engine-loaded (1-CB path), else the host
-        // per-op / CPU-fallback KvCache — the authoritative-source rule (scope
-        // §1.2): whichever the live decode path writes.
-        let (k, v) = if let Some(plane) = self.kv_res.get(&layer) {
-            plane.export_head(kv_head, head_dim, base, n_rows)
-        } else if let Some(cache) = self.kv.get(&layer) {
+        // Export from the store that actually HOLDS the sequence. The resident
+        // planes are allocated whenever an engine is loaded, but only the 1-CB path
+        // (VLLM_VULKAN_LAGUNA_1CB, default off) writes them; preferring them merely
+        // because they exist stored all-zero tiles for every per-op sequence (PR #94
+        // review). `export_source` picks the store whose seq_len covers `upto`, and
+        // the live decode path's store when both do.
+        let res = self.kv_res.get(&layer);
+        let host = self.kv.get(&layer);
+        let src = export_source(
+            res.map(|p| p.seq_len),
+            host.map(|c| c.seq_len),
+            crate::flags::flags_global().laguna_1cb,
+            upto,
+        )
+        .map_err(|e| format!("export_tile L{layer}: {e}"))?;
+        let (seq_len, capacity) = match src {
+            KvStore::Resident => { let p = res.unwrap(); (p.seq_len, p.capacity) }
+            KvStore::Host => { let c = host.unwrap(); (c.seq_len, c.capacity) }
+        };
+        // A sliding layer is a ring of `capacity` slots holding positions
+        // [seq_len - capacity, seq_len). Rows below that were overwritten by later
+        // tokens, so a tile ending at `upto < seq_len` may name dead slots (PR #94
+        // review). Refuse rather than store another position's K/V.
+        check_ring_rows(base, n_rows, seq_len, capacity)
+            .map_err(|e| format!("export_tile L{layer}: {e}"))?;
+        let (k, v) = if src == KvStore::Resident {
+            res.unwrap().export_head(kv_head, head_dim, base, n_rows)
+        } else if let Some(cache) = host {
             let stride = cache.num_kv_heads * cache.head_dim;
             let mut k = vec![0.0f32; n_rows * head_dim];
             let mut v = vec![0.0f32; n_rows * head_dim];
@@ -3522,5 +3542,126 @@ mod per_layer_kv_ring_tests {
                 }
             }
         }
+    }
+}
+
+
+/// Which per-layer K/V store a prefix export reads (see `export_tile`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KvStore {
+    /// The device-resident planes (`kv_res`, written by the 1-CB path).
+    Resident,
+    /// The host `KvCache` map (`kv`, written by the per-op / CPU path).
+    Host,
+}
+
+/// Pick the store to export rows `[.., upto)` from: one whose `seq_len` covers
+/// `upto`. When both do, the live decode path's store (`prefer_resident` =
+/// `laguna_1cb`). A store that exists but holds fewer rows is never used — that
+/// is how the per-op path used to export the never-written resident planes as
+/// zeros.
+fn export_source(
+    resident_len: Option<usize>,
+    host_len: Option<usize>,
+    prefer_resident: bool,
+    upto: usize,
+) -> Result<KvStore, String> {
+    let res_ok = resident_len.map_or(false, |n| n >= upto && n > 0);
+    let host_ok = host_len.map_or(false, |n| n >= upto && n > 0);
+    match (res_ok, host_ok) {
+        (true, true) => Ok(if prefer_resident { KvStore::Resident } else { KvStore::Host }),
+        (true, false) => Ok(KvStore::Resident),
+        (false, true) => Ok(KvStore::Host),
+        (false, false) => Err(format!(
+            "no K/V store holds {upto} rows (resident seq_len {resident_len:?}, host seq_len {host_len:?})"
+        )),
+    }
+}
+
+/// Rows `[base, base + n_rows)` must still be live in a ring of `capacity` slots
+/// that has seen `seq_len` tokens: the ring holds positions
+/// `[seq_len - capacity, seq_len)`. Full (non-ring) layers have
+/// `capacity >= seq_len`, so they always pass.
+fn check_ring_rows(base: usize, n_rows: usize, seq_len: usize, capacity: usize) -> Result<(), String> {
+    let end = base + n_rows;
+    if end > seq_len {
+        return Err(format!("rows [{base}, {end}) extend past seq_len {seq_len}"));
+    }
+    let oldest = seq_len.saturating_sub(capacity);
+    if base < oldest {
+        return Err(format!(
+            "rows [{base}, {oldest}) were overwritten: the {capacity}-slot ring now holds \
+             [{oldest}, {seq_len}) — export at upto = seq_len instead"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod export_tile_source_tests {
+    use super::{check_ring_rows, export_source, KvStore};
+
+    #[test]
+    fn export_reads_the_store_that_holds_the_rows() {
+        // The reported bug: 1-CB off -> only the host map is filled, the resident
+        // planes exist with seq_len 0. Must read the host map, never the zeros.
+        assert_eq!(export_source(Some(0), Some(40), false, 32), Ok(KvStore::Host));
+        // Even with the flag on, an unfilled resident store is not used.
+        assert_eq!(export_source(Some(0), Some(40), true, 32), Ok(KvStore::Host));
+        // 1-CB on and filled -> resident; both filled -> the live path's store.
+        assert_eq!(export_source(Some(40), Some(0), true, 32), Ok(KvStore::Resident));
+        assert_eq!(export_source(Some(40), Some(40), true, 32), Ok(KvStore::Resident));
+        assert_eq!(export_source(Some(40), Some(40), false, 32), Ok(KvStore::Host));
+        // CPU-only model (no resident planes).
+        assert_eq!(export_source(None, Some(40), true, 32), Ok(KvStore::Host));
+        // Nothing holds the rows -> refuse.
+        assert!(export_source(Some(10), Some(10), false, 32).is_err());
+        assert!(export_source(None, None, false, 1).is_err());
+    }
+
+    #[test]
+    fn ring_rows_must_still_be_live() {
+        // Full layer: capacity = max_seq >= seq_len -> any prefix is fine.
+        assert!(check_ring_rows(0, 32, 100, 4096).is_ok());
+        // Sliding ring of 512 after 600 tokens holds [88, 600).
+        assert!(check_ring_rows(88, 512, 600, 512).is_ok());
+        // A tile ending at upto = 400 wants [0, 400): rows [0, 88) are gone.
+        assert!(check_ring_rows(0, 400, 600, 512).is_err());
+        // Not wrapped yet: everything is live.
+        assert!(check_ring_rows(0, 300, 300, 512).is_ok());
+        // Past the end.
+        assert!(check_ring_rows(0, 301, 300, 512).is_err());
+    }
+}
+
+
+/// Largest `head_dim` the resident attention kernel handles:
+/// `laguna_gpu_sdpa.comp` gives each of its 64 lanes at most
+/// `MAX_DIMS_PER_LANE = 8` dimensions.
+pub(crate) const SDPA_MAX_HEAD_DIM: usize = 64 * 8;
+
+/// Refuse a checkpoint whose `head_dim` the resident attention kernel cannot hold.
+/// Above 512 the shader's fixed 8-element per-lane arrays would be indexed out of
+/// bounds (PR #94 review). Laguna-S ships head_dim 128.
+fn check_sdpa_head_dim(head_dim: usize) -> Result<(), String> {
+    if head_dim == 0 || head_dim > SDPA_MAX_HEAD_DIM {
+        return Err(format!(
+            "LagunaGpuModel: head_dim {head_dim} is outside the resident attention kernel's \
+             range 1..={SDPA_MAX_HEAD_DIM} (laguna_gpu_sdpa.comp: 64 lanes x 8 dims)"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod sdpa_head_dim_tests {
+    use super::{check_sdpa_head_dim, SDPA_MAX_HEAD_DIM};
+
+    #[test]
+    fn head_dim_must_fit_the_attention_kernel() {
+        assert!(check_sdpa_head_dim(128).is_ok());
+        assert!(check_sdpa_head_dim(SDPA_MAX_HEAD_DIM).is_ok());
+        assert!(check_sdpa_head_dim(SDPA_MAX_HEAD_DIM + 1).is_err());
+        assert!(check_sdpa_head_dim(0).is_err());
     }
 }

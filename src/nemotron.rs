@@ -34,9 +34,8 @@ use crate::{prof_add, prof_add_ns, prof_on};
 use crate::push_constants::{
     ew_mul_pc, ew_unary_pc, f32_slice_to_bytes, gemm_pc, matvec_fp8_pc, matvec_fp8_variant_k,
     matvec_mlx4_pc_off, matvec_f16_variant_k, matvec_nvfp4_variant_k, matvec_pc13,
-    matvec_nvfp4_e4m3_variant, matvec_nvfp4_e4m3_pc, matvec_nvfp4_e4m3_pc_off,
-    matvec_q8_0_variant_k, laguna_expert_repack_flag, nvfp4_repack_shape_ok,
-    nem_gated_rmsnorm_pc, nem_moe_accum_pc, nem_ssd_scan_pc, nem_ssm_conv_pc, read_f32_buf,
+    matvec_nvfp4_e4m3_pc, matvec_nvfp4_e4m3_pc_off,
+    matvec_q8_0_variant_k, nem_gated_rmsnorm_pc, nem_moe_accum_pc, nem_ssd_scan_pc, nem_ssm_conv_pc, read_f32_buf,
     rmsnorm_pc,
 };
 
@@ -215,11 +214,11 @@ fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 #[inline]
-fn silu(x: f32) -> f32 {
+pub(crate) fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 #[inline]
-fn softplus(x: f32) -> f32 {
+pub(crate) fn softplus(x: f32) -> f32 {
     // numerically stable log(1 + exp(x)), matching the numpy reference's
     // max(x,0) + log1p(exp(-|x|)) form.
     x.max(0.0) + (-x.abs()).exp().ln_1p()
@@ -2003,10 +2002,7 @@ impl NemotronModel {
     /// default f32-fold expert path already reaches the nvfp4 repack via
     /// `matvec_nvfp4_variant_k`. Flag off / out-of-gate shape ⇒ v1 (byte-identical).
     fn nem_e4m3_expert_shader(k: usize, n: usize, gs: usize) -> (String, u32) {
-        if laguna_expert_repack_flag() && nvfp4_repack_shape_ok(k, n, gs) {
-            return ("mul_mat_vec_nvfp4_e4m3repack_f32_f32_bs64_r4".to_string(), 4);
-        }
-        matvec_nvfp4_e4m3_variant(n)
+        crate::push_constants::nvfp4_e4m3_expert_shader(k, n, gs)
     }
 
     /// Record ONE format-routed matvec dispatch into an already-open command

@@ -82,7 +82,10 @@ pub const NVFP4_MOE_GROUP_SIZE: usize = 16;
 /// majority), F32 (e.g. the `k_scale`/`v_scale`/`e_score_correction_bias`
 /// scalars and vectors), and F16 (not present in this checkpoint but
 /// harmless to support).
-fn decode_plain(view: &safetensors::tensor::TensorView) -> Result<Vec<f32>, String> {
+///
+/// Shared with the Laguna loaders (`laguna_loader`, `laguna::load`) — one copy of
+/// the BF16/F16/F32 widen (PR #94 review de-dup).
+pub(crate) fn decode_plain(view: &safetensors::tensor::TensorView) -> Result<Vec<f32>, String> {
     let d = view.data();
     Ok(match view.dtype() {
         safetensors::Dtype::BF16 => d
@@ -97,7 +100,7 @@ fn decode_plain(view: &safetensors::tensor::TensorView) -> Result<Vec<f32>, Stri
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
-        other => return Err(format!("unsupported plain dtype {other:?} in Nemotron loader")),
+        other => return Err(format!("unsupported plain safetensors dtype {other:?}")),
     })
 }
 
@@ -117,11 +120,18 @@ fn squeeze_conv1d_middle_dim(shape: &[usize], data: Vec<f32>) -> Result<Vec<f32>
     }
 }
 
-/// GLOBAL layer index for a `backbone.layers.{i}.*` tensor name, else `None`.
-fn layer_of(name: &str) -> Option<usize> {
-    name.strip_prefix("backbone.layers.")
+/// GLOBAL layer index of a `{prefix}{i}.*` tensor name, else `None`. Nemotron
+/// names its layers `backbone.layers.`, Laguna `model.layers.` — one parser for
+/// both (PR #94 review de-dup).
+pub(crate) fn layer_index(name: &str, prefix: &str) -> Option<usize> {
+    name.strip_prefix(prefix)
         .and_then(|rest| rest.split('.').next())
         .and_then(|s| s.parse::<usize>().ok())
+}
+
+/// GLOBAL layer index for a `backbone.layers.{i}.*` tensor name, else `None`.
+fn layer_of(name: &str) -> Option<usize> {
+    layer_index(name, "backbone.layers.")
 }
 
 /// Validate that a `backbone.layers.{i}.mixer.*` tensor name is consistent
@@ -577,17 +587,24 @@ fn nvfp4_shape_check(
 }
 
 /// `.weight_scale` must hold exactly `out * in / gs` groups (one byte per group
-/// on disk). A partial trailing row would otherwise be written into the next
-/// expert's slot of the concat buffer.
-fn nvfp4_scale_len_check(
+/// on disk), and `in` must tile into `gs`. A partial trailing row would otherwise
+/// be written into the next expert's slot of the concat buffer; a group count
+/// derived by integer division let a tensor one byte short pass (`out*192 - 1`
+/// gives 191 groups and `3072 / 191 == 16`). Returns the groups per row. Shared
+/// with the Laguna loader (PR #94 review de-dup).
+pub(crate) fn nvfp4_scale_len_check(
     name: &str, scale_len: usize, out_f: usize, in_f: usize, gs: usize,
-) -> Result<(), String> {
-    let want = out_f * (in_f / gs);
+) -> Result<usize, String> {
+    if gs == 0 || out_f == 0 || in_f % gs != 0 {
+        return Err(format!("{name}: NVFP4 shape [{out_f},{in_f}] does not tile into group_size {gs}"));
+    }
+    let groups = in_f / gs;
+    let want = out_f * groups;
     if scale_len != want {
         return Err(format!(
             "{name}: weight_scale is {scale_len} bytes, expected out*in/gs = {want}"));
     }
-    Ok(())
+    Ok(groups)
 }
 
 /// Copy `bytes` into an already-allocated host-coherent buffer at `byte_off`
@@ -1193,6 +1210,15 @@ mod tests {
         let e = nvfp4_scale_len_check("w", 20, 8, 32, 16).unwrap_err();
         assert!(e.contains("expected out*in/gs = 16"), "{e}");
         assert!(nvfp4_scale_len_check("w", 15, 8, 32, 16).is_err());
+        // The Laguna expert: [512, 3072] at gs 16 -> 192 groups per row.
+        assert_eq!(nvfp4_scale_len_check("w", 512 * 192, 512, 3072, 16), Ok(192));
+        // One byte short: the old Laguna `len / out_f` gave 191 groups and
+        // 3072 / 191 == 16, so it passed (PR #94 review).
+        assert_eq!(3072 / ((512 * 192 - 1) / 512), 16, "the old derivation would have accepted it");
+        assert!(nvfp4_scale_len_check("w", 512 * 192 - 1, 512, 3072, 16).is_err());
+        assert!(nvfp4_scale_len_check("w", 512 * 192 + 1, 512, 3072, 16).is_err());
+        assert!(nvfp4_scale_len_check("w", 512 * 192, 512, 3072, 0).is_err());
+        assert!(nvfp4_scale_len_check("w", 512 * 192, 512, 3070, 16).is_err());
     }
 
     /// The footprint projection must follow the runtime knobs the loader reads,
