@@ -22,6 +22,7 @@ use memmap2::Mmap;
 
 use crate::dsv4_forward::Dsv4Src;
 use crate::model::dequantize_mlx_affine_bits;
+use crate::st_decode::{bf16_le_to_f32 as bf16_to_f32, f16_le_to_f32 as f16_to_f32, f32_le as f32_of};
 
 struct Loc {
     shard: String,
@@ -45,24 +46,19 @@ pub struct RawQ {
     pub gs: usize,
 }
 
+impl RawQ {
+    /// Host dequant -> f32 `[out, inn]` (the CPU oracle for the resident matvec).
+    pub fn dequant(&self) -> Vec<f32> {
+        dequantize_mlx_affine_bits(&self.packed, &self.scales, &self.biases,
+                                   self.out, self.inn, self.gs, self.bits)
+    }
+}
+
 pub struct Dsv4RealSrc {
     index: HashMap<String, Loc>,
     mmaps: HashMap<String, Mmap>,
 }
 
-fn bf16_to_f32(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(2)
-        .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
-        .collect()
-}
-fn f16_to_f32(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(2)
-        .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
-        .collect()
-}
-fn f32_of(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
-}
 fn u32_of(b: &[u8]) -> Vec<u32> {
     b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
 }
@@ -84,21 +80,46 @@ impl Dsv4RealSrc {
             let path = dir.join(shard);
             let file = std::fs::File::open(&path).map_err(|e| format!("open {shard}: {e}"))?;
             let mmap = unsafe { Mmap::map(&file) }.map_err(|e| format!("mmap {shard}: {e}"))?;
-            // header: u64 LE length, then JSON; data starts at 8 + len.
-            let hlen = u64::from_le_bytes(mmap[0..8].try_into().unwrap()) as usize;
+            // header: u64 LE length, then JSON; data starts at 8 + len. Every
+            // length/offset is checked against the file so a truncated or
+            // malformed shard is a loader Err, never a panic in a Python call.
+            let flen = mmap.len();
+            if flen < 8 {
+                return Err(format!("{shard}: {flen} bytes, too short for a safetensors header"));
+            }
+            let hlen = usize::try_from(u64::from_le_bytes(mmap[0..8].try_into().unwrap()))
+                .map_err(|_| format!("{shard}: header length overflows usize"))?;
+            let data_base = 8usize.checked_add(hlen)
+                .filter(|&e| e <= flen)
+                .ok_or_else(|| format!("{shard}: header length {hlen} exceeds the file ({flen} bytes)"))?;
             let header: serde_json::Value =
-                serde_json::from_slice(&mmap[8..8 + hlen]).map_err(|e| format!("header {shard}: {e}"))?;
-            let data_base = 8 + hlen;
-            for (name, meta) in header.as_object().ok_or("bad header")? {
+                serde_json::from_slice(&mmap[8..data_base]).map_err(|e| format!("header {shard}: {e}"))?;
+            for (name, meta) in header.as_object().ok_or_else(|| format!("{shard}: header is not an object"))? {
                 if name == "__metadata__" {
                     continue;
                 }
                 let dtype = meta["dtype"].as_str().unwrap_or("").to_string();
-                let shape: Vec<usize> =
-                    meta["shape"].as_array().map(|a| a.iter().map(|x| x.as_u64().unwrap() as usize).collect()).unwrap_or_default();
-                let off = meta["data_offsets"].as_array().ok_or("no offsets")?;
-                let start = data_base + off[0].as_u64().unwrap() as usize;
-                let end = data_base + off[1].as_u64().unwrap() as usize;
+                let shape: Vec<usize> = match meta["shape"].as_array() {
+                    Some(a) => a.iter().map(|x| x.as_u64().map(|v| v as usize))
+                        .collect::<Option<_>>()
+                        .ok_or_else(|| format!("{shard}: {name}: non-integer shape"))?,
+                    None => Vec::new(),
+                };
+                let off = meta["data_offsets"].as_array()
+                    .filter(|o| o.len() == 2)
+                    .ok_or_else(|| format!("{shard}: {name}: data_offsets must be [start, end]"))?;
+                let (o0, o1) = match (off[0].as_u64(), off[1].as_u64()) {
+                    (Some(a), Some(b)) => (a as usize, b as usize),
+                    _ => return Err(format!("{shard}: {name}: non-integer data_offsets")),
+                };
+                let start = data_base.checked_add(o0);
+                let end = data_base.checked_add(o1);
+                let (start, end) = match (start, end) {
+                    (Some(st), Some(en)) if st <= en && en <= flen => (st, en),
+                    _ => return Err(format!(
+                        "{shard}: {name}: data_offsets [{o0}, {o1}] outside the data section \
+                         ({} bytes)", flen - data_base)),
+                };
                 index.insert(name.clone(), Loc { shard: shard.clone(), dtype, shape, start, end });
             }
             mmaps.insert(shard.clone(), mmap);
@@ -171,15 +192,9 @@ impl Dsv4RealSrc {
 
     /// Dequantize a 2D quantized linear `prefix.{weight,scales,biases}` → f32 [out,in].
     fn dequant2d(&self, prefix: &str, out_f: usize, in_f: usize) -> Vec<f32> {
-        let packed = u32_of(self.bytes(&format!("{prefix}.weight")));
-        let scales = bf16_to_f32(self.bytes(&format!("{prefix}.scales")));
-        let biases = bf16_to_f32(self.bytes(&format!("{prefix}.biases")));
-        let packed_cols = packed.len() / out_f;
-        let scale_cols = scales.len() / out_f;
-        let bits = packed_cols * 32 / in_f;
-        let gs = in_f / scale_cols;
-        debug_assert_eq!((in_f * bits + 31) / 32, packed_cols, "{prefix} bits infer");
-        dequantize_mlx_affine_bits(&packed, &scales, &biases, out_f, in_f, gs, bits)
+        let q = self.raw_linear(prefix, out_f, in_f);
+        debug_assert_eq!((in_f * q.bits + 31) / 32, q.packed.len() / out_f, "{prefix} bits infer");
+        q.dequant()
     }
 }
 
@@ -202,20 +217,7 @@ impl Dsv4Src for Dsv4RealSrc {
 
     fn expert(&self, name: &str, e: usize, out_f: usize, in_f: usize) -> Vec<f32> {
         // 3D packed [E, out, packed_cols]; scales/biases [E, out, groups].
-        let wloc = self.index.get(&format!("{name}.weight")).unwrap_or_else(|| panic!("missing expert {name}.weight"));
-        let packed_cols = wloc.shape[2];
-        let groups = self.index[&format!("{name}.scales")].shape[2];
-        let per_e_w = out_f * packed_cols; // u32 elems
-        let per_e_s = out_f * groups; // scale elems
-        let wb = self.bytes(&format!("{name}.weight"));
-        let packed = u32_of(&wb[e * per_e_w * 4..(e + 1) * per_e_w * 4]);
-        let sb = self.bytes(&format!("{name}.scales"));
-        let scales = bf16_to_f32(&sb[e * per_e_s * 2..(e + 1) * per_e_s * 2]);
-        let bb = self.bytes(&format!("{name}.biases"));
-        let biases = bf16_to_f32(&bb[e * per_e_s * 2..(e + 1) * per_e_s * 2]);
-        let bits = packed_cols * 32 / in_f;
-        let gs = in_f / groups;
-        dequantize_mlx_affine_bits(&packed, &scales, &biases, out_f, in_f, gs, bits)
+        self.raw_expert(name, e, out_f, in_f).dequant()
     }
 
     fn dense_i64(&self, name: &str) -> Vec<i64> {
@@ -345,5 +347,43 @@ mod tests {
         );
         assert!(finite, "logits not finite");
         assert_eq!(argmax, 11111, "argmax {argmax} != golden 11111 (' Paris')");
+    }
+
+    /// Malformed shards are loader errors, never panics (PR #95 review).
+    #[test]
+    fn open_rejects_malformed_shards() {
+        let dir = std::env::temp_dir().join(format!("dsv4_loader_bad_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model.safetensors.index.json"),
+                       r#"{"weight_map":{"a":"s.safetensors"}}"#).unwrap();
+        let shard = dir.join("s.safetensors");
+        let open = || Dsv4RealSrc::open(dir.to_str().unwrap()).map(|_| ());
+        let with_header = |h: &str, data: usize| {
+            let mut b = (h.len() as u64).to_le_bytes().to_vec();
+            b.extend_from_slice(h.as_bytes());
+            b.extend(std::iter::repeat(0u8).take(data));
+            b
+        };
+        // Too short for the 8-byte length prefix.
+        std::fs::write(&shard, [1u8, 2, 3]).unwrap();
+        assert!(open().unwrap_err().contains("too short"));
+        // Header length past the end of the file.
+        let mut b = 1000u64.to_le_bytes().to_vec();
+        b.extend_from_slice(b"{}");
+        std::fs::write(&shard, b).unwrap();
+        assert!(open().unwrap_err().contains("exceeds the file"));
+        // data_offsets outside the data section.
+        std::fs::write(&shard, with_header(
+            r#"{"a":{"dtype":"F32","shape":[4],"data_offsets":[0,16]}}"#, 8)).unwrap();
+        assert!(open().unwrap_err().contains("outside the data section"));
+        // Reversed offsets.
+        std::fs::write(&shard, with_header(
+            r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[4,0]}}"#, 8)).unwrap();
+        assert!(open().is_err());
+        // A well-formed shard opens.
+        std::fs::write(&shard, with_header(
+            r#"{"a":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#, 8)).unwrap();
+        assert!(open().is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

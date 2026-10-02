@@ -1491,6 +1491,14 @@ impl Dsv4GpuStage {
         s: usize, m: usize, hd: usize, ix_hd: usize, ix_nh: usize, n_win: usize,
         index_topk: usize, rms_eps: f32, softmax_scale: f32, pos0: usize,
     ) -> Result<(Vec<f32>, Vec<i32>), String> {
+        // The trio's BLOCK_SIZE=64 compressor reduces with a bare subgroupAdd, so it
+        // is correct only when 64 lanes are ONE subgroup. On a wave32 device refuse
+        // here (the caller falls back to the host compressor) rather than compile
+        // the variant on demand past pipeline.rs's wave64 skip list.
+        if self.eng.subgroup_size() != 64 {
+            return Err(format!("DSA GPU trio needs subgroup_size 64, device has {}",
+                               self.eng.subgroup_size()));
+        }
         // Ensure the three trio pipelines (spec BLOCK_SIZE=64) before opening the CB.
         for base in ["dsv4_dsa_compress", "dsv4_dsa_index_score", "dsv4_dsa_topk"] {
             let shader = format!("{base}_bs64");
@@ -3344,10 +3352,7 @@ fn moe_layer_mv<M: Mv>(
     out
 }
 
-#[inline]
-fn silu_f64(z: f64) -> f64 {
-    z * (1.0 / (1.0 + (-z).exp()))
-}
+use crate::dsv4_moe::silu_f64;
 
 /// HyperHead final stream collapse (verbatim from `dsv4_forward::hyper_head`).
 fn hyper_head_mv<M: Mv>(streams: &[f32], cfg: &Dsv4Config, mv: &M, seq: usize) -> Vec<f32> {

@@ -1489,11 +1489,6 @@ mod softplus_tail_sample_tests {
 
 
 impl VulkanModel {
-    /// Refuse token ids outside the vocabulary before they reach the embedding.
-    /// The f16-resident `embed_row` reads the table through a raw pointer, so an id
-    /// >= vocab_size was an out-of-bounds read rather than an error (PR #94
-    /// review). `used` is false on PP stages that ignore the token (they receive a
-    /// hidden state instead), so a placeholder id there is not an error.
     /// The `pp_step_laguna*` ring role (`recv_from < 0` = first stage, `send_to < 0`
     /// = last stage) must match the layer window this model actually loaded. A
     /// mismatch used to pass the token check on one rule and pick the decode path
@@ -1514,6 +1509,11 @@ impl VulkanModel {
         Ok(())
     }
 
+    /// Refuse token ids outside the vocabulary before they reach the embedding.
+    /// The f16-resident `embed_row` reads the table through a raw pointer, so an id
+    /// >= vocab_size was an out-of-bounds read rather than an error (PR #94
+    /// review). `used` is false on PP stages that ignore the token (they receive a
+    /// hidden state instead), so a placeholder id there is not an error.
     fn laguna_check_tokens(&self, tokens: &[u32], used: bool) -> PyResult<()> {
         let g = match self.laguna_gpu.as_ref() {
             Some(g) => g,

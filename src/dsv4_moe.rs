@@ -48,7 +48,7 @@ pub fn sqrtsoftplus(x: f32) -> f32 {
 
 /// `silu(z) = z * sigmoid(z)`, f64.
 #[inline]
-fn silu_f64(z: f64) -> f64 {
+pub(crate) fn silu_f64(z: f64) -> f64 {
     z * (1.0 / (1.0 + (-z).exp()))
 }
 

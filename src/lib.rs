@@ -34,6 +34,7 @@ pub mod dsv4;
 pub mod dsv4_dsa;
 #[cfg(feature = "dsv4")]
 pub mod dsv4_forward;
+pub mod st_decode;
 #[cfg(feature = "dsv4")]
 pub mod dsv4_gpu;
 #[cfg(feature = "dsv4")]
@@ -4270,7 +4271,7 @@ impl VulkanModel {
             ling: None,
             laguna: None,
             laguna_gpu: None,
-                        laguna_cpu_hist: Vec::new(),
+            laguna_cpu_hist: Vec::new(),
             mtp_head: None,
             mtp_moe_gpu: None,
             q35_last_prenorm: None,
@@ -4384,7 +4385,7 @@ impl VulkanModel {
             ling: None,
             laguna: None,
             laguna_gpu: None,
-                        laguna_cpu_hist: Vec::new(),
+            laguna_cpu_hist: Vec::new(),
             mtp_head: None,
             mtp_moe_gpu: None,
             q35_last_prenorm: None,
@@ -5831,6 +5832,10 @@ impl VulkanModel {
         // happened to run the self-resetting PP prefill first (PR #94 review; same
         // gap #93 closed for nemotron). The CPU `LagunaModel` reference holds no
         // per-sequence state.
+        // The CPU-reference Laguna decode keeps its token history in
+        // `laguna_cpu_hist`; drop it too, or the next request's position check
+        // sees the previous sequence (PR #95 review).
+        self.laguna_cpu_hist.clear();
         #[cfg(feature = "laguna")]
         if let Some(g) = self.laguna_gpu.as_mut() {
             g.reset_kv();
@@ -6637,9 +6642,6 @@ impl VulkanModel {
 
 
 
-    /// Rust-native body of `forward` (no pyo3 in the signature or error type),
-    /// callable from unit tests and `forward_batched_impl` without pulling
-    /// Python C-API symbols into the test binary.
     /// Laguna single-token forward for `forward_rs`. The resident GPU model
     /// decodes against its KV cache; the CPU reference reruns its token history.
     /// Whole model only (a PP stage uses the `pp_step_laguna*` seams). Position 0
@@ -6713,6 +6715,9 @@ impl VulkanModel {
         Ok(m.forward_pp_stage(token_id, &[], position))
     }
 
+    /// Rust-native body of `forward` (no pyo3 in the signature or error type),
+    /// callable from unit tests and `forward_batched_impl` without pulling
+    /// Python C-API symbols into the test binary.
     pub(crate) fn forward_rs(&mut self, token_id: u32, position: usize) -> gpu_error::GpuResult<Vec<f32>> {
         // Qwen3.6 (qwen3_5) hybrid: its own GatedDeltaNet+GatedAttention forward
         // (CPU, Phase 1; GPU = forward_qwen35_gpu, Phase 2).
@@ -8794,6 +8799,21 @@ impl Dsv4Model {
 
     /// Last-position argmax + its logit (single-node GATE 2a helper).
     fn argmax_last(&mut self, input_ids: Vec<u32>) -> PyResult<(u32, f32)> {
+        // Whole-model helper only: a partial stage returns [seq, hc*h] streams
+        // (read as logits, or sliced out of bounds), an empty input underflows
+        // seq-1, and an out-of-vocab id panics in the embedding lookup.
+        if !(self.first && self.last) {
+            return Err(PyRuntimeError::new_err(
+                "argmax_last: needs a stage that owns every layer (first and last); \
+                 this is a partial PP window"));
+        }
+        if input_ids.is_empty() {
+            return Err(PyRuntimeError::new_err("argmax_last: input_ids is empty"));
+        }
+        if let Some((i, &t)) = input_ids.iter().enumerate().find(|(_, &t)| t as usize >= self.vocab) {
+            return Err(PyRuntimeError::new_err(format!(
+                "argmax_last: input_ids[{i}] = {t} is outside the vocabulary (size {})", self.vocab)));
+        }
         let (idx, val) = self.stage.argmax_last(&input_ids);
         if !val.is_finite() {
             // Same disguise `forward_argmax` had: an all-NaN logit row never
@@ -9445,7 +9465,7 @@ mod batched_forward_tests {
             ling: None,
             laguna: None,
             laguna_gpu: None,
-                        laguna_cpu_hist: Vec::new(),
+            laguna_cpu_hist: Vec::new(),
             mtp_head: None,
             mtp_moe_gpu: None,
             q35_last_prenorm: None,
@@ -9777,7 +9797,7 @@ pub(crate) mod qwen35_prefill_tests {
             ling: None,
             laguna: None,
             laguna_gpu: None,
-                        laguna_cpu_hist: Vec::new(),
+            laguna_cpu_hist: Vec::new(),
             mtp_head: None,
             mtp_moe_gpu: None,
             q35_last_prenorm: None,
@@ -10135,7 +10155,7 @@ mod kv_cache_pymethod_tests {
             ling: None,
             laguna: None,
             laguna_gpu: None,
-                        laguna_cpu_hist: Vec::new(),
+            laguna_cpu_hist: Vec::new(),
             mtp_head: None,
             mtp_moe_gpu: None,
             q35_last_prenorm: None,

@@ -735,7 +735,7 @@ impl Dsv4Config {
             .iter()
             .map(|v| MlpType::parse(v.as_str().unwrap_or("")).ok_or_else(|| format!("bad mlp_layer_type {v}")))
             .collect::<Result<_, _>>()?;
-        Ok(Dsv4Config {
+        let cfg = Dsv4Config {
             mla: Dsv4MlaConfig {
                 hidden_size: req_u("hidden_size")?,
                 num_attention_heads: req_u("num_attention_heads")?,
@@ -798,7 +798,24 @@ impl Dsv4Config {
             compress_rate_hca: get("compress_rates")
                 .and_then(|v| v.get("heavily_compressed_attention")).and_then(|v| v.as_u64())
                 .map(|x| x as usize).unwrap_or(128),
-        })
+        };
+        // Both per-layer vectors are indexed by every layer number at load and in
+        // the forward: a short one panics, a long one is silently inconsistent.
+        let n = cfg.num_hidden_layers;
+        if cfg.layer_types.len() != n || cfg.mlp_layer_types.len() != n {
+            return Err(format!(
+                "config: layer_types ({}) and mlp_layer_types ({}) must each have \
+                 num_hidden_layers ({n}) entries",
+                cfg.layer_types.len(), cfg.mlp_layer_types.len()));
+        }
+        // topk_router slices order[..top_k]: > num_local_experts panics, 0 silently
+        // drops every routed expert.
+        if cfg.num_experts_per_tok == 0 || cfg.num_experts_per_tok > cfg.num_local_experts {
+            return Err(format!(
+                "config: num_experts_per_tok {} must be in 1..={}",
+                cfg.num_experts_per_tok, cfg.num_local_experts));
+        }
+        Ok(cfg)
     }
 }
 
@@ -1163,6 +1180,30 @@ mod mla_tests {
         assert_eq!(c.hc_mult, 4);
         assert_eq!(c.layer_types, vec![LayerType::Sliding, LayerType::CompressedSparse, LayerType::HeavilyCompressed]);
         assert_eq!(c.mlp_layer_types, vec![MlpType::HashMoe, MlpType::Moe, MlpType::Moe]);
+    }
+
+    /// Per-layer vectors must match num_hidden_layers; top-k must be in 1..=E.
+    #[test]
+    fn config_rejects_bad_lengths_and_topk() {
+        let base = r#"{"hidden_size":4096,"num_attention_heads":64,"head_dim":512,
+                 "q_lora_rank":1024,"o_lora_rank":1024,"o_groups":8,"hc_mult":4,
+                 "sliding_window":128,"num_hidden_layers":3,"vocab_size":129280,
+                 "layer_types":["sliding_attention","compressed_sparse_attention","heavily_compressed_attention"],
+                 "mlp_layer_types":["hash_moe","moe","moe"]"#;
+        let parse = |extra: &str| -> Result<Dsv4Config, String> {
+            Dsv4Config::from_json(&serde_json::from_str::<Value>(&format!("{base}{extra}}}")).unwrap())
+        };
+        assert!(parse("").is_ok());
+        assert!(parse(r#","num_experts_per_tok":0"#).is_err());
+        assert!(parse(r#","num_local_experts":4,"num_experts_per_tok":5"#).is_err());
+        assert!(parse(r#","num_local_experts":4,"num_experts_per_tok":4"#).is_ok());
+        let short = base.replace(r#""hash_moe","moe","moe""#, r#""hash_moe","moe""#);
+        let j: Value = serde_json::from_str(&format!("{short}}}")).unwrap();
+        assert!(Dsv4Config::from_json(&j).unwrap_err().contains("num_hidden_layers"));
+        let long = base.replace(r#""heavily_compressed_attention"]"#,
+                                r#""heavily_compressed_attention","sliding_attention"]"#);
+        let j: Value = serde_json::from_str(&format!("{long}}}")).unwrap();
+        assert!(Dsv4Config::from_json(&j).is_err());
     }
 }
 

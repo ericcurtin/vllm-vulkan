@@ -805,9 +805,11 @@ fn global_scale_f32(name: &str, view: &safetensors::tensor::TensorView<'_>) -> R
     if view.dtype() != safetensors::Dtype::F32 {
         return Err(format!("{name}: expected an F32 global scale, got {:?}", view.dtype()));
     }
-    let bytes: [u8; 4] = view.data().get(..4)
-        .and_then(|b| b.try_into().ok())
-        .ok_or_else(|| format!("{name}: short global scale ({} bytes)", view.data().len()))?;
+    // Exactly one F32 (Laguna-S-2.1-NVFP4: all 72,192 scales are shape [], 4
+    // bytes). A longer tensor is a wrong-shape scale, not one to truncate.
+    let bytes: [u8; 4] = view.data().try_into()
+        .map_err(|_| format!("{name}: global scale must be exactly 4 bytes (one F32), got {}",
+                             view.data().len()))?;
     Ok(f32::from_le_bytes(bytes))
 }
 
@@ -1684,7 +1686,12 @@ mod tests {
         let empty: [u8; 0] = [];
         let v = TensorView::new(Dtype::F32, vec![0], &empty).unwrap();
         let e = super::global_scale_f32("x.weight_global_scale", &v).unwrap_err();
-        assert!(e.contains("short"), "{e}");
+        assert!(e.contains("exactly 4 bytes"), "{e}");
+        // Two F32s: a wrong-shape scale is refused, not truncated to the first.
+        let two = [0.25f32.to_le_bytes(), 0.5f32.to_le_bytes()].concat();
+        let v = TensorView::new(Dtype::F32, vec![2], &two).unwrap();
+        let e = super::global_scale_f32("x.weight_global_scale", &v).unwrap_err();
+        assert!(e.contains("exactly 4 bytes"), "{e}");
     }
 
     #[test]

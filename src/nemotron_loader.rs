@@ -86,22 +86,7 @@ pub const NVFP4_MOE_GROUP_SIZE: usize = 16;
 /// Shared with the Laguna loaders (`laguna_loader`, `laguna::load`) — one copy of
 /// the BF16/F16/F32 widen (PR #94 review de-dup).
 pub(crate) fn decode_plain(view: &safetensors::tensor::TensorView) -> Result<Vec<f32>, String> {
-    let d = view.data();
-    Ok(match view.dtype() {
-        safetensors::Dtype::BF16 => d
-            .chunks_exact(2)
-            .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
-            .collect(),
-        safetensors::Dtype::F16 => d
-            .chunks_exact(2)
-            .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
-            .collect(),
-        safetensors::Dtype::F32 => d
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect(),
-        other => return Err(format!("unsupported plain safetensors dtype {other:?}")),
-    })
+    crate::st_decode::decode_plain(view.dtype(), view.data())
 }
 
 /// `conv1d.weight` is `[conv_dim, 1, kernel]` on disk; the Mamba2 kernel

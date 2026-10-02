@@ -1160,8 +1160,6 @@ impl LagunaGpuModel {
     // read is bit-identical (the ring is a pure memory optimization, unneeded
     // for `seq < 512`).
 
-    /// Reset every resident layer's K/V counter to 0 (start of a fresh sequence).
-    /// The underlying storage is overwrite-in-place, so this is just the counters.
     /// Tokens currently in the KV cache (the next decode position).
     pub fn decode_len(&self) -> usize {
         let host = self.kv.values().map(|c| c.seq_len).max().unwrap_or(0);
@@ -1169,6 +1167,8 @@ impl LagunaGpuModel {
         host.max(res)
     }
 
+    /// Reset every resident layer's K/V counter to 0 (start of a fresh sequence).
+    /// The underlying storage is overwrite-in-place, so this is just the counters.
     pub fn reset_kv(&mut self) {
         for c in self.kv.values_mut() {
             c.truncate(0);
