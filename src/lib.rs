@@ -672,6 +672,9 @@ pub struct VulkanModel {
     /// with `laguna` (the CPU reference); the `mt=="laguna"` dispatch picks one.
     #[cfg(feature = "laguna")]
     laguna_gpu: Option<laguna_gpu::LagunaGpuModel>,
+    /// Token history for the non-resident (CPU) Laguna single-token `forward_rs`:
+    /// the CPU reference forward is stateless, so each step reruns the history.
+    laguna_cpu_hist: Vec<u32>,
     #[cfg(not(feature = "laguna"))]
     #[allow(dead_code)]
     laguna_gpu: Option<()>,
@@ -1208,6 +1211,7 @@ impl VulkanModel {
                         ling: None,
                         laguna: None,
                         laguna_gpu: None,
+                        laguna_cpu_hist: Vec::new(),
                         mtp_head: None,
                         mtp_moe_gpu: None,
                         q35_last_prenorm: None,
@@ -2000,6 +2004,7 @@ impl VulkanModel {
                         ling: None,
                         laguna: None,
                         laguna_gpu: None,
+                        laguna_cpu_hist: Vec::new(),
                         mtp_head: None,
                         mtp_moe_gpu: None,
                         q35_last_prenorm: None,
@@ -2541,6 +2546,7 @@ impl VulkanModel {
                         ling: None,
                         laguna: None,
                         laguna_gpu: None,
+                        laguna_cpu_hist: Vec::new(),
                         mtp_head: None,
                         mtp_moe_gpu: None,
                         q35_last_prenorm: None,
@@ -3018,6 +3024,7 @@ impl VulkanModel {
                         ling: None,
                         laguna: None,
                         laguna_gpu: None,
+                        laguna_cpu_hist: Vec::new(),
                         mtp_head: None,
                         mtp_moe_gpu: None,
                         q35_last_prenorm: None,
@@ -3158,6 +3165,7 @@ impl VulkanModel {
                             ling: None,
                             laguna: None,
                             laguna_gpu: Some(gpu),
+                            laguna_cpu_hist: Vec::new(),
                             mtp_head: None,
                             mtp_moe_gpu: None,
                             q35_last_prenorm: None,
@@ -3251,6 +3259,7 @@ impl VulkanModel {
                         ling: None,
                         laguna: Some(lag_model),
                         laguna_gpu: None,
+                        laguna_cpu_hist: Vec::new(),
                         mtp_head: None,
                         mtp_moe_gpu: None,
                         q35_last_prenorm: None,
@@ -3376,6 +3385,7 @@ impl VulkanModel {
                         ling: Some(ling_model),
                         laguna: None,
                         laguna_gpu: None,
+                        laguna_cpu_hist: Vec::new(),
                         mtp_head: None,
                         mtp_moe_gpu: None,
                         q35_last_prenorm: None,
@@ -3508,6 +3518,7 @@ impl VulkanModel {
                         ling: None,
                         laguna: None,
                         laguna_gpu: None,
+                        laguna_cpu_hist: Vec::new(),
                         mtp_head: None,
                         mtp_moe_gpu: None,
                         q35_last_prenorm: None,
@@ -3751,6 +3762,7 @@ impl VulkanModel {
                         ling: None,
                         laguna: None,
                         laguna_gpu: None,
+                        laguna_cpu_hist: Vec::new(),
                         mtp_head: None,
                         mtp_moe_gpu: None,
                         q35_last_prenorm: None,
@@ -4258,6 +4270,7 @@ impl VulkanModel {
             ling: None,
             laguna: None,
             laguna_gpu: None,
+                        laguna_cpu_hist: Vec::new(),
             mtp_head: None,
             mtp_moe_gpu: None,
             q35_last_prenorm: None,
@@ -4371,6 +4384,7 @@ impl VulkanModel {
             ling: None,
             laguna: None,
             laguna_gpu: None,
+                        laguna_cpu_hist: Vec::new(),
             mtp_head: None,
             mtp_moe_gpu: None,
             q35_last_prenorm: None,
@@ -6626,6 +6640,79 @@ impl VulkanModel {
     /// Rust-native body of `forward` (no pyo3 in the signature or error type),
     /// callable from unit tests and `forward_batched_impl` without pulling
     /// Python C-API symbols into the test binary.
+    /// Laguna single-token forward for `forward_rs`. The resident GPU model
+    /// decodes against its KV cache; the CPU reference reruns its token history.
+    /// Whole model only (a PP stage uses the `pp_step_laguna*` seams). Position 0
+    /// starts a new sequence; any other position must be the next one.
+    #[cfg(feature = "laguna")]
+    fn forward_laguna_rs(&mut self, token_id: u32, position: usize) -> gpu_error::GpuResult<Vec<f32>> {
+        if let Some(g) = self.laguna_gpu.as_mut() {
+            if !(g.pp_first && g.pp_last) {
+                return Err(format!(
+                    "forward: Laguna stage [{}, {}) is not the whole model; use pp_step_laguna*",
+                    g.pp_start, g.pp_end).into());
+            }
+            if token_id as usize >= g.config.vocab_size {
+                return Err(format!("forward: token {token_id} >= vocab_size {}", g.config.vocab_size).into());
+            }
+            if position == 0 {
+                g.reset_kv();
+            }
+            let cur = g.decode_len();
+            if position != cur {
+                return Err(format!(
+                    "forward: position {position} is not the next decode position {cur} \
+                     (send position 0 to start a new sequence)").into());
+            }
+            return Ok(g.forward_decode_token(token_id));
+        }
+        let m = self.laguna.as_ref().ok_or_else(|| gpu_error::GpuError::from("forward: no Laguna model".to_string()))?;
+        if !(m.pp_first && m.pp_last) {
+            return Err(format!(
+                "forward: Laguna stage [{}, {}) is not the whole model; use pp_step_laguna*",
+                m.pp_start, m.pp_end).into());
+        }
+        if token_id as usize >= m.config.vocab_size {
+            return Err(format!("forward: token {token_id} >= vocab_size {}", m.config.vocab_size).into());
+        }
+        if position == 0 {
+            self.laguna_cpu_hist.clear();
+        }
+        if position != self.laguna_cpu_hist.len() {
+            return Err(format!(
+                "forward: position {position} is not the next position {} (send position 0 \
+                 to start a new sequence)", self.laguna_cpu_hist.len()).into());
+        }
+        self.laguna_cpu_hist.push(token_id);
+        let out = m.forward(&self.laguna_cpu_hist);
+        if out.len() != m.config.vocab_size {
+            self.laguna_cpu_hist.pop();
+            return Err("forward: the CPU Laguna model has no lm_head loaded".to_string().into());
+        }
+        Ok(out)
+    }
+
+    /// Nemotron-H single-token forward for `forward_rs` (whole model only):
+    /// `forward_pp_stage` on a stage that is both first and last returns the
+    /// `[vocab]` logits. Position 0 resets the Mamba2 / attention state.
+    #[cfg(feature = "nemotron")]
+    fn forward_nemotron_rs(&mut self, token_id: u32, position: usize) -> gpu_error::GpuResult<Vec<f32>> {
+        let m = self.nemotron.as_mut().ok_or_else(|| gpu_error::GpuError::from("forward: no Nemotron model".to_string()))?;
+        let total = m.config.num_hidden_layers;
+        if !(m.pp_start == 0 && m.pp_end >= total) {
+            return Err(format!(
+                "forward: Nemotron stage [{}, {}) is not the whole model; use pp_step_nemotron*",
+                m.pp_start, m.pp_end).into());
+        }
+        if token_id as usize >= m.config.vocab_size {
+            return Err(format!("forward: token {token_id} >= vocab_size {}", m.config.vocab_size).into());
+        }
+        if position == 0 {
+            m.reset();
+        }
+        Ok(m.forward_pp_stage(token_id, &[], position))
+    }
+
     pub(crate) fn forward_rs(&mut self, token_id: u32, position: usize) -> gpu_error::GpuResult<Vec<f32>> {
         // Qwen3.6 (qwen3_5) hybrid: its own GatedDeltaNet+GatedAttention forward
         // (CPU, Phase 1; GPU = forward_qwen35_gpu, Phase 2).
@@ -6642,6 +6729,18 @@ impl VulkanModel {
                 return Ok(self.forward_qwen35_gpu(token_id, position));
             }
             return Ok(self.forward_qwen35_cpu_ref(token_id, position));
+        }
+        // Laguna and Nemotron-H: single-node single-token forward (the generic
+        // forward / forward_argmax / prefill / forward_and_sample seams). Before
+        // this, a node holding only one of these models fell through to the
+        // dense gemma/qwen3 path below.
+        #[cfg(feature = "laguna")]
+        if self.laguna_gpu.is_some() || self.laguna.is_some() {
+            return self.forward_laguna_rs(token_id, position);
+        }
+        #[cfg(feature = "nemotron")]
+        if self.nemotron.is_some() {
+            return self.forward_nemotron_rs(token_id, position);
         }
         // GPU acceleration is architecture-specific; the CPU reference path is
         // dispatched uniformly through the LanguageModel trait. Base Qwen3/Gemma4
@@ -9323,6 +9422,7 @@ mod batched_forward_tests {
             ling: None,
             laguna: None,
             laguna_gpu: None,
+                        laguna_cpu_hist: Vec::new(),
             mtp_head: None,
             mtp_moe_gpu: None,
             q35_last_prenorm: None,
@@ -9654,6 +9754,7 @@ pub(crate) mod qwen35_prefill_tests {
             ling: None,
             laguna: None,
             laguna_gpu: None,
+                        laguna_cpu_hist: Vec::new(),
             mtp_head: None,
             mtp_moe_gpu: None,
             q35_last_prenorm: None,
@@ -10011,6 +10112,7 @@ mod kv_cache_pymethod_tests {
             ling: None,
             laguna: None,
             laguna_gpu: None,
+                        laguna_cpu_hist: Vec::new(),
             mtp_head: None,
             mtp_moe_gpu: None,
             q35_last_prenorm: None,

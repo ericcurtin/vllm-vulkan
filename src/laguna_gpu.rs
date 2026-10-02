@@ -1162,6 +1162,13 @@ impl LagunaGpuModel {
 
     /// Reset every resident layer's K/V counter to 0 (start of a fresh sequence).
     /// The underlying storage is overwrite-in-place, so this is just the counters.
+    /// Tokens currently in the KV cache (the next decode position).
+    pub fn decode_len(&self) -> usize {
+        let host = self.kv.values().map(|c| c.seq_len).max().unwrap_or(0);
+        let res = self.kv_res.values().map(|p| p.seq_len).max().unwrap_or(0);
+        host.max(res)
+    }
+
     pub fn reset_kv(&mut self) {
         for c in self.kv.values_mut() {
             c.truncate(0);
