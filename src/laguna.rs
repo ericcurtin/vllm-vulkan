@@ -128,10 +128,24 @@ impl LagunaConfig {
             .unwrap_or(moe_intermediate_size);
         let num_experts = get_usize(v, "num_experts")?;
         let num_experts_per_tok = get_usize(v, "num_experts_per_tok")?;
+        // 0 or > num_experts made router_forward return fewer than top_k experts.
+        if num_experts_per_tok == 0 || num_experts_per_tok > num_experts {
+            return Err(format!(
+                "config: num_experts_per_tok {num_experts_per_tok} must be in 1..={num_experts}"));
+        }
         let norm_topk_prob = v.get("norm_topk_prob").and_then(|x| x.as_bool()).unwrap_or(true);
         let moe_routed_scaling_factor = get_f32(v, "moe_routed_scaling_factor", 1.0);
         let moe_router_logit_softcapping = get_f32(v, "moe_router_logit_softcapping", 0.0);
-        let sliding_window = get_usize(v, "sliding_window").unwrap_or(512);
+        // Absent -> 512 (the Laguna default). Present but not a positive integer is
+        // an error: a wrong type or null used to become 512 silently, and 0 gave the
+        // sliding layers a zero-capacity KV ring.
+        let sliding_window = match v.get("sliding_window") {
+            None => 512,
+            Some(x) => match x.as_u64() {
+                Some(n) if n > 0 => n as usize,
+                _ => return Err(format!("config: sliding_window {x} must be a positive integer")),
+            },
+        };
         let max_position_embeddings = get_usize(v, "max_position_embeddings").unwrap_or(8192);
 
         // A non-integer or out-of-range entry used to be dropped silently, turning
@@ -784,6 +798,19 @@ impl LagunaWeights {
 
 // ─── Real-checkpoint loader (compiles now; runs when the shards are present) ──
 
+/// Decode a compressed-tensors `weight_global_scale` (one F32). Rejects a
+/// non-F32 dtype (a BF16/F16 scale would be read as an F32 bit pattern) and a
+/// short buffer, with an error instead of a slice panic.
+fn global_scale_f32(name: &str, view: &safetensors::tensor::TensorView<'_>) -> Result<f32, String> {
+    if view.dtype() != safetensors::Dtype::F32 {
+        return Err(format!("{name}: expected an F32 global scale, got {:?}", view.dtype()));
+    }
+    let bytes: [u8; 4] = view.data().get(..4)
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| format!("{name}: short global scale ({} bytes)", view.data().len()))?;
+    Ok(f32::from_le_bytes(bytes))
+}
+
 /// Load `[0, num_layers)` of a Laguna checkpoint to host f32 (BF16 dequant) +
 /// packed NVFP4 experts, keyed off `model.safetensors.index.json` in `dir`.
 /// `keep_lm` also loads `lm_head.weight`. This is the pure-CPU reference loader
@@ -889,9 +916,7 @@ pub fn load_laguna_weights_cpu(
             if name.ends_with(".weight_packed") || name.ends_with(".weight_scale") {
                 u8s.insert(name.clone(), view.data().to_vec());
             } else if name.ends_with(".weight_global_scale") {
-                let g = f32::from_le_bytes(
-                    view.data()[..4].try_into().map_err(|_| format!("{name}: short global"))?,
-                );
+                let g = global_scale_f32(name, &view)?;
                 f32s.insert(name.clone(), vec![g]);
             } else {
                 f32s.insert(name.clone(), crate::nemotron_loader::decode_plain(&view)?);
@@ -1030,9 +1055,7 @@ pub fn load_owned_layer_cpu(
             if name.ends_with(".weight_packed") || name.ends_with(".weight_scale") {
                 u8s.insert(name.clone(), view.data().to_vec());
             } else if name.ends_with(".weight_global_scale") {
-                let g = f32::from_le_bytes(
-                    view.data()[..4].try_into().map_err(|_| format!("{name}: short global"))?,
-                );
+                let g = global_scale_f32(&name, &view)?;
                 f32s.insert(name.clone(), vec![g]);
             } else if name.ends_with(".input_scale")
                 || name.ends_with(".input_global_scale")
@@ -1625,6 +1648,43 @@ mod tests {
         let mut v = tiny_cfg_json();
         v.as_object_mut().unwrap().remove("mlp_only_layers");
         assert!(LagunaConfig::from_json(&v).unwrap().mlp_only_layers.is_empty());
+    }
+
+    #[test]
+    fn from_json_rejects_bad_top_k_and_sliding_window() {
+        for k in [0u64, 5] {
+            let mut v = tiny_cfg_json();
+            v["num_experts_per_tok"] = serde_json::json!(k);
+            let e = LagunaConfig::from_json(&v).expect_err("top_k outside 1..=num_experts must be refused");
+            assert!(e.contains("num_experts_per_tok"), "{e}");
+        }
+        for bad in [serde_json::json!(0), serde_json::json!("512"), serde_json::json!(null), serde_json::json!(-1)] {
+            let mut v = tiny_cfg_json();
+            v["sliding_window"] = bad.clone();
+            let e = LagunaConfig::from_json(&v).expect_err("non-positive / non-integer sliding_window must be refused");
+            assert!(e.contains("sliding_window"), "{bad}: {e}");
+        }
+        // absent -> the 512 default; a positive integer is kept
+        assert_eq!(LagunaConfig::from_json(&tiny_cfg_json()).unwrap().sliding_window, 512);
+        let mut v = tiny_cfg_json();
+        v["sliding_window"] = serde_json::json!(1024);
+        assert_eq!(LagunaConfig::from_json(&v).unwrap().sliding_window, 1024);
+    }
+
+    #[test]
+    fn global_scale_requires_f32_and_four_bytes() {
+        use safetensors::{tensor::TensorView, Dtype};
+        let f = 0.25f32.to_le_bytes();
+        let v = TensorView::new(Dtype::F32, vec![1], &f).unwrap();
+        assert_eq!(super::global_scale_f32("x.weight_global_scale", &v).unwrap(), 0.25);
+        let h = [0u8; 2];
+        let v = TensorView::new(Dtype::BF16, vec![1], &h).unwrap();
+        let e = super::global_scale_f32("x.weight_global_scale", &v).unwrap_err();
+        assert!(e.contains("expected an F32"), "{e}");
+        let empty: [u8; 0] = [];
+        let v = TensorView::new(Dtype::F32, vec![0], &empty).unwrap();
+        let e = super::global_scale_f32("x.weight_global_scale", &v).unwrap_err();
+        assert!(e.contains("short"), "{e}");
     }
 
     #[test]

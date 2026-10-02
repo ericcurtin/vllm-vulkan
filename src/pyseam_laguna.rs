@@ -980,8 +980,10 @@ impl VulkanModel {
         recv_from: i32,
         send_to: i32,
     ) -> PyResult<Option<(u32, f32)>> {
-        // Only the FIRST stage embeds `token_id`; later stages ignore it.
-        self.laguna_check_tokens(&[token_id], recv_from < 0)?;
+        // The ring role must match the stage this model loaded (pp_first /
+        // pp_last); only the FIRST stage embeds `token_id`.
+        self.laguna_check_role(recv_from, send_to)?;
+        self.laguna_check_tokens(&[token_id], true)?;
         if !self.native_comm_enabled() {
             return Err(PyRuntimeError::new_err(
                 "pp_step_laguna: native comm not enabled (set_collective_comm + VLLM_VULKAN_NATIVE_COMM!=0)"));
@@ -1115,8 +1117,10 @@ impl VulkanModel {
         send_to: i32,
         last_rank: i32,
     ) -> PyResult<Option<Vec<f32>>> {
-        // Only the FIRST stage embeds `token_id`; later stages ignore it.
-        self.laguna_check_tokens(&[token_id], recv_from < 0)?;
+        // The ring role must match the stage this model loaded (pp_first /
+        // pp_last); only the FIRST stage embeds `token_id`.
+        self.laguna_check_role(recv_from, send_to)?;
+        self.laguna_check_tokens(&[token_id], true)?;
         if !self.native_comm_enabled() {
             return Err(PyRuntimeError::new_err(
                 "pp_step_laguna_logits: native comm not enabled (set_collective_comm + VLLM_VULKAN_NATIVE_COMM!=0)"));
@@ -1288,8 +1292,10 @@ impl VulkanModel {
         last_rank: i32,
         k: usize,
     ) -> PyResult<Option<Vec<(u32, f32)>>> {
-        // Only the FIRST stage embeds `token_id`; later stages ignore it.
-        self.laguna_check_tokens(&[token_id], recv_from < 0)?;
+        // The ring role must match the stage this model loaded (pp_first /
+        // pp_last); only the FIRST stage embeds `token_id`.
+        self.laguna_check_role(recv_from, send_to)?;
+        self.laguna_check_tokens(&[token_id], true)?;
         if !self.native_comm_enabled() {
             return Err(PyRuntimeError::new_err(
                 "pp_step_laguna_topk: native comm not enabled (set_collective_comm + VLLM_VULKAN_NATIVE_COMM!=0)"));
@@ -1488,6 +1494,26 @@ impl VulkanModel {
     /// >= vocab_size was an out-of-bounds read rather than an error (PR #94
     /// review). `used` is false on PP stages that ignore the token (they receive a
     /// hidden state instead), so a placeholder id there is not an error.
+    /// The `pp_step_laguna*` ring role (`recv_from < 0` = first stage, `send_to < 0`
+    /// = last stage) must match the layer window this model actually loaded. A
+    /// mismatch used to pass the token check on one rule and pick the decode path
+    /// on the other (`g.pp_first`), so a mis-wired ring could embed on a mid stage
+    /// or skip the embed on the real first stage.
+    fn laguna_check_role(&self, recv_from: i32, send_to: i32) -> PyResult<()> {
+        let g = match self.laguna_gpu.as_ref() {
+            Some(g) => g,
+            None => return Ok(()), // the callers report the missing model themselves
+        };
+        let (first, last) = (recv_from < 0, send_to < 0);
+        if first != g.pp_first || last != g.pp_last {
+            return Err(PyRuntimeError::new_err(format!(
+                "pp_step_laguna: ring role (recv_from={recv_from} -> first={first}, send_to={send_to} \
+                 -> last={last}) does not match this stage (pp_first={}, pp_last={})",
+                g.pp_first, g.pp_last)));
+        }
+        Ok(())
+    }
+
     fn laguna_check_tokens(&self, tokens: &[u32], used: bool) -> PyResult<()> {
         let g = match self.laguna_gpu.as_ref() {
             Some(g) => g,
