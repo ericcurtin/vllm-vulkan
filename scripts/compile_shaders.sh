@@ -239,6 +239,9 @@ compile "dsv4_hc_residual_mix" "dsv4_hc_residual_mix.comp"
 # window + compressed-KV block_bias + output-rope conjugate). Class Plain; one
 # wave64 workgroup per head. Oracle dsv4_gpu::attention_layer_decode softmax core.
 compile "dsv4_mla_softmax" "dsv4_mla_softmax.comp"
+# Split-K twin + merge (VLLM_VULKAN_DSV4_MLA_SPLITK).
+compile "dsv4_mla_softmax_splitk" "dsv4_mla_softmax.comp" SPLITK=1
+compile "dsv4_mla_merge" "dsv4_mla_merge.comp"
 
 # Laguna per-head softplus attention gate (self-contained; class Plain).
 compile "laguna_softplus_gate" "laguna_softplus_gate.comp"

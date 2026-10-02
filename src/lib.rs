@@ -8793,8 +8793,24 @@ impl Dsv4Model {
     }
 
     /// Last-position argmax + its logit (single-node GATE 2a helper).
-    fn argmax_last(&mut self, input_ids: Vec<u32>) -> (u32, f32) {
-        self.stage.argmax_last(&input_ids)
+    fn argmax_last(&mut self, input_ids: Vec<u32>) -> PyResult<(u32, f32)> {
+        let (idx, val) = self.stage.argmax_last(&input_ids);
+        if !val.is_finite() {
+            // Same disguise `forward_argmax` had: an all-NaN logit row never
+            // beats the `-inf` sentinel, so the scan reports token 0 with score
+            // -inf — a plausible token that is really the uninitialised value.
+            // `dsv4_gpu::argmax_last` is used by a dozen in-crate tests, so the
+            // guard lives at this pymethod boundary rather than cascading a
+            // Result through all of them; the returned `-inf` IS the "no finite
+            // maximum" signal, so the check is exact and costs one comparison.
+            return Err(PyRuntimeError::new_err(format!(
+                "argmax_last: last-position logits have NO FINITE MAXIMUM (max={val}, \
+                 reported token {idx}). This is NOT a model output — an unguarded argmax \
+                 would have returned token 0. Suspect upstream NaN/inf (cpu_rms_norm \
+                 squaring a corrupt value into inf, then inf*0 = NaN), a defective GPU, \
+                 or an unwritten buffer.")));
+        }
+        Ok((idx, val))
     }
 
     /// One PP-window PREFILL. `streams_in` empty ⇒ first stage (embeds
@@ -8911,6 +8927,13 @@ impl Dsv4Model {
                 let (mut bi, mut bv) = (0usize, f32::NEG_INFINITY);
                 for (i, &v) in logits.iter().enumerate() {
                     if v > bv { bv = v; bi = i; }
+                }
+                // An all-NaN row never beats the -inf sentinel and would report
+                // token 0 as if the model chose it; refuse it instead.
+                if !bv.is_finite() {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "pp_decode_step (dsv4): logits have NO FINITE MAXIMUM (max={bv}); \
+                         not a model output -- suspect upstream NaN/inf or an unwritten buffer")));
                 }
                 if is_first {
                     // STANDALONE N=1: this rank both embeds and samples.

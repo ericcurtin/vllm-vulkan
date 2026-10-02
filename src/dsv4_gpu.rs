@@ -57,11 +57,24 @@ use crate::push_constants::{
 /// Matvec backend for [`forward_mv`]. `mm`/`mm_expert` are the swappable seam
 /// (CPU `cpu_matmul` vs GPU resident kernel); the rest are host-tensor fetches that
 /// are identical in both backends (dequantized/plain, bit-exact to the oracle).
+/// A dense (non-matvec) tensor as f32, shared so a cached copy is not cloned
+/// on every read (norms, mHC fn/base/scale, sinks, compressor ape/norm).
+pub type Dense = std::sync::Arc<[f32]>;
+/// The i64 twin (the hash-router `tid2eid` table).
+pub type DenseI64 = std::sync::Arc<[i64]>;
+
 pub trait Mv {
     /// `out[s,out_f] = x[s,in_f] @ W[out_f,in_f]^T` for a quantized/plain linear.
     fn mm(&mut self, name: &str, x: &[f32], s: usize, in_f: usize, out_f: usize) -> Vec<f32>;
     /// Same, but `W` is the `e`-th expert slice of a 3D `[E,out,in]` switch tensor.
     fn mm_expert(&mut self, name: &str, e: usize, x: &[f32], s: usize, in_f: usize, out_f: usize) -> Vec<f32>;
+    /// Two single-row projections of the SAME input `x [in_f]` (decode `wq_a` and
+    /// `wkv`). DEFAULT = two `mm` calls; [`Dsv4GpuStage`] records both into one
+    /// command buffer (one submit, one readback) with the same kernels, so the
+    /// results are bit-identical either way.
+    fn mm_pair(&mut self, a: &str, b: &str, x: &[f32], in_f: usize, out_a: usize, out_b: usize) -> (Vec<f32>, Vec<f32>) {
+        (self.mm(a, x, 1, in_f, out_a), self.mm(b, x, 1, in_f, out_b))
+    }
     /// Dequantized/plain weight fetch for the HOST seams (compressor, grouped `wo_a`,
     /// router gate) — bit-identical to the CPU oracle's `Dsv4Src::linear`.
     fn dq_linear(&self, name: &str, out_f: usize, in_f: usize) -> Vec<f32>;
@@ -72,9 +85,9 @@ pub trait Mv {
         None
     }
     /// Plain dense tensor (norms / hc fn|base|scale / sinks / position_bias).
-    fn dense(&self, name: &str) -> Vec<f32>;
+    fn dense(&self, name: &str) -> Dense;
     /// The hash-router `tid2eid` `[vocab, top_k]` i64 table.
-    fn dense_i64(&self, name: &str) -> Vec<i64>;
+    fn dense_i64(&self, name: &str) -> DenseI64;
     /// Embedding rows for `ids` → `[S, H]` (8-bit gs64 row-gather, host).
     fn embed_rows(&self, ids: &[u32], vocab: usize, h: usize) -> Vec<f32>;
 
@@ -241,11 +254,11 @@ impl<'a, S: Dsv4Src> Mv for CpuMv<'a, S> {
     fn dq_linear(&self, name: &str, out_f: usize, in_f: usize) -> Vec<f32> {
         self.src.linear(name, out_f, in_f)
     }
-    fn dense(&self, name: &str) -> Vec<f32> {
-        self.src.dense(name)
+    fn dense(&self, name: &str) -> Dense {
+        self.src.dense(name).into()
     }
-    fn dense_i64(&self, name: &str) -> Vec<i64> {
-        self.src.dense_i64(name)
+    fn dense_i64(&self, name: &str) -> DenseI64 {
+        self.src.dense_i64(name).into()
     }
     fn embed_rows(&self, ids: &[u32], vocab: usize, h: usize) -> Vec<f32> {
         self.src.embed_rows(ids, vocab, h)
@@ -324,11 +337,11 @@ impl<'a, S: Dsv4Src> Mv for CachedCpuMv<'a, S> {
     fn dq_linear(&self, name: &str, out_f: usize, in_f: usize) -> Vec<f32> {
         self.cached_linear(name, out_f, in_f)
     }
-    fn dense(&self, name: &str) -> Vec<f32> {
-        self.src.dense(name)
+    fn dense(&self, name: &str) -> Dense {
+        self.src.dense(name).into()
     }
-    fn dense_i64(&self, name: &str) -> Vec<i64> {
-        self.src.dense_i64(name)
+    fn dense_i64(&self, name: &str) -> DenseI64 {
+        self.src.dense_i64(name).into()
     }
     fn embed_rows(&self, ids: &[u32], vocab: usize, h: usize) -> Vec<f32> {
         self.src.embed_rows(ids, vocab, h)
@@ -361,9 +374,60 @@ fn base_shader(bits: usize) -> &'static str {
 }
 
 /// GPU matvec dispatch parameters shared by every resident linear (bs=64, rows=2 —
-/// the geometry `debug_dsv4_verify` gates cos=1.0 across mlx2/6/8).
+/// the geometry `debug_dsv4_verify` gates cos=1.0 across mlx2/6/8). The default
+/// for any shape [`dsv4_geom_pick`] does not list.
 const BS: u32 = 64;
 const ROWS: u32 = 2;
+
+/// Per-shape matvec geometry (default ON; `VLLM_VULKAN_DSV4_GEOM=0` = bs64/r2 for
+/// every linear).
+fn dsv4_geom_on() -> bool {
+    std::env::var("VLLM_VULKAN_DSV4_GEOM").map(|v| v != "0").unwrap_or(true)
+}
+
+/// Best `(BLOCK_SIZE, rows)` per (bits, in, out) for the DSV4 decode linears.
+///
+/// MEASURED 2026-10-01 (board #270 part 2, harness 2ad021c `debug_matvec_bw`,
+/// bc250-e0c920 40 CU @1850, cold L2; µs bs64/r2 -> best; every pick compiled and
+/// ran on GFX1013): mlx8 shared gate/up 4096->2048 68.2 -> 26.5, shared down
+/// 2048->4096 50.0 -> 27.4, lm_head 4096->129280 1713 -> 1426; mlx6 wo_b
+/// 8192->4096 132.0 -> 73.7, wq_a / wo_a 4096->1024 15.8 -> 13.5, wkv 4096->512
+/// 9.37 -> 8.04, indexer compressor 4096->256 7.90 -> 5.33, indexer wq_b
+/// 1024->8192 22.7 -> 21.3, indexer weights_proj 4096->64 6.39 -> 2.82; mlx2
+/// routed gate/up 4096->2048 30.5 -> 18.6, routed down 2048->4096 21.5 -> 18.5.
+/// (wq_b 1024->32768: bs64/r2 is already best.)
+fn dsv4_geom_pick(bits: usize, inn: usize, out: usize) -> Option<(u32, u32)> {
+    match (bits, inn, out) {
+        (8, 4096, 2048) => Some((512, 2)),
+        (8, 2048, 4096) => Some((256, 1)),
+        (8, 4096, 129280) => Some((256, 4)),
+        (6, 8192, 4096) => Some((512, 4)),
+        (6, 4096, 1024) => Some((512, 2)),
+        (6, 4096, 512) => Some((64, 1)),
+        (6, 4096, 256) => Some((128, 1)),
+        (6, 1024, 8192) => Some((32, 2)),
+        (6, 4096, 64) => Some((512, 1)),
+        (2, 4096, 2048) => Some((64, 8)),
+        (2, 2048, 4096) => Some((32, 4)),
+        _ => None,
+    }
+}
+
+/// The shapes [`dsv4_geom_pick`] covers, for the load-time pre-compile.
+const DSV4_GEOM_SHAPES: [(usize, usize, usize); 11] = [
+    (8, 4096, 2048), (8, 2048, 4096), (8, 4096, 129280), (6, 8192, 4096), (6, 4096, 1024),
+    (6, 4096, 512), (6, 4096, 256), (6, 1024, 8192), (6, 4096, 64), (2, 4096, 2048), (2, 2048, 4096),
+];
+
+/// `(shader, rows)` for a resident linear.
+fn dsv4_mv(q: &Qbuf) -> (String, u32) {
+    let (bs, r) = if dsv4_geom_on() {
+        dsv4_geom_pick(q.bits, q.inn, q.out).unwrap_or((BS, ROWS))
+    } else {
+        (BS, ROWS)
+    };
+    (format!("{}_bs{bs}_r{r}", base_shader(q.bits)), r)
+}
 
 /// One PP window of DSV4 held GPU quant-resident, decoded a token at a time. Owns
 /// its own `ComputeEngine`; the resident maps hold the layer window's packed
@@ -392,6 +456,54 @@ pub struct Dsv4GpuStage {
     /// so the per-token router stops re-dequantizing the bf16 gate from mmap. Empty
     /// (and thus byte-identical to the host dequant) when the flag is off.
     router_gate_f32: HashMap<String, Vec<f32>>,
+    /// VLLM_VULKAN_DSV4_RES_KV: per-layer persistent device copies of the decode
+    /// attention tail's sliding-KV history and compressed-KV plane, keyed by the
+    /// layer prefix. Each token appends only its new rows instead of re-uploading
+    /// both O(t) planes. Cleared with the decode cache.
+    res_kv: HashMap<String, ResKv>,
+    /// VLLM_VULKAN_DSV4_DENSE_CACHE (board dsv4-dense-f32-cache): every `dense()` /
+    /// `dense_i64()` tensor converted from its checkpoint dtype ONCE, then shared.
+    /// Before, the per-layer mHC `fn` tensors ([24,16384] bf16) and the stage-0
+    /// `tid2eid` table were re-converted on every call, every token.
+    dense_cache: std::sync::Mutex<HashMap<String, Dense>>,
+    dense_i64_cache: std::sync::Mutex<HashMap<String, DenseI64>>,
+}
+
+/// One layer's persistent attention-tail KV planes (see `Dsv4GpuStage::res_kv`).
+struct ResKv {
+    kv: compute::Buffer,
+    kv_cap: usize,
+    kv_rows: usize,
+    ckv: compute::Buffer,
+    ckv_cap: usize,
+    /// Host copy of what `ckv` holds. The compressed plane is append-only when it
+    /// comes from the compressor cache, but the full-indexer path (ctx > 2048)
+    /// recomputes it, so the uploaded prefix is compared bit-for-bit before an
+    /// append and fully re-written on any difference.
+    ckv_shadow: Vec<f32>,
+}
+
+/// VLLM_VULKAN_DSV4_MLA_PAIR (board dsv4-wqa-wkv-one-cb): decode `wq_a` + `wkv`
+/// in one command buffer.
+fn dsv4_dense_cache_enabled() -> bool {
+    std::env::var("VLLM_VULKAN_DSV4_DENSE_CACHE").map(|v| v != "0").unwrap_or(true)
+}
+
+fn dsv4_mla_pair_enabled() -> bool {
+    std::env::var("VLLM_VULKAN_DSV4_MLA_PAIR").map(|v| v != "0").unwrap_or(true)
+}
+
+fn dsv4_incr_indexer_enabled() -> bool {
+    std::env::var("VLLM_VULKAN_DSV4_INCR_INDEXER").map(|v| v != "0").unwrap_or(true)
+}
+
+/// True when the GPU DSA trio replaces the host indexer (`VLLM_VULKAN_DSV4_DSA_GPU`).
+fn mv_dsa_gpu() -> bool {
+    dsa_gpu_enabled()
+}
+
+fn dsv4_res_kv_enabled() -> bool {
+    std::env::var("VLLM_VULKAN_DSV4_RES_KV").map(|v| v != "0").unwrap_or(true)
 }
 
 impl Dsv4GpuStage {
@@ -414,6 +526,12 @@ impl Dsv4GpuStage {
         // Pre-compile the three resident matvec variants once.
         for bits in [2usize, 6, 8] {
             ensure_variant(&mut eng, &shader_spvs, base_shader(bits))?;
+        }
+        if dsv4_geom_on() {
+            for (bits, inn, out) in DSV4_GEOM_SHAPES {
+                let (bs, r) = dsv4_geom_pick(bits, inn, out).expect("listed shape");
+                ensure_variant_geom(&mut eng, &shader_spvs, base_shader(bits), bs, r)?;
+            }
         }
 
         let h = cfg.mla.hidden_size;
@@ -504,6 +622,9 @@ impl Dsv4GpuStage {
             first: layer_start == 0, last,
             decode_cache: None,
             router_gate_f32,
+            res_kv: HashMap::new(),
+            dense_cache: std::sync::Mutex::new(HashMap::new()),
+            dense_i64_cache: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -553,6 +674,9 @@ impl Dsv4GpuStage {
         }
         let cfg = self.cfg.clone();
         let (ls, le) = (self.layer_start, self.layer_end);
+        if self.decode_cache.is_none() {
+            self.res_kv_reset();
+        }
         let mut cache = self
             .decode_cache
             .take()
@@ -565,6 +689,107 @@ impl Dsv4GpuStage {
     /// Drop the rolling decode cache (call between independent sequences).
     pub fn reset_decode_cache(&mut self) {
         self.decode_cache = None;
+        self.res_kv_reset();
+    }
+
+    fn dense_cached(&self, name: &str) -> Dense {
+        dsv4_prof::timed(dsv4_prof::B::Dense, 0, || self.dense_cached_inner(name))
+    }
+
+    fn dense_cached_inner(&self, name: &str) -> Dense {
+        if !dsv4_dense_cache_enabled() {
+            return self.src.dense(name).into();
+        }
+        let mut c = self.dense_cache.lock().unwrap();
+        if let Some(v) = c.get(name) {
+            return v.clone();
+        }
+        let v: Dense = self.src.dense(name).into();
+        c.insert(name.to_string(), v.clone());
+        v
+    }
+
+    fn dense_i64_cached(&self, name: &str) -> DenseI64 {
+        dsv4_prof::timed(dsv4_prof::B::Dense, 0, || self.dense_i64_cached_inner(name))
+    }
+
+    fn dense_i64_cached_inner(&self, name: &str) -> DenseI64 {
+        if !dsv4_dense_cache_enabled() {
+            return self.src.dense_i64(name).into();
+        }
+        let mut c = self.dense_i64_cache.lock().unwrap();
+        if let Some(v) = c.get(name) {
+            return v.clone();
+        }
+        let v: DenseI64 = self.src.dense_i64(name).into();
+        c.insert(name.to_string(), v.clone());
+        v
+    }
+
+    fn res_kv_reset(&mut self) {
+        for (_, r) in self.res_kv.drain() {
+            self.eng.return_to_pool(r.kv);
+            self.eng.return_to_pool(r.ckv);
+        }
+    }
+
+    /// Bring layer `p`'s persistent KV planes up to date with this token's
+    /// `kv_sliding [t1, hd]` and `compressed_kv [t_comp, hd]`. A decode step adds
+    /// one sliding row (append); anything else (a new sequence, a recomputed
+    /// compressed plane) re-writes the plane in full, so the device copy always
+    /// equals the host slices exactly.
+    fn res_kv_sync(&mut self, p: &str, kv: &[f32], ckv: &[f32], hd: usize) -> Result<(), String> {
+        let t1 = kv.len() / hd;
+        let tc = ckv.len() / hd;
+        if !self.res_kv.contains_key(p) {
+            let kv_cap = (2 * t1).max(256);
+            let ckv_cap = (2 * tc).max(64);
+            let kvb = self.eng.alloc_host_coherent_storage((kv_cap * hd * 4) as u64)?;
+            let ckvb = self.eng.alloc_host_coherent_storage((ckv_cap * hd * 4) as u64)?;
+            self.res_kv.insert(p.to_string(), ResKv {
+                kv: kvb, kv_cap, kv_rows: 0, ckv: ckvb, ckv_cap, ckv_shadow: Vec::new(),
+            });
+        }
+        let r = self.res_kv.get_mut(p).unwrap();
+        if t1 > r.kv_cap {
+            let cap = 2 * t1;
+            let nb = self.eng.alloc_host_coherent_storage((cap * hd * 4) as u64)?;
+            self.eng.return_to_pool(std::mem::replace(&mut r.kv, nb));
+            r.kv_cap = cap;
+            r.kv_rows = 0;
+        }
+        if r.kv_rows + 1 == t1 {
+            r.kv.write_at((r.kv_rows * hd * 4) as u64, &f32_slice_to_bytes(&kv[r.kv_rows * hd..]))?;
+        } else if t1 > 0 {
+            r.kv.write(&f32_slice_to_bytes(kv))?;
+        }
+        r.kv_rows = t1;
+
+        let mut keep = false;
+        if tc > r.ckv_cap {
+            let cap = 2 * tc;
+            let nb = self.eng.alloc_host_coherent_storage((cap * hd * 4) as u64)?;
+            self.eng.return_to_pool(std::mem::replace(&mut r.ckv, nb));
+            r.ckv_cap = cap;
+        } else {
+            let n = r.ckv_shadow.len();
+            keep = n <= ckv.len()
+                && bytemuck::cast_slice::<f32, u32>(&ckv[..n]) == bytemuck::cast_slice::<f32, u32>(&r.ckv_shadow[..]);
+        }
+        if keep {
+            let n = r.ckv_shadow.len();
+            if ckv.len() > n {
+                r.ckv.write_at((n * 4) as u64, &f32_slice_to_bytes(&ckv[n..]))?;
+                r.ckv_shadow.extend_from_slice(&ckv[n..]);
+            }
+        } else {
+            if tc > 0 {
+                r.ckv.write(&f32_slice_to_bytes(ckv))?;
+            }
+            r.ckv_shadow.clear();
+            r.ckv_shadow.extend_from_slice(ckv);
+        }
+        Ok(())
     }
 
     /// Tokens ingested by this stage's decode cache so far (== next position).
@@ -582,6 +807,16 @@ impl Mv for Dsv4GpuStage {
         // Non-resident (e.g. plain bf16) → host dequant + cpu_matmul.
         crate::model::cpu_matmul(x, &self.src.linear(name, out_f, in_f), s, in_f, out_f)
     }
+    fn mm_pair(&mut self, a: &str, b: &str, x: &[f32], in_f: usize, out_a: usize, out_b: usize) -> (Vec<f32>, Vec<f32>) {
+        if dsv4_mla_pair_enabled() {
+            if let (Some(qa), Some(qb)) = (self.lin.get(a), self.lin.get(b)) {
+                if let Ok(r) = gpu_matvec_pair(&mut self.eng, qa, qb, x) {
+                    return r;
+                }
+            }
+        }
+        (self.mm(a, x, 1, in_f, out_a), self.mm(b, x, 1, in_f, out_b))
+    }
     fn mm_expert(&mut self, name: &str, e: usize, x: &[f32], s: usize, in_f: usize, out_f: usize) -> Vec<f32> {
         let key = format!("{name}#{e}");
         if let Some(q) = self.exp.get(&key) {
@@ -596,11 +831,11 @@ impl Mv for Dsv4GpuStage {
     fn resident_router_gate(&self, name: &str) -> Option<&[f32]> {
         self.router_gate_f32.get(name).map(|v| v.as_slice())
     }
-    fn dense(&self, name: &str) -> Vec<f32> {
-        self.src.dense(name)
+    fn dense(&self, name: &str) -> Dense {
+        self.dense_cached(name)
     }
-    fn dense_i64(&self, name: &str) -> Vec<i64> {
-        self.src.dense_i64(name)
+    fn dense_i64(&self, name: &str) -> DenseI64 {
+        self.dense_i64_cached(name)
     }
     fn embed_rows(&self, ids: &[u32], vocab: usize, h: usize) -> Vec<f32> {
         self.src.embed_rows(ids, vocab, h)
@@ -823,11 +1058,11 @@ impl Dsv4GpuStage {
         };
         let (idx, wts) = match mt {
             MlpType::Moe => {
-                let corr = self.src.dense(&format!("{p}.ffn.gate.e_score_correction_bias"));
+                let corr = self.dense_cached(&format!("{p}.ffn.gate.e_score_correction_bias"));
                 topk_router(x, gate_w, &corr, seq, h, ne, tk, cfg.routed_scaling_factor, cfg.norm_topk_prob)
             }
             MlpType::HashMoe => {
-                let tid2eid = self.src.dense_i64(&format!("{p}.ffn.gate.tid2eid"));
+                let tid2eid = self.dense_i64_cached(&format!("{p}.ffn.gate.tid2eid"));
                 hash_router(x, gate_w, &tid2eid, ids, seq, h, ne, tk, cfg.routed_scaling_factor, cfg.norm_topk_prob)
             }
         };
@@ -948,8 +1183,10 @@ impl Dsv4GpuStage {
 
         let a = |eng: &mut compute::ComputeEngine, n: usize| eng.alloc_host_coherent_storage((n * 4).max(4) as u64);
         let qbuf = a(&mut self.eng, nh * hd)?;
-        let kvbuf = a(&mut self.eng, (t1 * hd).max(1))?;
-        let ckvbuf = a(&mut self.eng, (t_comp * hd).max(1))?;
+        // VLLM_VULKAN_DSV4_RES_KV: the KV planes live in persistent per-layer buffers.
+        let use_res = dsv4_res_kv_enabled() && self.res_kv_sync(p, kv_sliding, compressed_kv, hd).is_ok();
+        let kvbuf_own = if use_res { None } else { Some(a(&mut self.eng, (t1 * hd).max(1))?) };
+        let ckvbuf_own = if use_res { None } else { Some(a(&mut self.eng, (t_comp * hd).max(1))?) };
         let bbbuf = a(&mut self.eng, t_comp.max(1))?;
         let sinkbuf = a(&mut self.eng, nh)?;
         let cosbuf = a(&mut self.eng, cos.len().max(1))?;
@@ -959,18 +1196,24 @@ impl Dsv4GpuStage {
         let outbuf = a(&mut self.eng, h)?;
 
         qbuf.write(&f32_slice_to_bytes(q))?;
-        if t1 > 0 { kvbuf.write(&f32_slice_to_bytes(kv_sliding))?; }
+        if let (Some(kb), Some(cb)) = (kvbuf_own.as_ref(), ckvbuf_own.as_ref()) {
+            if t1 > 0 { kb.write(&f32_slice_to_bytes(kv_sliding))?; }
+            if t_comp > 0 { cb.write(&f32_slice_to_bytes(compressed_kv))?; }
+        }
         if t_comp > 0 {
-            ckvbuf.write(&f32_slice_to_bytes(compressed_kv))?;
             bbbuf.write(&f32_slice_to_bytes(block_bias_last))?;
         }
+        let (kvbuf, ckvbuf): (&compute::Buffer, &compute::Buffer) = match (kvbuf_own.as_ref(), ckvbuf_own.as_ref()) {
+            (Some(kb), Some(cb)) => (kb, cb),
+            _ => { let r = &self.res_kv[p]; (&r.kv, &r.ckv) }
+        };
         sinkbuf.write(&f32_slice_to_bytes(sinks))?;
         cosbuf.write(&f32_slice_to_bytes(cos))?;
         sinbuf.write(&f32_slice_to_bytes(sin))?;
 
         let cb = self.eng.begin_batch()?;
         // Stage A — per-head eager softmax + output-rope → ao [nh*hd].
-        dsv4r_rec_mla_softmax(
+        let mla_scratch = dsv4r_rec_mla_softmax(
             &mut self.eng, cb, &qbuf, &kvbuf, &ckvbuf, &bbbuf, &sinkbuf, &cosbuf, &sinbuf, &aobuf,
             nh, hd, t1, t_comp, sw, rope_dim,
         )?;
@@ -987,7 +1230,10 @@ impl Dsv4GpuStage {
         self.eng.submit_batch(cb)?;
         let out = read_f32_buf(&outbuf, h);
 
-        for b in [qbuf, kvbuf, ckvbuf, bbbuf, sinkbuf, cosbuf, sinbuf, aobuf, projbuf, outbuf] {
+        for b in [qbuf, bbbuf, sinkbuf, cosbuf, sinbuf, aobuf, projbuf, outbuf] {
+            self.eng.return_to_pool(b);
+        }
+        for b in [kvbuf_own, ckvbuf_own, mla_scratch].into_iter().flatten() {
             self.eng.return_to_pool(b);
         }
         Ok(out)
@@ -1039,8 +1285,10 @@ impl Dsv4GpuStage {
         let a = |eng: &mut compute::ComputeEngine, n: usize| eng.alloc_host_coherent_storage((n * 4).max(4) as u64);
         // Tail scratch (== attn_tail_resident).
         let qbuf = a(&mut self.eng, nh * hd)?;
-        let kvbuf = a(&mut self.eng, (t1 * hd).max(1))?;
-        let ckvbuf = a(&mut self.eng, (t_comp * hd).max(1))?;
+        // VLLM_VULKAN_DSV4_RES_KV: the KV planes live in persistent per-layer buffers.
+        let use_res = dsv4_res_kv_enabled() && self.res_kv_sync(p, kv_sliding, compressed_kv, hd).is_ok();
+        let kvbuf_own = if use_res { None } else { Some(a(&mut self.eng, (t1 * hd).max(1))?) };
+        let ckvbuf_own = if use_res { None } else { Some(a(&mut self.eng, (t_comp * hd).max(1))?) };
         let bbbuf = a(&mut self.eng, t_comp.max(1))?;
         let sinkbuf = a(&mut self.eng, nh)?;
         let cosbuf = a(&mut self.eng, cos.len().max(1))?;
@@ -1061,11 +1309,17 @@ impl Dsv4GpuStage {
         let ncollbuf = a(&mut self.eng, h)?;
 
         qbuf.write(&f32_slice_to_bytes(q))?;
-        if t1 > 0 { kvbuf.write(&f32_slice_to_bytes(kv_sliding))?; }
+        if let (Some(kb), Some(cb)) = (kvbuf_own.as_ref(), ckvbuf_own.as_ref()) {
+            if t1 > 0 { kb.write(&f32_slice_to_bytes(kv_sliding))?; }
+            if t_comp > 0 { cb.write(&f32_slice_to_bytes(compressed_kv))?; }
+        }
         if t_comp > 0 {
-            ckvbuf.write(&f32_slice_to_bytes(compressed_kv))?;
             bbbuf.write(&f32_slice_to_bytes(block_bias_last))?;
         }
+        let (kvbuf, ckvbuf): (&compute::Buffer, &compute::Buffer) = match (kvbuf_own.as_ref(), ckvbuf_own.as_ref()) {
+            (Some(kb), Some(cb)) => (kb, cb),
+            _ => { let r = &self.res_kv[p]; (&r.kv, &r.ckv) }
+        };
         sinkbuf.write(&f32_slice_to_bytes(sinks))?;
         cosbuf.write(&f32_slice_to_bytes(cos))?;
         sinbuf.write(&f32_slice_to_bytes(sin))?;
@@ -1078,7 +1332,7 @@ impl Dsv4GpuStage {
 
         let cb = self.eng.begin_batch()?;
         // Stage A — per-head eager softmax + output-rope → ao [nh*hd].
-        dsv4r_rec_mla_softmax(
+        let mla_scratch = dsv4r_rec_mla_softmax(
             &mut self.eng, cb, &qbuf, &kvbuf, &ckvbuf, &bbbuf, &sinkbuf, &cosbuf, &sinbuf, &aobuf,
             nh, hd, t1, t_comp, sw, rope_dim,
         )?;
@@ -1110,9 +1364,12 @@ impl Dsv4GpuStage {
         let ncoll = read_f32_buf(&ncollbuf, h);
 
         for b in [
-            qbuf, kvbuf, ckvbuf, bbbuf, sinkbuf, cosbuf, sinbuf, aobuf, projbuf, outbuf,
+            qbuf, bbbuf, sinkbuf, cosbuf, sinbuf, aobuf, projbuf, outbuf,
             postbuf, combbuf, streamsbuf, fnbuf, basebuf, scalebuf, streams2buf, npostbuf, ncombbuf, ncollbuf,
         ] {
+            self.eng.return_to_pool(b);
+        }
+        for b in [kvbuf_own, ckvbuf_own, mla_scratch].into_iter().flatten() {
             self.eng.return_to_pool(b);
         }
         Ok((streams2, npost, ncomb, ncoll))
@@ -1549,13 +1806,24 @@ fn ensure_variant(
     shader_spvs: &HashMap<String, Vec<u8>>,
     base: &str,
 ) -> Result<(), String> {
-    let shader = format!("{base}_bs{BS}_r{ROWS}");
+    ensure_variant_geom(eng, shader_spvs, base, BS, ROWS)
+}
+
+/// [`ensure_variant`] for an explicit `(BLOCK_SIZE, rows)`.
+fn ensure_variant_geom(
+    eng: &mut compute::ComputeEngine,
+    shader_spvs: &HashMap<String, Vec<u8>>,
+    base: &str,
+    bs: u32,
+    rows: u32,
+) -> Result<(), String> {
+    let shader = format!("{base}_bs{bs}_r{rows}");
     if eng.has_pipeline(&shader) {
         return Ok(());
     }
     let spv = shader_spvs.get(base).map(|v| v.as_slice())
         .ok_or_else(|| format!("{base} SPIR-V missing"))?;
-    match eng.compile_variant_timeout(&shader, spv, &[(0, BS), (1, ROWS), (2, 1)], 2000)? {
+    match eng.compile_variant_timeout(&shader, spv, &[(0, bs), (1, rows), (2, 1)], 2000)? {
         true => Ok(()),
         false => Err(format!("{shader}: pipeline creation timed out")),
     }
@@ -1614,9 +1882,9 @@ fn gpu_matvec_rows(
     x: &[f32],
     s: usize,
 ) -> Result<Vec<f32>, String> {
-    let shader = format!("{}_bs{BS}_r{ROWS}", base_shader(q.bits));
+    let (shader, rows) = dsv4_mv(q);
     let pc = matvec_mlx4_pc(q.inn, q.out, q.gs);
-    let wg = (q.out as u32 + ROWS - 1) / ROWS;
+    let wg = (q.out as u32 + rows - 1) / rows;
     let mut out = vec![0f32; s * q.out];
     if s == 0 {
         return Ok(out);
@@ -1645,6 +1913,38 @@ fn gpu_matvec_rows(
     Ok(out)
 }
 
+/// [`gpu_matvec_rows`] for TWO weights over the same single-row input: both
+/// dispatches in one command buffer, one submit, one readback. Same kernels and
+/// push constants as two separate calls -> bit-identical.
+fn gpu_matvec_pair(
+    eng: &mut compute::ComputeEngine,
+    qa: &Qbuf,
+    qb: &Qbuf,
+    x: &[f32],
+) -> Result<(Vec<f32>, Vec<f32>), String> {
+    if qa.inn != qb.inn || x.len() < qa.inn {
+        return Err("mm_pair: input width mismatch".into());
+    }
+    let xbuf = eng.alloc_host_coherent_storage((qa.inn * 4).max(4) as u64)?;
+    let oa = eng.alloc_host_coherent_storage((qa.out * 4).max(4) as u64)?;
+    let ob = eng.alloc_host_coherent_storage((qb.out * 4).max(4) as u64)?;
+    xbuf.write(&f32_slice_to_bytes(&x[..qa.inn]))?;
+    let cb = eng.begin_batch()?;
+    for (q, o) in [(qa, &oa), (qb, &ob)] {
+        let (shader, rows) = dsv4_mv(q);
+        let pc = matvec_mlx4_pc(q.inn, q.out, q.gs);
+        let wg = (q.out as u32 + rows - 1) / rows;
+        eng.record_to_off(cb, &shader, &[(&q.p, 0), (&q.s, 0), (&q.b, 0), (&xbuf, 0), (o, 0)], &pc, (wg, 1, 1))?;
+    }
+    eng.submit_batch(cb)?;
+    let ra = read_f32_buf(&oa, qa.out);
+    let rb = read_f32_buf(&ob, qb.out);
+    for b in [xbuf, oa, ob] {
+        eng.return_to_pool(b);
+    }
+    Ok((ra, rb))
+}
+
 /// Record ONE resident quantized matvec (`out[out_f] = x[in_f] @ W^T`) into an
 /// OPEN command buffer over resident off-buffers — the resident twin of
 /// [`gpu_matvec_rows`] with NO per-op alloc/submit/readback. `x`/`out` are bound
@@ -1661,9 +1961,9 @@ fn dsv4r_rec_mv(
     out: &compute::Buffer,
     outoff: u64,
 ) -> Result<(), String> {
-    let shader = format!("{}_bs{BS}_r{ROWS}", base_shader(q.bits));
+    let (shader, rows) = dsv4_mv(q);
     let pc = matvec_mlx4_pc(q.inn, q.out, q.gs);
-    let wg = (q.out as u32 + ROWS - 1) / ROWS;
+    let wg = (q.out as u32 + rows - 1) / rows;
     eng.record_to_off(
         cb, &shader,
         &[(&q.p, 0), (&q.s, 0), (&q.b, 0), (xbuf, xoff), (out, outoff)],
@@ -1737,10 +2037,33 @@ fn dsv4r_rec_mla_softmax(
     t_comp: usize,
     sliding_window: usize,
     rope_dim: usize,
-) -> Result<(), String> {
+) -> Result<Option<compute::Buffer>, String> {
     let scaling = (hd as f64).powf(-0.5) as f32;
     let pc = crate::push_constants::dsv4_mla_softmax_pc(nh, hd, t1, t_comp, sliding_window, rope_dim, scaling);
-    eng.record_to(cb, "dsv4_mla_softmax", &[q, kvs, ckv, bb, sinks, cos, sin, out], &pc, (nh as u32, 1, 1))
+    // VLLM_VULKAN_DSV4_MLA_SPLITK: split the visible keys over several workgroups
+    // per head (~64 keys each, at most 16) and merge. Returns the partial-state
+    // scratch, which the caller frees after the submit.
+    let visible = t1.min(sliding_window) + t_comp;
+    let nsplit = (visible / 64).clamp(1, 16);
+    if dsv4_mla_splitk_enabled() && nsplit >= 2 {
+        let part = eng.alloc_host_coherent_storage((nh * nsplit * (hd + 2) * 4) as u64)?;
+        let mut pcs = pc.clone();
+        pcs.extend_from_slice(&(nsplit as u32).to_le_bytes());
+        eng.record_to(cb, "dsv4_mla_softmax_splitk", &[q, kvs, ckv, bb, sinks, cos, sin, &part], &pcs, (nh as u32, nsplit as u32, 1))?;
+        eng.record_barrier_to(cb);
+        let mut pcm = Vec::with_capacity(16);
+        for v in [nh as u32, hd as u32, nsplit as u32, rope_dim as u32] {
+            pcm.extend_from_slice(&v.to_le_bytes());
+        }
+        eng.record_to(cb, "dsv4_mla_merge", &[&part, cos, sin, out], &pcm, (nh as u32, 1, 1))?;
+        return Ok(Some(part));
+    }
+    eng.record_to(cb, "dsv4_mla_softmax", &[q, kvs, ckv, bb, sinks, cos, sin, out], &pc, (nh as u32, 1, 1))?;
+    Ok(None)
+}
+
+fn dsv4_mla_splitk_enabled() -> bool {
+    std::env::var("VLLM_VULKAN_DSV4_MLA_SPLITK").map(|v| v != "0").unwrap_or(true)
 }
 
 /// M2b: record the grouped block-diagonal `wo_a` output projection as `g` resident
@@ -1958,6 +2281,10 @@ pub struct Dsv4DecodeCache {
     ckv_hist: Vec<Vec<f32>>,
     /// Number of closed compressed windows already committed to `ckv_hist[li]`.
     ckv_nwin: Vec<usize>,
+    /// VLLM_VULKAN_DSV4_INCR_INDEXER: per-layer RoPE'd Lightning-Indexer keys for
+    /// the CLOSED windows (`[n_closed, index_head_dim]`), append-only like `ckv_hist`.
+    ixk_hist: Vec<Vec<f32>>,
+    ixk_nwin: Vec<usize>,
     /// Tokens ingested so far == the NEXT token's absolute position.
     pos: usize,
     layer_start: usize,
@@ -1977,6 +2304,8 @@ impl Dsv4DecodeCache {
             kv_hist: vec![Vec::new(); n],
             ckv_hist: vec![Vec::new(); n],
             ckv_nwin: vec![0usize; n],
+            ixk_hist: vec![Vec::new(); n],
+            ixk_nwin: vec![0usize; n],
             pos: 0,
             layer_start: ls,
             layer_end: le,
@@ -2015,6 +2344,11 @@ mod dsv4_prof {
         AttnTail,
         Router,
         Moe,
+        /// hc_residual_mix (host, 2 per layer). Counted in `accounted`.
+        Mix,
+        /// dense()/dense_i64() fetch + dtype conversion. NESTED inside other
+        /// buckets (compressor, hc, ...), so it is NOT added to `accounted`.
+        Dense,
     }
 
     #[derive(Default)]
@@ -2025,7 +2359,11 @@ mod dsv4_prof {
         attn_tail: Duration,
         router: Duration,
         moe: Duration,
+        mix: Duration,
+        dense: Duration,
         roundtrips: u64,
+        /// Wall time from `reset()` to `dump()` for this stage's token.
+        t0: Option<Instant>,
     }
 
     thread_local! {
@@ -2051,6 +2389,8 @@ mod dsv4_prof {
             B::AttnTail => a.attn_tail += d,
             B::Router => a.router += d,
             B::Moe => a.moe += d,
+            B::Mix => a.mix += d,
+            B::Dense => a.dense += d,
         }
     }
 
@@ -2102,7 +2442,7 @@ mod dsv4_prof {
         if !enabled() {
             return;
         }
-        ACC.with(|a| *a.borrow_mut() = Acc::default());
+        ACC.with(|a| *a.borrow_mut() = Acc { t0: Some(Instant::now()), ..Acc::default() });
     }
 
     /// Emit the per-token, per-stage bucket split (ms) + round-trip count.
@@ -2113,10 +2453,11 @@ mod dsv4_prof {
         ACC.with(|a| {
             let a = a.borrow();
             let ms = |d: Duration| d.as_secs_f64() * 1e3;
-            let total = ms(a.hc) + ms(a.mla_proj) + ms(a.compressor) + ms(a.attn_tail) + ms(a.router) + ms(a.moe);
+            let total = ms(a.hc) + ms(a.mla_proj) + ms(a.compressor) + ms(a.attn_tail) + ms(a.router) + ms(a.moe) + ms(a.mix);
+            let wall = a.t0.map(|t| ms(t.elapsed())).unwrap_or(0.0);
             println!(
-                "[dsv4-prof L{ls}..{le}] hc={:.2} mla_proj={:.2} compressor={:.2} attn_tail={:.2} router={:.2} moe={:.2} accounted={:.2} roundtrips={} (ms/tok, this stage)",
-                ms(a.hc), ms(a.mla_proj), ms(a.compressor), ms(a.attn_tail), ms(a.router), ms(a.moe), total, a.roundtrips
+                "[dsv4-prof L{ls}..{le}] hc={:.2} mla_proj={:.2} compressor={:.2} attn_tail={:.2} router={:.2} moe={:.2} mix={:.2} accounted={:.2} wall={:.2} unaccounted={:.2} dense_nested={:.2} roundtrips={} (ms/tok, this stage)",
+                ms(a.hc), ms(a.mla_proj), ms(a.compressor), ms(a.attn_tail), ms(a.router), ms(a.moe), ms(a.mix), total, wall, wall - total, ms(a.dense), a.roundtrips
             );
         });
     }
@@ -2254,7 +2595,7 @@ fn decoder_layer_decode<M: Mv>(
             AttnDecodeOut::Plain(v) => v,
             AttnDecodeOut::Fused { .. } => unreachable!("no trail must yield AttnDecodeOut::Plain"),
         };
-        streams = hc_residual_mix(&post, &attn_out, &comb, &streams, 1, hc, h);
+        streams = dsv4_prof::timed(dsv4_prof::B::Mix, 0, || hc_residual_mix(&post, &attn_out, &comb, &streams, 1, hc, h));
         let (pf, cf, coll_f) = dsv4_prof::timed(dsv4_prof::B::Hc, 0, || {
             mv.hc_block(&streams, 1, hc, h, &ffn_fn, &ffn_base, &ffn_scale, iters, hc_eps, eps)
         });
@@ -2267,7 +2608,7 @@ fn decoder_layer_decode<M: Mv>(
     // M1 seam: MoE goes GPU-resident (1-CB) when VLLM_VULKAN_DSV4_1CB=1 on the
     // Dsv4GpuStage backend; DEFAULT-OFF → the bit-exact host `moe_layer_mv`.
     let mlp_out = mv.moe_block(cfg, li, mt, &x_f, &[id]);
-    streams = hc_residual_mix(&post_f, &mlp_out, &comb_f, &streams, 1, hc, h);
+    streams = dsv4_prof::timed(dsv4_prof::B::Mix, 0, || hc_residual_mix(&post_f, &mlp_out, &comb_f, &streams, 1, hc, h));
     streams
 }
 
@@ -2346,19 +2687,30 @@ fn attention_layer_decode<M: Mv>(
     // arms; when the incremental cache (VLLM_VULKAN_DSV4_COMPRESSOR_CACHE) covers
     // this layer it reads `cache.x_hist[li]` directly, so we skip the O(T) memcpy.
     let cache_on = dsv4_compressor_cache_enabled();
+    // INCREMENTAL indexer (ctx > 2048): exact vs the HOST oracle only, so it stays
+    // off when the GPU DSA trio would score instead.
+    let incr_ix = cache_on && dsv4_incr_indexer_enabled() && !mv_dsa_gpu();
     let need_x_hist = match lt {
         LayerType::Sliding => false, // sliding attention never touches the compressor
         LayerType::HeavilyCompressed => !cache_on,
         LayerType::CompressedSparse => {
             let n_win_pred = t1 / cfg.compress_rate_csa;
             let short_circuit = dsv4_csa_shortcircuit_enabled() && n_win_pred <= cfg.index_topk;
-            !(cache_on && short_circuit)
+            !(cache_on && (short_circuit || incr_ix))
         }
     };
     let x_hist = if need_x_hist { cache.x_hist[li].clone() } else { Vec::new() };
+    // Current-token projections (Q path `wq_a` and KV `wkv`), computed once up
+    // front: both read only `x_cur`, and the incremental indexer reuses `q_a` as
+    // its last-row query input (row t1-1 of x_hist IS x_cur).
+    let (wqa, wkv) = dsv4_prof::timed(dsv4_prof::B::MlaProj, 1, || {
+        mv.mm_pair(&format!("{p}.attn.wq_a"), &format!("{p}.attn.wkv"), x_cur, h, ql, hd)
+    });
+    let q_a = rmsnorm_rows(&wqa, &w_q_a_norm, 1, ql, eps);
     let _comp_t = dsv4_prof::start();
-    let (compressed_kv, block_bias_last): (Vec<f32>, Vec<f32>) = match lt {
-        LayerType::Sliding => (Vec::new(), Vec::new()),
+    // `None` = the plane is `cache.ckv_hist[li]` itself (borrowed below, no O(t) clone).
+    let (compressed_kv_own, block_bias_last): (Option<Vec<f32>>, Vec<f32>) = match lt {
+        LayerType::Sliding => (Some(Vec::new()), Vec::new()),
         LayerType::HeavilyCompressed => {
             let m = cfg.compress_rate_hca;
             let ape = mv.dense(&format!("{p}.attn.compressor.ape"));
@@ -2378,7 +2730,7 @@ fn attention_layer_decode<M: Mv>(
                     cache.ckv_hist[li].extend_from_slice(&row);
                 }
                 cache.ckv_nwin[li] = n_win;
-                (cache.ckv_hist[li].clone(), vec![0.0f32; n_win])
+                (None, vec![0.0f32; n_win])
             } else {
                 // LEVER #2: run the compressor projections through the resident matvec
                 // seam (`mm`). NON-resident → byte-identical to the former
@@ -2391,7 +2743,7 @@ fn attention_layer_decode<M: Mv>(
                 );
                 let n_win = ckv.len() / hd;
                 let last = if n_win == 0 { Vec::new() } else { vis[(t1 - 1) * n_win..t1 * n_win].to_vec() };
-                (ckv, vis_to_additive(&last))
+                (Some(ckv), vis_to_additive(&last))
             }
         }
         LayerType::CompressedSparse => {
@@ -2432,7 +2784,7 @@ fn attention_layer_decode<M: Mv>(
                         cache.ckv_hist[li].extend_from_slice(&row);
                     }
                     cache.ckv_nwin[li] = n_win;
-                    (cache.ckv_hist[li].clone(), vec![0.0f32; n_win])
+                    (None, vec![0.0f32; n_win])
                 } else {
                     let c_kv = mv.mm(&format!("{p}.attn.compressor.wkv"), &x_hist, t1, h, 2 * hd);
                     let c_gate = mv.mm(&format!("{p}.attn.compressor.wgate"), &x_hist, t1, h, 2 * hd);
@@ -2442,8 +2794,55 @@ fn attention_layer_decode<M: Mv>(
                         &c_kv, &c_gate, t1, hd, m, &c_ape, &c_norm, eps, inv, scaling_rope,
                     );
                     // vis_to_additive(all-visible) == all zeros.
-                    (ckv, vec![0.0f32; n_win])
+                    (Some(ckv), vec![0.0f32; n_win])
                 }
+            } else if incr_ix {
+                // INCREMENTAL indexer: only the LAST query row is consumed. `mm` runs
+                // one matvec per row, so a row's projection does not depend on how
+                // many rows ride with it; closed windows (outer compressor AND index
+                // keys) are pooled once and cached; the last row's indexer query and
+                // head weights are projected from that row alone. Bit-identical to
+                // the full path's `vis[t1-1]` (shared scorer `indexer_row_topk`).
+                let c_ape = mv.dense(&format!("{p}.attn.compressor.ape"));
+                let c_norm = mv.dense(&format!("{p}.attn.compressor.norm.weight"));
+                let ix_pb = mv.dense(&format!("{p}.attn.indexer.compressor.ape"));
+                let ix_norm = mv.dense(&format!("{p}.attn.indexer.compressor.norm.weight"));
+                let n_win = n_win_pred;
+                for w in cache.ckv_nwin[li]..n_win {
+                    let (lo, s) = if w == 0 { (0usize, m) } else { ((w - 1) * m, 2 * m) };
+                    let src = &cache.x_hist[li][lo * h..(lo + s) * h];
+                    let c_kv = mv.mm(&format!("{p}.attn.compressor.wkv"), src, s, h, 2 * hd);
+                    let c_gate = mv.mm(&format!("{p}.attn.compressor.wgate"), src, s, h, 2 * hd);
+                    let row = crate::dsv4_dsa::csa_compress_window_incr(
+                        &c_kv, &c_gate, s, hd, m, w, &c_ape, &c_norm, eps, inv, scaling_rope,
+                    );
+                    cache.ckv_hist[li].extend_from_slice(&row);
+                }
+                cache.ckv_nwin[li] = n_win;
+                for w in cache.ixk_nwin[li]..n_win {
+                    let (lo, s) = if w == 0 { (0usize, m) } else { ((w - 1) * m, 2 * m) };
+                    let src = &cache.x_hist[li][lo * h..(lo + s) * h];
+                    let i_kv = mv.mm(&format!("{p}.attn.indexer.compressor.wkv"), src, s, h, 2 * ihd);
+                    let i_gate = mv.mm(&format!("{p}.attn.indexer.compressor.wgate"), src, s, h, 2 * ihd);
+                    let row = crate::dsv4_dsa::csa_compress_window_incr(
+                        &i_kv, &i_gate, s, ihd, m, w, &ix_pb, &ix_norm, eps, inv, scaling_rope,
+                    );
+                    cache.ixk_hist[li].extend_from_slice(&row);
+                }
+                cache.ixk_nwin[li] = n_win;
+                let x_last = &cache.x_hist[li][(t1 - 1) * h..t1 * h];
+                debug_assert_eq!(x_last, x_cur);
+                let ix_q = mv.mm(&format!("{p}.attn.indexer.wq_b"), &q_a, 1, ql, inh * ihd);
+                let ix_w = mv.mm(&format!("{p}.attn.indexer.weights_proj"), x_last, 1, h, inh);
+                let vis = crate::dsv4_dsa::indexer_last_row_vis(
+                    &ix_q, &ix_w, &cache.ixk_hist[li], t1 - 1, m, n_win, inh, ihd,
+                    cfg.index_topk, inv, scaling_rope,
+                );
+                static INCR_BANNER: std::sync::Once = std::sync::Once::new();
+                INCR_BANNER.call_once(|| eprintln!(
+                    "[vllm-vulkan] DSV4 INCR_INDEXER ENGAGED: n_win={n_win} > index_topk={} (layer {li})",
+                    cfg.index_topk));
+                (None, vis_to_additive(&vis))
             } else {
                 let q_a = rmsnorm_rows(&mv.mm(&format!("{p}.attn.wq_a"), &x_hist, t1, h, ql), &w_q_a_norm, t1, ql, eps);
                 // LEVER #2: outer-compressor + indexer projections via the resident
@@ -2468,7 +2867,7 @@ fn attention_layer_decode<M: Mv>(
                 );
                 let n_win = ckv.len() / hd;
                 let last = if n_win == 0 { Vec::new() } else { vis[(t1 - 1) * n_win..t1 * n_win].to_vec() };
-                (ckv, vis_to_additive(&last))
+                (Some(ckv), vis_to_additive(&last))
             }
         }
     };
@@ -2478,18 +2877,19 @@ fn attention_layer_decode<M: Mv>(
     dsv4_prof::stop(dsv4_prof::B::Compressor, comp_rt, _comp_t);
 
     // Q path for the CURRENT token only.
-    let wqa = dsv4_prof::timed(dsv4_prof::B::MlaProj, 1, || mv.mm(&format!("{p}.attn.wq_a"), x_cur, 1, h, ql));
-    let q_a = rmsnorm_rows(&wqa, &w_q_a_norm, 1, ql, eps);
     let q_flat = dsv4_prof::timed(dsv4_prof::B::MlaProj, 1, || mv.mm(&format!("{p}.attn.wq_b"), &q_a, 1, ql, nh * hd)); // [nh, hd], si=0
     let mut q = unweighted_rmsnorm_rows(&q_flat, nh, hd, eps);
     apply_interleaved_rope_inplace(&mut q, nh, hd, rope_dim, &|_r| 0, &cos, &sin);
 
     // KV for the current token → RoPE at `pos` → append to the rolling sliding cache.
-    let wkv = dsv4_prof::timed(dsv4_prof::B::MlaProj, 1, || mv.mm(&format!("{p}.attn.wkv"), x_cur, 1, h, hd));
     let mut kv_cur = rmsnorm_rows(&wkv, &w_kv_norm, 1, hd, eps);
     apply_interleaved_rope_inplace(&mut kv_cur, 1, hd, rope_dim, &|_r| 0, &cos, &sin);
     cache.kv_hist[li].extend_from_slice(&kv_cur);
     let kv_sliding = &cache.kv_hist[li]; // [t1, hd]
+    let compressed_kv: &[f32] = match &compressed_kv_own {
+        Some(v) => v,
+        None => &cache.ckv_hist[li],
+    };
 
     // Resident-capable attention TAIL: per-head eager softmax (sink + sliding +
     // compressed-KV block_bias) → output-rope conjugate → grouped block-diagonal
@@ -2500,14 +2900,14 @@ fn attention_layer_decode<M: Mv>(
     match hc_trail {
         None => AttnDecodeOut::Plain(dsv4_prof::timed(dsv4_prof::B::AttnTail, 1, || {
             mv.attn_tail(
-                &p, &q, kv_sliding, &compressed_kv, &block_bias_last, &sinks, &cos, &sin,
+                &p, &q, kv_sliding, compressed_kv, &block_bias_last, &sinks, &cos, &sin,
                 nh, hd, h, g, olr, sw, t1, rope_dim,
             )
         })),
         Some(tr) => {
             let (streams2, post_f, comb_f, coll_f) = dsv4_prof::timed(dsv4_prof::B::AttnTail, 1, || {
                 mv.attn_tail_hc(
-                    &p, &q, kv_sliding, &compressed_kv, &block_bias_last, &sinks, &cos, &sin,
+                    &p, &q, kv_sliding, compressed_kv, &block_bias_last, &sinks, &cos, &sin,
                     nh, hd, h, g, olr, sw, t1, rope_dim,
                     tr.post_a, tr.comb_a, tr.streams, tr.ffn_fn, tr.ffn_base, tr.ffn_scale,
                     tr.hc, tr.iters, tr.hc_eps, eps,
@@ -3696,8 +4096,8 @@ mod tests {
             crate::model::cpu_matmul(x, &self.src.expert(name, e, out_f, in_f), s, in_f, out_f)
         }
         fn dq_linear(&self, name: &str, out_f: usize, in_f: usize) -> Vec<f32> { self.src.linear(name, out_f, in_f) }
-        fn dense(&self, name: &str) -> Vec<f32> { self.src.dense(name) }
-        fn dense_i64(&self, name: &str) -> Vec<i64> { self.src.dense_i64(name) }
+        fn dense(&self, name: &str) -> Dense { self.src.dense(name).into() }
+        fn dense_i64(&self, name: &str) -> DenseI64 { self.src.dense_i64(name).into() }
         fn embed_rows(&self, ids: &[u32], vocab: usize, h: usize) -> Vec<f32> { self.src.embed_rows(ids, vocab, h) }
         fn hc_block(&mut self, streams: &[f32], seq: usize, hc: usize, h: usize, fn_w: &[f32],
                     base: &[f32], scale: &[f32], iters: usize, hc_eps: f32, rms_eps: f32) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
@@ -4026,6 +4426,53 @@ mod tests {
     /// (b) is the decisive claim: an INDEPENDENT full-indexer path (prefill) confirms
     /// the skipped indexer's last-row visibility is all-visible, not merely that ON
     /// reproduces itself.
+    /// Incremental decode indexer (`VLLM_VULKAN_DSV4_INCR_INDEXER`) on the tiny
+    /// fixture with `index_topk` lowered so `n_win > index_topk` (the full-indexer
+    /// regime above the short-circuit): decode with the flag ON must equal the
+    /// batched-prefill full-indexer oracle AND flag-OFF decode, bit for bit.
+    #[test]
+    fn incr_indexer_bit_identical_tiny() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/dsv4/selftest.json");
+        let raw = match std::fs::read_to_string(path) {
+            Ok(r) => r,
+            Err(_) => { eprintln!("SKIP: selftest.json fixture absent"); return; }
+        };
+        let j: Value = serde_json::from_str(&raw).unwrap();
+        let mut cfg = Dsv4Config::from_json(&j["config"]).unwrap();
+        let input_ids: Vec<u32> =
+            j["input_ids"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect();
+        let mut d = HashMap::new();
+        let mut i = HashMap::new();
+        for (k, v) in j["weights"].as_object().unwrap() { d.insert(k.clone(), f32v(v)); }
+        for (k, v) in j["weights_i64"].as_object().unwrap() {
+            i.insert(k.clone(), v.as_array().unwrap().iter().map(|x| x.as_i64().unwrap()).collect());
+        }
+        let src = DictSrc { d, i };
+        let vocab = cfg.vocab_size;
+        let max_nwin = input_ids.len() / cfg.compress_rate_csa;
+        assert!(max_nwin >= 2, "fixture too short to put n_win above a lowered index_topk");
+        cfg.index_topk = 1;
+
+        let mut mv = CpuMv { src: &src };
+        let prefill = forward_mv(&cfg, &input_ids, &mut mv);
+        let run_chain = |mv: &mut CpuMv<DictSrc>| -> Vec<Vec<f32>> {
+            let mut cache = Dsv4DecodeCache::new(&cfg);
+            input_ids.iter().map(|&id| decode_step(&cfg, id, &mut cache, mv)).collect()
+        };
+        std::env::set_var("VLLM_VULKAN_DSV4_INCR_INDEXER", "0");
+        let off = run_chain(&mut mv);
+        std::env::set_var("VLLM_VULKAN_DSV4_INCR_INDEXER", "1");
+        let on = run_chain(&mut mv);
+        std::env::remove_var("VLLM_VULKAN_DSV4_INCR_INDEXER");
+        for (t, (on_t, off_t)) in on.iter().zip(off.iter()).enumerate() {
+            let refrow = &prefill[t * vocab..(t + 1) * vocab];
+            let d_on = on_t.iter().zip(refrow).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+            let d_onoff = on_t.iter().zip(off_t).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+            assert_eq!(d_on, 0.0, "incr-indexer step {t} diverges from prefill (max_abs={d_on:.3e})");
+            assert_eq!(d_onoff, 0.0, "incr-indexer ON vs OFF step {t} (max_abs={d_onoff:.3e})");
+        }
+    }
+
     #[test]
     fn csa_shortcircuit_bit_identical_tiny() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/dsv4/selftest.json");
@@ -4177,8 +4624,8 @@ mod tests {
         fn dq_linear(&self, name: &str, out_f: usize, in_f: usize) -> Vec<f32> {
             self.src.linear(name, out_f, in_f)
         }
-        fn dense(&self, name: &str) -> Vec<f32> { self.src.dense(name) }
-        fn dense_i64(&self, name: &str) -> Vec<i64> { self.src.dense_i64(name) }
+        fn dense(&self, name: &str) -> Dense { self.src.dense(name).into() }
+        fn dense_i64(&self, name: &str) -> DenseI64 { self.src.dense_i64(name).into() }
         fn embed_rows(&self, ids: &[u32], vocab: usize, h: usize) -> Vec<f32> {
             self.src.embed_rows(ids, vocab, h)
         }

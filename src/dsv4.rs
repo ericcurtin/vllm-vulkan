@@ -516,6 +516,12 @@ pub fn hc_block(
     (post, comb, collapsed)
 }
 
+/// Default OFF: measured a small LOSS on DSV4 PP-10 (mix bucket 1.7 -> 2.5 ms/tok
+/// summed over stages; the 4 rows are too small for the rayon handoff).
+fn mix_rayon_enabled() -> bool {
+    std::env::var("VLLM_VULKAN_DSV4_MIX_RAYON").map(|v| v != "0").unwrap_or(false)
+}
+
 /// The `DeepseekV4DecoderLayer` residual mix consuming a site's `(post, comb)`:
 /// `new[s,k,d] = post[s,k]·sublayer_out[s,d] + Σ_j comb[s,j,k]·streams[s,j,d]`
 /// (== `post·out + combᵀ·streams`). Returns new streams `[S, hc, D]`.
@@ -532,6 +538,28 @@ pub fn hc_residual_mix(
     let d = hidden;
     let hcd = hc * d;
     let mut out = vec![0.0f32; s * hcd];
+    // VLLM_VULKAN_DSV4_MIX_RAYON: the hc output rows of one token are independent
+    // (each its own sequential sums), so a row per thread is bit-identical.
+    if s == 1 && hc > 1 && mix_rayon_enabled() {
+        use rayon::prelude::*;
+        out.par_chunks_mut(d).enumerate().for_each(|(k, orow)| {
+            let p = post[k] as f64;
+            for dd in 0..d {
+                orow[dd] = (p * sublayer_out[dd] as f64) as f32;
+            }
+            for j in 0..hc {
+                let cjk = comb[j * hc + k] as f64;
+                if cjk == 0.0 {
+                    continue;
+                }
+                let strow = &streams[j * d..j * d + d];
+                for dd in 0..d {
+                    orow[dd] += (cjk * strow[dd] as f64) as f32;
+                }
+            }
+        });
+        return out;
+    }
     for si in 0..s {
         let sub = &sublayer_out[si * d..(si + 1) * d];
         for k in 0..hc {
@@ -1163,6 +1191,9 @@ mod shader_guard {
     const REQUIRED_DSV4_KERNELS: &[&str] = &[
         // MLA decode attention + clamped SwiGLU MLP
         "dsv4_mla_softmax",
+        // split-K twin + merge (VLLM_VULKAN_DSV4_MLA_SPLITK)
+        "dsv4_mla_softmax_splitk",
+        "dsv4_mla_merge",
         "dsv4_swiglu_clamp",
         // hyper-connection mix / residual recombine
         "dsv4_hyper_connection",

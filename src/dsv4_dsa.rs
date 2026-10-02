@@ -464,43 +464,98 @@ fn indexer_topk_pre(
     let (cos_q, sin_q) = rope_cos_sin(positions, inv_freq, scaling);
     apply_interleaved_rope_inplace(&mut q, s * ix_nh, ix_hd, rope_dim, &|r| r / ix_nh, &cos_q, &sin_q);
 
-    let w_scale = (ix_nh as f64).powf(-0.5);
-    let softmax_scale = (ix_hd as f64).powf(-0.5);
     let top_k = index_topk.min(n_win);
     let mut out = vec![-1i32; s * top_k];
     for si in 0..s {
         let threshold = (positions[si] + 1) / m;
-        let mut scores = vec![f64::NEG_INFINITY; n_win];
-        for w in 0..n_win {
-            if w >= threshold {
-                continue;
-            }
-            let mut acc = 0.0f64;
-            for hh in 0..ix_nh {
-                let qrow = &q[(si * ix_nh + hh) * ix_hd..(si * ix_nh + hh) * ix_hd + ix_hd];
-                let krow = &ck[w * ix_hd..w * ix_hd + ix_hd];
-                let mut dot = 0.0f64;
-                for d in 0..ix_hd {
-                    dot += qrow[d] as f64 * krow[d] as f64;
-                }
-                let relu = if dot > 0.0 { dot } else { 0.0 } * softmax_scale;
-                let wv = p.wgt[si * ix_nh + hh] as f64 * w_scale;
-                acc += relu * wv;
-            }
-            scores[w] = acc;
+        let qs = &q[si * ix_nh * ix_hd..(si + 1) * ix_nh * ix_hd];
+        let ws = &p.wgt[si * ix_nh..(si + 1) * ix_nh];
+        out[si * top_k..(si + 1) * top_k]
+            .copy_from_slice(&indexer_row_topk(qs, ws, &ck, n_win, threshold, ix_nh, ix_hd, top_k));
+    }
+    out
+}
+
+/// Lightning-Indexer score + top-k for ONE query row: `q` is the row's RoPE'd
+/// `[ix_nh, ix_hd]` query, `wgt` its `[ix_nh]` head weights, `ck` the RoPE'd
+/// `[n_win, ix_hd]` index keys. Windows `w >= threshold` are causal-masked.
+/// Returns `top_k` window ids (`-1` = no admissible window). Shared by the full
+/// [`indexer_topk_pre`] and the incremental decode path ([`indexer_last_row_vis`])
+/// so both select from bit-identical scores in the same stable order.
+#[allow(clippy::too_many_arguments)]
+fn indexer_row_topk(
+    q: &[f32], wgt: &[f32], ck: &[f32], n_win: usize, threshold: usize,
+    ix_nh: usize, ix_hd: usize, top_k: usize,
+) -> Vec<i32> {
+    let w_scale = (ix_nh as f64).powf(-0.5);
+    let softmax_scale = (ix_hd as f64).powf(-0.5);
+    // One window's score: its own sequential f64 sum, so splitting windows
+    // across threads (VLLM_VULKAN_DSV4_IX_RAYON) leaves every score bit-identical.
+    let score = |w: usize| -> f64 {
+        if w >= threshold {
+            return f64::NEG_INFINITY;
         }
-        let mut order: Vec<usize> = (0..n_win).collect();
-        order.sort_by(|&a, &b| scores[b].partial_cmp(&scores[a]).unwrap_or(std::cmp::Ordering::Equal));
-        for kk in 0..top_k {
-            let w = order[kk];
-            if scores[w].is_finite() && w < threshold {
-                out[si * top_k + kk] = w as i32;
-            } else {
-                out[si * top_k + kk] = -1;
+        let mut acc = 0.0f64;
+        for hh in 0..ix_nh {
+            let qrow = &q[hh * ix_hd..hh * ix_hd + ix_hd];
+            let krow = &ck[w * ix_hd..w * ix_hd + ix_hd];
+            let mut dot = 0.0f64;
+            for d in 0..ix_hd {
+                dot += qrow[d] as f64 * krow[d] as f64;
             }
+            let relu = if dot > 0.0 { dot } else { 0.0 } * softmax_scale;
+            let wv = wgt[hh] as f64 * w_scale;
+            acc += relu * wv;
+        }
+        acc
+    };
+    let scores: Vec<f64> = if n_win >= 64 && ix_rayon_enabled() {
+        use rayon::prelude::*;
+        (0..n_win).into_par_iter().map(score).collect()
+    } else {
+        (0..n_win).map(score).collect()
+    };
+    let mut order: Vec<usize> = (0..n_win).collect();
+    order.sort_by(|&a, &b| scores[b].partial_cmp(&scores[a]).unwrap_or(std::cmp::Ordering::Equal));
+    let mut out = vec![-1i32; top_k];
+    for kk in 0..top_k {
+        let w = order[kk];
+        if scores[w].is_finite() && w < threshold {
+            out[kk] = w as i32;
         }
     }
     out
+}
+
+fn ix_rayon_enabled() -> bool {
+    std::env::var("VLLM_VULKAN_DSV4_IX_RAYON").map(|v| v != "0").unwrap_or(true)
+}
+
+/// INCREMENTAL decode indexer (board dsv4-incremental-indexer-long-ctx): the
+/// visibility row of the LAST query only, from the cached per-window index keys.
+/// `q_flat` is the last row's `indexer.wq_b` output `[ix_nh * ix_hd]` (pre-RoPE),
+/// `wgt` its `weights_proj` row `[ix_nh]`, `ck` the RoPE'd index keys of the
+/// `n_win` closed windows (rows built by [`csa_compress_window_incr`] at `ix_hd`
+/// over the indexer compressor). Bit-identical to row `pos` of
+/// [`csa_compressor_pre`]'s `vis`: same RoPE values, same scorer.
+#[allow(clippy::too_many_arguments)]
+pub fn indexer_last_row_vis(
+    q_flat: &[f32], wgt: &[f32], ck: &[f32], pos: usize, m: usize, n_win: usize,
+    ix_nh: usize, ix_hd: usize, index_topk: usize, inv_freq: &[f32], scaling: f32,
+) -> Vec<i32> {
+    let rope_dim = 2 * inv_freq.len();
+    let mut q = q_flat[..ix_nh * ix_hd].to_vec();
+    let (cos_q, sin_q) = rope_cos_sin(&[pos], inv_freq, scaling);
+    apply_interleaved_rope_inplace(&mut q, ix_nh, ix_hd, rope_dim, &|_| 0, &cos_q, &sin_q);
+    let top_k = index_topk.min(n_win);
+    let idx = indexer_row_topk(&q, wgt, ck, n_win, (pos + 1) / m, ix_nh, ix_hd, top_k);
+    let mut vis = vec![0i32; n_win];
+    for &i in &idx {
+        if i >= 0 {
+            vis[i as usize] = 1;
+        }
+    }
+    vis
 }
 
 /// Outer CSA compressor ONLY — the pooled + RoPE'd `compressed_kv` (`[n_win, hd]`)
@@ -660,6 +715,82 @@ mod tests {
     fn maxerr(a: &[f32], b: &[f32]) -> f32 {
         assert_eq!(a.len(), b.len());
         a.iter().zip(b).fold(0.0f32, |m, (x, y)| m.max((x - y).abs()))
+    }
+
+    /// The incremental decode indexer (cached per-window keys + last-row query)
+    /// selects exactly the windows the full-history indexer selects for the last
+    /// row, across many lengths and with n_win > index_topk.
+    #[test]
+    fn incremental_indexer_matches_full_last_row() {
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut rnd = move || {
+            seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+            ((seed >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) as f32
+        };
+        let (m, ix_nh, ix_hd, topk, eps) = (4usize, 3usize, 8usize, 3usize, 1e-6f32);
+        let inv = vec![0.5f32, 0.05];
+        let scaling = 1.0f32;
+        let pb: Vec<f32> = (0..m * 2 * ix_hd).map(|_| rnd()).collect();
+        let norm: Vec<f32> = (0..ix_hd).map(|_| 1.0 + 0.1 * rnd()).collect();
+        for s in [m * 4 + 1, m * 5, m * 7 + 3, m * 12 + 2] {
+            let kv: Vec<f32> = (0..s * 2 * ix_hd).map(|_| rnd()).collect();
+            let gate: Vec<f32> = (0..s * 2 * ix_hd).map(|_| rnd()).collect();
+            let q_flat: Vec<f32> = (0..s * ix_nh * ix_hd).map(|_| rnd()).collect();
+            let wgt: Vec<f32> = (0..s * ix_nh).map(|_| rnd()).collect();
+            let n_win = s / m;
+            assert!(n_win > topk);
+            let positions: Vec<usize> = (0..s).collect();
+            let win_pos: Vec<usize> = (0..n_win).map(|w| w * m).collect();
+            let ixp = IndexerProj {
+                kv: &kv, gate: &gate, q_flat: &q_flat, wgt: &wgt, position_bias: &pb, kv_norm: &norm,
+            };
+            let top = indexer_topk_pre(s, m, &positions, &win_pos, n_win, ix_nh, ix_hd, topk, eps, &inv, scaling, &ixp);
+            let mut vis_full = vec![0i32; n_win];
+            for &i in &top[(s - 1) * topk..s * topk] {
+                if i >= 0 { vis_full[i as usize] = 1; }
+            }
+            let mut ck = Vec::new();
+            for w in 0..n_win {
+                let (lo, sl) = if w == 0 { (0usize, m) } else { ((w - 1) * m, 2 * m) };
+                let r = 2 * ix_hd;
+                ck.extend_from_slice(&csa_compress_window_incr(
+                    &kv[lo * r..(lo + sl) * r], &gate[lo * r..(lo + sl) * r], sl, ix_hd, m, w,
+                    &pb, &norm, eps, &inv, scaling,
+                ));
+            }
+            let vis_incr = indexer_last_row_vis(
+                &q_flat[(s - 1) * ix_nh * ix_hd..], &wgt[(s - 1) * ix_nh..s * ix_nh], &ck,
+                s - 1, m, n_win, ix_nh, ix_hd, topk, &inv, scaling,
+            );
+            assert_eq!(vis_full, vis_incr, "s={s}");
+            assert_eq!(vis_full.iter().filter(|&&v| v == 1).count(), topk, "s={s}");
+        }
+    }
+
+    /// Rayon over windows (VLLM_VULKAN_DSV4_IX_RAYON) picks exactly the serial
+    /// top-k, including ties, at a realistic window count.
+    #[test]
+    fn indexer_row_topk_rayon_matches_serial() {
+        let mut seed = 0x2545f4914f6cdd1du64;
+        let mut rnd = move || {
+            seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+            ((seed >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) as f32
+        };
+        let (ix_nh, ix_hd, n_win, top_k) = (8usize, 16usize, 600usize, 512usize);
+        let q: Vec<f32> = (0..ix_nh * ix_hd).map(|_| rnd()).collect();
+        let w: Vec<f32> = (0..ix_nh).map(|_| rnd()).collect();
+        let mut ck: Vec<f32> = (0..n_win * ix_hd).map(|_| rnd()).collect();
+        // force exact ties: duplicate some key rows
+        for r in [10usize, 20, 30] {
+            let (a, b) = ck.split_at_mut((r + 1) * ix_hd);
+            b[..ix_hd].copy_from_slice(&a[r * ix_hd..]);
+        }
+        std::env::set_var("VLLM_VULKAN_DSV4_IX_RAYON", "0");
+        let serial = indexer_row_topk(&q, &w, &ck, n_win, 590, ix_nh, ix_hd, top_k);
+        std::env::set_var("VLLM_VULKAN_DSV4_IX_RAYON", "1");
+        let par = indexer_row_topk(&q, &w, &ck, n_win, 590, ix_nh, ix_hd, top_k);
+        std::env::remove_var("VLLM_VULKAN_DSV4_IX_RAYON");
+        assert_eq!(serial, par);
     }
 
     /// RoPE main + compress-yarn derivation matches the reference rotary buffers.
