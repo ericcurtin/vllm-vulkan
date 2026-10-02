@@ -1,0 +1,43 @@
+#version 450
+
+// Laguna-S-2.1 MoE tail — CONCATENATED-DOWN variant of `laguna_moe_accum` for
+// the CB-batch path. Identical math (top-10 score-weighted routed accumulate +
+// UNGATED shared add, NO sigmoid, NO residual), but reads the 10 routed `down`
+// outputs from ONE concatenated buffer `d[e*n + i]` (slot e in [0,10)) instead
+// of 10 separate bindings — the batched down projection writes all experts into
+// a single [10*n] buffer, so the tail needs only 3 bindings (down-all, shared,
+// out) and one `record_to`. Accumulation order (slot 0..9 then + shared) is
+// byte-identical to `laguna_moe_accum`, so the result is BIT-EXACT.
+//
+// The router weights w0..w9 already carry norm_topk_prob + moe_routed_scaling
+// (×2.5), baked host-side by router_forward. Fixed top_k = 10.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint n;      // hidden size (per-slot stride in d[])
+    float w0; float w1; float w2; float w3; float w4;
+    float w5; float w6; float w7; float w8; float w9;   // routed weights, slot order
+};
+
+layout(binding = 0) readonly  buffer D  { float d[];    };   // [10*n] concat routed down
+layout(binding = 1) readonly  buffer SH { float sh[];   };   // [n] ungated shared down
+layout(binding = 2) writeonly buffer OUTB { float outb[]; }; // [n] moe out
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= n) {
+        return;
+    }
+    float acc = w0 * d[0u * n + i];
+    acc += w1 * d[1u * n + i];
+    acc += w2 * d[2u * n + i];
+    acc += w3 * d[3u * n + i];
+    acc += w4 * d[4u * n + i];
+    acc += w5 * d[5u * n + i];
+    acc += w6 * d[6u * n + i];
+    acc += w7 * d[7u * n + i];
+    acc += w8 * d[8u * n + i];
+    acc += w9 * d[9u * n + i];
+    outb[i] = acc + sh[i];   // ungated shared expert (plain add)
+}

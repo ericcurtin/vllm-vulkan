@@ -1,0 +1,158 @@
+#version 450
+
+// EXPERT-BATCHED E4M3-RESIDENT NVFP4 matrix-vector kernel (Laguna MoE CB-batch
+// lever). Computes ONE projection (gate OR up OR down) for ALL `n_experts`
+// routed experts in a SINGLE dispatch, replacing the `n_experts` separate
+// `mul_mat_vec_nvfp4_e4m3` dispatches the per-op MoE path records. Each cuts one
+// `record_to` (=> one host `update_descriptor_sets`) per expert per projection;
+// the 30 routed-expert matvecs / layer collapse to 3 batched dispatches.
+//
+// The inner dequant + reduction is BYTE-IDENTICAL to `mul_mat_vec_nvfp4_e4m3.comp`
+// (same BLOCK_SIZE/NUM_ROWS spec constants, same E2M1/E4M3 LUTs, same
+// `(kE4M3[byte]*global)` parenthesization, same shared-mem tree reduce), so the
+// batched result is BIT-EXACT with the per-expert dispatch it replaces. The ONLY
+// additions are the expert dimension on `gl_WorkGroupID.y` and the per-expert
+// slice offsets/global read from a small `meta` buffer instead of push constants.
+//
+//   out[e][r] = sum_{j=0..k} ( E2M1[nib(w_e,r,j)] * (E4M3[sbyte_e(r,g)]*global_e) ) * x_e[j]
+//
+// where expert slot e in [0, n_experts) = gl_WorkGroupID.y. The concatenated
+// per-layer packed/scale buffers hold every expert; slot e reads the slice of
+// expert `eid = meta[2e]` at word offset `eid*n*(k/8)` (packed) / byte-elem
+// offset `eid*n*(k/gs)` (scale), exactly the per-op `packed_off`/`sb_off`. The
+// per-tensor `global` is `uintBitsToFloat(meta[2e+1])`. The activation is shared
+// across experts for gate/up (`x_stride==0`) or concatenated per slot for the
+// down projection (`x_stride==k`, slot e reads `x[e*k + j]`); output is always
+// concatenated (`dst[e*n + r]`).
+//
+// Bindings (auto-numbered 0.. by record_to in buffer order):
+//   0 = packed weight  (uint[],  4-bit E2M1 codes, 8 per u32; ALL experts)
+//   1 = scale          (uint[],  raw e4m3 block-scale bytes, 4 per u32; ALL experts)
+//   2 = activation x   (float[], shared [k] or concatenated [n_experts*k])
+//   3 = output         (float[], concatenated [n_experts*n])
+//   4 = meta           (uint[],  per slot e: [2e]=eid, [2e+1]=floatBitsToUint(global))
+//
+// Push constants: { uint ncols(=k); uint nrows(=n); uint group_size(=16);
+//                   uint x_stride; }.
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 512;
+layout(constant_id = 1) const uint NUM_ROWS = 1;
+
+layout(push_constant) uniform parameter {
+    uint  ncols;       // k = in_features (contraction dim)
+    uint  nrows;       // n = out_features (per expert)
+    uint  group_size;  // NVFP4 block size along k (16)
+    uint  x_stride;    // activation stride per expert slot (0 = shared, else k)
+} p;
+
+layout(binding = 0) readonly buffer Packed { uint  packed[]; };
+layout(binding = 1) readonly buffer Scales { uint  scaleb[]; };
+layout(binding = 2) readonly buffer Activ  { float x[];      };
+layout(binding = 3) writeonly buffer Dst   { float dst[];    };
+layout(binding = 4) readonly buffer Meta   { uint  meta[];   };
+
+shared float tmpsh[NUM_ROWS][BLOCK_SIZE];
+
+// E2M1 (FP4) code -> value. Magnitudes {0,.5,1,1.5,2,3,4,6}; sign in bit 3.
+const float kE2M1[16] = float[16](
+    0.0,  0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0,
+   -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0
+);
+
+// E4M3 (1 sign, 4 exp bias-7, 3 mantissa) code -> value, ARITHMETIC decode.
+// Was a 256-entry `const float kE4M3[256]` LUT indexed by the raw scale byte; on
+// GFX1013/ACO a DIVERGENT index into a 256-elem const array is NOT a memory load
+// — it lowers to a ~255-wide v_cndmask SELECT CASCADE (~16x the VALU of the dot's
+// kE2M1[16] lookup). Same address-gen-class pathology, and same cure, as the
+// nvfp4_e4m3repack twin (this is the verbatim kE4M3_decode from that kernel).
+// BIT-EXACT vs the old kE4M3[byte] for all 256 codes (fp8_arith_decode_matches_e4m3
+// + fp8_shader_lut_matches_e4m3 together prove decode == e4m3_to_f32 == LUT), so
+// the batched result stays BIT-EXACT with the per-expert mul_mat_vec_nvfp4_e4m3
+// dispatch it replaces (which uses the identical decode).
+float kE4M3_decode(uint b) {
+    const uint s = b & 0x80u;               // sign bit (in position 7)
+    const uint e = (b >> 3u) & 0xFu;        // 4-bit exponent (bias 7)
+    const uint m = b & 0x7u;                // 3-bit mantissa
+    float mag;
+    if (e == 0u) {
+        mag = float(m) * 0.001953125;       // subnormal: m * 2^-9 (exact)
+    } else if (e == 15u && m == 7u) {
+        mag = 0.0;                          // e4m3 nan-slot -> 0.0 (LUT contract)
+    } else {
+        mag = uintBitsToFloat(((e + 120u) << 23u) | (m << 20u));  // normal
+    }
+    return uintBitsToFloat(floatBitsToUint(mag) | (s << 24u));    // sign -> bit 31
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint first_row = NUM_ROWS * gl_WorkGroupID.x;
+    const uint e = gl_WorkGroupID.y;          // expert slot in [0, n_experts)
+
+    const uint k = p.ncols;
+    const uint gs = p.group_size;
+    const uint groups = k / gs;
+    const uint words_per_row = k / 8u;
+
+    // Per-slice bases for expert `eid` in the concatenated per-layer buffers,
+    // exactly the per-op `packed_off`/`sb_off`.
+    const uint eid = meta[2u * e];
+    const float global = uintBitsToFloat(meta[2u * e + 1u]);
+    const uint packed_off = eid * p.nrows * words_per_row;
+    const uint sb_off = eid * p.nrows * groups;
+    const uint x_off = e * p.x_stride;        // 0 (shared) or e*k (concatenated)
+    const uint out_off = e * p.nrows;
+
+    float temp[NUM_ROWS];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        temp[n] = 0.0;
+    }
+
+    // Each thread walks columns j = tid, tid+BLOCK_SIZE, ...
+    for (uint j = tid; j < k; j += BLOCK_SIZE) {
+        const float xv = x[x_off + j];
+        const uint widx = j >> 3u;             // j / 8  word index within a row
+        const uint shift = (j & 7u) * 4u;      // (j % 8) * 4  nibble bit offset
+        const uint g = j / gs;                 // block index
+
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint r = first_row + n;
+            if (r >= p.nrows) { continue; }
+            const uint word = packed[packed_off + r * words_per_row + widx];
+            const uint code = (word >> shift) & 0xFu;
+            const uint sidx  = sb_off + r * groups + g;
+            const uint sword = scaleb[sidx >> 2u];
+            const uint sbyte = (sword >> ((sidx & 3u) * 8u)) & 0xFFu;
+            // Parentheses load-bearing for bit-exactness (see e4m3 header).
+            const float bscale = kE4M3_decode(sbyte) * global;
+            const float w = kE2M1[code] * bscale;
+            temp[n] += w * xv;
+        }
+    }
+
+    // Reduce partial sums across the workgroup via shared memory.
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+        tmpsh[n][tid] = temp[n];
+    }
+    barrier();
+    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                tmpsh[n][tid] += tmpsh[n][tid + s];
+            }
+        }
+        barrier();
+    }
+    if (tid == 0) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            const uint r = first_row + n;
+            if (r < p.nrows) {
+                dst[out_off + r] = tmpsh[n][0];
+            }
+        }
+    }
+}

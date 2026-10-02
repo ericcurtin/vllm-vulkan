@@ -4460,6 +4460,29 @@ impl VulkanModel {
                 }
             }
         }
+        // PR #94 review: the resident Laguna model pins FOUR scratches lazily the
+        // same way (PP hidden recv/send, the [vocab] serving ring-back, the top-K
+        // ring-back) and this setter dropped none of them — the nemotron defect
+        // above, again. Deregister against the OLD comm and zero them so the next
+        // `pp_step_laguna*` call re-pins against the new one (guards: handle == 0).
+        #[cfg(feature = "laguna")]
+        {
+            let cur = self.collective_comm;
+            if let Some(g) = self.laguna_gpu.as_mut() {
+                for (h, buf) in [
+                    (&mut g.pp_recv_handle, &mut g.pp_recv_scratch),
+                    (&mut g.pp_send_handle, &mut g.pp_send_scratch),
+                    (&mut g.pp_vocab_handle, &mut g.pp_vocab_scratch),
+                    (&mut g.pp_topk_handle, &mut g.pp_topk_scratch),
+                ] {
+                    if *h != 0 && cur != 0 {
+                        let _ = vccl_ffi::comm_deregister(cur as *mut std::os::raw::c_void, *h);
+                    }
+                    *h = 0;
+                    buf.clear();
+                }
+            }
+        }
         self.collective_comm = handle;
         // TP=2×PP: nemotron's per-layer TP all-reduce uses the SAME flat comm.
         // Forward the handle (the TP-peer global rank is wired via set_tp_peer).
@@ -5784,6 +5807,19 @@ impl VulkanModel {
         #[cfg(feature = "nemotron")]
         if let Some(m) = self.nemotron.as_mut() {
             m.reset();
+            return;
+        }
+        // Laguna: the only per-sequence state is the resident model's K/V — the
+        // host `kv` map (per-op path) AND the device `kv_res` planes (1-CB path,
+        // VLLM_VULKAN_LAGUNA_1CB). `reset_kv` zeroes both counters. Without this
+        // branch an OP_RESET fell through to the dense `inner` placeholder and the
+        // next request decoded on top of the previous one's KV, unless the caller
+        // happened to run the self-resetting PP prefill first (PR #94 review; same
+        // gap #93 closed for nemotron). The CPU `LagunaModel` reference holds no
+        // per-sequence state.
+        #[cfg(feature = "laguna")]
+        if let Some(g) = self.laguna_gpu.as_mut() {
+            g.reset_kv();
             return;
         }
         #[cfg(feature = "gemma")]
