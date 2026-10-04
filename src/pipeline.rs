@@ -47,6 +47,11 @@ pub struct PipelineCache {
 }
 
 impl PipelineCache {
+    /// The device subgroup size the cache compiled for.
+    pub fn subgroup_size(&self) -> u32 {
+        self.subgroup_size
+    }
+
     /// Create a new pipeline cache for the given device.
     ///
     /// `shader_spvs`: map from shader name → SPIR-V bytes.
@@ -96,9 +101,14 @@ impl PipelineCache {
             // table below supersedes that routing and never registers it.)
             // M10: genuinely-wave64 shader — a 64-thread workgroup IS one subgroup
             // (baked in GLSL, no spec constant fixes it). Skip on non-64 devices
-            // rather than compile a wrong kernel.
+            // rather than compile a wrong kernel. The dsv4 MLA softmax (both
+            // variants) and the DSA compressor reduce with a bare subgroupAdd over
+            // a 64-wide workgroup; their callers fall back to the host path when
+            // the pipeline is absent.
             if (name == "paged_attn_decode_f32_sg" || name == "paged_attn_decode_f16_sg"
-                || name == "laguna_gpu_sdpa")
+                || name == "laguna_gpu_sdpa"
+                || name == "dsv4_mla_softmax" || name == "dsv4_mla_softmax_splitk"
+                || name == "dsv4_dsa_compress")
                 && cache.subgroup_size != 64 {
                 log::warn!(
                     "skipping '{name}': requires subgroup_size==64, device has {}",

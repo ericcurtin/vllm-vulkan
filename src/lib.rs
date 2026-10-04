@@ -34,6 +34,7 @@ pub mod dsv4;
 pub mod dsv4_dsa;
 #[cfg(feature = "dsv4")]
 pub mod dsv4_forward;
+pub mod st_decode;
 #[cfg(feature = "dsv4")]
 pub mod dsv4_gpu;
 #[cfg(feature = "dsv4")]
@@ -672,6 +673,9 @@ pub struct VulkanModel {
     /// with `laguna` (the CPU reference); the `mt=="laguna"` dispatch picks one.
     #[cfg(feature = "laguna")]
     laguna_gpu: Option<laguna_gpu::LagunaGpuModel>,
+    /// Token history for the non-resident (CPU) Laguna single-token `forward_rs`:
+    /// the CPU reference forward is stateless, so each step reruns the history.
+    laguna_cpu_hist: Vec<u32>,
     #[cfg(not(feature = "laguna"))]
     #[allow(dead_code)]
     laguna_gpu: Option<()>,
@@ -1208,6 +1212,7 @@ impl VulkanModel {
                         ling: None,
                         laguna: None,
                         laguna_gpu: None,
+                        laguna_cpu_hist: Vec::new(),
                         mtp_head: None,
                         mtp_moe_gpu: None,
                         q35_last_prenorm: None,
@@ -2000,6 +2005,7 @@ impl VulkanModel {
                         ling: None,
                         laguna: None,
                         laguna_gpu: None,
+                        laguna_cpu_hist: Vec::new(),
                         mtp_head: None,
                         mtp_moe_gpu: None,
                         q35_last_prenorm: None,
@@ -2541,6 +2547,7 @@ impl VulkanModel {
                         ling: None,
                         laguna: None,
                         laguna_gpu: None,
+                        laguna_cpu_hist: Vec::new(),
                         mtp_head: None,
                         mtp_moe_gpu: None,
                         q35_last_prenorm: None,
@@ -3018,6 +3025,7 @@ impl VulkanModel {
                         ling: None,
                         laguna: None,
                         laguna_gpu: None,
+                        laguna_cpu_hist: Vec::new(),
                         mtp_head: None,
                         mtp_moe_gpu: None,
                         q35_last_prenorm: None,
@@ -3158,6 +3166,7 @@ impl VulkanModel {
                             ling: None,
                             laguna: None,
                             laguna_gpu: Some(gpu),
+                            laguna_cpu_hist: Vec::new(),
                             mtp_head: None,
                             mtp_moe_gpu: None,
                             q35_last_prenorm: None,
@@ -3251,6 +3260,7 @@ impl VulkanModel {
                         ling: None,
                         laguna: Some(lag_model),
                         laguna_gpu: None,
+                        laguna_cpu_hist: Vec::new(),
                         mtp_head: None,
                         mtp_moe_gpu: None,
                         q35_last_prenorm: None,
@@ -3376,6 +3386,7 @@ impl VulkanModel {
                         ling: Some(ling_model),
                         laguna: None,
                         laguna_gpu: None,
+                        laguna_cpu_hist: Vec::new(),
                         mtp_head: None,
                         mtp_moe_gpu: None,
                         q35_last_prenorm: None,
@@ -3508,6 +3519,7 @@ impl VulkanModel {
                         ling: None,
                         laguna: None,
                         laguna_gpu: None,
+                        laguna_cpu_hist: Vec::new(),
                         mtp_head: None,
                         mtp_moe_gpu: None,
                         q35_last_prenorm: None,
@@ -3751,6 +3763,7 @@ impl VulkanModel {
                         ling: None,
                         laguna: None,
                         laguna_gpu: None,
+                        laguna_cpu_hist: Vec::new(),
                         mtp_head: None,
                         mtp_moe_gpu: None,
                         q35_last_prenorm: None,
@@ -4258,6 +4271,7 @@ impl VulkanModel {
             ling: None,
             laguna: None,
             laguna_gpu: None,
+            laguna_cpu_hist: Vec::new(),
             mtp_head: None,
             mtp_moe_gpu: None,
             q35_last_prenorm: None,
@@ -4371,6 +4385,7 @@ impl VulkanModel {
             ling: None,
             laguna: None,
             laguna_gpu: None,
+            laguna_cpu_hist: Vec::new(),
             mtp_head: None,
             mtp_moe_gpu: None,
             q35_last_prenorm: None,
@@ -5817,6 +5832,10 @@ impl VulkanModel {
         // happened to run the self-resetting PP prefill first (PR #94 review; same
         // gap #93 closed for nemotron). The CPU `LagunaModel` reference holds no
         // per-sequence state.
+        // The CPU-reference Laguna decode keeps its token history in
+        // `laguna_cpu_hist`; drop it too, or the next request's position check
+        // sees the previous sequence (PR #95 review).
+        self.laguna_cpu_hist.clear();
         #[cfg(feature = "laguna")]
         if let Some(g) = self.laguna_gpu.as_mut() {
             g.reset_kv();
@@ -6623,6 +6642,85 @@ impl VulkanModel {
 
 
 
+    /// Laguna single-token forward for `forward_rs`. The resident GPU model
+    /// decodes against its KV cache; the CPU reference reruns its token history.
+    /// Whole model only (a PP stage uses the `pp_step_laguna*` seams). Position 0
+    /// starts a new sequence; any other position must be the next one.
+    #[cfg(feature = "laguna")]
+    fn forward_laguna_rs(&mut self, token_id: u32, position: usize) -> gpu_error::GpuResult<Vec<f32>> {
+        if let Some(g) = self.laguna_gpu.as_mut() {
+            if !(g.pp_first && g.pp_last) {
+                return Err(format!(
+                    "forward: Laguna stage [{}, {}) is not the whole model; use pp_step_laguna*",
+                    g.pp_start, g.pp_end).into());
+            }
+            if token_id as usize >= g.config.vocab_size {
+                return Err(format!("forward: token {token_id} >= vocab_size {}", g.config.vocab_size).into());
+            }
+            if position == 0 {
+                g.reset_kv();
+            }
+            let cur = g.decode_len();
+            if position != cur {
+                return Err(format!(
+                    "forward: position {position} is not the next decode position {cur} \
+                     (send position 0 to start a new sequence)").into());
+            }
+            // Same path as the prefill/decode seams: with `laguna_1cb` the prompt
+            // lives in the resident `kv_res` planes, not the host `kv` cache.
+            return Ok(if crate::flags::flags_global().laguna_1cb {
+                g.forward_decode_token_1cb(token_id)
+            } else {
+                g.forward_decode_token(token_id)
+            });
+        }
+        let m = self.laguna.as_ref().ok_or_else(|| gpu_error::GpuError::from("forward: no Laguna model".to_string()))?;
+        if !(m.pp_first && m.pp_last) {
+            return Err(format!(
+                "forward: Laguna stage [{}, {}) is not the whole model; use pp_step_laguna*",
+                m.pp_start, m.pp_end).into());
+        }
+        if token_id as usize >= m.config.vocab_size {
+            return Err(format!("forward: token {token_id} >= vocab_size {}", m.config.vocab_size).into());
+        }
+        if position == 0 {
+            self.laguna_cpu_hist.clear();
+        }
+        if position != self.laguna_cpu_hist.len() {
+            return Err(format!(
+                "forward: position {position} is not the next position {} (send position 0 \
+                 to start a new sequence)", self.laguna_cpu_hist.len()).into());
+        }
+        self.laguna_cpu_hist.push(token_id);
+        let out = m.forward(&self.laguna_cpu_hist);
+        if out.len() != m.config.vocab_size {
+            self.laguna_cpu_hist.pop();
+            return Err("forward: the CPU Laguna model has no lm_head loaded".to_string().into());
+        }
+        Ok(out)
+    }
+
+    /// Nemotron-H single-token forward for `forward_rs` (whole model only):
+    /// `forward_pp_stage` on a stage that is both first and last returns the
+    /// `[vocab]` logits. Position 0 resets the Mamba2 / attention state.
+    #[cfg(feature = "nemotron")]
+    fn forward_nemotron_rs(&mut self, token_id: u32, position: usize) -> gpu_error::GpuResult<Vec<f32>> {
+        let m = self.nemotron.as_mut().ok_or_else(|| gpu_error::GpuError::from("forward: no Nemotron model".to_string()))?;
+        let total = m.config.num_hidden_layers;
+        if !(m.pp_start == 0 && m.pp_end >= total) {
+            return Err(format!(
+                "forward: Nemotron stage [{}, {}) is not the whole model; use pp_step_nemotron*",
+                m.pp_start, m.pp_end).into());
+        }
+        if token_id as usize >= m.config.vocab_size {
+            return Err(format!("forward: token {token_id} >= vocab_size {}", m.config.vocab_size).into());
+        }
+        if position == 0 {
+            m.reset();
+        }
+        Ok(m.forward_pp_stage(token_id, &[], position))
+    }
+
     /// Rust-native body of `forward` (no pyo3 in the signature or error type),
     /// callable from unit tests and `forward_batched_impl` without pulling
     /// Python C-API symbols into the test binary.
@@ -6642,6 +6740,18 @@ impl VulkanModel {
                 return Ok(self.forward_qwen35_gpu(token_id, position));
             }
             return Ok(self.forward_qwen35_cpu_ref(token_id, position));
+        }
+        // Laguna and Nemotron-H: single-node single-token forward (the generic
+        // forward / forward_argmax / prefill / forward_and_sample seams). Before
+        // this, a node holding only one of these models fell through to the
+        // dense gemma/qwen3 path below.
+        #[cfg(feature = "laguna")]
+        if self.laguna_gpu.is_some() || self.laguna.is_some() {
+            return self.forward_laguna_rs(token_id, position);
+        }
+        #[cfg(feature = "nemotron")]
+        if self.nemotron.is_some() {
+            return self.forward_nemotron_rs(token_id, position);
         }
         // GPU acceleration is architecture-specific; the CPU reference path is
         // dispatched uniformly through the LanguageModel trait. Base Qwen3/Gemma4
@@ -8637,6 +8747,11 @@ impl MtpHeadPy {
 /// (`gate2b_pp10_window_chain_cpu`, argmax 11111). Cross-stage payload is the
 /// `[seq, hc*h]` hyper-connection stream (NOT `[h]` — DSV4's residual stream is
 /// `hc_mult=4` parallel streams).
+/// Ring-back value `pp_step_dsv4` sends rank0 when the last stage has no
+/// finite maximum: never a token id, so rank0 raises instead of sampling it.
+#[cfg(feature = "dsv4")]
+const PP_DSV4_NO_TOKEN: f32 = -1.0;
+
 #[cfg(feature = "dsv4")]
 #[pyclass]
 pub struct Dsv4Model {
@@ -8648,6 +8763,57 @@ pub struct Dsv4Model {
     vocab: usize,
     first: bool,
     last: bool,
+}
+
+#[cfg(feature = "dsv4")]
+impl Dsv4Model {
+    /// Every entry point that takes token ids checks them here first: the
+    /// embedding lookup and the hash router index by id, so an out-of-vocab id
+    /// would panic inside Rust instead of raising a Python error. `need_rows`:
+    /// the ids are the input rows (embedding stage), so they cannot be empty.
+    fn check_ids(&self, what: &str, ids: &[u32], need_rows: bool) -> PyResult<()> {
+        if need_rows && ids.is_empty() {
+            return Err(PyRuntimeError::new_err(format!("{what}: input_ids is empty")));
+        }
+        if let Some((i, &t)) = ids.iter().enumerate().find(|(_, &t)| t as usize >= self.vocab) {
+            return Err(PyRuntimeError::new_err(format!(
+                "{what}: input_ids[{i}] = {t} is outside the vocabulary (size {})", self.vocab)));
+        }
+        Ok(())
+    }
+
+    /// Shared prelude of `pp_step_dsv4` / `pp_step_dsv4_logits`: check the comm
+    /// handle and the token id, recv the previous stage's `[hc*h]` streams (none
+    /// on the first stage, which embeds `token_id`), then run this window's
+    /// resident decode step (the rolling cache advances in place).
+    fn pp_dsv4_window(
+        &mut self,
+        py: Python<'_>,
+        what: &str,
+        token_id: u32,
+        recv_from: i32,
+    ) -> PyResult<(*mut std::os::raw::c_void, dsv4_gpu::WindowOut)> {
+        if self.collective_comm == 0 {
+            return Err(PyRuntimeError::new_err(format!(
+                "{what}: native comm not set (call set_collective_comm)")));
+        }
+        // The ring role must match this stage: a non-first stage with
+        // `recv_from < 0` would decode with no streams, and a first stage with
+        // `recv_from >= 0` would block on a sender that does not exist.
+        if (recv_from < 0) != self.first {
+            return Err(PyRuntimeError::new_err(format!(
+                "{what}: recv_from={recv_from} does not match this stage (first={})",
+                self.first)));
+        }
+        self.check_ids(what, &[token_id], true)?;
+        let comm = self.collective_comm as *mut std::os::raw::c_void;
+        let sin = if recv_from >= 0 {
+            Some(vccl_ffi::recv_f32(py, comm, self.hcd, recv_from).map_err(PyRuntimeError::new_err)?)
+        } else {
+            None
+        };
+        Ok((comm, self.stage.decode_step_stage(token_id, sin)))
+    }
 }
 
 #[cfg(feature = "dsv4")]
@@ -8689,36 +8855,65 @@ impl Dsv4Model {
 
     /// Single-node (this window == all layers) GPU-resident forward → `[S, vocab]`
     /// logits. Only meaningful when this stage owns `[0, num_hidden_layers)`.
-    fn forward(&mut self, input_ids: Vec<u32>) -> Vec<f32> {
-        self.stage.forward(&input_ids)
+    fn forward(&mut self, input_ids: Vec<u32>) -> PyResult<Vec<f32>> {
+        self.check_ids("forward", &input_ids, true)?;
+        Ok(self.stage.forward(&input_ids))
     }
 
     /// Last-position argmax + its logit (single-node GATE 2a helper).
-    fn argmax_last(&mut self, input_ids: Vec<u32>) -> (u32, f32) {
-        self.stage.argmax_last(&input_ids)
+    fn argmax_last(&mut self, input_ids: Vec<u32>) -> PyResult<(u32, f32)> {
+        // Whole-model helper only: a partial stage returns [seq, hc*h] streams
+        // (read as logits, or sliced out of bounds), an empty input underflows
+        // seq-1, and an out-of-vocab id panics in the embedding lookup.
+        if !(self.first && self.last) {
+            return Err(PyRuntimeError::new_err(
+                "argmax_last: needs a stage that owns every layer (first and last); \
+                 this is a partial PP window"));
+        }
+        self.check_ids("argmax_last", &input_ids, true)?;
+        let (idx, val) = self.stage.argmax_last(&input_ids);
+        if !val.is_finite() {
+            // Same disguise `forward_argmax` had: an all-NaN logit row never
+            // beats the `-inf` sentinel, so the scan reports token 0 with score
+            // -inf — a plausible token that is really the uninitialised value.
+            // `dsv4_gpu::argmax_last` is used by a dozen in-crate tests, so the
+            // guard lives at this pymethod boundary rather than cascading a
+            // Result through all of them; the returned `-inf` IS the "no finite
+            // maximum" signal, so the check is exact and costs one comparison.
+            return Err(PyRuntimeError::new_err(format!(
+                "argmax_last: last-position logits have NO FINITE MAXIMUM (max={val}, \
+                 reported token {idx}). This is NOT a model output — an unguarded argmax \
+                 would have returned token 0. Suspect upstream NaN/inf (cpu_rms_norm \
+                 squaring a corrupt value into inf, then inf*0 = NaN), a defective GPU, \
+                 or an unwritten buffer.")));
+        }
+        Ok((idx, val))
     }
 
     /// One PP-window PREFILL. `streams_in` empty ⇒ first stage (embeds
     /// `input_ids`); else the `[seq, hc*h]` payload from the previous stage.
     /// Returns `(is_logits, data)`: `(false, [seq, hc*h])` mid-stage streams, or
     /// `(true, [seq, vocab])` last-stage logits.
-    fn forward_pp_stage_prefill(&mut self, input_ids: Vec<u32>, streams_in: Vec<f32>) -> (bool, Vec<f32>) {
+    fn forward_pp_stage_prefill(&mut self, input_ids: Vec<u32>, streams_in: Vec<f32>) -> PyResult<(bool, Vec<f32>)> {
+        // A later stage gets its rows as streams; its ids may be empty.
+        self.check_ids("forward_pp_stage_prefill", &input_ids, streams_in.is_empty())?;
         let sin = if streams_in.is_empty() { None } else { Some(streams_in) };
-        match self.stage.forward_pp_stage_prefill(&input_ids, sin) {
+        Ok(match self.stage.forward_pp_stage_prefill(&input_ids, sin) {
             dsv4_gpu::WindowOut::Logits(l) => (true, l),
             dsv4_gpu::WindowOut::Streams(s) => (false, s),
-        }
+        })
     }
 
     /// One PP-window DECODE step (advances the rolling cache). `streams_in` empty
     /// ⇒ first stage (embeds `id`). Returns `(is_logits, data)` as above with a
     /// single row: `(false, [hc*h])` streams or `(true, [vocab])` logits.
-    fn decode_step_stage(&mut self, id: u32, streams_in: Vec<f32>) -> (bool, Vec<f32>) {
+    fn decode_step_stage(&mut self, id: u32, streams_in: Vec<f32>) -> PyResult<(bool, Vec<f32>)> {
+        self.check_ids("decode_step_stage", &[id], true)?;
         let sin = if streams_in.is_empty() { None } else { Some(streams_in) };
-        match self.stage.decode_step_stage(id, sin) {
+        Ok(match self.stage.decode_step_stage(id, sin) {
             dsv4_gpu::WindowOut::Logits(l) => (true, l),
             dsv4_gpu::WindowOut::Streams(s) => (false, s),
-        }
+        })
     }
 
     /// Drop the rolling decode cache (call between independent sequences).
@@ -8783,28 +8978,8 @@ impl Dsv4Model {
         send_to: i32,
         last_rank: i32,
     ) -> PyResult<Option<u32>> {
-        if self.collective_comm == 0 {
-            return Err(PyRuntimeError::new_err(
-                "pp_step_dsv4: native comm not set (call set_collective_comm)",
-            ));
-        }
-        let comm = self.collective_comm as *mut std::os::raw::c_void;
-        let do_recv = recv_from >= 0;
+        let (comm, out) = self.pp_dsv4_window(py, "pp_step_dsv4", token_id, recv_from)?;
         let is_first = recv_from < 0;
-
-        // 1) recv the previous stage's [hc*h] streams (empty on the first stage,
-        //    which embeds token_id).
-        let streams_in: Vec<f32> = if do_recv {
-            vccl_ffi::recv_f32(py, comm, self.hcd, recv_from).map_err(PyRuntimeError::new_err)?
-        } else {
-            Vec::new()
-        };
-        let sin = if streams_in.is_empty() { None } else { Some(streams_in) };
-
-        // 2) resident stateful decode of this window (advances the rolling cache).
-        let out = self.stage.decode_step_stage(token_id, sin);
-
-        // 3) route the result.
         match out {
             dsv4_gpu::WindowOut::Logits(logits) => {
                 // Last stage: argmax in Rust (strict-`>` first-max, == the driver's
@@ -8813,26 +8988,42 @@ impl Dsv4Model {
                 for (i, &v) in logits.iter().enumerate() {
                     if v > bv { bv = v; bi = i; }
                 }
+                // An all-NaN row never beats the -inf sentinel and would report
+                // token 0 as if the model chose it; refuse it instead. rank0 is
+                // blocked in its ring-back recv, so send it the -1 sentinel first:
+                // both ranks then raise instead of rank0 hanging.
+                if !bv.is_finite() {
+                    if !is_first {
+                        vccl_ffi::send_f32(py, comm, &[PP_DSV4_NO_TOKEN], 0)
+                            .map_err(PyRuntimeError::new_err)?;
+                    }
+                    return Err(PyRuntimeError::new_err(format!(
+                        "pp_decode_step (dsv4): logits have NO FINITE MAXIMUM (max={bv}); \
+                         not a model output -- suspect upstream NaN/inf or an unwritten buffer")));
+                }
                 if is_first {
                     // STANDALONE N=1: this rank both embeds and samples.
                     return Ok(Some(bi as u32));
                 }
                 // Ring back ONLY the token id (1 f32; vocab≪2^24 ⇒ exact round-trip).
-                let tok_f = [bi as f32];
-                vccl_ffi::send_f32(py, comm, &tok_f, 0).map_err(PyRuntimeError::new_err)?;
+                vccl_ffi::send_f32(py, comm, &[bi as f32], 0).map_err(PyRuntimeError::new_err)?;
                 Ok(None)
             }
             dsv4_gpu::WindowOut::Streams(s) => {
                 // First/mid stage: ship the [hc*h] streams onward.
                 vccl_ffi::send_f32(py, comm, &s, send_to).map_err(PyRuntimeError::new_err)?;
-                if is_first {
-                    // rank0 receives the single-token ring-back from the last stage.
-                    let tb = vccl_ffi::recv_f32(py, comm, 1, last_rank)
-                        .map_err(PyRuntimeError::new_err)?;
-                    Ok(Some(tb[0] as u32))
-                } else {
-                    Ok(None)
+                if !is_first {
+                    return Ok(None);
                 }
+                // rank0 receives the single-token ring-back from the last stage.
+                let tb = vccl_ffi::recv_f32(py, comm, 1, last_rank).map_err(PyRuntimeError::new_err)?;
+                let t = tb[0];
+                if !(t >= 0.0 && (t as usize) < self.vocab) {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "pp_step_dsv4: the last stage (rank {last_rank}) sent no token (got {t}); \
+                         its logits had no finite maximum -- see that rank's error")));
+                }
+                Ok(Some(t as u32))
             }
         }
     }
@@ -8854,28 +9045,9 @@ impl Dsv4Model {
         send_to: i32,
         last_rank: i32,
     ) -> PyResult<Option<Vec<f32>>> {
-        if self.collective_comm == 0 {
-            return Err(PyRuntimeError::new_err(
-                "pp_step_dsv4_logits: native comm not set (call set_collective_comm)",
-            ));
-        }
-        let comm = self.collective_comm as *mut std::os::raw::c_void;
-        let do_recv = recv_from >= 0;
+        let (comm, out) = self.pp_dsv4_window(py, "pp_step_dsv4_logits", token_id, recv_from)?;
         let is_first = recv_from < 0;
-
-        // 1) recv the previous stage's [hc*h] streams (empty on the first stage,
-        //    which embeds token_id).
-        let streams_in: Vec<f32> = if do_recv {
-            vccl_ffi::recv_f32(py, comm, self.hcd, recv_from).map_err(PyRuntimeError::new_err)?
-        } else {
-            Vec::new()
-        };
-        let sin = if streams_in.is_empty() { None } else { Some(streams_in) };
-
-        // 2) resident stateful decode of this window (advances the rolling cache).
-        let out = self.stage.decode_step_stage(token_id, sin);
-
-        // 3) route the result.
+        // Route the result.
         match out {
             dsv4_gpu::WindowOut::Logits(logits) => {
                 // Last stage.
@@ -9323,6 +9495,7 @@ mod batched_forward_tests {
             ling: None,
             laguna: None,
             laguna_gpu: None,
+            laguna_cpu_hist: Vec::new(),
             mtp_head: None,
             mtp_moe_gpu: None,
             q35_last_prenorm: None,
@@ -9654,6 +9827,7 @@ pub(crate) mod qwen35_prefill_tests {
             ling: None,
             laguna: None,
             laguna_gpu: None,
+            laguna_cpu_hist: Vec::new(),
             mtp_head: None,
             mtp_moe_gpu: None,
             q35_last_prenorm: None,
@@ -10011,6 +10185,7 @@ mod kv_cache_pymethod_tests {
             ling: None,
             laguna: None,
             laguna_gpu: None,
+            laguna_cpu_hist: Vec::new(),
             mtp_head: None,
             mtp_moe_gpu: None,
             q35_last_prenorm: None,

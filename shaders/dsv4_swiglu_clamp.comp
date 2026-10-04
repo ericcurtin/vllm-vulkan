@@ -1,0 +1,30 @@
+#version 450
+
+// DeepSeek-V4-Flash routed-expert SwiGLU with the `swiglu_limit` clamp.
+//
+// Matches the CPU oracle `dsv4_gpu::moe_layer_mv` (the routed-expert branch,
+// argmax-11111 oracle):
+//     gv   = min(gate, limit)
+//     uv   = clamp(up, -limit, limit)
+//     hid  = silu(gv) * uv           , silu(z) = z / (1 + exp(-z))
+//
+// This is NOT `swiglu_oai.comp`: that computes `silu(min(a,limit)) * (1 + gi)`
+// (the GPT-OSS "+1" up-bias). DSV4 multiplies by the clamped up term directly
+// (no +1) and uses alpha=1 in the sigmoid. The shared expert reuses this shader
+// with limit=+inf (min/clamp become identity) => plain SwiGLU, no clamp — see
+// the fixture note "shared has NO swiglu_limit".
+//
+// Reuses glu_head.glsl (bindings 0=A gate, 1=B up, 2=D out; push struct with
+// `limit`/`alpha`) and glu_main.glsl (Split mode 2 => op(a[i], b[i]) from the
+// two separate gate/up buffers).
+
+#include "glu_head.glsl"
+
+float op(float a, float b) {
+    float gv = min(a, p.limit);
+    float uv = max(min(b, p.limit), -p.limit);
+    float silu = gv / (1.0f + exp(-gv * p.alpha));
+    return silu * uv;
+}
+
+#include "glu_main.glsl"
