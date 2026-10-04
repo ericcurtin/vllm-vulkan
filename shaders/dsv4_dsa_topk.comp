@@ -36,7 +36,7 @@ layout(push_constant) uniform parameter {
 } p;
 
 layout(binding = 0) readonly  buffer Scr { float scores[]; };  // [S, n_win]
-layout(binding = 1) writeonly buffer Out { int   sel[];    };  // [S, top_k]
+layout(binding = 1) coherent writeonly buffer Out { int   sel[];    };  // [S, top_k]
 
 void main() {
     const uint s    = gl_WorkGroupID.x;
@@ -56,6 +56,10 @@ void main() {
     for (uint i = lane; i < tk; i += BLOCK_SIZE) {
         sel[obase + i] = -1;
     }
+    // A selected window can land on a slot another lane just cleared: make the
+    // -1 stores visible before any rank-scatter store, or a late -1 can
+    // overwrite a selected window. barrier() alone orders execution, not memory.
+    memoryBarrierBuffer();
     barrier();
 
     // Rank-scatter: each valid window computes its strict rank; if < k, write it.

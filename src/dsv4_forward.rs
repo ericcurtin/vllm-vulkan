@@ -38,6 +38,7 @@ pub trait Dsv4Src {
     /// Embedding rows for `ids` → `[S, H]`. Default: full-table dequant + gather
     /// (real streaming sources override to read only the needed rows).
     fn embed_rows(&self, ids: &[u32], vocab: usize, h: usize) -> Vec<f32> {
+        assert!(ids.iter().all(|&t| (t as usize) < vocab), "embed_rows: token id outside vocab {vocab}");
         let w = self.linear("model.embed_tokens", vocab, h);
         let mut out = vec![0.0f32; ids.len() * h];
         for (i, &t) in ids.iter().enumerate() {

@@ -120,6 +120,38 @@ impl Dsv4RealSrc {
                         "{shard}: {name}: data_offsets [{o0}, {o1}] outside the data section \
                          ({} bytes)", flen - data_base)),
                 };
+                // The payload must hold exactly shape x dtype bytes: the readers
+                // slice by shape (a short payload panics, or a zero dim divides
+                // by zero). Unknown dtypes are never read, so they skip this.
+                let elem = match dtype.as_str() {
+                    "F64" | "I64" | "U64" => Some(8usize),
+                    "F32" | "I32" | "U32" => Some(4),
+                    "BF16" | "F16" | "I16" | "U16" => Some(2),
+                    "U8" | "I8" | "BOOL" | "F8_E4M3" | "F8_E5M2" | "F8_E8M0" => Some(1),
+                    _ => None,
+                };
+                if let Some(elem) = elem {
+                    let want = shape.iter().try_fold(elem, |a, &d| a.checked_mul(d));
+                    if want != Some(end - start) {
+                        return Err(format!(
+                            "{shard}: {name}: {dtype} {shape:?} needs {want:?} bytes, the payload has {}",
+                            end - start));
+                    }
+                }
+                // embed_rows and raw_expert index these dims directly.
+                let rank = if name.starts_with("model.embed_tokens.") {
+                    Some(2)
+                } else if name.contains(".ffn.switch_mlp.") {
+                    Some(3)
+                } else {
+                    None
+                };
+                if let Some(rank) = rank {
+                    if shape.len() != rank || shape.contains(&0) {
+                        return Err(format!(
+                            "{shard}: {name}: expected a rank-{rank} shape with no zero dim, got {shape:?}"));
+                    }
+                }
                 index.insert(name.clone(), Loc { shard: shard.clone(), dtype, shape, start, end });
             }
             mmaps.insert(shard.clone(), mmap);
@@ -232,7 +264,9 @@ impl Dsv4Src for Dsv4RealSrc {
 
     /// Dequantize only the needed rows of the 8-bit gs64 embedding table.
     fn embed_rows(&self, ids: &[u32], vocab: usize, h: usize) -> Vec<f32> {
-        let _ = vocab;
+        // The pymethod entry points reject out-of-vocab ids with a Python error
+        // (`Dsv4Model::check_ids`); this is a backstop, not the boundary check.
+        assert!(ids.iter().all(|&t| (t as usize) < vocab), "embed_rows: token id outside vocab {vocab}");
         let name = "model.embed_tokens";
         let wloc = self.index.get(&format!("{name}.weight")).unwrap_or_else(|| panic!("no embed"));
         let packed_cols = wloc.shape[1];
@@ -380,6 +414,17 @@ mod tests {
         std::fs::write(&shard, with_header(
             r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[4,0]}}"#, 8)).unwrap();
         assert!(open().is_err());
+        // Payload length does not match dtype x shape.
+        std::fs::write(&shard, with_header(
+            r#"{"a":{"dtype":"BF16","shape":[1,1],"data_offsets":[0,0]}}"#, 8)).unwrap();
+        assert!(open().unwrap_err().contains("needs"));
+        // An expert tensor that is not rank 3.
+        std::fs::write(&dir.join("model.safetensors.index.json"),
+                       r#"{"weight_map":{"x":"s.safetensors"}}"#).unwrap();
+        std::fs::write(&shard, with_header(
+            r#"{"layers.0.ffn.switch_mlp.up_proj.weight":{"dtype":"U32","shape":[2],"data_offsets":[0,8]}}"#,
+            8)).unwrap();
+        assert!(open().unwrap_err().contains("rank-3"));
         // A well-formed shard opens.
         std::fs::write(&shard, with_header(
             r#"{"a":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#, 8)).unwrap();

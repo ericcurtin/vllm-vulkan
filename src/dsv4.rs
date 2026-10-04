@@ -815,6 +815,19 @@ impl Dsv4Config {
                 "config: num_experts_per_tok {} must be in 1..={}",
                 cfg.num_experts_per_tok, cfg.num_local_experts));
         }
+        // A compressed layer divides positions by its rate (0 panics in the
+        // forward), and a CSA layer with index_topk 0 selects no window, so its
+        // whole compressed-KV path is masked out without an error.
+        let has = |t: LayerType| cfg.layer_types.contains(&t);
+        if has(LayerType::CompressedSparse) && cfg.compress_rate_csa == 0 {
+            return Err("config: compress_rates.compressed_sparse_attention must be > 0".into());
+        }
+        if has(LayerType::HeavilyCompressed) && cfg.compress_rate_hca == 0 {
+            return Err("config: compress_rates.heavily_compressed_attention must be > 0".into());
+        }
+        if has(LayerType::CompressedSparse) && cfg.index_topk == 0 {
+            return Err("config: index_topk must be > 0".into());
+        }
         Ok(cfg)
     }
 }
@@ -1182,7 +1195,8 @@ mod mla_tests {
         assert_eq!(c.mlp_layer_types, vec![MlpType::HashMoe, MlpType::Moe, MlpType::Moe]);
     }
 
-    /// Per-layer vectors must match num_hidden_layers; top-k must be in 1..=E.
+    /// Per-layer vectors must match num_hidden_layers; top-k must be in 1..=E;
+    /// compress rates and index_topk must be > 0.
     #[test]
     fn config_rejects_bad_lengths_and_topk() {
         let base = r#"{"hidden_size":4096,"num_attention_heads":64,"head_dim":512,
@@ -1197,6 +1211,9 @@ mod mla_tests {
         assert!(parse(r#","num_experts_per_tok":0"#).is_err());
         assert!(parse(r#","num_local_experts":4,"num_experts_per_tok":5"#).is_err());
         assert!(parse(r#","num_local_experts":4,"num_experts_per_tok":4"#).is_ok());
+        assert!(parse(r#","compress_rates":{"compressed_sparse_attention":0}"#).is_err());
+        assert!(parse(r#","compress_rates":{"heavily_compressed_attention":0}"#).is_err());
+        assert!(parse(r#","index_topk":0"#).is_err());
         let short = base.replace(r#""hash_moe","moe","moe""#, r#""hash_moe","moe""#);
         let j: Value = serde_json::from_str(&format!("{short}}}")).unwrap();
         assert!(Dsv4Config::from_json(&j).unwrap_err().contains("num_hidden_layers"));

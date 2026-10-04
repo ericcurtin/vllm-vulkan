@@ -6666,7 +6666,13 @@ impl VulkanModel {
                     "forward: position {position} is not the next decode position {cur} \
                      (send position 0 to start a new sequence)").into());
             }
-            return Ok(g.forward_decode_token(token_id));
+            // Same path as the prefill/decode seams: with `laguna_1cb` the prompt
+            // lives in the resident `kv_res` planes, not the host `kv` cache.
+            return Ok(if crate::flags::flags_global().laguna_1cb {
+                g.forward_decode_token_1cb(token_id)
+            } else {
+                g.forward_decode_token(token_id)
+            });
         }
         let m = self.laguna.as_ref().ok_or_else(|| gpu_error::GpuError::from("forward: no Laguna model".to_string()))?;
         if !(m.pp_first && m.pp_last) {
@@ -8741,6 +8747,11 @@ impl MtpHeadPy {
 /// (`gate2b_pp10_window_chain_cpu`, argmax 11111). Cross-stage payload is the
 /// `[seq, hc*h]` hyper-connection stream (NOT `[h]` — DSV4's residual stream is
 /// `hc_mult=4` parallel streams).
+/// Ring-back value `pp_step_dsv4` sends rank0 when the last stage has no
+/// finite maximum: never a token id, so rank0 raises instead of sampling it.
+#[cfg(feature = "dsv4")]
+const PP_DSV4_NO_TOKEN: f32 = -1.0;
+
 #[cfg(feature = "dsv4")]
 #[pyclass]
 pub struct Dsv4Model {
@@ -8752,6 +8763,49 @@ pub struct Dsv4Model {
     vocab: usize,
     first: bool,
     last: bool,
+}
+
+#[cfg(feature = "dsv4")]
+impl Dsv4Model {
+    /// Every entry point that takes token ids checks them here first: the
+    /// embedding lookup and the hash router index by id, so an out-of-vocab id
+    /// would panic inside Rust instead of raising a Python error. `need_rows`:
+    /// the ids are the input rows (embedding stage), so they cannot be empty.
+    fn check_ids(&self, what: &str, ids: &[u32], need_rows: bool) -> PyResult<()> {
+        if need_rows && ids.is_empty() {
+            return Err(PyRuntimeError::new_err(format!("{what}: input_ids is empty")));
+        }
+        if let Some((i, &t)) = ids.iter().enumerate().find(|(_, &t)| t as usize >= self.vocab) {
+            return Err(PyRuntimeError::new_err(format!(
+                "{what}: input_ids[{i}] = {t} is outside the vocabulary (size {})", self.vocab)));
+        }
+        Ok(())
+    }
+
+    /// Shared prelude of `pp_step_dsv4` / `pp_step_dsv4_logits`: check the comm
+    /// handle and the token id, recv the previous stage's `[hc*h]` streams (none
+    /// on the first stage, which embeds `token_id`), then run this window's
+    /// resident decode step (the rolling cache advances in place).
+    fn pp_dsv4_window(
+        &mut self,
+        py: Python<'_>,
+        what: &str,
+        token_id: u32,
+        recv_from: i32,
+    ) -> PyResult<(*mut std::os::raw::c_void, dsv4_gpu::WindowOut)> {
+        if self.collective_comm == 0 {
+            return Err(PyRuntimeError::new_err(format!(
+                "{what}: native comm not set (call set_collective_comm)")));
+        }
+        self.check_ids(what, &[token_id], true)?;
+        let comm = self.collective_comm as *mut std::os::raw::c_void;
+        let sin = if recv_from >= 0 {
+            Some(vccl_ffi::recv_f32(py, comm, self.hcd, recv_from).map_err(PyRuntimeError::new_err)?)
+        } else {
+            None
+        };
+        Ok((comm, self.stage.decode_step_stage(token_id, sin)))
+    }
 }
 
 #[cfg(feature = "dsv4")]
@@ -8793,8 +8847,9 @@ impl Dsv4Model {
 
     /// Single-node (this window == all layers) GPU-resident forward → `[S, vocab]`
     /// logits. Only meaningful when this stage owns `[0, num_hidden_layers)`.
-    fn forward(&mut self, input_ids: Vec<u32>) -> Vec<f32> {
-        self.stage.forward(&input_ids)
+    fn forward(&mut self, input_ids: Vec<u32>) -> PyResult<Vec<f32>> {
+        self.check_ids("forward", &input_ids, true)?;
+        Ok(self.stage.forward(&input_ids))
     }
 
     /// Last-position argmax + its logit (single-node GATE 2a helper).
@@ -8807,13 +8862,7 @@ impl Dsv4Model {
                 "argmax_last: needs a stage that owns every layer (first and last); \
                  this is a partial PP window"));
         }
-        if input_ids.is_empty() {
-            return Err(PyRuntimeError::new_err("argmax_last: input_ids is empty"));
-        }
-        if let Some((i, &t)) = input_ids.iter().enumerate().find(|(_, &t)| t as usize >= self.vocab) {
-            return Err(PyRuntimeError::new_err(format!(
-                "argmax_last: input_ids[{i}] = {t} is outside the vocabulary (size {})", self.vocab)));
-        }
+        self.check_ids("argmax_last", &input_ids, true)?;
         let (idx, val) = self.stage.argmax_last(&input_ids);
         if !val.is_finite() {
             // Same disguise `forward_argmax` had: an all-NaN logit row never
@@ -8837,23 +8886,26 @@ impl Dsv4Model {
     /// `input_ids`); else the `[seq, hc*h]` payload from the previous stage.
     /// Returns `(is_logits, data)`: `(false, [seq, hc*h])` mid-stage streams, or
     /// `(true, [seq, vocab])` last-stage logits.
-    fn forward_pp_stage_prefill(&mut self, input_ids: Vec<u32>, streams_in: Vec<f32>) -> (bool, Vec<f32>) {
+    fn forward_pp_stage_prefill(&mut self, input_ids: Vec<u32>, streams_in: Vec<f32>) -> PyResult<(bool, Vec<f32>)> {
+        // A later stage gets its rows as streams; its ids may be empty.
+        self.check_ids("forward_pp_stage_prefill", &input_ids, streams_in.is_empty())?;
         let sin = if streams_in.is_empty() { None } else { Some(streams_in) };
-        match self.stage.forward_pp_stage_prefill(&input_ids, sin) {
+        Ok(match self.stage.forward_pp_stage_prefill(&input_ids, sin) {
             dsv4_gpu::WindowOut::Logits(l) => (true, l),
             dsv4_gpu::WindowOut::Streams(s) => (false, s),
-        }
+        })
     }
 
     /// One PP-window DECODE step (advances the rolling cache). `streams_in` empty
     /// ⇒ first stage (embeds `id`). Returns `(is_logits, data)` as above with a
     /// single row: `(false, [hc*h])` streams or `(true, [vocab])` logits.
-    fn decode_step_stage(&mut self, id: u32, streams_in: Vec<f32>) -> (bool, Vec<f32>) {
+    fn decode_step_stage(&mut self, id: u32, streams_in: Vec<f32>) -> PyResult<(bool, Vec<f32>)> {
+        self.check_ids("decode_step_stage", &[id], true)?;
         let sin = if streams_in.is_empty() { None } else { Some(streams_in) };
-        match self.stage.decode_step_stage(id, sin) {
+        Ok(match self.stage.decode_step_stage(id, sin) {
             dsv4_gpu::WindowOut::Logits(l) => (true, l),
             dsv4_gpu::WindowOut::Streams(s) => (false, s),
-        }
+        })
     }
 
     /// Drop the rolling decode cache (call between independent sequences).
@@ -8918,28 +8970,8 @@ impl Dsv4Model {
         send_to: i32,
         last_rank: i32,
     ) -> PyResult<Option<u32>> {
-        if self.collective_comm == 0 {
-            return Err(PyRuntimeError::new_err(
-                "pp_step_dsv4: native comm not set (call set_collective_comm)",
-            ));
-        }
-        let comm = self.collective_comm as *mut std::os::raw::c_void;
-        let do_recv = recv_from >= 0;
+        let (comm, out) = self.pp_dsv4_window(py, "pp_step_dsv4", token_id, recv_from)?;
         let is_first = recv_from < 0;
-
-        // 1) recv the previous stage's [hc*h] streams (empty on the first stage,
-        //    which embeds token_id).
-        let streams_in: Vec<f32> = if do_recv {
-            vccl_ffi::recv_f32(py, comm, self.hcd, recv_from).map_err(PyRuntimeError::new_err)?
-        } else {
-            Vec::new()
-        };
-        let sin = if streams_in.is_empty() { None } else { Some(streams_in) };
-
-        // 2) resident stateful decode of this window (advances the rolling cache).
-        let out = self.stage.decode_step_stage(token_id, sin);
-
-        // 3) route the result.
         match out {
             dsv4_gpu::WindowOut::Logits(logits) => {
                 // Last stage: argmax in Rust (strict-`>` first-max, == the driver's
@@ -8949,8 +8981,14 @@ impl Dsv4Model {
                     if v > bv { bv = v; bi = i; }
                 }
                 // An all-NaN row never beats the -inf sentinel and would report
-                // token 0 as if the model chose it; refuse it instead.
+                // token 0 as if the model chose it; refuse it instead. rank0 is
+                // blocked in its ring-back recv, so send it the -1 sentinel first:
+                // both ranks then raise instead of rank0 hanging.
                 if !bv.is_finite() {
+                    if !is_first {
+                        vccl_ffi::send_f32(py, comm, &[PP_DSV4_NO_TOKEN], 0)
+                            .map_err(PyRuntimeError::new_err)?;
+                    }
                     return Err(PyRuntimeError::new_err(format!(
                         "pp_decode_step (dsv4): logits have NO FINITE MAXIMUM (max={bv}); \
                          not a model output -- suspect upstream NaN/inf or an unwritten buffer")));
@@ -8960,21 +8998,24 @@ impl Dsv4Model {
                     return Ok(Some(bi as u32));
                 }
                 // Ring back ONLY the token id (1 f32; vocab≪2^24 ⇒ exact round-trip).
-                let tok_f = [bi as f32];
-                vccl_ffi::send_f32(py, comm, &tok_f, 0).map_err(PyRuntimeError::new_err)?;
+                vccl_ffi::send_f32(py, comm, &[bi as f32], 0).map_err(PyRuntimeError::new_err)?;
                 Ok(None)
             }
             dsv4_gpu::WindowOut::Streams(s) => {
                 // First/mid stage: ship the [hc*h] streams onward.
                 vccl_ffi::send_f32(py, comm, &s, send_to).map_err(PyRuntimeError::new_err)?;
-                if is_first {
-                    // rank0 receives the single-token ring-back from the last stage.
-                    let tb = vccl_ffi::recv_f32(py, comm, 1, last_rank)
-                        .map_err(PyRuntimeError::new_err)?;
-                    Ok(Some(tb[0] as u32))
-                } else {
-                    Ok(None)
+                if !is_first {
+                    return Ok(None);
                 }
+                // rank0 receives the single-token ring-back from the last stage.
+                let tb = vccl_ffi::recv_f32(py, comm, 1, last_rank).map_err(PyRuntimeError::new_err)?;
+                let t = tb[0];
+                if !(t >= 0.0 && (t as usize) < self.vocab) {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "pp_step_dsv4: the last stage (rank {last_rank}) sent no token (got {t}); \
+                         its logits had no finite maximum -- see that rank's error")));
+                }
+                Ok(Some(t as u32))
             }
         }
     }
@@ -8996,28 +9037,9 @@ impl Dsv4Model {
         send_to: i32,
         last_rank: i32,
     ) -> PyResult<Option<Vec<f32>>> {
-        if self.collective_comm == 0 {
-            return Err(PyRuntimeError::new_err(
-                "pp_step_dsv4_logits: native comm not set (call set_collective_comm)",
-            ));
-        }
-        let comm = self.collective_comm as *mut std::os::raw::c_void;
-        let do_recv = recv_from >= 0;
+        let (comm, out) = self.pp_dsv4_window(py, "pp_step_dsv4_logits", token_id, recv_from)?;
         let is_first = recv_from < 0;
-
-        // 1) recv the previous stage's [hc*h] streams (empty on the first stage,
-        //    which embeds token_id).
-        let streams_in: Vec<f32> = if do_recv {
-            vccl_ffi::recv_f32(py, comm, self.hcd, recv_from).map_err(PyRuntimeError::new_err)?
-        } else {
-            Vec::new()
-        };
-        let sin = if streams_in.is_empty() { None } else { Some(streams_in) };
-
-        // 2) resident stateful decode of this window (advances the rolling cache).
-        let out = self.stage.decode_step_stage(token_id, sin);
-
-        // 3) route the result.
+        // Route the result.
         match out {
             dsv4_gpu::WindowOut::Logits(logits) => {
                 // Last stage.

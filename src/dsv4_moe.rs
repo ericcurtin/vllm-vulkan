@@ -159,7 +159,9 @@ pub fn topk_router(
         order.sort_by(|&a, &b| {
             let ka = scores[a] + corr_bias[a] as f64;
             let kb = scores[b] + corr_bias[b] as f64;
-            kb.partial_cmp(&ka).unwrap().then(a.cmp(&b))
+            // total_cmp: a NaN score sorts deterministically instead of
+            // panicking; the order of finite keys is unchanged.
+            kb.total_cmp(&ka).then(a.cmp(&b))
         });
         let sel = &order[..top_k];
         let sel_scores: Vec<f64> = sel.iter().map(|&e| scores[e]).collect();
