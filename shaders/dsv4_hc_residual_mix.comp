@@ -1,0 +1,50 @@
+#version 450
+
+// DeepSeek-V4-Flash manifold Hyper-Connection residual mix (resident).
+//
+// Matches the CPU oracle `dsv4::hc_residual_mix` (argmax-11111 oracle), per
+// output element (si, k, dd) of the `[seq, hc, hidden]` stream stack:
+//     out[si,k,dd] = post[si,k] * sublayer[si,dd]
+//                  + Σ_j  comb[si,j,k] * streams[si,j,dd]
+// i.e. each updated stream k = its gated sublayer contribution plus the
+// hc×hc Sinkhorn-combine mixing of the incoming streams. Called 2 sites × 43
+// layers/token in decode — one of the "becomes free once resident" glue ops.
+//
+// One invocation per output element (flat index == si*hc*hidden + k*hidden + dd).
+// f32 accumulation (the oracle accumulates in f64); the mix coefficients are
+// O(1) Sinkhorn gates so the low-order-bit gap is tiny (mirror gate: cos>0.999999).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer Post    { float post[]; };     // [seq*hc]
+layout(binding = 1) readonly  buffer Sub     { float sub[]; };      // [seq*hidden]
+layout(binding = 2) readonly  buffer Comb    { float comb[]; };     // [seq*hc*hc]
+layout(binding = 3) readonly  buffer Streams { float streams[]; };  // [seq*hc*hidden]
+layout(binding = 4) writeonly buffer Out     { float outb[]; };     // [seq*hc*hidden]
+
+layout(push_constant) uniform Params {
+    uint seq;
+    uint hc;
+    uint hidden;
+} p;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    const uint hcd = p.hc * p.hidden;
+    const uint total = p.seq * hcd;
+    if (i >= total) {
+        return;
+    }
+    const uint si  = i / hcd;
+    const uint rem = i - si * hcd;
+    const uint k   = rem / p.hidden;
+    const uint dd  = rem - k * p.hidden;
+
+    float acc = post[si * p.hc + k] * sub[si * p.hidden + dd];
+    const uint comb_base = si * p.hc * p.hc;
+    for (uint j = 0u; j < p.hc; ++j) {
+        float cjk = comb[comb_base + j * p.hc + k];
+        acc += cjk * streams[si * hcd + j * p.hidden + dd];
+    }
+    outb[i] = acc;
+}

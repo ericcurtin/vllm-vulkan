@@ -1,0 +1,241 @@
+#version 450
+// DeepSeek-V4-Flash Phase 2b — Manifold Hyper-Connection (mHC) GPU kernel WITH
+// the fp32-stability treatment the reference lacks (see scripts/dsv4/hc_stability.py
+// for the numpy oracle + the equivalence/depth-finiteness proofs, and the memory
+// note deepseek-v4-flash-feasibility for the L32-NaN forensics).
+//
+// One WORKGROUP per token (grid.x = n_tokens). BLOCK_SIZE is a spec constant so the
+// same SPIR-V drives a decode-shaped MANY-WAVE workgroup (BLOCK_SIZE=256/512 => 4/8
+// wave64 subgroups on GFX1013) as well as the historical BLOCK_SIZE=64 single-wave
+// build. hc_mult (=4) is tiny, so the 24-output mix + the 4x4 Sinkhorn is negligible.
+//
+// ── DECODE-SHAPED RESTRUCTURE (2026-08-16) ───────────────────────────────────
+//  The seq=1 decode path launches exactly ONE workgroup. The old build fixed
+//  BLOCK_SIZE=64 => a single wave64 ran the whole HD-wide `flat@fn` projection with
+//  a per-lane SERIAL two-float compensated chain (256+ dependent dfAdd) and a lane-0
+//  SERIAL 64-partial combine — one wave on one of 40 CUs could not hide the fnw
+//  streaming latency (~4.3 ms/call, resident HC-site NET-NEGATIVE +40%). The math is
+//  UNCHANGED; only the REDUCTION is restructured:
+//   • BLOCK_SIZE>64 => 4-8 waves per workgroup hide the fnw memory latency (the true
+//     wall — a single wave cannot pipeline the ~1.5MB fnw stream) and cut each lane's
+//     accumulation chain from HD/64 to HD/BLOCK_SIZE.
+//   • every reduction (max, mean-of-squares, and each of the 24 mix dots) is a
+//     WORKGROUP-WIDE LDS TREE reduction (log2(BLOCK_SIZE) steps), replacing the
+//     subgroupMax/subgroupAdd (which only spanned one wave) and the O(64) serial
+//     lane-0 combine. The two-float dot partials tree-combine with the same
+//     compensated dfAdd, so the accumulator stays double-single (~fp64-equiv).
+//  A parallel two-float tree-reduce is NOT bit-identical to the old serial
+//  compensated sum (different summation ORDER) but is well within argmax tolerance
+//  (~fp64-equiv reordering); gated by debug_dsv4_hc (cos>0.9999 vs the f64 CPU
+//  oracle) + the on-node argmax-11111 / GEN=8,64 bit-identity gate.
+//
+// Computes, per token, the reference mHC mapping (paper §2.2 eq.8):
+//   flat   = RMSNorm(streams.flatten())            [H*D]
+//   mixed  = flat @ fn^T                            [(2+H)*H]
+//   pre    = sigmoid(mixed_pre *s0 + base_pre)+eps  [H]  (stream collapse weights)
+//   post   = 2*sigmoid(mixed_post*s1 + base_post)   [H]  (block-output placement)
+//   comb   = Sinkhorn_iters( softmax(mixed_comb*s2+base_comb) + eps )  [H,H]
+//   collapsed = sum_h pre[h]*streams[h]             [D]
+//
+// ── STABILITY TREATMENT (each an IDENTITY on finite input => shallow layers stay
+//    cos=1.0 vs the reference; proven in hc_stability.py) ─────────────────────
+//  (1) SANITIZE: san(v) = isnan/isinf ? 0 : v, applied to every stream read. An
+//      overflowed residual (the L32 mechanism: RMSNorm's mean(x*x) overflows ->
+//      rsqrt(inf)=0 -> 0*inf = NaN) is neutralised at the HC boundary instead of
+//      poisoning the whole forward.
+//  (2) MAX-FACTORED RMSNorm: m=max|san(x)|; work in xs=san(x)/m so the sum of
+//      squares is over [-1,1] and can never overflow. inv = rsqrt(mean(xs^2) +
+//      rms_eps/m^2); flat = xs*inv. Algebraically == x*rsqrt(mean(x^2)+eps) for
+//      finite m. mixed[o] = inv * sum_i xs_i*fn[o,i] (never materialises flat).
+//  (3) LOGIT CLAMP: sigmoid/softmax logits clamped to +-logit_clamp (default 1e4,
+//      a no-op for any finite real logit; caps only literal inf). The linear
+//      Sinkhorn schedule itself is kept EXACT (reference-identical: softmax(row)+
+//      eps, col-norm, then (iters-1)x(row,col)) — it is already robust to any
+//      finite comb_logits (softmax saturates + the +eps denominator floors the
+//      4x4 positive), so no log-domain change is needed and the finite result is
+//      bit-identical.
+//
+// ── Phase 2d (2026-08-14) LOAD-BEARING PRECISION FIX ─────────────────────────
+//  The full-depth golden milestone (scripts/dsv4/golden.py --stable, Phase 2c)
+//  proved the L32 NaN is the fp32 mix projection `mixed = flat @ fn` (an HD=H*D-wide
+//  reduction) losing precision under the depth-grown residual: with the sanitize +
+//  max-factored guards ON, the HC input is byte-identical across the all-fp32 and
+//  the fp64-mix runs, yet `comb_logits` is NaN in fp32 vs 12.57 in fp64. GFX1013 has
+//  no fast native fp64, so the mix dot here is accumulated in a TWO-FLOAT
+//  (double-single, ~fp64-equivalent) carry: exact fma product (twoProd) + compensated
+//  (Knuth twoSum) accumulation, per-lane then a compensated LDS-TREE combine of the
+//  BLOCK_SIZE lane partials. Each op is an identity on well-conditioned finite input
+//  (existing debug_dsv4_hc gate stays cos>0.9999); it only recovers the low-order
+//  bits the deep-layer reduction needs. The ms (mean-of-squares) pass stays fp32 —
+//  it is a sum of [0,1] positives with no cancellation. Only the mix dot carries the
+//  two-float accumulator.
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+
+const uint HMAX = 8u;              // hc_mult cap (real = 4)
+const uint MIXMAX = (2u + HMAX) * HMAX;  // 80
+
+layout(push_constant) uniform parameter {
+    uint hc_mult;     // H
+    uint hidden;      // D
+    uint iters;       // Sinkhorn iterations
+    float hc_eps;
+    float rms_eps;
+    float logit_clamp;
+} p;
+
+layout(binding = 0) readonly  buffer Streams { float streams[]; };   // [T,H,D]
+layout(binding = 1) readonly  buffer Fn      { float fnw[];     };   // [(2+H)*H, H*D]
+layout(binding = 2) readonly  buffer Base    { float base[];    };   // [(2+H)*H]
+layout(binding = 3) readonly  buffer Scale   { float scal[];    };   // [3]
+layout(binding = 4) writeonly buffer PostO   { float post_o[];  };   // [T,H]
+layout(binding = 5) writeonly buffer CombO   { float comb_o[];  };   // [T,H,H]
+layout(binding = 6) writeonly buffer CollO   { float coll_o[];  };   // [T,D]
+
+shared float smixed[MIXMAX];
+shared float spre[HMAX];
+// workgroup-wide LDS tree-reduction scratch (sized by the BLOCK_SIZE spec constant)
+shared float red[BLOCK_SIZE];      // scalar (max / mean-of-squares) partials
+shared float rhi[BLOCK_SIZE];      // two-float hi partials for the mix dots
+shared float rlo[BLOCK_SIZE];      // two-float lo partials for the mix dots
+
+float san(float v) { return (isnan(v) || isinf(v)) ? 0.0 : v; }
+float sigmoidf(float x) { return 1.0 / (1.0 + exp(-x)); }
+float clampl(float x, float c) { return clamp(x, -c, c); }
+
+// Knuth/Møller compensated 2-sum: s = a+b exactly represented as (s,e).
+void twoSum(float a, float b, out float s, out float e) {
+    s = a + b;
+    float bb = s - a;
+    e = (a - (s - bb)) + (b - bb);
+}
+// Exact fp32 product a*b as (p,e) via FMA (GFX1013 has native fma).
+void twoProd(float a, float b, out float pr, out float e) {
+    pr = a * b;
+    e = fma(a, b, -pr);
+}
+// Accumulate the two-float value (xhi,xlo) into the running two-float (hi,lo).
+void dfAdd(inout float hi, inout float lo, float xhi, float xlo) {
+    float s, e; twoSum(hi, xhi, s, e);
+    e += lo + xlo;
+    float s2, e2; twoSum(s, e, s2, e2);
+    hi = s2; lo = e2;
+}
+
+void main() {
+    const uint t   = gl_WorkGroupID.x;
+    const uint lane = gl_LocalInvocationID.x;
+    const uint H   = p.hc_mult;
+    const uint D   = p.hidden;
+    const uint HD  = H * D;
+    const uint mix = (2u + H) * H;
+    const uint sbase = t * HD;
+
+    // ── pass 1: m = max|san(x)| via a workgroup LDS tree ──────────────────────
+    float lm = 0.0;
+    for (uint i = lane; i < HD; i += BLOCK_SIZE) {
+        lm = max(lm, abs(san(streams[sbase + i])));
+    }
+    red[lane] = lm;
+    barrier();
+    for (uint stride = BLOCK_SIZE >> 1u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) { red[lane] = max(red[lane], red[lane + stride]); }
+        barrier();
+    }
+    const float m = red[0] > 0.0 ? red[0] : 1.0;
+    const float invm = 1.0 / m;
+    barrier();  // all lanes have read red[0]; safe to reuse red[] below
+
+    // ── pass 2: ms = mean((x/m)^2) via a workgroup LDS tree ───────────────────
+    float msl = 0.0;
+    for (uint i = lane; i < HD; i += BLOCK_SIZE) {
+        const float xs = san(streams[sbase + i]) * invm;
+        msl += xs * xs;
+    }
+    red[lane] = msl;
+    barrier();
+    for (uint stride = BLOCK_SIZE >> 1u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) { red[lane] += red[lane + stride]; }
+        barrier();
+    }
+    const float ms  = red[0] / float(HD);
+    const float inv = inversesqrt(ms + p.rms_eps * invm * invm);
+    barrier();
+
+    // ── the 24 mix dots: two-float per-lane accumulation + compensated LDS tree ─
+    for (uint o = 0u; o < mix; ++o) {
+        float hi = 0.0, lo = 0.0;
+        const uint frow = o * HD;
+        for (uint i = lane; i < HD; i += BLOCK_SIZE) {
+            const float a = san(streams[sbase + i]) * invm;
+            const float b = fnw[frow + i];
+            float pp, ee; twoProd(a, b, pp, ee);   // exact product (pp,ee)
+            dfAdd(hi, lo, pp, ee);                  // compensated accumulate
+        }
+        rhi[lane] = hi; rlo[lane] = lo;
+        barrier();
+        // compensated (two-float) tree combine of the BLOCK_SIZE lane partials
+        for (uint stride = BLOCK_SIZE >> 1u; stride > 0u; stride >>= 1u) {
+            if (lane < stride) {
+                float ahi = rhi[lane], alo = rlo[lane];
+                dfAdd(ahi, alo, rhi[lane + stride], rlo[lane + stride]);
+                rhi[lane] = ahi; rlo[lane] = alo;
+            }
+            barrier();
+        }
+        if (lane == 0u) {
+            smixed[o] = inv * (rhi[0] + rlo[0]);   // final collapse fits fp32 (comb_logits ~O(10))
+        }
+        barrier();
+    }
+
+    // ── lane 0: pre/post + comb (softmax + exact linear Sinkhorn) ─────────────
+    if (lane == 0u) {
+        const float s0 = scal[0], s1 = scal[1], s2 = scal[2];
+        const float c = p.logit_clamp, eps = p.hc_eps;
+        for (uint h = 0u; h < H; ++h) {
+            spre[h]        = sigmoidf(clampl(smixed[h] * s0 + base[h], c)) + eps;
+            post_o[t * H + h] = 2.0 * sigmoidf(clampl(smixed[H + h] * s1 + base[H + h], c));
+        }
+        // comb_logits -> row softmax + eps
+        float comb[HMAX * HMAX];
+        for (uint i = 0u; i < H; ++i) {
+            float mx = -3.4e38;
+            for (uint j = 0u; j < H; ++j) {
+                const float lg = clampl(smixed[2u * H + i * H + j] * s2 + base[2u * H + i * H + j], c);
+                comb[i * H + j] = lg;
+                mx = max(mx, lg);
+            }
+            float sm = 0.0;
+            for (uint j = 0u; j < H; ++j) { comb[i * H + j] = exp(comb[i * H + j] - mx); sm += comb[i * H + j]; }
+            for (uint j = 0u; j < H; ++j) { comb[i * H + j] = comb[i * H + j] / sm + eps; }
+        }
+        // Sinkhorn: col-normalise, then (iters-1) x (row, col).
+        for (uint j = 0u; j < H; ++j) {
+            float cs = 0.0; for (uint i = 0u; i < H; ++i) cs += comb[i * H + j];
+            cs += eps; for (uint i = 0u; i < H; ++i) comb[i * H + j] /= cs;
+        }
+        for (uint it = 1u; it < p.iters; ++it) {
+            for (uint i = 0u; i < H; ++i) {
+                float rs = 0.0; for (uint j = 0u; j < H; ++j) rs += comb[i * H + j];
+                rs += eps; for (uint j = 0u; j < H; ++j) comb[i * H + j] /= rs;
+            }
+            for (uint j = 0u; j < H; ++j) {
+                float cs = 0.0; for (uint i = 0u; i < H; ++i) cs += comb[i * H + j];
+                cs += eps; for (uint i = 0u; i < H; ++i) comb[i * H + j] /= cs;
+            }
+        }
+        for (uint i = 0u; i < H * H; ++i) comb_o[t * H * H + i] = comb[i];
+    }
+    barrier();
+
+    // ── all lanes: collapsed[d] = sum_h pre[h]*san(streams[h,d]) ──────────────
+    for (uint d = lane; d < D; d += BLOCK_SIZE) {
+        float acc = 0.0;
+        for (uint h = 0u; h < H; ++h) {
+            acc += spre[h] * san(streams[sbase + h * D + d]);
+        }
+        coll_o[t * D + d] = acc;
+    }
+}

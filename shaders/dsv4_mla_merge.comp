@@ -1,0 +1,65 @@
+#version 450
+// Merge for `dsv4_mla_softmax_splitk` (board dsv4-mla-softmax-splitk): per head,
+// combine the nsplit partial online-softmax states [m, den, acc[hd]] into the
+// attention output, then apply the output-rope conjugate exactly as
+// dsv4_mla_softmax.comp does. Split 0 always holds the sink, so the global max is
+// finite and empty splits (m = -inf, den = 0) contribute exp(-inf) = 0.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+const uint BLOCK = 64u;
+const uint HDMAX = 512u;
+
+layout(push_constant) uniform parameter {
+    uint num_heads;
+    uint head_dim;
+    uint nsplit;
+    uint rope_dim;
+} p;
+
+layout(binding = 0) readonly  buffer Part { float part[]; };   // [nh*nsplit*(hd+2)]
+layout(binding = 1) readonly  buffer CosB { float cosb[]; };   // [rope_dim/2]
+layout(binding = 2) readonly  buffer SinB { float sinb[]; };   // [rope_dim/2]
+layout(binding = 3) writeonly buffer Out  { float ao[]; };     // [nh*hd]
+
+shared float sao[HDMAX];
+
+void main() {
+    const uint hh = gl_WorkGroupID.x;
+    const uint lane = gl_LocalInvocationID.x;
+    const uint hd = p.head_dim;
+    const uint stride = hd + 2u;
+    const uint base = hh * p.nsplit * stride;
+
+    float gmax = -1.0 / 0.0;
+    for (uint s = 0u; s < p.nsplit; ++s) gmax = max(gmax, part[base + s * stride]);
+    float den = 0.0;
+    for (uint s = 0u; s < p.nsplit; ++s) {
+        den += part[base + s * stride + 1u] * exp(part[base + s * stride] - gmax);
+    }
+    float invden = 1.0 / den;
+    for (uint d = lane; d < hd; d += BLOCK) {
+        float a = 0.0;
+        for (uint s = 0u; s < p.nsplit; ++s) {
+            a += part[base + s * stride + 2u + d] * exp(part[base + s * stride] - gmax);
+        }
+        sao[d] = a * invden;
+    }
+    barrier();
+
+    const uint nhalf = p.rope_dim / 2u;
+    const uint nope = hd - p.rope_dim;
+    for (uint i = lane; i < nhalf; i += BLOCK) {
+        float c = cosb[i];
+        float sn = -sinb[i];
+        float a = sao[nope + 2u * i];
+        float b = sao[nope + 2u * i + 1u];
+        sao[nope + 2u * i]      = a * c - b * sn;
+        sao[nope + 2u * i + 1u] = b * c + a * sn;
+    }
+    barrier();
+
+    const uint qbase = hh * hd;
+    for (uint d = lane; d < hd; d += BLOCK) {
+        ao[qbase + d] = sao[d];
+    }
+}

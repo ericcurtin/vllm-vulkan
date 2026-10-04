@@ -1250,6 +1250,11 @@ impl ComputeEngine {
     }
 
     /// Whether a compiled pipeline named `name` exists in this engine's cache.
+    /// The device subgroup size (32 or 64 on AMD); wave64-only kernels check it.
+    pub fn subgroup_size(&self) -> u32 {
+        self.pipeline_cache.subgroup_size()
+    }
+
     pub fn has_pipeline(&self, name: &str) -> bool {
         self.pipeline_cache.get(name).is_some()
     }
