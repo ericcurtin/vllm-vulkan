@@ -1499,6 +1499,15 @@ impl Dsv4GpuStage {
             return Err(format!("DSA GPU trio needs subgroup_size 64, device has {}",
                                self.eng.subgroup_size()));
         }
+        // dsv4_dsa_compress keeps the 2m gate/kv slots in g[8]/v[8] (m <= 4) and the
+        // pooled row in a 512-wide shared array. Past either bound the shader writes
+        // out of bounds with no dispatch error, so refuse here and let the caller
+        // use the host compressor.
+        if m == 0 || m > 4 || hd > 512 || ix_hd > 512 {
+            return Err(format!(
+                "DSA GPU trio supports compress_rate 1..=4 and head_dim <= 512 \
+                 (got m={m}, hd={hd}, ix_hd={ix_hd})"));
+        }
         // Ensure the three trio pipelines (spec BLOCK_SIZE=64) before opening the CB.
         for base in ["dsv4_dsa_compress", "dsv4_dsa_index_score", "dsv4_dsa_topk"] {
             let shader = format!("{base}_bs64");

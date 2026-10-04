@@ -8797,6 +8797,14 @@ impl Dsv4Model {
             return Err(PyRuntimeError::new_err(format!(
                 "{what}: native comm not set (call set_collective_comm)")));
         }
+        // The ring role must match this stage: a non-first stage with
+        // `recv_from < 0` would decode with no streams, and a first stage with
+        // `recv_from >= 0` would block on a sender that does not exist.
+        if (recv_from < 0) != self.first {
+            return Err(PyRuntimeError::new_err(format!(
+                "{what}: recv_from={recv_from} does not match this stage (first={})",
+                self.first)));
+        }
         self.check_ids(what, &[token_id], true)?;
         let comm = self.collective_comm as *mut std::os::raw::c_void;
         let sin = if recv_from >= 0 {
