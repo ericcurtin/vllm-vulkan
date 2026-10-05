@@ -5820,6 +5820,17 @@ impl VulkanModel {
             }
             return;
         }
+        // Kimi-Linear: the same shape of state as Ling (KDA recurrence + conv
+        // window + MLA KV, host and the GPU-resident stage). Without this branch a
+        // serve OP_RESET fell through and the next request decoded on top of the
+        // previous one.
+        #[cfg(feature = "kimi")]
+        if let Some(m) = self.kimi.as_mut() {
+            if let Err(e) = m.reset_decode_state() {
+                log::error!("reset_kv_cache: kimi reset_decode_state failed: {e}");
+            }
+            return;
+        }
         #[cfg(feature = "qwen35")]
         if let Some(m) = self.qwen35.as_mut() {
             m.reset();  // resets both DeltaNetState + KvCache for all layers

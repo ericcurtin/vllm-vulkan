@@ -1315,9 +1315,16 @@ impl KimiModel {
         x
     }
 
-    /// Re-zero the resident decode state (start a fresh decode session).
-    pub fn reset_decode_state(&mut self) {
+    /// Re-zero the resident decode state (start a fresh decode session): the
+    /// host states AND the GPU quant-resident stage (`KIMI_GPU_RESIDENT`), which
+    /// keeps its own KDA recurrence, conv windows and MLA cache. Without the GPU
+    /// reset the next sequence would decode on top of the previous one.
+    pub fn reset_decode_state(&mut self) -> Result<(), String> {
         self.states = self.init_decode_state();
+        if let Some(g) = self.gpu.as_mut() {
+            g.reset_state()?;
+        }
+        Ok(())
     }
 
     /// One PP-stage single-token decode step (the nemotron `forward_pp_stage`
@@ -1330,19 +1337,33 @@ impl KimiModel {
     ///
     /// Only the `[H]` hidden (or the tail `[vocab]` logits) crosses a PP hop; the
     /// recurrence/KV state lives entirely on its owning stage.
-    pub fn forward_pp_stage(&mut self, token_id: u32, hidden_in: &[f32], _pos: usize) -> Vec<f32> {
-        // Phase C: dispatch to the GPU quant-resident stage when present.
-        if self.gpu.is_some() {
-            return self
-                .gpu
-                .as_mut()
-                .unwrap()
-                .forward_pp_stage(token_id, hidden_in)
-                .expect("kimi gpu forward_pp_stage");
-        }
+    ///
+    /// Errors (bad `token_id`, wrong `hidden_in` size, a missing edge weight, a GPU
+    /// failure) come back as `Err` so the pyo3 seams raise a Python exception
+    /// instead of panicking.
+    pub fn forward_pp_stage(&mut self, token_id: u32, hidden_in: &[f32], _pos: usize) -> Result<Vec<f32>, String> {
+        self.forward_pp_stage_opt(token_id, hidden_in, true)
+    }
+
+    /// `forward_pp_stage` with the tail lm_head optional: `want_logits = false`
+    /// advances the state through this position but skips the final norm +
+    /// `[vocab]` lm_head on the last stage and returns an empty vec there (the
+    /// prefill needs logits only at the last prompt position).
+    pub fn forward_pp_stage_opt(&mut self, token_id: u32, hidden_in: &[f32], want_logits: bool)
+        -> Result<Vec<f32>, String> {
         let h = self.cfg.hidden_size;
-        let eps = self.cfg.rms_norm_eps;
         let first = self.layer_start == 0;
+        if first && token_id as usize >= self.cfg.vocab_size {
+            return Err(format!("kimi forward_pp_stage: token {token_id} >= vocab_size {}", self.cfg.vocab_size));
+        }
+        if !first && hidden_in.len() != h {
+            return Err(format!("kimi forward_pp_stage: hidden_in {} != hidden_size {h}", hidden_in.len()));
+        }
+        // Phase C: dispatch to the GPU quant-resident stage when present.
+        if let Some(gpu) = self.gpu.as_mut() {
+            return gpu.forward_pp_stage(token_id, hidden_in, want_logits);
+        }
+        let eps = self.cfg.rms_norm_eps;
         let last = self.layer_end == self.cfg.num_hidden_layers;
         if self.states.len() != self.layers.len() {
             self.states = self.init_decode_state();
@@ -1350,11 +1371,10 @@ impl KimiModel {
 
         // stage input hidden
         let mut x = if first {
-            let emb = self.embed.as_ref().expect("stage 0 requires embed (load_edges)");
+            let emb = self.embed.as_ref().ok_or("stage 0 requires embed (load_edges)")?;
             let row = token_id as usize * h;
-            emb[row..row + h].to_vec()
+            emb.get(row..row + h).ok_or_else(|| format!("kimi embed: token {token_id} out of range"))?.to_vec()
         } else {
-            assert_eq!(hidden_in.len(), h, "PP hidden_in wrong size");
             hidden_in.to_vec()
         };
 
@@ -1366,9 +1386,11 @@ impl KimiModel {
         }
         self.states = states;
 
-        if last {
-            let fnorm = self.final_norm.as_ref().expect("tail stage requires final_norm");
-            let lm = self.lm_head.as_ref().expect("tail stage requires lm_head");
+        if last && !want_logits {
+            Ok(Vec::new())
+        } else if last {
+            let fnorm = self.final_norm.as_ref().ok_or("tail stage requires final_norm")?;
+            let lm = self.lm_head.as_ref().ok_or("tail stage requires lm_head")?;
             let normed = rmsnorm(&x, 1, h, fnorm, eps);
             let vocab = lm.len() / h;
             let mut logits = vec![0f32; vocab];
@@ -1380,9 +1402,9 @@ impl KimiModel {
                 }
                 logits[o] = acc;
             }
-            logits
+            Ok(logits)
         } else {
-            x
+            Ok(x)
         }
     }
 }
@@ -2914,6 +2936,35 @@ mod p_decode_tests {
         KimiConfig::from_json(&serde_json::from_str(&raw).unwrap()).unwrap()
     }
 
+    /// `forward_pp_stage` returns `Err` (the seams raise a Python exception)
+    /// instead of panicking on a bad token, a wrong-size hidden or a missing edge
+    /// weight; `want_logits = false` skips the tail lm_head; reset is a Result.
+    #[test]
+    fn forward_pp_stage_errors_instead_of_panicking() {
+        let cfg = fixture_config();
+        let (h, vocab, n) = (cfg.hidden_size, cfg.vocab_size, cfg.num_hidden_layers);
+        let model = |start: usize, end: usize| KimiModel {
+            cfg: cfg.clone(), layer_start: start, layer_end: end, layers: Vec::new(),
+            embed: None, final_norm: None, lm_head: None, states: Vec::new(), gpu: None,
+            pp_recv_scratch: Vec::new(), pp_recv_handle: 0, pp_send_scratch: Vec::new(), pp_send_handle: 0,
+        };
+        let mut first = model(0, 3);
+        let e = first.forward_pp_stage(vocab as u32, &[], 0).unwrap_err();
+        assert!(e.contains("vocab_size"), "{e}");
+        let e = first.forward_pp_stage(1, &[], 0).unwrap_err();
+        assert!(e.contains("embed"), "{e}");
+        let mut last = model(3, n);
+        let e = last.forward_pp_stage(0, &vec![0.0; h - 1], 0).unwrap_err();
+        assert!(e.contains("hidden_in"), "{e}");
+        assert_eq!(last.forward_pp_stage_opt(0, &vec![0.0; h], false).unwrap(), Vec::<f32>::new());
+        let e = last.forward_pp_stage(0, &vec![0.0; h], 0).unwrap_err();
+        assert!(e.contains("final_norm"), "{e}");
+        let mut mid = model(3, 6);
+        let x: Vec<f32> = (0..h).map(|i| i as f32).collect();
+        assert_eq!(mid.forward_pp_stage(0, &x, 0).unwrap(), x);
+        assert!(mid.reset_decode_state().is_ok());
+    }
+
     #[test]
     fn kimi_decode_eq_prefill_bit_exact() {
         let ckpt = match std::env::var("KIMI_CKPT") {
@@ -3027,7 +3078,7 @@ mod p_decode_tests {
         // smoke: forward_pp_stage embed (first) path == decode_step over embed row.
         let mut m_edge = KimiModel::load_cpu(&ckpt, &cfg, 0, 2, true).expect("[0,2) edges");
         let tok = 12345u32;
-        let stage_out = m_edge.forward_pp_stage(tok, &[], 0);
+        let stage_out = m_edge.forward_pp_stage(tok, &[], 0).unwrap();
         assert_eq!(stage_out.len(), h, "non-last stage returns [H] hidden");
         let embed = m_edge.embed.as_ref().unwrap();
         let emb_row = embed[tok as usize * h..(tok as usize + 1) * h].to_vec();

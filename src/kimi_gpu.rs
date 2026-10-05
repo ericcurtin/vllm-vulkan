@@ -548,13 +548,18 @@ impl KimiGpuStage {
     /// One PP-stage single-token decode step (the GPU-resident `forward_pp_stage`).
     /// First stage embeds `token_id`; else consumes `hidden_in[H]`. Last stage
     /// returns `[vocab]` logits; else the `[H]` hidden to ship onward.
-    pub fn forward_pp_stage(&mut self, token_id: u32, hidden_in: &[f32]) -> Result<Vec<f32>, String> {
+    /// `want_logits = false` skips the tail final-norm + lm_head (returns an
+    /// empty vec on the last stage) for prefill positions whose logits are unused.
+    pub fn forward_pp_stage(&mut self, token_id: u32, hidden_in: &[f32], want_logits: bool)
+        -> Result<Vec<f32>, String> {
         let h = self.h;
         let eps = self.eps;
         let mut x = if self.first {
             let emb = self.embed.as_ref().ok_or("stage 0 requires embed")?;
             let row = token_id as usize * h;
-            emb[row..row + h].to_vec()
+            emb.get(row..row + h)
+                .ok_or_else(|| format!("kimi embed: token {token_id} out of range"))?
+                .to_vec()
         } else {
             if hidden_in.len() != h { return Err(format!("PP hidden_in {} != {h}", hidden_in.len())); }
             hidden_in.to_vec()
@@ -592,7 +597,9 @@ impl KimiGpuStage {
             x = out;
         }
 
-        if self.last {
+        if self.last && !want_logits {
+            Ok(Vec::new())
+        } else if self.last {
             let fnorm = self.final_norm.as_ref().ok_or("tail stage requires final_norm")?;
             let normed = kimi::rmsnorm(&x, 1, h, fnorm, eps);
             // GPU-resident logits matvec (matvec_mlx4 / repack) — disjoint field

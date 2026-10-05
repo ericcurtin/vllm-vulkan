@@ -22,7 +22,7 @@ impl VulkanModel {
     fn forward_pp_kimi(&mut self, token_id: u32, hidden_in: Vec<f32>, pos: usize) -> PyResult<Vec<f32>> {
         let m = self.kimi.as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("forward_pp_kimi needs a kimi_linear model"))?;
-        Ok(m.forward_pp_stage(token_id, &hidden_in, pos))
+        m.forward_pp_stage(token_id, &hidden_in, pos).map_err(PyRuntimeError::new_err)
     }
 
 
@@ -61,7 +61,20 @@ impl VulkanModel {
         if seq == 0 {
             return Err(PyRuntimeError::new_err("forward_pp_kimi_prefill: empty prompt"));
         }
-        if !first && hidden_in.len() != seq * h {
+        if first {
+            // Check every consumed token up front: `tokens` comes straight from
+            // Python, and a short or out-of-vocab prompt must raise, not panic,
+            // and must not advance the decode state part-way.
+            if tokens.len() < seq {
+                return Err(PyRuntimeError::new_err(format!(
+                    "forward_pp_kimi_prefill: tokens.len()={} < seq={}", tokens.len(), seq)));
+            }
+            let vocab = self.kimi.as_ref().unwrap().cfg.vocab_size;
+            if let Some((i, &t)) = tokens[..seq].iter().enumerate().find(|(_, &t)| t as usize >= vocab) {
+                return Err(PyRuntimeError::new_err(format!(
+                    "forward_pp_kimi_prefill: token[{i}]={t} >= vocab_size {vocab}")));
+            }
+        } else if hidden_in.len() != seq * h {
             return Err(PyRuntimeError::new_err(format!(
                 "forward_pp_kimi_prefill: hidden_in.len()={} != seq*H={}",
                 hidden_in.len(), seq * h)));
@@ -69,13 +82,15 @@ impl VulkanModel {
         let m = self.kimi.as_mut().unwrap();
         let mut out: Vec<f32> = if last { Vec::new() } else { Vec::with_capacity(seq * h) };
         for pos in 0..seq {
+            // The last stage computes the [vocab] lm_head only at the last position.
+            let want_logits = pos + 1 == seq;
             let step = if first {
-                m.forward_pp_stage(tokens[pos], &[], pos)
+                m.forward_pp_stage_opt(tokens[pos], &[], want_logits)
             } else {
-                m.forward_pp_stage(0, &hidden_in[pos * h..(pos + 1) * h], pos)
-            };
+                m.forward_pp_stage_opt(0, &hidden_in[pos * h..(pos + 1) * h], want_logits)
+            }.map_err(PyRuntimeError::new_err)?;
             if last {
-                out = step; // keep only the last position's [vocab]
+                if want_logits { out = step; } // keep only the last position's [vocab]
             } else {
                 out.extend_from_slice(&step); // accumulate [seq*H]
             }
@@ -158,7 +173,8 @@ impl VulkanModel {
             Vec::new()
         };
 
-        let out = self.kimi.as_mut().unwrap().forward_pp_stage(token_id, &hidden_in, pos);
+        let out = self.kimi.as_mut().unwrap().forward_pp_stage(token_id, &hidden_in, pos)
+            .map_err(PyRuntimeError::new_err)?;
 
         if !is_last {
             // 3) send onward FROM the registered scratch (mid/first stage out is
@@ -260,7 +276,8 @@ impl VulkanModel {
 
         // 2) resident stage forward (Kimi ignores pos → internal tracking). [H]
         //    on mid stages, [vocab] on the last.
-        let out = self.kimi.as_mut().unwrap().forward_pp_stage(token_id, &hidden_in, 0);
+        let out = self.kimi.as_mut().unwrap().forward_pp_stage(token_id, &hidden_in, 0)
+            .map_err(PyRuntimeError::new_err)?;
 
         // 3) route the result.
         if is_first && is_last {
