@@ -268,6 +268,24 @@ pub(crate) fn include_all_shaders() -> std::collections::HashMap<String, Vec<u8>
         .collect()
 }
 
+/// Device + compute engine with every built-in shader registered (the setup the
+/// GPU-resident stages share; `dsv4_gpu` also keeps the SPIR-V map to build
+/// matvec variants on demand).
+#[allow(dead_code)]
+pub(crate) fn make_engine(
+    device_idx: usize,
+) -> Result<(compute::ComputeEngine, device::ComputeDevice, std::collections::HashMap<String, Vec<u8>>), String> {
+    let dev = device::ComputeDevice::create(device_idx)?;
+    let shader_spvs = include_all_shaders();
+    let refs: std::collections::HashMap<&str, &[u8]> =
+        shader_spvs.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect();
+    let eng = compute::ComputeEngine::new(
+        dev.instance.clone(), dev.physical_device, dev.device.clone(),
+        dev.compute_queue, dev.compute_queue_family, dev.caps(), &refs,
+    )?;
+    Ok((eng, dev, shader_spvs))
+}
+
 // ─── PyO3 module ────────────────────────────────────────────────────────────
 
 // ─── VulkanModel — end-to-end Gemma4 forward pass ────────────────────────────
@@ -3282,8 +3300,8 @@ impl VulkanModel {
         // then a PP window `[layer_start,layer_end)` is loaded through
         // `ling::LingModel::load_cpu` (int4-sym experts held quant-resident via the
         // bit-exact `int4_symmetric_to_mlx4` path). The CPU-reference window forward
-        // runs (`forward_pp_bailing_prefill`); the resident GPU decode is the
-        // cluster follow-on (docs/ling-3.0-flash-int4-bringup.md). Loading requires
+        // runs (`forward_pp_bailing_prefill`); `VLLM_VULKAN_LING_GPU_RESIDENT=1`
+        // loads the GPU-resident window instead (`ling_gpu.rs`). Loading requires
         // the on-disk checkpoint. Fail LOUD (never silent-falls-through to gemma).
         if let Ok(cfg_text) = std::fs::read_to_string(&config_path) {
             if let Ok(cfg_json) = serde_json::from_str::<serde_json::Value>(&cfg_text) {
@@ -5797,7 +5815,9 @@ impl VulkanModel {
         // ling prefill seam also self-resets, so this is belt-and-suspenders.
         #[cfg(feature = "ling")]
         if let Some(m) = self.ling.as_mut() {
-            m.reset_decode_state();
+            if let Err(e) = m.reset_decode_state() {
+                log::error!("reset_kv_cache: ling reset_decode_state failed: {e}");
+            }
             return;
         }
         #[cfg(feature = "qwen35")]

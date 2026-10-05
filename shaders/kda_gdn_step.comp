@@ -1,0 +1,96 @@
+#version 450
+
+// Kimi Delta Attention (KDA) decode-step recurrence + gated RMSNorm.
+// KDA variant of `q35_gdn_step.comp`: identical block skeleton and the SAME
+// per-column f32 accumulation order (bit-exact vs the CPU `kimi::kda::forward`
+// recurrence), with the ONLY math deltas:
+//
+//   (1) decay is PER KEY-CHANNEL (a d_k-vector from KDA's low-rank f_a/f_b
+//       proj) instead of the qwen GDN per-value-head SCALAR. Binding 3 is
+//       repurposed from the qwen `a_in[nv]` to `decay_in[nk*kd]` (precomputed
+//       on host — `exp(-exp(A_log[h]) * softplus(f_b(f_a(x)) + dt_bias))`), and
+//       the scalar `g=-exp(A_log)*softplus(...)` compute is dropped. The state
+//       multiply becomes `state[kk*vd+vv] *= decay_in[kh*kd + kk]`.
+//   (2) the output gate is `sigmoid(gate)` (KDA g_b(g_a(x)), fed via `z_in`)
+//       instead of qwen's `silu(z)`.
+//
+// UNCHANGED vs q35_gdn_step: state shape [nv,kd,vd], beta=sigmoid(b_in[j]),
+// the two fused passes (state*=decay ; kv_mem; delta; state+=k(x)delta ; out),
+// and the weighted o_norm RMSNorm (params[2*nv + vv]). One workgroup per
+// value-head `j` (dispatch (nv,1,1)); one thread per value column `vv`
+// (vd <= 128). exp/sigmoid use GPU intrinsics (last-ulp vs libm — the
+// documented cos>=0.99999 tolerance; accumulation order is bit-identical).
+//
+// params[] packs [A_log(nv) | dt_bias(nv) | o_norm_w(vd)]; only the o_norm_w
+// tail is read here (A_log/dt_bias are folded into decay_in on the host).
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint kd;
+    uint vd;
+    uint ratio;   // nv / nk (KDA: 1); v-head j uses k-head j/ratio
+    uint v_off;   // v_flat offset into conv_out (= 2*key_dim)
+    float eps;    // o_norm eps (rms_norm_eps)
+    uint nv;
+};
+
+layout(binding = 0) readonly buffer QBuf { float q_in[]; };       // [key_dim] normed+scaled
+layout(binding = 1) readonly buffer KBuf { float k_in[]; };       // [key_dim] normed+scaled
+layout(binding = 2) readonly buffer CBuf { float conv_out[]; };   // v at v_off
+layout(binding = 3) readonly buffer DBuf { float decay_in[]; };   // [nk*kd] per key-channel
+layout(binding = 4) readonly buffer BBuf { float b_in[]; };       // [nv] pre-sigmoid beta
+layout(binding = 5) readonly buffer ZBuf { float gate_in[]; };    // [value_dim] KDA g_b(g_a(x))
+layout(binding = 6) readonly buffer PBuf { float params[]; };     // [2*nv + vd]
+layout(binding = 7) buffer SBuf { float state[]; };               // [nv, kd, vd]
+layout(binding = 8) writeonly buffer GBuf { float gated[]; };     // [value_dim]
+
+shared float sh_out[128];
+shared float sh_scale;
+
+void main() {
+    const uint j = gl_WorkGroupID.x;
+    const uint vv = gl_LocalInvocationID.x;
+    const uint kh = j / ratio;
+
+    const float beta = 1.0 / (1.0 + exp(-b_in[j]));
+
+    const uint sb = j * kd * vd;
+    const uint db = kh * kd;   // decay base for this key-head
+    float outv = 0.0;
+    if (vv < vd) {
+        // Pass 1: state *= decay[kk] (per key-channel) fused with
+        // kv_mem = state^T . k (kk order matches the CPU loops).
+        float kv_mem = 0.0;
+        for (uint kk = 0u; kk < kd; kk++) {
+            const float s = state[sb + kk * vd + vv] * decay_in[db + kk];
+            state[sb + kk * vd + vv] = s;
+            kv_mem += s * k_in[kh * kd + kk];
+        }
+        const float delta = (conv_out[v_off + j * vd + vv] - kv_mem) * beta;
+        // Pass 2: state += k (x) delta fused with out = state . q.
+        float o = 0.0;
+        for (uint kk = 0u; kk < kd; kk++) {
+            const float s = state[sb + kk * vd + vv] + k_in[kh * kd + kk] * delta;
+            state[sb + kk * vd + vv] = s;
+            o += s * q_in[kh * kd + kk];
+        }
+        outv = o;
+        sh_out[vv] = o;
+    }
+    barrier();
+    if (vv == 0u) {
+        float ss = 0.0;
+        for (uint i = 0u; i < vd; i++) {
+            const float v = sh_out[i];
+            ss += v * v;
+        }
+        sh_scale = 1.0 / sqrt(ss / float(vd) + eps);
+    }
+    barrier();
+    if (vv < vd) {
+        const float normed = outv * sh_scale * params[2u * nv + vv];
+        const float gg = gate_in[j * vd + vv];
+        gated[j * vd + vv] = normed * (1.0 / (1.0 + exp(-gg))); // * sigmoid(gate)
+    }
+}

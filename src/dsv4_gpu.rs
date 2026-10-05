@@ -522,7 +522,7 @@ impl Dsv4GpuStage {
         device_idx: usize,
     ) -> Result<Dsv4GpuStage, String> {
         let src = Dsv4RealSrc::open(ckpt_dir)?;
-        let (mut eng, dev, shader_spvs) = make_engine(device_idx)?;
+        let (mut eng, dev, shader_spvs) = crate::make_engine(device_idx)?;
         // Pre-compile the three resident matvec variants once.
         for bits in [2usize, 6, 8] {
             ensure_variant(&mut eng, &shader_spvs, base_shader(bits))?;
@@ -1801,20 +1801,6 @@ fn dsa_dump_ab(ckv_g: &[f32], vis_g: &[i32], ckv_h: &[f32], vis_h: &[i32], s: us
 
 
 // ---------------- GPU plumbing ----------------
-
-fn make_engine(
-    device_idx: usize,
-) -> Result<(compute::ComputeEngine, device::ComputeDevice, HashMap<String, Vec<u8>>), String> {
-    let dev = device::ComputeDevice::create(device_idx)?;
-    let shader_spvs = crate::include_all_shaders();
-    let refs: HashMap<&str, &[u8]> =
-        shader_spvs.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect();
-    let eng = compute::ComputeEngine::new(
-        dev.instance.clone(), dev.physical_device, dev.device.clone(),
-        dev.compute_queue, dev.compute_queue_family, dev.caps(), &refs,
-    )?;
-    Ok((eng, dev, shader_spvs))
-}
 
 /// Ensure the `{base}_bs{BS}_r{ROWS}` matvec variant pipeline exists (mirrors
 /// `debug_dsv4_verify`'s lazy compile).
