@@ -30,9 +30,9 @@
 //!      `lower_bound=-5.0` decay clamps. Adapted from `kimi::kda`; the recurrence
 //!      bit-exact gate vs the `fla` `chunk_kda` oracle is cluster/download-gated.
 //!
-//! Full-model argmax-exact oracle (Kimi's P5 gate) and the GPU/cluster decode
-//! phase are the remaining, expected-out-of-offline-scope gates — see
-//! `docs/ling-3.0-flash-int4-bringup.md`.
+//! The full-model argmax-exact oracle (Kimi's P5 gate) needs the checkpoint, and
+//! the GPU-resident decode (`ling_gpu.rs`) needs a GPU: both run outside the
+//! offline test suite (on-node, against this CPU reference).
 #![allow(dead_code)]
 
 /// Per-layer attention kind in the Ling heterogeneous schedule.
@@ -1690,12 +1690,12 @@ impl LingModel {
     }
 
     /// Re-zero the resident decode state (start a fresh decode session).
-    pub fn reset_decode_state(&mut self) {
+    pub fn reset_decode_state(&mut self) -> Result<(), String> {
         if let Some(gpu) = self.gpu.as_mut() {
-            gpu.reset_state().expect("ling gpu reset_state");
-            return;
+            return gpu.reset_state();
         }
         self.states = self.init_decode_state();
+        Ok(())
     }
 
     /// One decoder layer's single-token decode step, advancing `st` in place.
@@ -1751,25 +1751,43 @@ impl LingModel {
     ///
     /// Only the `[H]` hidden (or the tail `[vocab]` logits) crosses a PP hop; the
     /// recurrence/KV state lives entirely on its owning stage.
-    pub fn forward_pp_stage(&mut self, token_id: u32, hidden_in: &[f32], _pos: usize) -> Vec<f32> {
+    ///
+    /// Errors (bad `token_id`, wrong `hidden_in` size, a missing edge weight, a GPU
+    /// failure) come back as `Err` so the pyo3 seams raise a Python exception
+    /// instead of panicking.
+    pub fn forward_pp_stage(&mut self, token_id: u32, hidden_in: &[f32], _pos: usize) -> Result<Vec<f32>, String> {
+        self.forward_pp_stage_opt(token_id, hidden_in, true)
+    }
+
+    /// `forward_pp_stage` with the tail lm_head optional: `want_logits = false`
+    /// advances the state through this position but skips the final norm +
+    /// `[vocab]` lm_head on the last stage and returns an empty vec there (the
+    /// serve prefill needs logits only at the last prompt position).
+    pub fn forward_pp_stage_opt(&mut self, token_id: u32, hidden_in: &[f32], want_logits: bool)
+        -> Result<Vec<f32>, String> {
+        let h = self.cfg.hidden_size;
+        let first = self.layer_start == 0;
+        if first && token_id as usize >= self.cfg.vocab_size {
+            return Err(format!("ling forward_pp_stage: token {token_id} >= vocab_size {}", self.cfg.vocab_size));
+        }
+        if !first && hidden_in.len() != h {
+            return Err(format!("ling forward_pp_stage: hidden_in {} != hidden_size {h}", hidden_in.len()));
+        }
         // Perf port: dispatch to the GPU quant-resident stage when present.
         if let Some(gpu) = self.gpu.as_mut() {
-            return gpu.forward_pp_stage(token_id, hidden_in).expect("ling gpu forward_pp_stage");
+            return gpu.forward_pp_stage(token_id, hidden_in, want_logits);
         }
-        let h = self.cfg.hidden_size;
         let eps = self.cfg.rms_norm_eps;
-        let first = self.layer_start == 0;
         let last = self.layer_end == self.cfg.num_hidden_layers;
         if self.states.len() != self.layers.len() {
             self.states = self.init_decode_state();
         }
 
         let mut x = if first {
-            let emb = self.embed.as_ref().expect("stage 0 requires embed (load_edges)");
+            let emb = self.embed.as_ref().ok_or("stage 0 requires embed (load_edges)")?;
             let row = token_id as usize * h;
-            emb[row..row + h].to_vec()
+            emb.get(row..row + h).ok_or_else(|| format!("ling embed: token {token_id} out of range"))?.to_vec()
         } else {
-            assert_eq!(hidden_in.len(), h, "PP hidden_in wrong size");
             hidden_in.to_vec()
         };
 
@@ -1780,9 +1798,11 @@ impl LingModel {
         }
         self.states = states;
 
-        if last {
-            let fnorm = self.final_norm.as_ref().expect("tail stage requires final_norm");
-            let lm = self.lm_head.as_ref().expect("tail stage requires lm_head");
+        if last && !want_logits {
+            Ok(Vec::new())
+        } else if last {
+            let fnorm = self.final_norm.as_ref().ok_or("tail stage requires final_norm")?;
+            let lm = self.lm_head.as_ref().ok_or("tail stage requires lm_head")?;
             let normed = rmsnorm(&x, 1, h, fnorm, eps);
             let vocab = lm.len() / h;
             let mut logits = vec![0f32; vocab];
@@ -1794,9 +1814,9 @@ impl LingModel {
                 }
                 logits[o] = acc;
             }
-            logits
+            Ok(logits)
         } else {
-            x
+            Ok(x)
         }
     }
 
@@ -3019,6 +3039,38 @@ mod tests {
             assert_eq!(full_out, split_out, "PP-split decode != single-window at t={i}");
         }
         eprintln!("[ling PP-decompose] [0,3)+[3,6) == [0,6) decode bit-identical");
+    }
+
+    /// PR #96 review: `forward_pp_stage` returns `Err` (the seams raise a Python
+    /// exception) instead of panicking on a bad token, a wrong-size hidden or a
+    /// missing edge weight; `want_logits = false` skips the tail lm_head.
+    #[test]
+    fn forward_pp_stage_errors_instead_of_panicking() {
+        let cfg = LingConfig::from_json(&real_config()).unwrap();
+        let (h, vocab, n) = (cfg.hidden_size, cfg.vocab_size, cfg.num_hidden_layers);
+        let model = |start: usize, end: usize| LingModel {
+            cfg: cfg.clone(), layer_start: start, layer_end: end, layers: Vec::new(),
+            embed: None, final_norm: None, lm_head: None, states: Vec::new(), gpu: None,
+        };
+        // First stage: out-of-vocab token, then a missing embed table.
+        let mut first = model(0, 3);
+        let e = first.forward_pp_stage(vocab as u32, &[], 0).unwrap_err();
+        assert!(e.contains("vocab_size"), "{e}");
+        let e = first.forward_pp_stage(1, &[], 0).unwrap_err();
+        assert!(e.contains("embed"), "{e}");
+        // Mid / last stage: wrong hidden size.
+        let mut last = model(3, n);
+        let e = last.forward_pp_stage(0, &vec![0.0; h - 1], 0).unwrap_err();
+        assert!(e.contains("hidden_in"), "{e}");
+        // Last stage: no logits wanted -> no lm_head needed; wanted -> clear Err.
+        assert_eq!(last.forward_pp_stage_opt(0, &vec![0.0; h], false).unwrap(), Vec::<f32>::new());
+        let e = last.forward_pp_stage(0, &vec![0.0; h], 0).unwrap_err();
+        assert!(e.contains("final_norm"), "{e}");
+        // Mid stage returns the hidden unchanged through zero layers.
+        let mut mid = model(3, 6);
+        let x: Vec<f32> = (0..h).map(|i| i as f32).collect();
+        assert_eq!(mid.forward_pp_stage(0, &x, 0).unwrap(), x);
+        assert!(mid.reset_decode_state().is_ok());
     }
 }
 

@@ -27,8 +27,10 @@
 // differ by ~1 ULP — the on-node gate (`debug_ling_gpu_router`) confirms this
 // does NOT flip the selected top-k SET (the argmax-exact contract).
 //
-// One workgroup, one thread per expert (ne <= 512 — Ling has num_experts=512,
-// n_group=8 => 64 experts/group). Thread 0 does the serial grouped-topk (n_group
+// One workgroup, one thread per expert (ne <= 512 — the Ling-3.0-flash
+// checkpoint config has num_experts=512, n_group=8 => 64 experts/group; the
+// host checks ne <= 512, n_group <= 64, ne % n_group == 0 and
+// top_k <= topk_group * ne/n_group before building this path). Thread 0 does the serial grouped-topk (n_group
 // top-2 scans + topk_group group-argmax + top_k expert-argmax — all negligible
 // vs the matvec).
 
@@ -106,6 +108,14 @@ void main() {
             for (uint e2 = 0u; e2 < ne; ++e2) {
                 float v = s_choice[e2];
                 if (v > bestval) { bestval = v; best = int(e2); }
+            }
+            if (best < 0) {
+                // No candidate left (NaN logits/bias, or a config the host check
+                // missed): emit expert 0 with weight 0 so the meta stage indexes
+                // in range and the slot adds nothing.
+                outb[k] = 0.0;
+                outb[top_k + k] = 0.0;
+                continue;
             }
             float raw = s_score[best];
             outb[k] = float(best);

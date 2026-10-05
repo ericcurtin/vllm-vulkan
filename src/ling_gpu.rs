@@ -34,7 +34,6 @@ use crate::push_constants::*;
 use crate::ling::{self, LingAttn, LingConfig, LingExpertQ, LingKdaState, LingLayerKind, LingMlp, LingModel};
 
 use ash::vk;
-use std::collections::HashMap;
 
 /// int4-symmetric group size for Ling routed experts (compressed-tensors group-32).
 const EXPERT_GROUP: usize = 32;
@@ -240,11 +239,13 @@ pub struct LingGpuStage {
     pub last: bool,
     h: usize,
     eps: f32,
-    /// Expert-batched MoE decode lever (`VLLM_VULKAN_LING_MOE_BATCH`, default OFF):
+    /// Expert-batched MoE decode lever (`VLLM_VULKAN_LING_MOE_BATCH`, default ON;
+    /// `=0` disables):
     /// collapse the 8-experts × {gate,up,down} = 24 per-expert matvec dispatches
     /// into 3 batched dispatches through `mul_mat_vec_mlx4repack_batched_f32_f32`.
     moe_batch: bool,
-    /// Phase-3 fused-KDA decode lever (`VLLM_VULKAN_LING_KDA_FUSED`, default OFF):
+    /// Phase-3 fused-KDA decode lever (`VLLM_VULKAN_LING_KDA_FUSED`, default ON;
+    /// `=0` disables; used only for `kda_safe_gate` configs, the decay it fuses):
     /// collapse each KDA layer's 2-submit host-seam path (6 projections → host
     /// conv/L2norm/decay glue → gdn_step+o_proj) into ONE submit by moving the
     /// conv (`q35_dn_conv_step`) + L2-norm qknorm (`ling_kda_l2norm`) + safe_gate
@@ -252,7 +253,7 @@ pub struct LingGpuStage {
     /// buffers — killing ~1 fence + the host round-trip on 35/42 layers.
     kda_fused: bool,
     /// Phase-1 GPU-router decode lever (`VLLM_VULKAN_LING_MOE_INDIRECT`, default
-    /// OFF): run the grouped-topk router (`ling_moe_router`) on the GPU instead
+    /// ON; `=0` disables): run the grouped-topk router (`ling_moe_router`) on the GPU instead
     /// of the host `cpu_matmul` + `grouped_topk_route`; only the top-k idx+weights
     /// is read back. Composes with `moe_batch` (the batched gather-matvec).
     moe_indirect: bool,
@@ -294,8 +295,13 @@ struct LingFlags {
     // Phase-1 GPU-router lever (`VLLM_VULKAN_LING_MOE_INDIRECT`, default-ON): run
     // the grouped-topk router on the GPU; uploads router_gate/expert_bias resident.
     moe_indirect: bool,
+    // Expert-batched MoE (`VLLM_VULKAN_LING_MOE_BATCH`, default-ON). The fully
+    // GPU-driven MoE (indirect router + batched experts) needs BOTH this and
+    // `moe_indirect`; `=0` on either restores the host-routed path.
     moe_batch: bool,
+    // Fused single-submit KDA (`VLLM_VULKAN_LING_KDA_FUSED`, default-ON).
     kda_fused: bool,
+    // Resident single-CB layer (`VLLM_VULKAN_LING_RESIDENT_LAYER`, default-OFF).
     resident_layer: bool,
 }
 
@@ -313,15 +319,7 @@ fn read_ling_flags() -> LingFlags {
 /// Create the compute engine + device for a stage (identical setup for both
 /// constructors, so the resident kernels behave the same regardless of loader).
 fn make_engine(device_idx: usize) -> Result<(compute::ComputeEngine, device::ComputeDevice), String> {
-    let dev = device::ComputeDevice::create(device_idx)?;
-    let shader_spvs = crate::include_all_shaders();
-    let refs: HashMap<&str, &[u8]> =
-        shader_spvs.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect();
-    let eng = compute::ComputeEngine::new(
-        dev.instance.clone(), dev.physical_device, dev.device.clone(),
-        dev.compute_queue, dev.compute_queue_family, dev.caps(), &refs,
-    )?;
-    Ok((eng, dev))
+    crate::make_engine(device_idx).map(|(eng, dev, _)| (eng, dev))
 }
 
 /// Upload a dense `[n,k]` matvec weight (f16 under `f16_dense`, else f32).
@@ -350,7 +348,8 @@ fn build_switch(
 ) -> Result<SwitchR, String> {
     let want_slot_buf = moe_indirect;
     let e = experts.len();
-    let (out, inn) = (experts[0].out, experts[0].inn);
+    let first = experts.first().ok_or("ling MoE layer has no routed experts (config num_experts = 0?)")?;
+    let (out, inn) = (first.out, first.inn);
     let groups = inn / EXPERT_GROUP;
     let words_per_row = inn / 8;
     let mut packed: Vec<u32> = Vec::new();
@@ -511,6 +510,7 @@ fn upload_ling_layer(
         LingMlp::Moe(m) => {
             let sh_inter = m.shared_inter;
             let (router_gate_buf, expert_bias_buf) = if moe_indirect {
+                validate_gpu_router(m.e, m.top_k, m.n_group, m.topk_group)?;
                 (Some(up_raw(eng, &m.gate)?), Some(up_raw(eng, &m.expert_bias)?))
             } else {
                 (None, None)
@@ -691,16 +691,17 @@ impl LingGpuStage {
     /// One PP-stage single-token decode step (the GPU-resident `forward_pp_stage`).
     /// First stage embeds `token_id`; else consumes `hidden_in[H]`. Last stage
     /// returns `[vocab]` logits; else the `[H]` hidden to ship onward.
-    pub fn forward_pp_stage(&mut self, token_id: u32, hidden_in: &[f32]) -> Result<Vec<f32>, String> {
+    /// `want_logits = false` skips the tail final-norm + lm_head (returns an
+    /// empty vec on the last stage) for prefill positions whose logits are unused.
+    pub fn forward_pp_stage(&mut self, token_id: u32, hidden_in: &[f32], want_logits: bool)
+        -> Result<Vec<f32>, String> {
         if self.resident_layer {
-            return self.forward_pp_stage_resident(token_id, hidden_in);
+            return self.forward_pp_stage_resident(token_id, hidden_in, want_logits);
         }
         let h = self.h;
         let eps = self.eps;
         let mut x = if self.first {
-            let emb = self.embed.as_ref().ok_or("stage 0 requires embed")?;
-            let row = token_id as usize * h;
-            emb[row..row + h].to_vec()
+            embed_row(self.embed.as_ref(), token_id, h)?
         } else {
             if hidden_in.len() != h {
                 return Err(format!("PP hidden_in {} != {h}", hidden_in.len()));
@@ -713,7 +714,7 @@ impl LingGpuStage {
             let xn = ling::rmsnorm(&x, 1, h, &layer.input_ln, eps);
             let attn = match &mut layer.attn {
                 LAttnR::Kda(kda) => {
-                    if self.kda_fused {
+                    if self.kda_fused && kda.safe_gate {
                         kda_step_resident_fused(eng, kda, &xn, eps)?
                     } else {
                         kda_step_resident(eng, kda, &xn)?
@@ -735,12 +736,7 @@ impl LingGpuStage {
                     // (else the host can't detect a streamed expert). Otherwise the
                     // host-route batched/per-expert path (the standalone GPU router
                     // as its own submit is a known regression — not used).
-                    if self.moe_indirect
-                        && m.router_gate_buf.is_some()
-                        && m.gate.fully_resident()
-                        && m.up.fully_resident()
-                        && m.down.fully_resident()
-                    {
+                    if moe_gpu_driven(m, self.moe_indirect, self.moe_batch) {
                         moe_combine_batched_fused(eng, m, &hn, h)?
                     } else if self.moe_batch {
                         moe_combine_batched(eng, m, &hn, h, false)?
@@ -754,7 +750,9 @@ impl LingGpuStage {
             x = out;
         }
 
-        if self.last {
+        if self.last && !want_logits {
+            Ok(Vec::new())
+        } else if self.last {
             let fnorm = self.final_norm.as_ref().ok_or("tail stage requires final_norm")?;
             let normed = ling::rmsnorm(&x, 1, h, fnorm, eps);
             let lm = self.lm_head.as_ref().ok_or("tail stage requires lm_head")?;
@@ -778,7 +776,8 @@ impl LingGpuStage {
     /// the GPU RMSNorm (`rms_norm_f32_mul`, the same argmax-exact kernel qwen3.6 uses)
     /// and the GPU residual add replace host `ling::rmsnorm` / host `+`; the attn/mlp
     /// dispatches are the identical stacked-lever kernels.
-    fn forward_pp_stage_resident(&mut self, token_id: u32, hidden_in: &[f32]) -> Result<Vec<f32>, String> {
+    fn forward_pp_stage_resident(&mut self, token_id: u32, hidden_in: &[f32], want_logits: bool)
+        -> Result<Vec<f32>, String> {
         let h = self.h;
         let eps = self.eps;
         let (moe_indirect, moe_batch, kda_fused) = (self.moe_indirect, self.moe_batch, self.kda_fused);
@@ -786,9 +785,7 @@ impl LingGpuStage {
 
         // initial hidden -> resident GPU buffer
         let x0: Vec<f32> = if first {
-            let emb = self.embed.as_ref().ok_or("stage 0 requires embed")?;
-            let row = token_id as usize * h;
-            emb[row..row + h].to_vec()
+            embed_row(self.embed.as_ref(), token_id, h)?
         } else {
             if hidden_in.len() != h {
                 return Err(format!("PP hidden_in {} != {h}", hidden_in.len()));
@@ -804,16 +801,13 @@ impl LingGpuStage {
             // Single-CB capable = KDA attn AND an MLP with no host seam (Dense, or a
             // fully-resident GPU-driven MoE). MLA layers + overflow-streamed / non-
             // indirect MoE fall back to the host-seam op-by-op path below.
-            let kda_attn = matches!(layer.attn, LAttnR::Kda(_));
+            // The single-CB layer records the fused KDA (`kda_record`), which
+            // implements only the safe_gate decay (`ling_kda_decay`) and is the
+            // fused path, so `VLLM_VULKAN_LING_KDA_FUSED=0` must also skip it.
+            let kda_attn = matches!(&layer.attn, LAttnR::Kda(k) if k.safe_gate && kda_fused);
             let moe_single_cb = match &layer.mlp {
                 LMlpR::Dense(_) => true,
-                LMlpR::Moe(m) => {
-                    moe_indirect
-                        && m.router_gate_buf.is_some()
-                        && m.gate.fully_resident()
-                        && m.up.fully_resident()
-                        && m.down.fully_resident()
-                }
+                LMlpR::Moe(m) => moe_gpu_driven(m, moe_indirect, moe_batch),
             };
 
             if kda_attn && moe_single_cb {
@@ -857,7 +851,7 @@ impl LingGpuStage {
                 let xn = ling::rmsnorm(&x, 1, h, &layer.input_ln, eps);
                 let attn = match &mut layer.attn {
                     LAttnR::Kda(kda) => {
-                        if kda_fused { kda_step_resident_fused(eng, kda, &xn, eps)? }
+                        if kda_fused && kda.safe_gate { kda_step_resident_fused(eng, kda, &xn, eps)? }
                         else { kda_step_resident(eng, kda, &xn)? }
                     }
                     LAttnR::Mla(m) => match m {
@@ -871,8 +865,7 @@ impl LingGpuStage {
                 let mlp = match &layer.mlp {
                     LMlpR::Dense(d) => dense_step_resident(eng, d, &hn)?,
                     LMlpR::Moe(m) => {
-                        if moe_indirect && m.router_gate_buf.is_some()
-                            && m.gate.fully_resident() && m.up.fully_resident() && m.down.fully_resident() {
+                        if moe_gpu_driven(m, moe_indirect, moe_batch) {
                             moe_combine_batched_fused(eng, m, &hn, h)?
                         } else if moe_batch {
                             moe_combine_batched(eng, m, &hn, h, false)?
@@ -890,7 +883,9 @@ impl LingGpuStage {
         let x = read_f32_buf(&x_buf, h);
         self.eng.return_to_pool(x_buf);
 
-        if self.last {
+        if self.last && !want_logits {
+            Ok(Vec::new())
+        } else if self.last {
             let fnorm = self.final_norm.as_ref().ok_or("tail stage requires final_norm")?;
             let normed = ling::rmsnorm(&x, 1, h, fnorm, eps);
             let lm = self.lm_head.as_ref().ok_or("tail stage requires lm_head")?;
@@ -928,6 +923,48 @@ impl LingGpuStage {
     }
 }
 
+/// The grouped-topk config limits `ling_moe_router.comp` assumes: one thread per
+/// expert in a 512-wide workgroup (`MAX_E`), a 64-entry group table (`MAX_G`),
+/// equal-size groups, and enough experts in the kept groups to fill `top_k`
+/// (else the selection loop finds no candidate). Checked when the GPU router is
+/// built; `VLLM_VULKAN_LING_MOE_INDIRECT=0` routes on the host instead.
+fn validate_gpu_router(e: usize, top_k: usize, n_group: usize, topk_group: usize) -> Result<(), String> {
+    let bad = |why: String| Err(format!(
+        "ling GPU router: {why} (num_experts={e}, n_group={n_group}, topk_group={topk_group}, top_k={top_k}); \
+         set VLLM_VULKAN_LING_MOE_INDIRECT=0 to route on the host"));
+    if e == 0 || e > 512 { return bad(format!("num_experts must be 1..=512")); }
+    if n_group == 0 || n_group > 64 { return bad(format!("n_group must be 1..=64")); }
+    if e % n_group != 0 { return bad(format!("num_experts must be a multiple of n_group")); }
+    if e / n_group < 2 { return bad(format!("each group needs >= 2 experts (the group score is a top-2 sum)")); }
+    if topk_group == 0 || topk_group > n_group { return bad(format!("topk_group must be 1..=n_group")); }
+    if top_k == 0 || top_k > topk_group * (e / n_group) {
+        return bad(format!("top_k must be 1..=topk_group * experts_per_group"));
+    }
+    Ok(())
+}
+
+/// The fully GPU-driven MoE (`moe_record`: GPU router + gather descriptors +
+/// batched experts, one CB, no host index readback) runs only when BOTH levers
+/// are on and every expert is resident (the host cannot detect a streamed expert
+/// on that path). Either kill switch at `0` restores the host-routed path.
+fn moe_gpu_driven(m: &MoeGpuR, moe_indirect: bool, moe_batch: bool) -> bool {
+    moe_indirect && moe_batch
+        && m.router_gate_buf.is_some()
+        && m.gate.fully_resident()
+        && m.up.fully_resident()
+        && m.down.fully_resident()
+}
+
+/// First-stage embedding row for `token_id`, as an `Err` (not a panic) when the
+/// stage has no embed table or the token is out of range.
+fn embed_row(embed: Option<&Vec<f32>>, token_id: u32, h: usize) -> Result<Vec<f32>, String> {
+    let emb = embed.ok_or("stage 0 requires embed")?;
+    let row = token_id as usize * h;
+    emb.get(row..row + h)
+        .map(|r| r.to_vec())
+        .ok_or_else(|| format!("ling embed: token {token_id} out of range (vocab {})", emb.len() / h.max(1)))
+}
+
 // ---------------- primitives ----------------
 
 fn alloc(eng: &mut compute::ComputeEngine, n: usize) -> Result<compute::Buffer, String> {
@@ -946,19 +983,33 @@ fn record_matvec_f32(
     xin: &compute::Buffer,
     out: &compute::Buffer,
 ) -> Result<(), String> {
-    let (shader, r) = if m.f16 {
-        matvec_variant_by_format(crate::flags::QuantFormat::F16, m.n)
-    } else {
-        matvec_f32_variant(m.n)
-    };
+    let (shader, r) = matvec_shader_for(m);
     let wg = (m.n as u32 + r - 1) / r;
     let pc = matvec_pc13(m.k, m.n);
     eng.record_to(cb, &shader, &[&m.buf, xin, out], &pc, (wg, 1, 1))
 }
 
+/// The matvec shader + rows-per-workgroup `record_matvec_f32` dispatches for `m`.
+fn matvec_shader_for(m: &GpuMatF32) -> (String, u32) {
+    if m.f16 {
+        matvec_variant_by_format(crate::flags::QuantFormat::F16, m.n)
+    } else {
+        matvec_f32_variant(m.n)
+    }
+}
+
 /// One f32 matvec, own submit+fence, returns `[n]`.
 fn f32_matvec_once(eng: &mut compute::ComputeEngine, m: &GpuMatF32, x: &[f32]) -> Result<Vec<f32>, String> {
     if x.len() != m.k { return Err(format!("matvec x {} != k {}", x.len(), m.k)); }
+    // Check the grid before opening the batch: a VLLM_VULKAN_MATVEC_ROWS=1/2
+    // override on the 157k-row lm_head would exceed the portable 65535
+    // workgroups-per-dimension limit.
+    let (shader, r) = matvec_shader_for(m);
+    let wg = (m.n as u32 + r - 1) / r;
+    if wg > 65_535 {
+        return Err(format!("matvec {shader}: {wg} workgroups > 65535 (n={}, rows={r}); \
+                            raise VLLM_VULKAN_MATVEC_ROWS", m.n));
+    }
     let xb = f32_slice_to_bytes(x);
     let xbuf = eng.alloc_host_coherent_storage(xb.len().max(4) as u64)?;
     xbuf.write(&xb)?;
@@ -970,6 +1021,30 @@ fn f32_matvec_once(eng: &mut compute::ComputeEngine, m: &GpuMatF32, x: &[f32]) -
     eng.return_to_pool(xbuf);
     eng.return_to_pool(o);
     Ok(out)
+}
+
+/// Run one `*_record` function as its own submit: upload `x`, open a batch,
+/// record, submit + fence, read back `[n_out]`, return every buffer to the pool.
+/// The per-layer step functions (`kda_step_resident_fused`, `dense_step_resident`,
+/// `moe_combine_batched_fused`) are this wrapper around the same recorders the
+/// resident single-CB layer uses, so the two paths cannot drift apart.
+fn run_recorded(
+    eng: &mut compute::ComputeEngine,
+    x: &[f32],
+    n_out: usize,
+    record: impl FnOnce(&mut compute::ComputeEngine, vk::CommandBuffer, &compute::Buffer, &compute::Buffer,
+                        &mut Vec<compute::Buffer>) -> Result<(), String>,
+) -> Result<Vec<f32>, String> {
+    let xbuf = alloc(eng, x.len())?;
+    xbuf.write(&f32_slice_to_bytes(x))?;
+    let out = alloc(eng, n_out)?;
+    let mut g = Vec::new();
+    let cb = eng.begin_batch()?;
+    record(eng, cb, &xbuf, &out, &mut g)?;
+    eng.submit_batch(cb)?;
+    let r = read_f32_buf(&out, n_out);
+    for b in g.into_iter().chain([xbuf, out]) { eng.return_to_pool(b); }
+    Ok(r)
 }
 
 /// Record `out[h] = rmsnorm(x[h])·w[h]` into an OPEN command buffer (one row,
@@ -1377,90 +1452,11 @@ fn kda_step_resident_fused(
     x: &[f32],
     eps: f32,
 ) -> Result<Vec<f32>, String> {
-    let (nh, hd, kern) = (kda.nh, kda.hd, kda.kern);
-    let proj = nh * hd;
-    let key_dim = proj;   // KDA: nk == nh, kd == hd
-    let value_dim = proj; // nv == nh, vd == hd
-    let conv_dim = 2 * key_dim + value_dim;
-    let v_off = 2 * key_dim;
-    let scale = (hd as f32).powf(-0.5);
     if x.len() != kda.q.k {
         return Err(format!("kda x {} != k {}", x.len(), kda.q.k));
     }
-
-    let xb = f32_slice_to_bytes(x);
-    let xbuf = eng.alloc_host_coherent_storage(xb.len().max(4) as u64)?;
-    xbuf.write(&xb)?;
-    // projection outputs
-    let o_q = alloc(eng, kda.q.n)?;
-    let o_k = alloc(eng, kda.k.n)?;
-    let o_v = alloc(eng, kda.v.n)?;
-    let o_f = alloc(eng, kda.f.n)?; // f_proj(x) [proj] -> decay input
-    let o_g = alloc(eng, kda.g.n)?; // g_proj(x) [value_dim] (pre-sigmoid gate)
-    let o_b = alloc(eng, kda.b.n)?; // b_proj(x) [nh] (pre-sigmoid beta)
-    // fused intermediates
-    let b_conv = alloc(eng, conv_dim)?;
-    let b_decay = alloc(eng, proj)?;
-    let b_q = alloc(eng, key_dim)?;
-    let b_k = alloc(eng, key_dim)?;
-    let b_gated = alloc(eng, value_dim)?;
-    let o_out = alloc(eng, kda.o.n)?;
-
-    let conv_pc = q35_conv_pc(key_dim, kern); // key_dim == value_dim == proj
-    let qk_pc = q35_qknorm_pc(nh, hd, key_dim, kda.eps, scale);
-    let decay_pc = ling_kda_decay_pc(nh, hd, kda.lower_bound);
-    let gdn_pc = q35_gdn_pc(hd, hd, 1, v_off, eps, nh);
-    let conv_wg = ((key_dim as u32) + 255) / 256;
-    let decay_wg = ((proj as u32) + 255) / 256;
-
-    // ---- ENTIRE KDA layer in ONE command buffer / ONE fence ----
-    let cb = eng.begin_batch()?;
-    // stage A: 6 direct projections (read x).
-    record_matvec_f32(eng, cb, &kda.q, &xbuf, &o_q)?;
-    record_matvec_f32(eng, cb, &kda.k, &xbuf, &o_k)?;
-    record_matvec_f32(eng, cb, &kda.v, &xbuf, &o_v)?;
-    record_matvec_f32(eng, cb, &kda.f, &xbuf, &o_f)?;
-    record_matvec_f32(eng, cb, &kda.g, &xbuf, &o_g)?;
-    record_matvec_f32(eng, cb, &kda.b, &xbuf, &o_b)?;
-    eng.record_barrier_to(cb); // projections written -> conv + decay
-    // stage B: depthwise conv+silu q/k/v into the combined b_conv (offset outputs;
-    // advances the resident conv windows in place) + safe_gate per-channel decay.
-    eng.record_to_off(cb, "q35_dn_conv_step",
-        &[(&kda.q_conv_buf, 0), (&o_q, 0), (&kda.conv_state_q, 0), (&b_conv, 0)],
-        &conv_pc, (conv_wg, 1, 1))?;
-    eng.record_to_off(cb, "q35_dn_conv_step",
-        &[(&kda.k_conv_buf, 0), (&o_k, 0), (&kda.conv_state_k, 0), (&b_conv, (key_dim * 4) as u64)],
-        &conv_pc, (conv_wg, 1, 1))?;
-    eng.record_to_off(cb, "q35_dn_conv_step",
-        &[(&kda.v_conv_buf, 0), (&o_v, 0), (&kda.conv_state_v, 0), (&b_conv, (v_off * 4) as u64)],
-        &conv_pc, (conv_wg, 1, 1))?;
-    eng.record_to(cb, "ling_kda_decay",
-        &[&o_f, &kda.dt_bias_buf, &kda.a_log_buf, &b_decay],
-        &decay_pc, (decay_wg, 1, 1))?;
-    eng.record_barrier_to(cb); // conv (q/k) + decay written -> qknorm
-    // stage C: L2-norm qknorm (reads q/k from b_conv, writes b_q/b_k; q scaled).
-    eng.record_to(cb, "ling_kda_l2norm",
-        &[&b_conv, &b_q, &b_k],
-        &qk_pc, (2 * nh as u32, 1, 1))?;
-    eng.record_barrier_to(cb); // b_q/b_k written -> gdn_step
-    // stage D: KDA delta-rule recurrence + gated o_norm (advances g_state in place;
-    // v read from b_conv at v_off; beta from o_b; gate from o_g).
-    eng.record_to(cb, "kda_gdn_step",
-        &[&b_q, &b_k, &b_conv, &b_decay, &o_b, &o_g, &kda.g_params, &kda.g_state, &b_gated],
-        &gdn_pc, (nh as u32, 1, 1))?;
-    eng.record_barrier_to(cb); // b_gated written -> o_proj
-    // stage E: o_proj.
-    record_matvec_f32(eng, cb, &kda.o, &b_gated, &o_out)?;
-    eng.submit_batch(cb)?;
-    let out = read_f32_buf(&o_out, kda.o.n);
-
-    for buf in [
-        xbuf, o_q, o_k, o_v, o_f, o_g, o_b,
-        b_conv, b_decay, b_q, b_k, b_gated, o_out,
-    ] {
-        eng.return_to_pool(buf);
-    }
-    Ok(out)
+    let n_out = kda.o.n;
+    run_recorded(eng, x, n_out, |eng, cb, xbuf, out, g| kda_record(eng, cb, kda, xbuf, out, eps, g))
 }
 
 /// The resident MLA decode step (`VLLM_VULKAN_LING_MLA_RESIDENT`): the 6 MLA
@@ -1565,33 +1561,8 @@ fn dense_step_resident(
     d: &DenseGpuR,
     hn: &[f32],
 ) -> Result<Vec<f32>, String> {
-    let (h, inter) = (d.h, d.inter);
-    if hn.len() != h { return Err(format!("dense hn {} != h {h}", hn.len())); }
-    let xb = f32_slice_to_bytes(hn);
-    let inp = eng.alloc_host_coherent_storage(xb.len().max(4) as u64)?;
-    inp.write(&xb)?;
-    let b_g = alloc(eng, inter)?;
-    let b_u = alloc(eng, inter)?;
-    let b_a = alloc(eng, inter)?;
-    let b_m = alloc(eng, inter)?;
-    let b_out = alloc(eng, h)?;
-    let silu_pc = ew_unary_pc(inter as u32);
-    let mul_pc = ew_mul_pc(inter as u32);
-    let silu_wg = (inter as u32 + 511) / 512;
-    let mul_wg = (inter as u32 + 255) / 256;
-    let cb = eng.begin_batch()?;
-    record_matvec_f32(eng, cb, &d.gate, &inp, &b_g)?;
-    record_matvec_f32(eng, cb, &d.up, &inp, &b_u)?;
-    eng.record_barrier_to(cb);
-    eng.record_to(cb, "silu_f32", &[&b_g, &b_a], &silu_pc, (silu_wg, 1, 1))?;
-    eng.record_barrier_to(cb);
-    eng.record_to(cb, "mul_f32_f32_f32", &[&b_a, &b_u, &b_m], &mul_pc, (mul_wg, 1, 1))?;
-    eng.record_barrier_to(cb);
-    record_matvec_f32(eng, cb, &d.down, &b_m, &b_out)?;
-    eng.submit_batch(cb)?;
-    let out = read_f32_buf(&b_out, h);
-    for buf in [inp, b_g, b_u, b_a, b_m, b_out] { eng.return_to_pool(buf); }
-    Ok(out)
+    if hn.len() != d.h { return Err(format!("dense hn {} != h {}", hn.len(), d.h)); }
+    run_recorded(eng, hn, d.h, |eng, cb, xbuf, out, g| dense_record(eng, cb, d, xbuf, out, g))
 }
 
 /// Record one selected expert's gate/up (or down) mlx4 matvec — resident slot in the
@@ -2029,123 +2000,42 @@ fn moe_combine_batched_fused(
     hn: &[f32],
     h: usize,
 ) -> Result<Vec<f32>, String> {
-    let top_k = m.top_k;
-    if top_k != 8 { return Err(format!("ling moe top_k {top_k} != 8 (q35_moe_accum is fixed-8)")); }
-    let n_ex = top_k as u32;
-    let inter = m.inter;
-    let sh_inter = m.sh_inter;
+    run_recorded(eng, hn, h, |eng, cb, xbuf, out, g| moe_record(eng, cb, m, xbuf, out, h, g))
+}
 
-    let (rg_buf, eb_buf) = match (&m.router_gate_buf, &m.expert_bias_buf) {
-        (Some(g), Some(b)) => (g, b),
-        _ => return Err("moe_indirect fused path requires resident router buffers".into()),
-    };
-    let (slot_g, slot_u, slot_d) = match (&m.gate.slot_buf, &m.up.slot_buf, &m.down.slot_buf) {
-        (Some(g), Some(u), Some(d)) => (g, u, d),
-        _ => return Err("moe_indirect fused path requires resident slot buffers".into()),
-    };
+#[cfg(test)]
+mod review_guard_tests {
+    use super::*;
 
-    let inp = {
-        let xb = f32_slice_to_bytes(hn);
-        let b = eng.alloc_host_coherent_storage(xb.len().max(4) as u64)?;
-        b.write(&xb)?; b
-    };
-
-    // GPU-built router logits + top-k output + gather descriptors + routed scores.
-    let logits = alloc(eng, m.e)?;
-    let router_out = alloc(eng, 2 * top_k)?;
-    let meta_gate = alloc(eng, top_k * 4)?; // top_k uvec4
-    let meta_up = alloc(eng, top_k * 4)?;
-    let meta_down = alloc(eng, top_k * 4)?;
-    let scores = alloc(eng, top_k)?;
-
-    // concatenated [n_ex, inter] / [n_ex, h] work buffers
-    let b_g_all = alloc(eng, top_k * inter)?;
-    let b_u_all = alloc(eng, top_k * inter)?;
-    let b_act_all = alloc(eng, top_k * inter)?;
-    let b_mid_all = alloc(eng, top_k * inter)?;
-    let dwn_all = alloc(eng, top_k * h)?;
-
-    // shared expert (bf16-origin dense, ungated) — same as moe_combine_batched.
-    let (sgu_shader, sgu_r) = if m.sh_gate.f16 {
-        matvec_variant_by_format(crate::flags::QuantFormat::F16, sh_inter)
-    } else { matvec_f32_variant(sh_inter) };
-    let s_wg_i = (sh_inter as u32 + sgu_r - 1) / sgu_r;
-    let (sd_shader, sd_r) = if m.sh_down.f16 {
-        matvec_variant_by_format(crate::flags::QuantFormat::F16, h)
-    } else { matvec_f32_variant(h) };
-    let s_wg_h = (h as u32 + sd_r - 1) / sd_r;
-    let pc_sgu = matvec_pc13(h, sh_inter);
-    let pc_sd = matvec_pc13(sh_inter, h);
-    let ss_pc = ew_unary_pc(sh_inter as u32);
-    let sm_pc = ew_mul_pc(sh_inter as u32);
-    let silu_wg_s = (sh_inter as u32 + 511) / 512;
-    let mul_wg_s = (sh_inter as u32 + 255) / 256;
-    let b_sg = alloc(eng, sh_inter)?; let b_su = alloc(eng, sh_inter)?;
-    let b_sa = alloc(eng, sh_inter)?; let b_sm = alloc(eng, sh_inter)?;
-    let b_sop = alloc(eng, h)?;
-
-    let all_i = (top_k * inter) as u32;
-    let silu_pc = ew_unary_pc(all_i);
-    let mul_pc = ew_mul_pc(all_i);
-    let silu_wg = (all_i + 511) / 512;
-    let mul_wg = (all_i + 255) / 256;
-
-    let slog = { let b = alloc(eng, 1)?; b.write(&f32_slice_to_bytes(&[30.0]))?; b };
-    let b_out = alloc(eng, h)?;
-    let acc_pc = q35_moe_accum_batched_pc(1, h, top_k);
-
-    // meta strides (gate/up share shape; down is transposed) — see expert_meta_bytes.
-    let ps_gu = m.gate.out * (m.gate.inn / 8);
-    let sb_gu = m.gate.out * (m.gate.inn / EXPERT_GROUP);
-    let ps_dn = m.down.out * (m.down.inn / 8);
-    let sb_dn = m.down.out * (m.down.inn / EXPERT_GROUP);
-    let router_pc = ling_moe_router_pc(
-        m.e, top_k, m.n_group, m.topk_group, m.scale, m.norm_topk_prob);
-    let meta_pc = ling_moe_meta_pc(
-        top_k, m.gate.out, ps_gu, sb_gu, m.down.out, ps_dn, sb_dn, m.down.inn);
-    let (mv_shader, mv_r) = matvec_f32_variant(m.e);
-    let mv_wg = (m.e as u32 + mv_r - 1) / mv_r;
-    let mv_pc = matvec_pc13(h, m.e);
-
-    let cb = eng.begin_batch()?;
-    // GPU route (fast matvec -> grouped-topk) -> GPU gather descriptors (no host readback).
-    eng.record_to(cb, &mv_shader, &[rg_buf, &inp, &logits], &mv_pc, (mv_wg, 1, 1))?;
-    eng.record_barrier_to(cb);
-    eng.record_to(cb, "ling_moe_router", &[&logits, eb_buf, &router_out], &router_pc, (1, 1, 1))?;
-    eng.record_barrier_to(cb);
-    eng.record_to(cb, "ling_moe_meta",
-        &[&router_out, slot_g, slot_u, slot_d, &meta_gate, &meta_up, &meta_down, &scores],
-        &meta_pc, (1, 1, 1))?;
-    eng.record_barrier_to(cb);
-    // stage A: batched gate + up (routed) + shared gate/up
-    record_batched_matvec(eng, cb, &m.gate, &inp, &b_g_all, &meta_gate, n_ex)?;
-    record_batched_matvec(eng, cb, &m.up, &inp, &b_u_all, &meta_up, n_ex)?;
-    eng.record_to(cb, &sgu_shader, &[&m.sh_gate.buf, &inp, &b_sg], &pc_sgu, (s_wg_i, 1, 1))?;
-    eng.record_to(cb, &sgu_shader, &[&m.sh_up.buf, &inp, &b_su], &pc_sgu, (s_wg_i, 1, 1))?;
-    eng.record_barrier_to(cb);
-    // stage B: silu (routed batched + shared)
-    eng.record_to(cb, "silu_f32", &[&b_g_all, &b_act_all], &silu_pc, (silu_wg, 1, 1))?;
-    eng.record_to(cb, "silu_f32", &[&b_sg, &b_sa], &ss_pc, (silu_wg_s, 1, 1))?;
-    eng.record_barrier_to(cb);
-    // stage C: mul(silu, up) (routed batched + shared)
-    eng.record_to(cb, "mul_f32_f32_f32", &[&b_act_all, &b_u_all, &b_mid_all], &mul_pc, (mul_wg, 1, 1))?;
-    eng.record_to(cb, "mul_f32_f32_f32", &[&b_sa, &b_su, &b_sm], &sm_pc, (mul_wg_s, 1, 1))?;
-    eng.record_barrier_to(cb);
-    // stage D: batched down (routed) + shared down
-    record_batched_matvec(eng, cb, &m.down, &b_mid_all, &dwn_all, &meta_down, n_ex)?;
-    eng.record_to(cb, &sd_shader, &[&m.sh_down.buf, &b_sm, &b_sop], &pc_sd, (s_wg_h, 1, 1))?;
-    eng.record_barrier_to(cb);
-    // stage E: weighted accum + ungated shared (sigmoid(30)) — GPU-built scores.
-    eng.record_to(cb, "q35_moe_accum_batched",
-        &[&dwn_all, &scores, &b_sop, &slog, &b_out],
-        &acc_pc, ((h as u32 + 255) / 256, 1, 1))?;
-    eng.submit_batch(cb)?;
-    let out = read_f32_buf(&b_out, h);
-
-    for buf in [inp, logits, router_out, meta_gate, meta_up, meta_down, scores,
-                b_g_all, b_u_all, b_act_all, b_mid_all, dwn_all,
-                b_sg, b_su, b_sa, b_sm, b_sop, slog, b_out] {
-        eng.return_to_pool(buf);
+    #[test]
+    fn gpu_router_config_limits() {
+        // The Ling-3.0-flash checkpoint: 512 experts, 8 groups, keep 4, top-8.
+        assert!(validate_gpu_router(512, 8, 8, 4).is_ok());
+        assert!(validate_gpu_router(256, 8, 8, 4).is_ok());
+        for (e, k, g, tg) in [
+            (513, 8, 8, 4),  // > MAX_E
+            (0, 8, 8, 4),
+            (512, 8, 0, 4),  // n_group 0
+            (512, 8, 128, 4),// > MAX_G
+            (500, 8, 8, 4),  // e % n_group != 0
+            (8, 2, 8, 4),    // 1 expert per group: no top-2 group score
+            (512, 8, 8, 0),  // topk_group 0
+            (512, 8, 8, 9),  // topk_group > n_group
+            (16, 8, 8, 2),   // top_k 8 > 2 groups x 2 experts
+            (512, 0, 8, 4),
+        ] {
+            let r = validate_gpu_router(e, k, g, tg);
+            assert!(r.is_err(), "accepted e={e} top_k={k} n_group={g} topk_group={tg}");
+            assert!(r.unwrap_err().contains("VLLM_VULKAN_LING_MOE_INDIRECT=0"));
+        }
     }
-    Ok(out)
+
+    #[test]
+    fn embed_row_bounds() {
+        let emb: Vec<f32> = (0..12).map(|i| i as f32).collect(); // vocab 3, h 4
+        assert_eq!(embed_row(Some(&emb), 2, 4).unwrap(), vec![8.0, 9.0, 10.0, 11.0]);
+        assert!(embed_row(Some(&emb), 3, 4).unwrap_err().contains("out of range"));
+        assert!(embed_row(Some(&emb), u32::MAX, 4).is_err());
+        assert!(embed_row(None, 0, 4).unwrap_err().contains("embed"));
+    }
 }

@@ -14,13 +14,16 @@ use pyo3::exceptions::PyRuntimeError;
 #[pymethods]
 impl VulkanModel {
 
-    // ── Ling / BailingMoeV3 serve seams (STUBS) ─────────────────────────────
+    // ── Ling / BailingMoeV3 serve seams ─────────────────────────────────────
     // The `serve_dist` launcher resolves the per-arch PP seam BY NAME
     // (`forward_pp_<arch>_prefill` / `pp_step_<arch>_logits`) for
-    // `--model-type bailing`. These stubs reserve the seam names so the arch is
-    // wired end-to-end; the bodies land with the resident 42-layer forward (the
-    // cluster-gated phase — docs/ling-3.0-flash-int4-bringup.md). They mirror the
-    // kimi seam signatures exactly so wiring the bodies is a drop-in.
+    // `--model-type bailing`. Implemented: `forward_pp_bailing_prefill`,
+    // `forward_pp_bailing`, `reset_bailing_decode_state` and
+    // `pp_step_bailing_logits`. Only `pp_step_bailing` (the hidden-only PP step
+    // without the logits ring-back) is still a stub that returns an error. The
+    // seams follow the kimi ones, except that the prefill resets the decode
+    // state itself and `pp_step_bailing_logits` takes no `pos` (Ling tracks its
+    // decode position internally).
     fn forward_pp_bailing_prefill(
         &mut self,
         tokens: Vec<u32>,
@@ -57,6 +60,13 @@ impl VulkanModel {
                     "forward_pp_bailing_prefill: tokens.len()={} < seq={}",
                     tokens.len(), seq)));
             }
+            // Check every consumed token BEFORE the reset below, so a bad prompt
+            // raises without clobbering the current decode state.
+            let vocab = self.ling.as_ref().unwrap().cfg.vocab_size;
+            if let Some((i, &t)) = tokens[..seq].iter().enumerate().find(|(_, &t)| t as usize >= vocab) {
+                return Err(PyRuntimeError::new_err(format!(
+                    "forward_pp_bailing_prefill: token[{i}]={t} >= vocab_size {vocab}")));
+            }
         } else if hidden_in.len() != seq * h {
             return Err(PyRuntimeError::new_err(format!(
                 "forward_pp_bailing_prefill: hidden_in.len()={} != seq*H={}",
@@ -64,19 +74,21 @@ impl VulkanModel {
         }
         // Fresh decode session for this request (idempotent with the OP_RESET
         // request boundary — safe to reset here so a missed reset never leaks state).
-        self.ling.as_mut().unwrap().reset_decode_state();
+        self.ling.as_mut().unwrap().reset_decode_state().map_err(PyRuntimeError::new_err)?;
         // Advance state through every prompt position. First stage embeds each token;
         // mid/last stages consume the previous stage's per-position hidden. Mid/first
-        // stages accumulate the [seq*H] hidden to ship onward; the last stage keeps
-        // only the LAST position's [vocab] (state still advances through all seq).
+        // stages accumulate the [seq*H] hidden to ship onward; the last stage
+        // computes the [vocab] lm_head only at the LAST position (state still
+        // advances through all seq).
         let mut out: Vec<f32> = if last { Vec::new() } else { Vec::with_capacity(seq * h) };
         for t in 0..seq {
             let m = self.ling.as_mut().unwrap();
+            let want_logits = t + 1 == seq;
             let o = if first {
-                m.forward_pp_stage(tokens[t], &[], t)
+                m.forward_pp_stage_opt(tokens[t], &[], want_logits)
             } else {
-                m.forward_pp_stage(0, &hidden_in[t * h..(t + 1) * h], t)
-            };
+                m.forward_pp_stage_opt(0, &hidden_in[t * h..(t + 1) * h], want_logits)
+            }.map_err(PyRuntimeError::new_err)?;
             if last {
                 if t + 1 == seq {
                     out = o;
@@ -103,7 +115,7 @@ impl VulkanModel {
         let m = self.ling.as_mut().ok_or_else(|| {
             PyRuntimeError::new_err("forward_pp_bailing needs a bailing_hybrid model")
         })?;
-        Ok(m.forward_pp_stage(token_id, &hidden_in, pos))
+        m.forward_pp_stage(token_id, &hidden_in, pos).map_err(PyRuntimeError::new_err)
     }
 
 
@@ -113,8 +125,7 @@ impl VulkanModel {
         let m = self.ling.as_mut().ok_or_else(|| {
             PyRuntimeError::new_err("reset_bailing_decode_state needs a bailing_hybrid model")
         })?;
-        m.reset_decode_state();
-        Ok(())
+        m.reset_decode_state().map_err(PyRuntimeError::new_err)
     }
 
 
@@ -127,7 +138,7 @@ impl VulkanModel {
         _send_to: i32,
     ) -> PyResult<()> {
         Err(PyRuntimeError::new_err(
-            "pp_step_bailing: cluster-gated (see docs/ling-3.0-flash-int4-bringup.md)",
+            "pp_step_bailing: not implemented; use pp_step_bailing_logits (the PP decode step with the logits ring-back)",
         ))
     }
 
@@ -159,6 +170,8 @@ impl VulkanModel {
                 .ok_or_else(|| PyRuntimeError::new_err("pp_step_bailing_logits needs a bailing_hybrid model"))?;
             (m.cfg.hidden_size, m.cfg.vocab_size)
         };
+        // Before any recv: a miswired ring must error, not block or send garbage.
+        self.ling_check_role(recv_from, send_to)?;
         let comm = self.collective_comm as *mut std::os::raw::c_void;
         let (do_recv, is_last) = pp_step_role(recv_from, send_to);
         let is_first = recv_from < 0;
@@ -173,7 +186,8 @@ impl VulkanModel {
 
         // 2) resident stateful decode of this window (advances state in place). [H]
         //    on mid stages, [vocab] on the last.
-        let out = self.ling.as_mut().unwrap().forward_pp_stage(token_id, &hidden_in, 0);
+        let out = self.ling.as_mut().unwrap().forward_pp_stage(token_id, &hidden_in, 0)
+            .map_err(PyRuntimeError::new_err)?;
 
         // 3) route the result.
         if is_first && is_last {
@@ -194,4 +208,26 @@ impl VulkanModel {
     }
 
 
+}
+
+
+impl VulkanModel {
+    /// The `pp_step_bailing_logits` ring role (`recv_from < 0` = first stage,
+    /// `send_to < 0` = last stage) must match the layer window this model loaded.
+    /// A mismatch would recv on the first stage (blocking forever) or send a
+    /// `[vocab]` output as a hidden vector from a mis-wired tail.
+    fn ling_check_role(&self, recv_from: i32, send_to: i32) -> PyResult<()> {
+        let m = match self.ling.as_ref() {
+            Some(m) => m,
+            None => return Ok(()), // the callers report the missing model themselves
+        };
+        let (first, last) = (recv_from < 0, send_to < 0);
+        let (pp_first, pp_last) = (m.layer_start == 0, m.layer_end >= m.cfg.num_hidden_layers);
+        if first != pp_first || last != pp_last {
+            return Err(PyRuntimeError::new_err(format!(
+                "pp_step_bailing: ring role (recv_from={recv_from} -> first={first}, send_to={send_to} \
+                 -> last={last}) does not match this stage (first={pp_first}, last={pp_last})")));
+        }
+        Ok(())
+    }
 }
