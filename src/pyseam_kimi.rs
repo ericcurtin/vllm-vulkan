@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Per-model pyo3 seam for `kimi` — moved verbatim out of the monolithic
-//! `VulkanModel` `#[pymethods]` block in `lib.rs` (Phase A upstream refactor).
-//! Behavior-preserving code motion: method bodies are byte-for-byte identical.
-//! Kept as separate `#[pymethods] impl VulkanModel` block(s) via pyo3's
-//! `multiple-pymethods` feature so a per-model upstream PR can carve this file.
+//! Per-model pyo3 seam for `kimi` (Kimi-Linear PP serve entry points). Kept as a
+//! separate `#[pymethods] impl VulkanModel` block via pyo3's `multiple-pymethods`
+//! feature so the per-model code stays out of the monolithic block in `lib.rs`.
 #![allow(clippy::all)]
 
 use crate::*;
@@ -134,27 +132,11 @@ impl VulkanModel {
             && vccl_ffi::registration_available();
         if want_reg {
             let km = self.kimi.as_mut().unwrap();
-            if do_recv && km.pp_recv_handle == 0 {
-                km.pp_recv_scratch = vec![0.0f32; h];
-                let addr = km.pp_recv_scratch.as_ptr() as usize;
-                match vccl_ffi::comm_register(comm, addr, h * std::mem::size_of::<f32>()) {
-                    Ok(hd) => km.pp_recv_handle = hd,
-                    Err(e) => {
-                        log::warn!("pp_step_kimi: register recv scratch failed: {e}; per-call regMr");
-                        km.pp_recv_scratch.clear();
-                    }
-                }
+            if do_recv && km.pp_hop_recv.handle == 0 {
+                pin_pp_hop(comm, &mut km.pp_hop_recv, h, "pp_step_kimi recv");
             }
-            if !is_last && km.pp_send_handle == 0 {
-                km.pp_send_scratch = vec![0.0f32; h];
-                let addr = km.pp_send_scratch.as_ptr() as usize;
-                match vccl_ffi::comm_register(comm, addr, h * std::mem::size_of::<f32>()) {
-                    Ok(hd) => km.pp_send_handle = hd,
-                    Err(e) => {
-                        log::warn!("pp_step_kimi: register send scratch failed: {e}; per-call regMr");
-                        km.pp_send_scratch.clear();
-                    }
-                }
+            if !is_last && km.pp_hop_send.handle == 0 {
+                pin_pp_hop(comm, &mut km.pp_hop_send, h, "pp_step_kimi send");
             }
         }
 
@@ -162,10 +144,10 @@ impl VulkanModel {
         //    pre-pinned MR), or empty on the first stage (it embeds token_id).
         let hidden_in: Vec<f32> = if do_recv {
             let km = self.kimi.as_mut().unwrap();
-            if km.pp_recv_handle != 0 {
-                vccl_ffi::recv_f32_into(py, comm, &mut km.pp_recv_scratch, recv_from)
+            if km.pp_hop_recv.handle != 0 {
+                vccl_ffi::recv_f32_into(py, comm, &mut km.pp_hop_recv.buf, recv_from)
                     .map_err(PyRuntimeError::new_err)?;
-                km.pp_recv_scratch.clone()
+                km.pp_hop_recv.buf.clone()
             } else {
                 vccl_ffi::recv_f32(py, comm, h, recv_from).map_err(PyRuntimeError::new_err)?
             }
@@ -180,9 +162,9 @@ impl VulkanModel {
             // 3) send onward FROM the registered scratch (mid/first stage out is
             //    [H]); fall back to a fresh-Vec send if registration is off.
             let km = self.kimi.as_mut().unwrap();
-            if km.pp_send_handle != 0 && out.len() == km.pp_send_scratch.len() {
-                km.pp_send_scratch.copy_from_slice(&out);
-                vccl_ffi::send_f32(py, comm, &km.pp_send_scratch, send_to)
+            if km.pp_hop_send.handle != 0 && out.len() == km.pp_hop_send.buf.len() {
+                km.pp_hop_send.buf.copy_from_slice(&out);
+                vccl_ffi::send_f32(py, comm, &km.pp_hop_send.buf, send_to)
                     .map_err(PyRuntimeError::new_err)?;
             } else {
                 vccl_ffi::send_f32(py, comm, &out, send_to).map_err(PyRuntimeError::new_err)?;
@@ -208,10 +190,10 @@ impl VulkanModel {
     /// Kimi's `forward_pp_stage` tracks its decode position internally (the KDA
     /// recurrence + conv window + MLA KV cache advance in place and it IGNORES the
     /// `pos` argument), so `0` is passed. Reuses the pre-pinned `[H]` hidden
-    /// scratch (`pp_recv/send_scratch`, `comm_register`'d) exactly as
-    /// `pp_step_kimi`; the `[vocab]` ring-back uses plain `send_f32`/`recv_f32` (a
-    /// registered vocab scratch, as in `pp_step_laguna_logits`, is a later perf
-    /// lever). Bit-exact with `pp_step_kimi`'s last-stage logits. Requires
+    /// scratch (`pp_hop_recv`/`pp_hop_send`, `pin_pp_hop`) exactly as `pp_step_kimi`;
+    /// the `[vocab]` ring-back goes through the registered `pp_vocab_ring`
+    /// (`pp_send_vocab`/`pp_recv_vocab`). Bit-exact with `pp_step_kimi`'s
+    /// last-stage logits. Requires
     /// `set_collective_comm` + `VLLM_VULKAN_NATIVE_COMM!=0`.
     fn pp_step_kimi_logits(
         &mut self,
@@ -241,21 +223,11 @@ impl VulkanModel {
             && vccl_ffi::registration_available();
         if want_reg {
             let km = self.kimi.as_mut().unwrap();
-            if do_recv && km.pp_recv_handle == 0 {
-                km.pp_recv_scratch = vec![0.0f32; h];
-                let addr = km.pp_recv_scratch.as_ptr() as usize;
-                match vccl_ffi::comm_register(comm, addr, h * std::mem::size_of::<f32>()) {
-                    Ok(hd) => km.pp_recv_handle = hd,
-                    Err(e) => { log::warn!("pp_step_kimi_logits: register recv scratch failed: {e}; per-call regMr"); km.pp_recv_scratch.clear(); }
-                }
+            if do_recv && km.pp_hop_recv.handle == 0 {
+                pin_pp_hop(comm, &mut km.pp_hop_recv, h, "pp_step_kimi_logits recv");
             }
-            if !is_last && km.pp_send_handle == 0 {
-                km.pp_send_scratch = vec![0.0f32; h];
-                let addr = km.pp_send_scratch.as_ptr() as usize;
-                match vccl_ffi::comm_register(comm, addr, h * std::mem::size_of::<f32>()) {
-                    Ok(hd) => km.pp_send_handle = hd,
-                    Err(e) => { log::warn!("pp_step_kimi_logits: register send scratch failed: {e}; per-call regMr"); km.pp_send_scratch.clear(); }
-                }
+            if !is_last && km.pp_hop_send.handle == 0 {
+                pin_pp_hop(comm, &mut km.pp_hop_send, h, "pp_step_kimi_logits send");
             }
         }
 
@@ -263,10 +235,10 @@ impl VulkanModel {
         //    empty on the first stage (it embeds token_id).
         let hidden_in: Vec<f32> = if do_recv {
             let km = self.kimi.as_mut().unwrap();
-            if km.pp_recv_handle != 0 {
-                vccl_ffi::recv_f32_into(py, comm, &mut km.pp_recv_scratch, recv_from)
+            if km.pp_hop_recv.handle != 0 {
+                vccl_ffi::recv_f32_into(py, comm, &mut km.pp_hop_recv.buf, recv_from)
                     .map_err(PyRuntimeError::new_err)?;
-                km.pp_recv_scratch.clone()
+                km.pp_hop_recv.buf.clone()
             } else {
                 vccl_ffi::recv_f32(py, comm, h, recv_from).map_err(PyRuntimeError::new_err)?
             }
@@ -287,9 +259,9 @@ impl VulkanModel {
             // FIRST / MID: forward `[H]` onward FROM the registered scratch, then
             // (rank0 only) recv the ring-back.
             let km = self.kimi.as_mut().unwrap();
-            if km.pp_send_handle != 0 && out.len() == km.pp_send_scratch.len() {
-                km.pp_send_scratch.copy_from_slice(&out);
-                vccl_ffi::send_f32(py, comm, &km.pp_send_scratch, send_to)
+            if km.pp_hop_send.handle != 0 && out.len() == km.pp_hop_send.buf.len() {
+                km.pp_hop_send.buf.copy_from_slice(&out);
+                vccl_ffi::send_f32(py, comm, &km.pp_hop_send.buf, send_to)
                     .map_err(PyRuntimeError::new_err)?;
             } else {
                 vccl_ffi::send_f32(py, comm, &out, send_to).map_err(PyRuntimeError::new_err)?;

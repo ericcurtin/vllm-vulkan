@@ -160,6 +160,7 @@ struct MoeGpuR {
     sh_inter: usize,
     inter: usize,
     e: usize,
+    top_k: usize, // num_experts_per_token (q35_moe_accum is fixed top-8; checked in new())
     scale: f32, // routed_scaling_factor
 }
 
@@ -222,13 +223,9 @@ pub struct KimiGpuStage {
     eps: f32,
 }
 
-// ---- little-endian tensor readers (mirror the harness) ----
-fn to_u32(d: &[u8]) -> Vec<u32> {
-    d.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
-}
-fn bf16(d: &[u8]) -> Vec<f32> {
-    d.chunks_exact(2).map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32()).collect()
-}
+// ---- little-endian tensor readers (shared with the CPU loader / `st_decode`) ----
+use crate::kimi::bytes_u32 as to_u32;
+use crate::st_decode::bf16_le_to_f32 as bf16;
 
 impl KimiGpuStage {
     /// Build the resident stage for window `[layer_start, layer_end)`. Uploads all
@@ -244,6 +241,15 @@ impl KimiGpuStage {
     ) -> Result<KimiGpuStage, String> {
         if layer_start >= layer_end || layer_end > cfg.num_hidden_layers {
             return Err(format!("bad window [{layer_start},{layer_end}) for {} layers", cfg.num_hidden_layers));
+        }
+        // The GPU MoE combine accumulates through `q35_moe_accum`, a fixed top-8
+        // kernel (Kimi-Linear-48B routes 8 experts). Refuse any other top-k here
+        // instead of mis-weighting the experts at decode time.
+        if cfg.num_experts_per_token != 8 {
+            return Err(format!(
+                "kimi GPU stage: num_experts_per_token={} but the GPU MoE combine \
+                 (q35_moe_accum) is fixed top-8; use the CPU path (KIMI_GPU_RESIDENT=0)",
+                cfg.num_experts_per_token));
         }
         let h = cfg.hidden_size;
         let eps = cfg.rms_norm_eps;
@@ -294,14 +300,10 @@ impl KimiGpuStage {
             let sp = shard_of(name)?;
             let st = SafeTensors::deserialize(&mmaps[&sp]).map_err(|e| format!("deser {sp}: {e}"))?;
             let tv = st.tensor(name).map_err(|e| format!("{name}: {e}"))?;
-            Ok(match tv.dtype() {
-                safetensors::Dtype::BF16 => bf16(tv.data()),
-                safetensors::Dtype::F32 => tv.data().chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
-                d => return Err(format!("{name}: dtype {d:?}")),
-            })
+            crate::st_decode::decode_plain(tv.dtype(), tv.data()).map_err(|e| format!("{name}: {e}"))
         };
         // resident packed matvec uploader
-        let mut up_mat = |eng: &mut compute::ComputeEngine, base: &str| -> Result<GpuMatR, String> {
+        let up_mat = |eng: &mut compute::ComputeEngine, base: &str| -> Result<GpuMatR, String> {
             let wname = format!("{base}.weight");
             let sp = shard_of(&wname)?;
             let st = SafeTensors::deserialize(&mmaps[&sp]).map_err(|e| format!("deser {sp}: {e}"))?;
@@ -498,7 +500,7 @@ impl KimiGpuStage {
                 let gate = up_switch(&mut eng, qg)?;
                 let up = up_switch(&mut eng, qu)?;
                 let down = up_switch(&mut eng, qd)?;
-                KMlpR::Moe(MoeGpuR { gate, up, down, router_gate, bias, sh_gate_gpu, sh_up_gpu, sh_down_gpu, sh_gate, sh_up, sh_down, sh_inter, inter, e, scale: cfg.routed_scaling_factor })
+                KMlpR::Moe(MoeGpuR { gate, up, down, router_gate, bias, sh_gate_gpu, sh_up_gpu, sh_down_gpu, sh_gate, sh_up, sh_down, sh_inter, inter, e, top_k: cfg.num_experts_per_token, scale: cfg.routed_scaling_factor })
             };
 
             layers.push(KLayerR { idx: l, input_ln, post_ln, attn, mlp });
@@ -554,6 +556,13 @@ impl KimiGpuStage {
         -> Result<Vec<f32>, String> {
         let h = self.h;
         let eps = self.eps;
+        // Check every edge weight this call needs BEFORE any layer runs: a layer
+        // advances its resident state (KDA recurrence, conv window, MLA cache),
+        // so a late error would leave the stage part-way through the token.
+        if self.last && want_logits {
+            if self.final_norm.is_none() { return Err("tail stage requires final_norm".into()); }
+            if self.lm_head_gpu.is_none() { return Err("tail stage requires lm_head_gpu".into()); }
+        }
         let mut x = if self.first {
             let emb = self.embed.as_ref().ok_or("stage 0 requires embed")?;
             let row = token_id as usize * h;
@@ -568,7 +577,7 @@ impl KimiGpuStage {
         // disjoint field borrows: eng (mut) + layers (mut) + cfg (shared)
         let eng = &mut self.eng;
         for layer in self.layers.iter_mut() {
-            let xn = kimi::rmsnorm(&x, 1, h, &layer.input_ln, eps);
+            let xn = crate::model::cpu_rms_norm(&x, &layer.input_ln, eps);
             let attn = match &mut layer.attn {
                 KAttnR::Kda(kda) => {
                     if crate::flags::flags_global().kimi_kda_fused {
@@ -584,7 +593,7 @@ impl KimiGpuStage {
             };
             let mut hres = vec![0f32; h];
             for i in 0..h { hres[i] = x[i] + attn[i]; }
-            let hn = kimi::rmsnorm(&hres, 1, h, &layer.post_ln, eps);
+            let hn = crate::model::cpu_rms_norm(&hres, &layer.post_ln, eps);
             let mlp = match &layer.mlp {
                 KMlpR::Dense(d) => match d {
                     DenseImpl::Gpu(g) => dense_step_resident(eng, g, &hn)?,
@@ -601,7 +610,7 @@ impl KimiGpuStage {
             Ok(Vec::new())
         } else if self.last {
             let fnorm = self.final_norm.as_ref().ok_or("tail stage requires final_norm")?;
-            let normed = kimi::rmsnorm(&x, 1, h, fnorm, eps);
+            let normed = crate::model::cpu_rms_norm(&x, fnorm, eps);
             // GPU-resident logits matvec (matvec_mlx4 / repack) — disjoint field
             // borrows: &self.lm_head_gpu (shared) + &mut self.eng.
             let lm = self.lm_head_gpu.as_ref().ok_or("tail stage requires lm_head_gpu")?;
@@ -1065,9 +1074,8 @@ fn moe_combine_resident(
 ) -> Result<Vec<f32>, String> {
     // host router selection (sigmoid + bias + scale + top-k renorm)
     let lc = model::cpu_matmul(hn, &m.router_gate, 1, h, m.e);
-    let (inds, weights) = kimi::moe::route(&lc, &m.bias, 8, m.scale, true);
+    let (inds, weights) = kimi::moe::route(&lc, &m.bias, m.top_k, m.scale, true);
     let top_k = inds.len();
-    debug_assert_eq!(top_k, 8);
     let inter = m.inter;
 
     let up_f32 = |eng: &mut compute::ComputeEngine, w: &[f32]| -> Result<compute::Buffer, String> {
@@ -1213,4 +1221,193 @@ fn moe_combine_resident(
     for buf in b_mid { eng.return_to_pool(buf); }
     for buf in dwn { eng.return_to_pool(buf); }
     Ok(out)
+}
+
+/// Hermetic `KimiGpuStage` test: a tiny synthetic Kimi checkpoint (4 layers that
+/// cover every block type — KDA + dense MLP, KDA + MoE, MLA + MoE, KDA + MoE —
+/// mlx-affine 4-bit weights, an 8-bit router as on disk) is written to a temp
+/// dir, loaded by BOTH the CPU reference (`KimiModel::load_cpu`) and the GPU
+/// stage (`KimiGpuStage::new`), and decoded token by token through
+/// `forward_pp_stage`. The GPU logits must track the CPU oracle (cos, argmax).
+///
+/// `#[ignore]` because it needs a Vulkan device; CI runs it explicitly on Mesa
+/// lavapipe (`rust-test-kimi`). Run locally with
+/// `cargo test --lib kimi_gpu_stage -- --ignored`. It panics, never skips,
+/// when no device is present.
+#[cfg(test)]
+mod gpu_stage_tests {
+    use super::*;
+    use safetensors::{serialize_to_file, tensor::TensorView, Dtype};
+
+    struct Rng(u64);
+    impl Rng {
+        fn u(&mut self) -> u64 { self.0 ^= self.0 << 13; self.0 ^= self.0 >> 7; self.0 ^= self.0 << 17; self.0 }
+        fn f(&mut self) -> f32 { ((self.u() >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0 }
+    }
+
+    #[derive(Default)]
+    struct Ckpt { t: Vec<(String, Dtype, Vec<usize>, Vec<u8>)> }
+    impl Ckpt {
+        fn bf16(&mut self, name: &str, shape: &[usize], vals: &[f32]) {
+            let b = vals.iter().flat_map(|v| half::bf16::from_f32(*v).to_bits().to_le_bytes()).collect();
+            self.t.push((name.into(), Dtype::BF16, shape.to_vec(), b));
+        }
+        /// mlx-affine quantized weight `[..lead, out, inn]` at `bits`, group 64.
+        fn quant(&mut self, r: &mut Rng, name: &str, lead: &[usize], out: usize, inn: usize, bits: usize) {
+            let rows: usize = lead.iter().product::<usize>() * out;
+            let words = inn * bits / 32;
+            let packed: Vec<u8> = (0..rows * words).flat_map(|_| (r.u() as u32).to_le_bytes()).collect();
+            let groups = inn / 64;
+            let qmax = ((1u32 << bits) - 1) as f32;
+            // scale * q + bias centred on 0, |w| ~ 0.05 / sqrt(inn/64)
+            let amp = 0.1 / (groups as f32).sqrt();
+            let sc: Vec<f32> = (0..rows * groups).map(|_| amp * (0.5 + 0.5 * r.f().abs()) / qmax).collect();
+            let bi: Vec<f32> = sc.iter().map(|s| -s * qmax / 2.0).collect();
+            let mut ws = lead.to_vec(); ws.extend([out, words]);
+            let mut ss = lead.to_vec(); ss.extend([out, groups]);
+            self.t.push((format!("{name}.weight"), Dtype::U32, ws, packed));
+            self.bf16(&format!("{name}.scales"), &ss, &sc);
+            self.bf16(&format!("{name}.biases"), &ss, &bi);
+        }
+        fn write(&self, dir: &std::path::Path) {
+            let views: Vec<(String, TensorView)> = self.t.iter()
+                .map(|(n, d, s, b)| (n.clone(), TensorView::new(*d, s.clone(), b).unwrap())).collect();
+            serialize_to_file(views, &None, &dir.join("model.safetensors")).unwrap();
+            let wm: serde_json::Map<String, serde_json::Value> = self.t.iter()
+                .map(|(n, ..)| (n.clone(), serde_json::Value::from("model.safetensors"))).collect();
+            std::fs::write(dir.join("model.safetensors.index.json"),
+                           serde_json::json!({"metadata": {}, "weight_map": wm}).to_string()).unwrap();
+        }
+    }
+
+    fn tiny_config() -> serde_json::Value {
+        let raw = std::fs::read_to_string("tests/fixtures/kimi/config.json").expect("fixture config.json");
+        let mut c: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        for (k, v) in [("hidden_size", 128u64), ("num_hidden_layers", 4), ("vocab_size", 256),
+                       ("intermediate_size", 128), ("num_attention_heads", 2), ("num_key_value_heads", 2),
+                       ("kv_lora_rank", 64), ("qk_nope_head_dim", 64), ("qk_rope_head_dim", 64),
+                       ("v_head_dim", 64), ("first_k_dense_replace", 1), ("num_experts", 16),
+                       ("num_experts_per_token", 8), ("num_shared_experts", 1), ("moe_intermediate_size", 64)] {
+            c[k] = serde_json::Value::from(v);
+        }
+        c["linear_attn_config"] = serde_json::json!({
+            "full_attn_layers": [3], "kda_layers": [1, 2, 4], "head_dim": 128,
+            "num_heads": 1, "short_conv_kernel_size": 4});
+        c
+    }
+
+    fn build_ckpt(dir: &std::path::Path, cfg: &KimiConfig) {
+        let mut r = Rng(0x4B49_4D49);
+        let mut ck = Ckpt::default();
+        let (h, v) = (cfg.hidden_size, cfg.vocab_size);
+        let (nh, hd, kern) = (cfg.kda_num_heads, cfg.kda_head_dim, cfg.kda_conv_kernel);
+        let proj = nh * hd;
+        let ones = |n: usize| vec![1.0f32; n];
+        for l in 0..cfg.num_hidden_layers {
+            let p = format!("model.layers.{l}");
+            let a = format!("{p}.self_attn");
+            ck.bf16(&format!("{p}.input_layernorm.weight"), &[h], &ones(h));
+            ck.bf16(&format!("{p}.post_attention_layernorm.weight"), &[h], &ones(h));
+            match cfg.layer_schedule[l] {
+                kimi::KimiLayerKind::Kda => {
+                    for nm in ["q_proj", "k_proj", "v_proj"] { ck.quant(&mut r, &format!("{a}.{nm}"), &[], proj, h, 4); }
+                    for ab in ["f", "g"] {
+                        ck.quant(&mut r, &format!("{a}.{ab}_a_proj"), &[], hd, h, 4);
+                        ck.quant(&mut r, &format!("{a}.{ab}_b_proj"), &[], proj, hd, 4);
+                    }
+                    ck.quant(&mut r, &format!("{a}.b_proj"), &[], nh, h, 4);
+                    ck.quant(&mut r, &format!("{a}.o_proj"), &[], h, proj, 4);
+                    for c in ["q_conv", "k_conv", "v_conv"] {
+                        let w: Vec<f32> = (0..proj * kern).map(|_| 0.3 * r.f()).collect();
+                        ck.bf16(&format!("{a}.{c}.conv.weight"), &[proj, 1, kern], &w);
+                    }
+                    let alog: Vec<f32> = (0..nh).map(|_| 0.5 * r.f()).collect();
+                    ck.bf16(&format!("{a}.A_log"), &[nh], &alog);
+                    let dtb: Vec<f32> = (0..proj).map(|_| 0.1 * r.f()).collect();
+                    ck.bf16(&format!("{a}.dt_bias"), &[proj], &dtb);
+                    ck.bf16(&format!("{a}.o_norm.weight"), &[hd], &ones(hd));
+                }
+                kimi::KimiLayerKind::Mla => {
+                    let (mh, nope, rope, vd, rank) = (cfg.num_attention_heads, cfg.qk_nope_head_dim,
+                        cfg.qk_rope_head_dim, cfg.v_head_dim, cfg.kv_lora_rank);
+                    ck.quant(&mut r, &format!("{a}.q_proj"), &[], mh * (nope + rope), h, 4);
+                    ck.quant(&mut r, &format!("{a}.kv_a_proj_with_mqa"), &[], rank + rope, h, 4);
+                    ck.bf16(&format!("{a}.kv_a_layernorm.weight"), &[rank], &ones(rank));
+                    ck.quant(&mut r, &format!("{a}.kv_b_proj"), &[], mh * (nope + vd), rank, 4);
+                    ck.quant(&mut r, &format!("{a}.o_proj"), &[], h, mh * vd, 4);
+                }
+            }
+            let m = format!("{p}.mlp");
+            if cfg.is_dense_mlp(l) {
+                let i = cfg.intermediate_size;
+                ck.quant(&mut r, &format!("{m}.gate_proj"), &[], i, h, 4);
+                ck.quant(&mut r, &format!("{m}.up_proj"), &[], i, h, 4);
+                ck.quant(&mut r, &format!("{m}.down_proj"), &[], h, i, 4);
+            } else {
+                let (e, mi) = (cfg.num_experts, cfg.moe_intermediate_size);
+                let si = mi * cfg.num_shared_experts;
+                ck.quant(&mut r, &format!("{m}.gate"), &[], e, h, 8); // 8-bit router, as on disk
+                let bias: Vec<f32> = (0..e).map(|_| 0.05 * r.f()).collect();
+                ck.bf16(&format!("{m}.e_score_correction_bias"), &[e], &bias);
+                ck.quant(&mut r, &format!("{m}.switch_mlp.gate_proj"), &[e], mi, h, 4);
+                ck.quant(&mut r, &format!("{m}.switch_mlp.up_proj"), &[e], mi, h, 4);
+                ck.quant(&mut r, &format!("{m}.switch_mlp.down_proj"), &[e], h, mi, 4);
+                ck.quant(&mut r, &format!("{m}.shared_experts.gate_proj"), &[], si, h, 4);
+                ck.quant(&mut r, &format!("{m}.shared_experts.up_proj"), &[], si, h, 4);
+                ck.quant(&mut r, &format!("{m}.shared_experts.down_proj"), &[], h, si, 4);
+            }
+        }
+        ck.quant(&mut r, "model.embed_tokens", &[], v, h, 4);
+        ck.bf16("model.norm.weight", &[h], &ones(h));
+        ck.quant(&mut r, "lm_head", &[], v, h, 4);
+        ck.write(dir);
+    }
+
+    fn cos(a: &[f32], b: &[f32]) -> f64 {
+        let (mut ab, mut aa, mut bb) = (0f64, 0f64, 0f64);
+        for (x, y) in a.iter().zip(b) { ab += *x as f64 * *y as f64; aa += (*x as f64).powi(2); bb += (*y as f64).powi(2); }
+        ab / (aa.sqrt() * bb.sqrt()).max(1e-30)
+    }
+
+    #[test]
+    #[ignore = "needs a Vulkan device (CI runs it on Mesa lavapipe); run with --ignored"]
+    fn kimi_gpu_stage_tracks_cpu_reference() {
+        assert!(crate::device::is_vulkan_available(),
+                "kimi_gpu_stage test needs a Vulkan device (set VK_ICD_FILENAMES, e.g. Mesa lavapipe)");
+        let cfg_json = tiny_config();
+        let cfg = KimiConfig::from_json(&cfg_json).unwrap();
+        let dir = std::env::temp_dir().join(format!("kimi_gpu_stage_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), cfg_json.to_string()).unwrap();
+        build_ckpt(&dir, &cfg);
+        let d = dir.to_str().unwrap();
+        let n = cfg.num_hidden_layers;
+        let mut cpu = kimi::KimiModel::load_cpu(d, &cfg, 0, n, true).expect("CPU reference load");
+        let mut gpu = KimiGpuStage::new(d, &cfg, 0, n, true, 0).expect("KimiGpuStage::new");
+        let argmax = |v: &[f32]| v.iter().enumerate().fold((0, f32::MIN), |b, (i, &x)| if x > b.1 { (i, x) } else { b }).0;
+        let (mut worst, mut matches) = (1.0f64, 0usize);
+        let toks = [3u32, 17, 42, 5, 99, 200];
+        for (pos, &t) in toks.iter().enumerate() {
+            let a = cpu.forward_pp_stage(t, &[], pos).expect("cpu step");
+            let b = gpu.forward_pp_stage(t, &[], true).expect("gpu step");
+            assert_eq!(a.len(), cfg.vocab_size);
+            assert_eq!(b.len(), cfg.vocab_size);
+            assert!(b.iter().all(|x| x.is_finite()), "non-finite GPU logits at pos {pos}");
+            let c = cos(&a, &b);
+            worst = worst.min(c);
+            matches += (argmax(&a) == argmax(&b)) as usize;
+            eprintln!("[kimi_gpu_stage] pos {pos} tok {t}: cos {c:.7} argmax cpu {} gpu {}", argmax(&a), argmax(&b));
+        }
+        // The state carries through all 6 steps (KDA recurrence, conv window, MLA
+        // cache), so a stale or mis-indexed state shows up as a cos drop here.
+        assert!(worst > 0.9999, "GPU stage drifted from the CPU reference: worst cos {worst}");
+        assert_eq!(matches, toks.len(), "argmax disagreed at {} of {} steps", toks.len() - matches, toks.len());
+        // reset must return the GPU stage to the fresh-sequence state
+        gpu.reset_state().unwrap();
+        cpu.reset_decode_state().unwrap();
+        let a = cpu.forward_pp_stage(toks[0], &[], 0).unwrap();
+        let b = gpu.forward_pp_stage(toks[0], &[], true).unwrap();
+        assert!(cos(&a, &b) > 0.9999, "after reset the GPU stage does not restart from zero state");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

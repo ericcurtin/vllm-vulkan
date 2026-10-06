@@ -3,7 +3,7 @@
 //! schedule (P1a), plus KDA / MLA / MoE-router hooks landed in later phases.
 //!
 //! Architecture (from the shipped `config.json`, verified in Phase-0 against the
-//! mlx-lm `kimi_linear` oracle — see `docs/kimi-linear-48b-bringup-plan.md`):
+//! mlx-lm `kimi_linear` oracle):
 //!   - 27 layers, hidden 2304, vocab 163840, untied lm_head, rms_norm_eps 1e-5.
 //!   - Heterogeneous attention schedule: 7 **MLA** layers (0-idx
 //!     `[3,7,11,15,19,23,26]`), 20 **KDA** (GatedDeltaNet-family, per-CHANNEL
@@ -960,12 +960,9 @@ pub mod moe {
         let biased: Vec<f32> = scores.iter().zip(bias).map(|(s, b)| s + b).collect();
         // top_k by biased score (selection); tie-break lower index first.
         let mut order: Vec<usize> = (0..e).collect();
-        order.sort_by(|&a, &b| {
-            biased[b]
-                .partial_cmp(&biased[a])
-                .unwrap()
-                .then(a.cmp(&b))
-        });
+        // total_cmp: a NaN score sorts deterministically instead of panicking;
+        // the order of finite keys is unchanged.
+        order.sort_by(|&a, &b| biased[b].total_cmp(&biased[a]).then(a.cmp(&b)));
         let inds: Vec<usize> = order[..top_k].to_vec();
         // combine weights = UN-biased sigmoid scores at selected inds.
         let mut w: Vec<f32> = inds.iter().map(|&i| scores[i]).collect();
@@ -1115,17 +1112,16 @@ pub struct KimiModel {
     /// the CPU resident decode runs (fine for small windows / bit-exact gates).
     pub gpu: Option<crate::kimi_gpu::KimiGpuStage>,
     /// Persistent RDMA-registered PP-hop scratch (`[H]` f32 each), pinned ONCE
-    /// with `vcclCommRegister` on the first `pp_step_kimi`. The native fused hop
-    /// recvs into `pp_recv_scratch` and sends from `pp_send_scratch`, so vCCL
-    /// skips the per-call `ibv_reg_mr`/dereg temp-MR (the "buffer not registered"
-    /// warning + the ~700 ms/tok Kimi PP-3 comm floor). `*_handle == 0` ⇒ not
-    /// registered (falls back to the fresh-Vec recv_f32/send_f32 path). Wired
-    /// from `lib.rs::pp_step_kimi` (which owns the comm handle); addresses stay
-    /// stable because the Vecs are allocated once and never resized.
-    pub pp_recv_scratch: Vec<f32>,
-    pub pp_recv_handle: usize,
-    pub pp_send_scratch: Vec<f32>,
-    pub pp_send_handle: usize,
+    /// with `vcclCommRegister` (via `pin_pp_hop`) on the first `pp_step_kimi*`. The
+    /// native fused hop recvs into `pp_hop_recv` and sends from `pp_hop_send`, so
+    /// vCCL skips the per-call `ibv_reg_mr`/dereg temp-MR (the "buffer not
+    /// registered" warning + the ~700 ms/tok Kimi PP-3 comm floor). `handle == 0`
+    /// ⇒ not registered (falls back to the fresh-Vec recv_f32/send_f32 path).
+    /// Driven from `pyseam_kimi.rs` (the seam owns the comm handle) and dropped by
+    /// `VulkanModel::set_collective_comm` on a comm change; addresses stay stable
+    /// because the Vecs are allocated once and never resized.
+    pub(crate) pp_hop_recv: crate::PpTokRing,
+    pub(crate) pp_hop_send: crate::PpTokRing,
 }
 
 // ------------------------------- math helpers -------------------------------
@@ -1133,21 +1129,6 @@ pub struct KimiModel {
 #[inline]
 fn kimi_sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
-}
-
-/// Weighted RMSNorm over the last `h` dims: `x[rows,h] -> [rows,h]`.
-pub(crate) fn rmsnorm(x: &[f32], rows: usize, h: usize, w: &[f32], eps: f32) -> Vec<f32> {
-    let mut y = vec![0f32; rows * h];
-    for r in 0..rows {
-        let s = &x[r * h..(r + 1) * h];
-        let ms: f32 = s.iter().map(|z| z * z).sum::<f32>() / h as f32;
-        let inv = 1.0 / (ms + eps).sqrt();
-        let o = &mut y[r * h..(r + 1) * h];
-        for i in 0..h {
-            o[i] = s[i] * inv * w[i];
-        }
-    }
-    y
 }
 
 /// Dense SwiGLU MLP forward: `x[l,h] -> [l,h]`.
@@ -1191,7 +1172,7 @@ impl KimiModel {
         let eps = self.cfg.rms_norm_eps;
 
         // --- attention sub-block ---
-        let xn = rmsnorm(x, l, h, &layer.input_ln, eps);
+        let xn = crate::model::cpu_rms_norm(x, &layer.input_ln, eps);
         let attn = match &layer.attn {
             KimiAttn::Kda(w) => {
                 let mut state = vec![0f32; w.nh * w.hd * w.hd];
@@ -1209,7 +1190,7 @@ impl KimiModel {
         }
 
         // --- MLP sub-block ---
-        let hn = rmsnorm(&hres, l, h, &layer.post_ln, eps);
+        let hn = crate::model::cpu_rms_norm(&hres, &layer.post_ln, eps);
         let mlp = match &layer.mlp {
             KimiMlp::Dense(d) => dense_forward(d, &hn, l),
             KimiMlp::Moe(w) => {
@@ -1280,7 +1261,7 @@ impl KimiModel {
         let h = self.cfg.hidden_size;
         let eps = self.cfg.rms_norm_eps;
 
-        let xn = rmsnorm(x, 1, h, &layer.input_ln, eps);
+        let xn = crate::model::cpu_rms_norm(x, &layer.input_ln, eps);
         let attn = match (&layer.attn, st) {
             (KimiAttn::Kda(w), KimiLayerState::Kda(s)) => kda::decode_step(w, &xn, s),
             (KimiAttn::Mla(w), KimiLayerState::Mla(c)) => mla::decode_step(w, &xn, c),
@@ -1291,7 +1272,7 @@ impl KimiModel {
             hres[i] = x[i] + attn[i];
         }
 
-        let hn = rmsnorm(&hres, 1, h, &layer.post_ln, eps);
+        let hn = crate::model::cpu_rms_norm(&hres, &layer.post_ln, eps);
         let mlp = match &layer.mlp {
             KimiMlp::Dense(d) => dense_forward(d, &hn, 1),
             KimiMlp::Moe(w) => moe::block(w, &hn).0,
@@ -1365,6 +1346,15 @@ impl KimiModel {
         }
         let eps = self.cfg.rms_norm_eps;
         let last = self.layer_end == self.cfg.num_hidden_layers;
+        // Check the edge weights this call needs BEFORE any layer advances its
+        // state, so an error never leaves the window part-way through a token.
+        if first && self.embed.is_none() {
+            return Err("stage 0 requires embed (load_edges)".into());
+        }
+        if last && want_logits && (self.final_norm.is_none() || self.lm_head.is_none()) {
+            return Err(format!("tail stage requires final_norm and lm_head (final_norm={}, lm_head={})",
+                               self.final_norm.is_some(), self.lm_head.is_some()));
+        }
         if self.states.len() != self.layers.len() {
             self.states = self.init_decode_state();
         }
@@ -1391,7 +1381,7 @@ impl KimiModel {
         } else if last {
             let fnorm = self.final_norm.as_ref().ok_or("tail stage requires final_norm")?;
             let lm = self.lm_head.as_ref().ok_or("tail stage requires lm_head")?;
-            let normed = rmsnorm(&x, 1, h, fnorm, eps);
+            let normed = crate::model::cpu_rms_norm(&x, fnorm, eps);
             let vocab = lm.len() / h;
             let mut logits = vec![0f32; vocab];
             for o in 0..vocab {
@@ -1540,7 +1530,7 @@ impl KimiConfig {
                     let (tail, _) = best(start + take, stages_left - 1, false, n, range, vocab, memo);
                     let mut cost = tail.clone();
                     cost.push(head);
-                    cost.sort_by(|a, b| b.partial_cmp(a).unwrap()); // desc
+                    cost.sort_by(|a, b| b.total_cmp(a)); // desc
                     let better = match &best_cost {
                         None => true,
                         Some(bc) => cost < *bc, // lexicographic on desc-sorted vecs
@@ -1583,22 +1573,9 @@ impl KimiConfig {
 
 // ------------------------------- loader (P5) -------------------------------
 
-/// Read a little-endian bf16 tensor's bytes into f32.
-fn bytes_bf16_to_f32(bytes: &[u8]) -> Vec<f32> {
-    use half::bf16;
-    bytes
-        .chunks_exact(2)
-        .map(|c| bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
-        .collect()
-}
-/// Read a little-endian f32 tensor's bytes.
-fn bytes_f32(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
-}
-fn bytes_u32(bytes: &[u8]) -> Vec<u32> {
+/// Read a little-endian u32 tensor's bytes (the packed mlx-affine words). The
+/// plain bf16/f32 decoders live in `st_decode`.
+pub(crate) fn bytes_u32(bytes: &[u8]) -> Vec<u32> {
     bytes
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -1702,8 +1679,8 @@ impl KimiModel {
             let out_total: usize = wshape[..wshape.len() - 1].iter().product();
             let bits = (packed_last * 32) / in_features;
             let w = bytes_u32(wv.data());
-            let s = bytes_bf16_to_f32(sv.data());
-            let b = bytes_bf16_to_f32(bv.data());
+            let s = crate::st_decode::bf16_le_to_f32(sv.data());
+            let b = crate::st_decode::bf16_le_to_f32(bv.data());
             Ok(crate::model::dequantize_mlx_affine(
                 &w, &s, &b, out_total, in_features, group_size, bits,
             ))
@@ -1714,11 +1691,7 @@ impl KimiModel {
             let st = SafeTensors::deserialize(&mmaps[&sp])
                 .map_err(|e| format!("deserialize {sp}: {e}"))?;
             let tv = st.tensor(name).map_err(|e| format!("{name}: {e}"))?;
-            Ok(match tv.dtype() {
-                safetensors::Dtype::BF16 => bytes_bf16_to_f32(tv.data()),
-                safetensors::Dtype::F32 => bytes_f32(tv.data()),
-                d => return Err(format!("{name}: unexpected raw dtype {d:?}")),
-            })
+            crate::st_decode::decode_plain(tv.dtype(), tv.data()).map_err(|e| format!("{name}: {e}"))
         };
 
         let mut layers = Vec::with_capacity(layer_end - layer_start);
@@ -1854,10 +1827,8 @@ impl KimiModel {
             lm_head,
             states: Vec::new(),
             gpu: None,
-            pp_recv_scratch: Vec::new(),
-            pp_recv_handle: 0,
-            pp_send_scratch: Vec::new(),
-            pp_send_handle: 0,
+            pp_hop_recv: Default::default(),
+            pp_hop_send: Default::default(),
         };
         m.states = m.init_decode_state();
         Ok(m)
@@ -1889,10 +1860,8 @@ impl KimiModel {
             lm_head: None,
             states: Vec::new(),
             gpu: Some(gpu),
-            pp_recv_scratch: Vec::new(),
-            pp_recv_handle: 0,
-            pp_send_scratch: Vec::new(),
-            pp_send_handle: 0,
+            pp_hop_recv: Default::default(),
+            pp_hop_send: Default::default(),
         })
     }
 }
@@ -1973,14 +1942,9 @@ mod p4_tests {
     }
 
     #[test]
+    #[ignore = "needs the oracle dump: KIMI_P4_DIR (run kimi_p4_dump_moe.py) (run with --ignored)"]
     fn kimi_moe_router_and_block_vs_oracle() {
-        let dir = match std::env::var("KIMI_P4_DIR") {
-            Ok(d) => d,
-            Err(_) => {
-                eprintln!("P4 SKIP: set KIMI_P4_DIR (run kimi_p4_dump_moe.py first)");
-                return;
-            }
-        };
+        let dir = std::env::var("KIMI_P4_DIR").expect("set KIMI_P4_DIR (run kimi_p4_dump_moe.py)");
         let m: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(format!("{dir}/manifest.json")).unwrap())
                 .unwrap();
@@ -2064,14 +2028,9 @@ mod p3_tests {
     }
 
     #[test]
+    #[ignore = "needs the oracle dump: KIMI_P3_DIR (run kimi_p3_dump_mla.py) (run with --ignored)"]
     fn kimi_mla_vs_oracle() {
-        let dir = match std::env::var("KIMI_P3_DIR") {
-            Ok(d) => d,
-            Err(_) => {
-                eprintln!("P3 SKIP: set KIMI_P3_DIR (run kimi_p3_dump_mla.py first)");
-                return;
-            }
-        };
+        let dir = std::env::var("KIMI_P3_DIR").expect("set KIMI_P3_DIR (run kimi_p3_dump_mla.py)");
         let m: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(format!("{dir}/manifest.json")).unwrap())
                 .unwrap();
@@ -2116,19 +2075,16 @@ mod p3_tests {
     /// P3 real-weight loader gate — reproduce the mlx `sanitize` split of the REAL
     /// on-disk `kv_b_proj` (layer 3) into embed_q / unembed_out.
     #[test]
+    #[ignore = "needs the oracle dump: KIMI_P3_DIR (run kimi_p3_dump_mla.py) (run with --ignored)"]
     fn kimi_mla_kvb_split_real_weights() {
-        let dir = match std::env::var("KIMI_P3_DIR") {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        let dir = std::env::var("KIMI_P3_DIR").expect("set KIMI_P3_DIR (run kimi_p3_dump_mla.py)");
         let m: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(format!("{dir}/manifest.json")).unwrap())
                 .unwrap();
         let split = match m.get("split") {
             Some(s) => s,
             None => {
-                eprintln!("P3 split SKIP: dump run without ckpt dir");
-                return;
+                panic!("KIMI_P3_DIR dump has no `split` section: re-run kimi_p3_dump_mla.py with the checkpoint dir");
             }
         };
         let g = |k: &str| split[k].as_u64().unwrap() as usize;
@@ -2246,14 +2202,9 @@ mod p2_tests {
 
     /// P2 gate — Rust KDA forward vs the mlx-lm KimiDeltaAttention oracle.
     #[test]
+    #[ignore = "needs the oracle dump: KIMI_P2_DIR (run kimi_p2_dump_kda.py) (run with --ignored)"]
     fn kimi_kda_vs_oracle() {
-        let dir = match std::env::var("KIMI_P2_DIR") {
-            Ok(d) => d,
-            Err(_) => {
-                eprintln!("P2 SKIP: set KIMI_P2_DIR (run kimi_p2_dump_kda.py first)");
-                return;
-            }
-        };
+        let dir = std::env::var("KIMI_P2_DIR").expect("set KIMI_P2_DIR (run kimi_p2_dump_kda.py)");
         let d = load_dump(&dir);
         let (w, x, golden, l) = weights_from(&d);
         let mut state = vec![0f32; w.nh * w.hd * w.hd];
@@ -2268,14 +2219,9 @@ mod p2_tests {
     /// (bit-identical output AND carried state). Guards against a future chunked/
     /// batched refactor that reorders the rank-1 accumulations.
     #[test]
+    #[ignore = "needs the oracle dump: KIMI_P2_DIR (run kimi_p2_dump_kda.py) (run with --ignored)"]
     fn kimi_kda_scan_bit_exact_vs_serial() {
-        let dir = match std::env::var("KIMI_P2_DIR") {
-            Ok(d) => d,
-            Err(_) => {
-                eprintln!("P2 SKIP: set KIMI_P2_DIR");
-                return;
-            }
-        };
+        let dir = std::env::var("KIMI_P2_DIR").expect("set KIMI_P2_DIR (run kimi_p2_dump_kda.py)");
         let d = load_dump(&dir);
         let (w, x, _golden, l) = weights_from(&d);
 
@@ -2317,14 +2263,7 @@ mod p1b_tests {
     //! `scripts/kimi_phase0/kimi_p1b_dump_golden.py`). Skips cleanly when unset so
     //! checkpoint-less CI stays green.
     use crate::model::dequantize_mlx_affine;
-    use half::bf16;
 
-    fn bf16_slice_to_f32(bytes: &[u8]) -> Vec<f32> {
-        bytes
-            .chunks_exact(2)
-            .map(|c| bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
-            .collect()
-    }
     fn u32_slice(bytes: &[u8]) -> Vec<u32> {
         bytes
             .chunks_exact(4)
@@ -2333,14 +2272,9 @@ mod p1b_tests {
     }
 
     #[test]
+    #[ignore = "needs the oracle dump: KIMI_P1B_MANIFEST (real-weight manifest) (run with --ignored)"]
     fn kimi_p1b_real_weight_mlx4_dequant() {
-        let manifest_path = match std::env::var("KIMI_P1B_MANIFEST") {
-            Ok(p) => p,
-            Err(_) => {
-                eprintln!("P1b SKIP: set KIMI_P1B_MANIFEST to run the real-weight gate");
-                return;
-            }
-        };
+        let manifest_path = std::env::var("KIMI_P1B_MANIFEST").expect("set KIMI_P1B_MANIFEST (real-weight manifest)");
         use memmap2::Mmap;
         use safetensors::SafeTensors;
         use std::fs::File;
@@ -2382,8 +2316,8 @@ mod p1b_tests {
             // base row index into the (flattened) [.., out, cols] tensor.
             let base_row = expert.map(|e| e * out_full).unwrap_or(0) + row_start;
             let w_all = u32_slice(wv.data());
-            let s_all = bf16_slice_to_f32(sv.data());
-            let b_all = bf16_slice_to_f32(bv.data());
+            let s_all = crate::st_decode::bf16_le_to_f32(sv.data());
+            let b_all = crate::st_decode::bf16_le_to_f32(bv.data());
             let w = &w_all[base_row * packed_cols..(base_row + row_count) * packed_cols];
             let s = &s_all[base_row * scales_cols..(base_row + row_count) * scales_cols];
             let b = &b_all[base_row * scales_cols..(base_row + row_count) * scales_cols];
@@ -2559,14 +2493,10 @@ mod p4half_tests {
     /// P4½ ASSEMBLY GATE (real weights). Gated on `KIMI_CKPT` (checkpoint dir with
     /// shard 1) + `KIMI_P4HALF_DIR` (oracle dump from `kimi_p4half_dump_layers.py`).
     #[test]
+    #[ignore = "needs the checkpoint: KIMI_CKPT + KIMI_P4HALF_DIR (run with --ignored)"]
     fn kimi_assembly_dispatch_vs_oracle() {
-        let (ckpt, dump) = match (std::env::var("KIMI_CKPT"), std::env::var("KIMI_P4HALF_DIR")) {
-            (Ok(a), Ok(b)) => (a, b),
-            _ => {
-                eprintln!("P4½ SKIP: set KIMI_CKPT + KIMI_P4HALF_DIR");
-                return;
-            }
-        };
+        let ckpt = std::env::var("KIMI_CKPT").expect("set KIMI_CKPT (checkpoint dir with shard 1)");
+        let dump = std::env::var("KIMI_P4HALF_DIR").expect("set KIMI_P4HALF_DIR (oracle dump)");
         let cfg = fixture_config();
         // Window [0,5): all fully in shard 1 (KDA-dense L0, MLA L3, KDA-MoE L1..).
         let model = KimiModel::load_cpu(&ckpt, &cfg, 0, 5, false).expect("load_cpu");
@@ -2723,14 +2653,10 @@ mod p5_tests {
     }
 
     #[test]
+    #[ignore = "needs the full checkpoint: KIMI_CKPT + KIMI_P5_DIR (run with --ignored)"]
     fn kimi_p5_full_model_gate() {
-        let (ckpt, dump) = match (std::env::var("KIMI_CKPT"), std::env::var("KIMI_P5_DIR")) {
-            (Ok(a), Ok(b)) => (a, b),
-            _ => {
-                eprintln!("P5 SKIP: set KIMI_CKPT (full checkpoint) + KIMI_P5_DIR (oracle dump)");
-                return;
-            }
-        };
+        let ckpt = std::env::var("KIMI_CKPT").expect("set KIMI_CKPT (full checkpoint)");
+        let dump = std::env::var("KIMI_P5_DIR").expect("set KIMI_P5_DIR (oracle dump)");
         let stride: usize = std::env::var("KIMI_P5_STRIDE")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -2818,7 +2744,7 @@ mod p5_tests {
                 let fnorm = model.final_norm.as_ref().expect("final_norm at tail");
                 let lm = model.lm_head.as_ref().expect("lm_head at tail");
                 let vocab = lm.len() / h;
-                let normed = rmsnorm(&hidden, seq, h, fnorm, eps);
+                let normed = crate::model::cpu_rms_norm(&hidden, fnorm, eps);
 
                 // depth-chain spot-check: max_abs_err + worst cos on the normed hidden
                 let (mut worst_mae, mut worst_cos) = (0f64, 1f64);
@@ -2936,6 +2862,21 @@ mod p_decode_tests {
         KimiConfig::from_json(&serde_json::from_str(&raw).unwrap()).unwrap()
     }
 
+    /// The router sorts with `total_cmp`: a NaN logit (or bias) selects
+    /// deterministically instead of panicking in `partial_cmp().unwrap()`.
+    #[test]
+    fn moe_route_tolerates_nan_scores() {
+        let mut logits: Vec<f32> = (0..16).map(|i| i as f32 * 0.1 - 0.8).collect();
+        logits[5] = f32::NAN;
+        let bias = vec![0.0f32; 16];
+        let (inds, w) = moe::route(&logits, &bias, 8, 2.446, true);
+        assert_eq!(inds.len(), 8);
+        let mut uniq = inds.clone(); uniq.sort(); uniq.dedup();
+        assert_eq!(uniq.len(), 8, "duplicate experts selected: {inds:?}");
+        assert!(inds.iter().all(|&i| i < 16));
+        assert_eq!(w.len(), 8);
+    }
+
     /// `forward_pp_stage` returns `Err` (the seams raise a Python exception)
     /// instead of panicking on a bad token, a wrong-size hidden or a missing edge
     /// weight; `want_logits = false` skips the tail lm_head; reset is a Result.
@@ -2946,7 +2887,7 @@ mod p_decode_tests {
         let model = |start: usize, end: usize| KimiModel {
             cfg: cfg.clone(), layer_start: start, layer_end: end, layers: Vec::new(),
             embed: None, final_norm: None, lm_head: None, states: Vec::new(), gpu: None,
-            pp_recv_scratch: Vec::new(), pp_recv_handle: 0, pp_send_scratch: Vec::new(), pp_send_handle: 0,
+            pp_hop_recv: Default::default(), pp_hop_send: Default::default(),
         };
         let mut first = model(0, 3);
         let e = first.forward_pp_stage(vocab as u32, &[], 0).unwrap_err();
@@ -2966,14 +2907,9 @@ mod p_decode_tests {
     }
 
     #[test]
+    #[ignore = "needs the checkpoint: KIMI_CKPT (shard 1, window [0,5)) (run with --ignored)"]
     fn kimi_decode_eq_prefill_bit_exact() {
-        let ckpt = match std::env::var("KIMI_CKPT") {
-            Ok(c) => c,
-            Err(_) => {
-                eprintln!("decode SKIP: set KIMI_CKPT (checkpoint dir w/ shard 1 for window [0,5))");
-                return;
-            }
-        };
+        let ckpt = std::env::var("KIMI_CKPT").expect("set KIMI_CKPT (checkpoint dir w/ shard 1 for window [0,5))");
         let cfg = fixture_config();
         let h = cfg.hidden_size;
         let l = 6usize; // token-stream length (each step is one decode token)
@@ -2987,7 +2923,7 @@ mod p_decode_tests {
             s = s
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
-            *v = ((s >> 40) as f32 / (1u64 << 24) as f32 - 0.5); // ~[-0.5,0.5]
+            *v = (s >> 40) as f32 / (1u64 << 24) as f32 - 0.5; // ~[-0.5,0.5]
         }
 
         // (a) fresh full-sequence prefill through the window.
@@ -3031,14 +2967,9 @@ mod p_decode_tests {
     /// per-stage state carry (the cluster PP machinery) on CPU, single-node. Also
     /// smoke-checks `forward_pp_stage`'s embed (first-stage) + non-last return path.
     #[test]
+    #[ignore = "needs the checkpoint: KIMI_CKPT (shard-1 windows [0,2)+[2,5)) (run with --ignored)"]
     fn kimi_pp_stage_decompose_bit_exact() {
-        let ckpt = match std::env::var("KIMI_CKPT") {
-            Ok(c) => c,
-            Err(_) => {
-                eprintln!("PP-decompose SKIP: set KIMI_CKPT (shard-1 windows [0,2)+[2,5))");
-                return;
-            }
-        };
+        let ckpt = std::env::var("KIMI_CKPT").expect("set KIMI_CKPT (shard-1 windows [0,2)+[2,5))");
         let cfg = fixture_config();
         let h = cfg.hidden_size;
         let l = 6usize;
