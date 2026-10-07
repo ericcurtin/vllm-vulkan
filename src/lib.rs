@@ -5309,7 +5309,7 @@ impl VulkanModel {
                 "prompt length {t} exceeds max_seq_len {} — construct VulkanModel with a larger max_seq_len",
                 self.max_seq_len)));
         }
-        self.reset_kv_cache();
+        self.reset_kv_cache()?;
 
         // Embed all T tokens → [T, h].
         let mut hidden: Vec<f32> = {
@@ -5428,12 +5428,12 @@ impl VulkanModel {
 
         // (a) serial: T per-token decode steps from a fresh cache.
         for _ in 0..warmup {
-            self.reset_kv_cache();
+            self.reset_kv_cache()?;
             for (i, &tok) in tokens.iter().enumerate() { self.forward(tok, i)?; }
         }
         let mut serial = std::time::Duration::ZERO;
         for _ in 0..iters {
-            self.reset_kv_cache();
+            self.reset_kv_cache()?;
             let t0 = std::time::Instant::now();
             for (i, &tok) in tokens.iter().enumerate() { self.forward(tok, i)?; }
             serial += t0.elapsed();
@@ -5472,10 +5472,10 @@ impl VulkanModel {
         // (it appends at the caller-given start_pos, trusting caller-managed
         // state — see truncate_kv/§5) so the harness resets explicitly before
         // every timed call, same as the serial loop above.
-        for _ in 0..warmup { self.reset_kv_cache(); self.forward_batched(tokens.clone(), 0)?; }
+        for _ in 0..warmup { self.reset_kv_cache()?; self.forward_batched(tokens.clone(), 0)?; }
         let mut batched = std::time::Duration::ZERO;
         for _ in 0..iters {
-            self.reset_kv_cache();
+            self.reset_kv_cache()?;
             let t0 = std::time::Instant::now();
             self.forward_batched(tokens.clone(), 0)?;
             batched += t0.elapsed();
@@ -5748,7 +5748,7 @@ impl VulkanModel {
         if prompt.is_empty() {
             return Err(PyRuntimeError::new_err("debug_mtp_draft_vs_greedy: empty prompt"));
         }
-        self.reset_kv_cache();
+        self.reset_kv_cache()?;
         let mut last = Vec::new();
         for (i, &tok) in prompt.iter().enumerate() {
             last = self.forward_pp_qwen35_impl(tok, Vec::new(), i)?;
@@ -5803,8 +5803,10 @@ impl VulkanModel {
         Ok(cos_maxd(&gpu, &cpu))
     }
 
-    /// Reset the KV cache (start a new sequence).
-    fn reset_kv_cache(&mut self) {
+    /// Reset the KV cache (start a new sequence). A failure (e.g. a GPU-resident
+    /// state that cannot be zeroed) is a `RuntimeError`: decoding on top of a
+    /// half-reset state would silently mix two requests (PR #96 review).
+    fn reset_kv_cache(&mut self) -> PyResult<()> {
         // Restart the Gemma 1-CB resident-KV watermark for the new sequence.
         // gpu_kv buffers stay allocated (each position is overwritten before it
         // is read, so no stale-read hazard); only the fill counter resets.
@@ -5815,10 +5817,8 @@ impl VulkanModel {
         // ling prefill seam also self-resets, so this is belt-and-suspenders.
         #[cfg(feature = "ling")]
         if let Some(m) = self.ling.as_mut() {
-            if let Err(e) = m.reset_decode_state() {
-                log::error!("reset_kv_cache: ling reset_decode_state failed: {e}");
-            }
-            return;
+            return m.reset_decode_state().map_err(|e| PyRuntimeError::new_err(
+                format!("reset_kv_cache: ling reset_decode_state failed: {e}")));
         }
         // Kimi-Linear: the same shape of state as Ling (KDA recurrence + conv
         // window + MLA KV, host and the GPU-resident stage). Without this branch a
@@ -5826,10 +5826,15 @@ impl VulkanModel {
         // previous one.
         #[cfg(feature = "kimi")]
         if let Some(m) = self.kimi.as_mut() {
-            if let Err(e) = m.reset_decode_state() {
-                log::error!("reset_kv_cache: kimi reset_decode_state failed: {e}");
-            }
-            return;
+            return m.reset_decode_state().map_err(|e| PyRuntimeError::new_err(
+                format!("reset_kv_cache: kimi reset_decode_state failed: {e}")));
+        }
+        // Step-3.7: the stateful decode (host KV + the GPU-resident stage's KV and
+        // attention buffers). Same gap as Kimi: without this an OP_RESET fell through.
+        #[cfg(feature = "step3p7")]
+        if let Some(m) = self.step3p7.as_mut() {
+            m.reset_decode_state();
+            return Ok(());
         }
         #[cfg(feature = "qwen35")]
         if let Some(m) = self.qwen35.as_mut() {
@@ -5838,10 +5843,12 @@ impl VulkanModel {
             // while VLLM_VULKAN_DN_GPU is on — zero it alongside the CPU state
             // (host-coherent buffers: a direct write is safe between submits).
             for l in self.dn_gpu.values() {
-                let _ = l.conv_state.write(&vec![0u8; l.conv_state.size as usize]);
-                let _ = l.state.write(&vec![0u8; l.state.size as usize]);
+                l.conv_state.write(&vec![0u8; l.conv_state.size as usize])
+                    .and_then(|_| l.state.write(&vec![0u8; l.state.size as usize]))
+                    .map_err(|e| PyRuntimeError::new_err(
+                        format!("reset_kv_cache: zeroing the GPU DeltaNet state failed: {e}")))?;
             }
-            return;
+            return Ok(());
         }
         // Nemotron-H: per-request Mamba2 recurrence (conv + ssm state, host AND
         // the GPU-resident scan state) plus the NoPE-attention KV. Without this
@@ -5853,7 +5860,7 @@ impl VulkanModel {
         #[cfg(feature = "nemotron")]
         if let Some(m) = self.nemotron.as_mut() {
             m.reset();
-            return;
+            return Ok(());
         }
         // Laguna: the only per-sequence state is the resident model's K/V — the
         // host `kv` map (per-op path) AND the device `kv_res` planes (1-CB path,
@@ -5870,10 +5877,11 @@ impl VulkanModel {
         #[cfg(feature = "laguna")]
         if let Some(g) = self.laguna_gpu.as_mut() {
             g.reset_kv();
-            return;
+            return Ok(());
         }
         #[cfg(feature = "gemma")]
         self.cpu_model_mut().reset_kv_cache();
+        Ok(())
     }
 
     /// P1 speculative-pipelining: snapshot ALL per-token mutable decode state

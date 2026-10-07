@@ -1126,7 +1126,7 @@ impl VulkanModel {
                  ring-correct resident decode path.",
                 cfg.sliding_window, cfg.num_kv_shared_layers)));
         }
-        self.reset_kv_cache();
+        self.reset_kv_cache()?;
 
         // ── Embed + PLE for all T tokens. gemma_embed_and_ple returns, per
         // token: (hidden[h] (×embed_scale), ple_inputs[num_layers*ple_dim]).
