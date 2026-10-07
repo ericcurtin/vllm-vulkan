@@ -120,55 +120,23 @@ impl VulkanModel {
         let comm = self.collective_comm as *mut std::os::raw::c_void;
         let (do_recv, is_last) = pp_step_role(recv_from, send_to);
 
-        // Pin the persistent [H] PP-hop scratch with the RDMA transport ONCE
-        // (recv side + send side), so vCCL's send/recv skip the per-call
-        // `ibv_reg_mr`/dereg temp-MR — the "buffer not registered with the comm"
-        // warning and the ~700 ms/tok Kimi PP-3 comm floor. Registration is
-        // gated by `VLLM_VULKAN_REG_REDUCE` (same lever as the TP reduce scratch)
-        // and libvccl exposing `vcclCommRegister`; on failure we fall back to the
-        // fresh-Vec recv_f32/send_f32 path (correct, just per-call regMr).
-        let want_reg = self.flags.reg_reduce
-            && !comm.is_null()
-            && vccl_ffi::registration_available();
-        if want_reg {
-            let km = self.kimi.as_mut().unwrap();
-            if do_recv && km.pp_hop_recv.handle == 0 {
-                pin_pp_hop(comm, &mut km.pp_hop_recv, h, "pp_step_kimi recv");
-            }
-            if !is_last && km.pp_hop_send.handle == 0 {
-                pin_pp_hop(comm, &mut km.pp_hop_send, h, "pp_step_kimi send");
-            }
-        }
-
-        // 1) recv the previous stage's hidden INTO the registered scratch (fast
-        //    pre-pinned MR), or empty on the first stage (it embeds token_id).
-        let hidden_in: Vec<f32> = if do_recv {
-            let km = self.kimi.as_mut().unwrap();
-            if km.pp_hop_recv.handle != 0 {
-                vccl_ffi::recv_f32_into(py, comm, &mut km.pp_hop_recv.buf, recv_from)
-                    .map_err(PyRuntimeError::new_err)?;
-                km.pp_hop_recv.buf.clone()
-            } else {
-                vccl_ffi::recv_f32(py, comm, h, recv_from).map_err(PyRuntimeError::new_err)?
-            }
-        } else {
-            Vec::new()
-        };
+        // Pin the persistent [H] PP-hop scratches ONCE so vCCL's send/recv skip the
+        // per-call `ibv_reg_mr`/dereg temp MR (the ~700 ms/tok Kimi PP-3 comm floor).
+        // Gated by `VLLM_VULKAN_REG_REDUCE` + libvccl exposing `vcclCommRegister`;
+        // otherwise the hop helpers fall back to a fresh Vec (correct, slower).
+        let want_reg = self.flags.reg_reduce && vccl_ffi::registration_available();
+        let km = self.kimi.as_mut().unwrap();
+        pin_pp_hops(comm, want_reg, &mut km.pp_hop_recv, &mut km.pp_hop_send, h, do_recv, !is_last,
+                    "pp_step_kimi");
+        // 1) recv the previous stage's hidden (empty on the first stage: it embeds token_id).
+        let hidden_in = if do_recv { pp_hop_recv(py, comm, &mut km.pp_hop_recv, h, recv_from)? } else { Vec::new() };
 
         let out = self.kimi.as_mut().unwrap().forward_pp_stage(token_id, &hidden_in, pos)
             .map_err(PyRuntimeError::new_err)?;
 
         if !is_last {
-            // 3) send onward FROM the registered scratch (mid/first stage out is
-            //    [H]); fall back to a fresh-Vec send if registration is off.
-            let km = self.kimi.as_mut().unwrap();
-            if km.pp_hop_send.handle != 0 && out.len() == km.pp_hop_send.buf.len() {
-                km.pp_hop_send.buf.copy_from_slice(&out);
-                vccl_ffi::send_f32(py, comm, &km.pp_hop_send.buf, send_to)
-                    .map_err(PyRuntimeError::new_err)?;
-            } else {
-                vccl_ffi::send_f32(py, comm, &out, send_to).map_err(PyRuntimeError::new_err)?;
-            }
+            // 3) send the [H] hidden onward.
+            pp_hop_send(py, comm, &mut self.kimi.as_mut().unwrap().pp_hop_send, &out, send_to)?;
             Ok(None)
         } else {
             let (mut bi, mut bv) = (0usize, f32::NEG_INFINITY);
@@ -216,35 +184,13 @@ impl VulkanModel {
         let (do_recv, is_last) = pp_step_role(recv_from, send_to);
         let is_first = recv_from < 0;
 
-        // Pin the persistent [H] PP-hop scratch ONCE (recv + send), mirroring
-        // `pp_step_kimi`; on failure fall back to the fresh-Vec recv/send path.
-        let want_reg = self.flags.reg_reduce
-            && !comm.is_null()
-            && vccl_ffi::registration_available();
-        if want_reg {
-            let km = self.kimi.as_mut().unwrap();
-            if do_recv && km.pp_hop_recv.handle == 0 {
-                pin_pp_hop(comm, &mut km.pp_hop_recv, h, "pp_step_kimi_logits recv");
-            }
-            if !is_last && km.pp_hop_send.handle == 0 {
-                pin_pp_hop(comm, &mut km.pp_hop_send, h, "pp_step_kimi_logits send");
-            }
-        }
-
-        // 1) recv the previous stage's [H] hidden INTO the registered scratch, or
-        //    empty on the first stage (it embeds token_id).
-        let hidden_in: Vec<f32> = if do_recv {
-            let km = self.kimi.as_mut().unwrap();
-            if km.pp_hop_recv.handle != 0 {
-                vccl_ffi::recv_f32_into(py, comm, &mut km.pp_hop_recv.buf, recv_from)
-                    .map_err(PyRuntimeError::new_err)?;
-                km.pp_hop_recv.buf.clone()
-            } else {
-                vccl_ffi::recv_f32(py, comm, h, recv_from).map_err(PyRuntimeError::new_err)?
-            }
-        } else {
-            Vec::new()
-        };
+        // Pin the [H] PP-hop scratches once and recv the previous stage's hidden,
+        // exactly as `pp_step_kimi`.
+        let want_reg = self.flags.reg_reduce && vccl_ffi::registration_available();
+        let km = self.kimi.as_mut().unwrap();
+        pin_pp_hops(comm, want_reg, &mut km.pp_hop_recv, &mut km.pp_hop_send, h, do_recv, !is_last,
+                    "pp_step_kimi_logits");
+        let hidden_in = if do_recv { pp_hop_recv(py, comm, &mut km.pp_hop_recv, h, recv_from)? } else { Vec::new() };
 
         // 2) resident stage forward (Kimi ignores pos → internal tracking). [H]
         //    on mid stages, [vocab] on the last.
@@ -256,16 +202,8 @@ impl VulkanModel {
             return Ok(Some(out)); // STANDALONE N=1: `out` is already [vocab].
         }
         if !is_last {
-            // FIRST / MID: forward `[H]` onward FROM the registered scratch, then
-            // (rank0 only) recv the ring-back.
-            let km = self.kimi.as_mut().unwrap();
-            if km.pp_hop_send.handle != 0 && out.len() == km.pp_hop_send.buf.len() {
-                km.pp_hop_send.buf.copy_from_slice(&out);
-                vccl_ffi::send_f32(py, comm, &km.pp_hop_send.buf, send_to)
-                    .map_err(PyRuntimeError::new_err)?;
-            } else {
-                vccl_ffi::send_f32(py, comm, &out, send_to).map_err(PyRuntimeError::new_err)?;
-            }
+            // FIRST / MID: forward `[H]` onward, then (rank0 only) recv the ring-back.
+            pp_hop_send(py, comm, &mut self.kimi.as_mut().unwrap().pp_hop_send, &out, send_to)?;
             if is_first {
                 // rank0: ring the [vocab] back from the last stage through the
                 // registered `pp_vocab_ring` (no per-step temp-MR).
