@@ -269,6 +269,51 @@ pub struct LingGpuStage {
     resident_layer: bool,
 }
 
+/// One decoder layer through the host seam (op-by-op): host RMSNorms and
+/// residuals around the GPU attention (KDA or MLA) and MLP (dense or MoE)
+/// dispatches. Shared by the non-resident stage and the resident stage's
+/// fallback layers (MLA, or a MoE that is not fully GPU-driven). Returns the
+/// layer output `x + attn + mlp` (pre-norm residual form).
+#[allow(clippy::too_many_arguments)]
+fn host_seam_layer(eng: &mut compute::ComputeEngine, layer: &mut LLayerR, x: &[f32], h: usize,
+                   eps: f32, kda_fused: bool, moe_indirect: bool, moe_batch: bool)
+                   -> Result<Vec<f32>, String> {
+    let xn = ling::rmsnorm(x, 1, h, &layer.input_ln, eps);
+    let attn = match &mut layer.attn {
+        LAttnR::Kda(kda) => {
+            if kda_fused && kda.safe_gate {
+                kda_step_resident_fused(eng, kda, &xn, eps)?
+            } else {
+                kda_step_resident(eng, kda, &xn)?
+            }
+        }
+        LAttnR::Mla(m) => match m {
+            LMlaR::Host(w, c) => w.decode_step(&xn, c),
+            LMlaR::Gpu(g) => mla_step_resident(eng, g, &xn)?,
+        },
+    };
+    let hres: Vec<f32> = x.iter().zip(&attn).map(|(a, b)| a + b).collect();
+    let hn = ling::rmsnorm(&hres, 1, h, &layer.post_ln, eps);
+    let mlp = match &layer.mlp {
+        LMlpR::Dense(d) => dense_step_resident(eng, d, &hn)?,
+        LMlpR::Moe(m) => {
+            // Fully-GPU-driven route->meta->matvec (one CB, no host index readback)
+            // when the lever is on AND every expert is resident (else the host can't
+            // detect a streamed expert). Otherwise the host-route batched/per-expert
+            // path (the standalone GPU router as its own submit is a known
+            // regression -- not used).
+            if moe_gpu_driven(m, moe_indirect, moe_batch) {
+                moe_combine_batched_fused(eng, m, &hn, h)?
+            } else if moe_batch {
+                moe_combine_batched(eng, m, &hn, h, false)?
+            } else {
+                moe_combine_resident(eng, m, &hn, h, false)?
+            }
+        }
+    };
+    Ok(hres.iter().zip(&mlp).map(|(a, b)| a + b).collect())
+}
+
 /// Per-layer upload context: the resident-layout levers + dims needed to mirror
 /// ONE host `LingLayer` into GPU-resident buffers. Shared by `from_cpu` (consume a
 /// fully-loaded CPU window) and `from_ckpt_streamed` (per-layer read→upload→free),
@@ -698,68 +743,42 @@ impl LingGpuStage {
         if self.resident_layer {
             return self.forward_pp_stage_resident(token_id, hidden_in, want_logits);
         }
-        let h = self.h;
-        let eps = self.eps;
-        let mut x = if self.first {
-            embed_row(self.embed.as_ref(), token_id, h)?
-        } else {
-            if hidden_in.len() != h {
-                return Err(format!("PP hidden_in {} != {h}", hidden_in.len()));
-            }
-            hidden_in.to_vec()
-        };
-
+        let (h, eps) = (self.h, self.eps);
+        let (moe_indirect, moe_batch, kda_fused) = (self.moe_indirect, self.moe_batch, self.kda_fused);
+        let mut x = self.stage_input(token_id, hidden_in)?;
         let eng = &mut self.eng;
         for layer in self.layers.iter_mut() {
-            let xn = ling::rmsnorm(&x, 1, h, &layer.input_ln, eps);
-            let attn = match &mut layer.attn {
-                LAttnR::Kda(kda) => {
-                    if self.kda_fused && kda.safe_gate {
-                        kda_step_resident_fused(eng, kda, &xn, eps)?
-                    } else {
-                        kda_step_resident(eng, kda, &xn)?
-                    }
-                }
-                LAttnR::Mla(m) => match m {
-                    LMlaR::Host(w, c) => w.decode_step(&xn, c),
-                    LMlaR::Gpu(g) => mla_step_resident(eng, g, &xn)?,
-                },
-            };
-            let mut hres = vec![0f32; h];
-            for i in 0..h { hres[i] = x[i] + attn[i]; }
-            let hn = ling::rmsnorm(&hres, 1, h, &layer.post_ln, eps);
-            let mlp = match &layer.mlp {
-                LMlpR::Dense(d) => dense_step_resident(eng, d, &hn)?,
-                LMlpR::Moe(m) => {
-                    // Fully-GPU-driven route->meta->matvec (one CB, no host index
-                    // readback) when the lever is on AND every expert is resident
-                    // (else the host can't detect a streamed expert). Otherwise the
-                    // host-route batched/per-expert path (the standalone GPU router
-                    // as its own submit is a known regression — not used).
-                    if moe_gpu_driven(m, self.moe_indirect, self.moe_batch) {
-                        moe_combine_batched_fused(eng, m, &hn, h)?
-                    } else if self.moe_batch {
-                        moe_combine_batched(eng, m, &hn, h, false)?
-                    } else {
-                        moe_combine_resident(eng, m, &hn, h, false)?
-                    }
-                }
-            };
-            let mut out = vec![0f32; h];
-            for i in 0..h { out[i] = hres[i] + mlp[i]; }
-            x = out;
+            x = host_seam_layer(eng, layer, &x, h, eps, kda_fused, moe_indirect, moe_batch)?;
         }
+        self.stage_tail(x, want_logits)
+    }
 
-        if self.last && !want_logits {
-            Ok(Vec::new())
-        } else if self.last {
-            let fnorm = self.final_norm.as_ref().ok_or("tail stage requires final_norm")?;
-            let normed = ling::rmsnorm(&x, 1, h, fnorm, eps);
-            let lm = self.lm_head.as_ref().ok_or("tail stage requires lm_head")?;
-            f32_matvec_once(&mut self.eng, lm, &normed)
+    /// The stage's input hidden: the embedding row on the first stage, else the
+    /// previous stage's `[H]` (length-checked).
+    fn stage_input(&self, token_id: u32, hidden_in: &[f32]) -> Result<Vec<f32>, String> {
+        let h = self.h;
+        if self.first {
+            embed_row(self.embed.as_ref(), token_id, h)
+        } else if hidden_in.len() != h {
+            Err(format!("PP hidden_in {} != {h}", hidden_in.len()))
         } else {
-            Ok(x)
+            Ok(hidden_in.to_vec())
         }
+    }
+
+    /// The stage's output: `[vocab]` logits on the last stage (empty when
+    /// `want_logits` is false), else the `[H]` hidden to ship onward.
+    fn stage_tail(&mut self, x: Vec<f32>, want_logits: bool) -> Result<Vec<f32>, String> {
+        if !self.last {
+            return Ok(x);
+        }
+        if !want_logits {
+            return Ok(Vec::new());
+        }
+        let fnorm = self.final_norm.as_ref().ok_or("tail stage requires final_norm")?;
+        let normed = ling::rmsnorm(&x, 1, self.h, fnorm, self.eps);
+        let lm = self.lm_head.as_ref().ok_or("tail stage requires lm_head")?;
+        f32_matvec_once(&mut self.eng, lm, &normed)
     }
 
     /// Resident single-CB-layer decode (`VLLM_VULKAN_LING_RESIDENT_LAYER`). The
@@ -781,17 +800,9 @@ impl LingGpuStage {
         let h = self.h;
         let eps = self.eps;
         let (moe_indirect, moe_batch, kda_fused) = (self.moe_indirect, self.moe_batch, self.kda_fused);
-        let first = self.first;
 
         // initial hidden -> resident GPU buffer
-        let x0: Vec<f32> = if first {
-            embed_row(self.embed.as_ref(), token_id, h)?
-        } else {
-            if hidden_in.len() != h {
-                return Err(format!("PP hidden_in {} != {h}", hidden_in.len()));
-            }
-            hidden_in.to_vec()
-        };
+        let x0 = self.stage_input(token_id, hidden_in)?;
 
         let eng = &mut self.eng;
         let x_buf = alloc(eng, h)?;
@@ -848,51 +859,14 @@ impl LingGpuStage {
             } else {
                 // ---- host-seam op-by-op path (MLA / non-resident MoE) ----
                 let x = read_f32_buf(&x_buf, h);
-                let xn = ling::rmsnorm(&x, 1, h, &layer.input_ln, eps);
-                let attn = match &mut layer.attn {
-                    LAttnR::Kda(kda) => {
-                        if kda_fused && kda.safe_gate { kda_step_resident_fused(eng, kda, &xn, eps)? }
-                        else { kda_step_resident(eng, kda, &xn)? }
-                    }
-                    LAttnR::Mla(m) => match m {
-                        LMlaR::Host(w, c) => w.decode_step(&xn, c),
-                        LMlaR::Gpu(gp) => mla_step_resident(eng, gp, &xn)?,
-                    },
-                };
-                let mut hres = vec![0f32; h];
-                for i in 0..h { hres[i] = x[i] + attn[i]; }
-                let hn = ling::rmsnorm(&hres, 1, h, &layer.post_ln, eps);
-                let mlp = match &layer.mlp {
-                    LMlpR::Dense(d) => dense_step_resident(eng, d, &hn)?,
-                    LMlpR::Moe(m) => {
-                        if moe_gpu_driven(m, moe_indirect, moe_batch) {
-                            moe_combine_batched_fused(eng, m, &hn, h)?
-                        } else if moe_batch {
-                            moe_combine_batched(eng, m, &hn, h, false)?
-                        } else {
-                            moe_combine_resident(eng, m, &hn, h, false)?
-                        }
-                    }
-                };
-                let mut out = vec![0f32; h];
-                for i in 0..h { out[i] = hres[i] + mlp[i]; }
+                let out = host_seam_layer(eng, layer, &x, h, eps, kda_fused, moe_indirect, moe_batch)?;
                 x_buf.write(&f32_slice_to_bytes(&out))?;
             }
         }
 
         let x = read_f32_buf(&x_buf, h);
         self.eng.return_to_pool(x_buf);
-
-        if self.last && !want_logits {
-            Ok(Vec::new())
-        } else if self.last {
-            let fnorm = self.final_norm.as_ref().ok_or("tail stage requires final_norm")?;
-            let normed = ling::rmsnorm(&x, 1, h, fnorm, eps);
-            let lm = self.lm_head.as_ref().ok_or("tail stage requires lm_head")?;
-            f32_matvec_once(&mut self.eng, lm, &normed)
-        } else {
-            Ok(x)
-        }
+        self.stage_tail(x, want_logits)
     }
 
     /// Router-selection gate (Phase-1): for the FIRST MoE layer in this window,

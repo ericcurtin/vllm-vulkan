@@ -476,6 +476,15 @@ compile "mul_mat_vec_nvfp4repack_f32_f32" "mul_mat_vec_nvfp4repack_f32_f32.comp"
 # win. Bit-exact vs the f32-fold repack (parenthesized global fold).
 compile "mul_mat_vec_nvfp4_e4m3repack_f32_f32" "mul_mat_vec_nvfp4_e4m3repack_f32_f32.comp"
 
+# NVFP4-e4m3 repack EXPERT-BATCHED (VLLM_VULKAN_STEP37_EXPERT_BATCH, default ON):
+# the Step-3.7-Flash MoE decode dispatch collapse. The batched analog of
+# mul_mat_vec_nvfp4_e4m3repack_f32_f32 -- same dwordx4 repack dequant + subgroupAdd
+# reduction body, plus a per-expert meta[] base lookup + per-expert globals[] and a
+# 2D dispatch (gl_WorkGroupID.y = expert slot). BIT-EXACT with the per-expert e4m3
+# repack dispatches it replaces. Same mul_mat_vec_ prefix -> build.rs classes it
+# Matvec -> auto _r2/_r4/_r8 + geom _bs{bs}_r{r} siblings.
+compile "mul_mat_vec_nvfp4_e4m3repack_batched_f32_f32" "mul_mat_vec_nvfp4_e4m3repack_batched_f32_f32.comp"
+
 # NVFP4 E4M3-RESIDENT scale variant (VLLM_VULKAN_NVFP4_E4M3_SCALES=1). Keeps the
 # raw per-group e4m3 block scale resident (1 byte) + the per-tensor f32 global as
 # a push-constant, re-adding the e4m3 decode in-loop (0.5 bits/param vs the

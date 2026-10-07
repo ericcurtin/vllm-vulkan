@@ -227,6 +227,25 @@ pub struct KimiGpuStage {
 use crate::kimi::bytes_u32 as to_u32;
 use crate::st_decode::bf16_le_to_f32 as bf16;
 
+/// The shard files holding the tensors a `[layer_start, layer_end)` stage reads:
+/// every `model.layers.{l}.*` in the window, plus `model.embed_tokens.*` on the
+/// first stage and `model.norm.*` / `lm_head.*` on the last (when it loads edges).
+fn window_shards(wm: &serde_json::Map<String, serde_json::Value>, layer_start: usize,
+                 layer_end: usize, first_edges: bool, last_edges: bool) -> BTreeSet<String> {
+    let in_window = |name: &str| -> bool {
+        if let Some(rest) = name.strip_prefix("model.layers.") {
+            return rest.split('.').next().and_then(|l| l.parse::<usize>().ok())
+                .is_some_and(|l| (layer_start..layer_end).contains(&l));
+        }
+        (first_edges && name.starts_with("model.embed_tokens."))
+            || (last_edges && (name.starts_with("model.norm.") || name.starts_with("lm_head.")))
+    };
+    wm.iter()
+        .filter(|(k, _)| in_window(k))
+        .filter_map(|(_, v)| v.as_str().map(str::to_string))
+        .collect()
+}
+
 impl KimiGpuStage {
     /// Build the resident stage for window `[layer_start, layer_end)`. Uploads all
     /// packed KDA/MoE buffers ONCE. `load_edges` pulls embed (first stage) and
@@ -276,8 +295,9 @@ impl KimiGpuStage {
             wm.get(name).and_then(|x| x.as_str()).map(|s| s.to_string())
                 .ok_or_else(|| format!("{name} not in weight_map"))
         };
-        let mut shard_set: BTreeSet<String> = Default::default();
-        for v in wm.values() { if let Some(s) = v.as_str() { shard_set.insert(s.to_string()); } }
+        // Open only the shards this window reads (like `KimiModel::load_cpu`): a
+        // PP stage must not map the other stages' shards.
+        let shard_set = window_shards(wm, layer_start, layer_end, load_edges && first, load_edges && last);
         let mut mmaps: HashMap<String, Mmap> = Default::default();
         for sp in &shard_set {
             let f = std::fs::File::open(format!("{model_dir}/{sp}")).map_err(|e| format!("open {sp}: {e}"))?;
@@ -1409,5 +1429,33 @@ mod gpu_stage_tests {
         let b = gpu.forward_pp_stage(toks[0], &[], true).unwrap();
         assert!(cos(&a, &b) > 0.9999, "after reset the GPU stage does not restart from zero state");
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod window_shard_tests {
+    use super::window_shards;
+
+    #[test]
+    fn opens_only_the_windows_shards() {
+        let wm: serde_json::Map<String, serde_json::Value> = serde_json::from_str(r#"{
+            "model.embed_tokens.weight": "s1",
+            "model.layers.0.mlp.gate.weight": "s1",
+            "model.layers.1.mlp.gate.weight": "s2",
+            "model.layers.10.mlp.gate.weight": "s3",
+            "model.layers.2.self_attn.o_proj.weight": "s3",
+            "model.norm.weight": "s4",
+            "lm_head.weight": "s4",
+            "lm_head.scales": "s5"
+        }"#).unwrap();
+        let v = |a, b, f, l| window_shards(&wm, a, b, f, l).into_iter().collect::<Vec<_>>();
+        // Middle stage: layer 1 only; "model.layers.10" must not match layer 1.
+        assert_eq!(v(1, 2, false, false), ["s2"]);
+        // First stage with edges: embed + layers 0..2.
+        assert_eq!(v(0, 2, true, false), ["s1", "s2"]);
+        // Last stage with edges: layer 2 + norm + both lm_head shards.
+        assert_eq!(v(2, 3, false, true), ["s3", "s4", "s5"]);
+        // Edges off: no embed / norm / lm_head shards.
+        assert_eq!(v(0, 1, false, false), ["s1"]);
     }
 }

@@ -341,12 +341,18 @@ struct PpTokRing {
     handle: usize,
 }
 
-/// (Re-)pin a [`PpTokRing`] as a `len`-f32 RDMA-registered scratch on `comm`:
-/// deregister any prior handle, reallocate the buffer to `len` (a stable
-/// address while live), and `comm_register` it. On registration failure the
-/// buffer is cleared and `handle` left 0 so the caller falls back to the
-/// fresh-`Vec` send/recv (correct, just the per-call regMr). Free function so
-/// callers can pass `&mut self.pp_hop_send` while reading other `self` fields.
+/// Deregister a lazily pinned scratch against the comm it was pinned on (`comm`),
+/// then zero its handle and clear its buffer, so the next use re-pins it against
+/// the new comm (every pin site guards on `handle == 0`). `set_collective_comm`
+/// calls this for every scratch it owns before it swaps the handle.
+fn drop_pinned_scratch(comm: usize, handle: &mut usize, buf: &mut Vec<f32>) {
+    if *handle != 0 && comm != 0 {
+        let _ = vccl_ffi::comm_deregister(comm as *mut std::os::raw::c_void, *handle);
+    }
+    *handle = 0;
+    buf.clear();
+}
+
 /// Stage the `[vocab]` logits `out` into `ring` for a registered ring-back
 /// send. When `ring` is pinned (`handle != 0`) and correctly sized, `out` is
 /// copied into the NIC-registered buffer (stable address, no per-call temp-MR)
@@ -364,6 +370,12 @@ fn stage_vocab_send(ring: &mut PpTokRing, out: &[f32]) -> bool {
     }
 }
 
+/// (Re-)pin a [`PpTokRing`] as a `len`-f32 RDMA-registered scratch on `comm`:
+/// deregister any prior handle, reallocate the buffer to `len` (a stable
+/// address while live), and `comm_register` it. On registration failure the
+/// buffer is cleared and `handle` left 0 so the caller falls back to the
+/// fresh-`Vec` send/recv (correct, just the per-call regMr). Free function so
+/// callers can pass `&mut self.pp_hop_send` while reading other `self` fields.
 fn pin_pp_hop(comm: *mut std::os::raw::c_void, ring: &mut PpTokRing, len: usize, tag: &str) {
     if ring.handle != 0 {
         let _ = vccl_ffi::comm_deregister(comm, ring.handle);
@@ -377,6 +389,50 @@ fn pin_pp_hop(comm: *mut std::os::raw::c_void, ring: &mut PpTokRing, len: usize,
             log::warn!("{tag}: register PP hop scratch ({len} f32) failed: {e}; per-call regMr");
             ring.buf.clear();
         }
+    }
+}
+
+/// Pin a PP stage's `[len]` hop scratches once: the recv side when the stage has a
+/// previous stage (`do_recv`), the send side when it has a next one (`do_send`).
+/// Only when `want_reg` (registration on + libvccl exports it); an already pinned
+/// ring is left as is. A failed pin leaves `handle == 0`, and [`pp_hop_recv`] /
+/// [`pp_hop_send`] then fall back to a fresh `Vec`.
+#[allow(clippy::too_many_arguments)]
+fn pin_pp_hops(comm: *mut std::os::raw::c_void, want_reg: bool, recv: &mut PpTokRing,
+               send: &mut PpTokRing, len: usize, do_recv: bool, do_send: bool, tag: &str) {
+    if !want_reg || comm.is_null() {
+        return;
+    }
+    if do_recv && recv.handle == 0 {
+        pin_pp_hop(comm, recv, len, &format!("{tag} recv"));
+    }
+    if do_send && send.handle == 0 {
+        pin_pp_hop(comm, send, len, &format!("{tag} send"));
+    }
+}
+
+/// Receive the previous stage's `[len]` hidden: into the pinned `ring` (no per-call
+/// temp MR) when it is registered and sized for `len`, else into a fresh `Vec`.
+/// Same bytes either way; a ring pinned at another length is never used, so the
+/// receive count always matches the sender's.
+fn pp_hop_recv(py: Python<'_>, comm: *mut std::os::raw::c_void, ring: &mut PpTokRing,
+               len: usize, from: i32) -> PyResult<Vec<f32>> {
+    if ring.handle != 0 && ring.buf.len() == len {
+        vccl_ffi::recv_f32_into(py, comm, &mut ring.buf, from).map_err(PyRuntimeError::new_err)?;
+        Ok(ring.buf.clone())
+    } else {
+        vccl_ffi::recv_f32(py, comm, len, from).map_err(PyRuntimeError::new_err)
+    }
+}
+
+/// Send `out` to the next stage: from the pinned `ring` when it is registered and
+/// sized for `out`, else directly from `out`. Same bytes either way.
+fn pp_hop_send(py: Python<'_>, comm: *mut std::os::raw::c_void, ring: &mut PpTokRing,
+               out: &[f32], to: i32) -> PyResult<()> {
+    if stage_vocab_send(ring, out) {
+        vccl_ffi::send_f32(py, comm, &ring.buf, to).map_err(PyRuntimeError::new_err)
+    } else {
+        vccl_ffi::send_f32(py, comm, out, to).map_err(PyRuntimeError::new_err)
     }
 }
 
@@ -4438,99 +4494,34 @@ impl VulkanModel {
         // duration, so an in-flight collective cannot observe a torn-down
         // comm handle (or a second Python thread's re-entrant set) mid-flight.
         let _g = vccl_ffi::comm_lock().lock().unwrap_or_else(|e| e.into_inner());
-        // Drop any prior registration (handle is changing).
-        if self.reduce_scratch_handle != 0 && self.collective_comm != 0 {
-            let _ = vccl_ffi::comm_deregister(
-                self.collective_comm as *mut std::os::raw::c_void,
-                self.reduce_scratch_handle,
-            );
-            self.reduce_scratch_handle = 0;
+        // Drop every scratch pinned against the OLD comm (handle is changing): the
+        // all-reduce scratch, the PP ring-back token ring, the forward-hidden hop and
+        // [vocab] rings, and each model's own PP-hop scratches. A pinned handle kept
+        // across a comm change would be reused on the new comm with an MR that
+        // belongs to the old one (PR #93 / #94 review). Each pin site re-pins on its
+        // next use (guards: handle == 0).
+        let cur = self.collective_comm;
+        drop_pinned_scratch(cur, &mut self.reduce_scratch_handle, &mut self.reduce_scratch);
+        for ring in [&mut self.pp_tok_ring, &mut self.pp_hop_send, &mut self.pp_hop_recv,
+                     &mut self.pp_vocab_ring] {
+            drop_pinned_scratch(cur, &mut ring.handle, &mut ring.buf);
         }
-        // Same for the PP ring-back token scratch (registered lazily on the
-        // first `pp_bcast_token`, but re-pinned against the new comm here).
-        if self.pp_tok_ring.handle != 0 && self.collective_comm != 0 {
-            let _ = vccl_ffi::comm_deregister(
-                self.collective_comm as *mut std::os::raw::c_void,
-                self.pp_tok_ring.handle,
-            );
-            self.pp_tok_ring.handle = 0;
-            self.pp_tok_ring.buf.clear();
-        }
-        // Same for the non-fused forward-hidden hop scratch (qwen3.5 PP path,
-        // registered lazily on the first `pp_send_hidden`/`pp_recv_hidden`).
-        let cur_comm = self.collective_comm;
-        for ring in [&mut self.pp_hop_send, &mut self.pp_hop_recv, &mut self.pp_vocab_ring] {
-            if ring.handle != 0 && cur_comm != 0 {
-                let _ = vccl_ffi::comm_deregister(
-                    cur_comm as *mut std::os::raw::c_void,
-                    ring.handle,
-                );
-            }
-            ring.handle = 0;
-            ring.buf.clear();
-        }
-        // F7/F8 (PR #93 review): nemotron's PP-hop send/recv scratches are pinned
-        // lazily against whatever comm was live at first use, and their handles
-        // were the ONLY registrations this setter did not drop. After a comm
-        // change the nonzero handle was reused on the NEW comm while its
-        // registration still belonged to the old one — a send or recv through an
-        // invalid MR. Deregister against the OLD comm and zero both, so the next
-        // `pp_step_nemotron` re-pins them against the new one (its guards are
-        // `handle == 0`).
         #[cfg(feature = "nemotron")]
-        {
-            let cur = self.collective_comm;
-            if let Some(nem) = self.nemotron.as_mut() {
-                for (h, buf) in [
-                    (&mut nem.pp_recv_handle, &mut nem.pp_recv_scratch),
-                    (&mut nem.pp_send_handle, &mut nem.pp_send_scratch),
-                ] {
-                    if *h != 0 && cur != 0 {
-                        let _ = vccl_ffi::comm_deregister(cur as *mut std::os::raw::c_void, *h);
-                    }
-                    *h = 0;
-                    buf.clear();
-                }
-            }
+        if let Some(nem) = self.nemotron.as_mut() {
+            drop_pinned_scratch(cur, &mut nem.pp_recv_handle, &mut nem.pp_recv_scratch);
+            drop_pinned_scratch(cur, &mut nem.pp_send_handle, &mut nem.pp_send_scratch);
         }
-        // PR #94 review: the resident Laguna model pins FOUR scratches lazily the
-        // same way (PP hidden recv/send, the [vocab] serving ring-back, the top-K
-        // ring-back) and this setter dropped none of them — the nemotron defect
-        // above, again. Deregister against the OLD comm and zero them so the next
-        // `pp_step_laguna*` call re-pins against the new one (guards: handle == 0).
         #[cfg(feature = "laguna")]
-        {
-            let cur = self.collective_comm;
-            if let Some(g) = self.laguna_gpu.as_mut() {
-                for (h, buf) in [
-                    (&mut g.pp_recv_handle, &mut g.pp_recv_scratch),
-                    (&mut g.pp_send_handle, &mut g.pp_send_scratch),
-                    (&mut g.pp_vocab_handle, &mut g.pp_vocab_scratch),
-                    (&mut g.pp_topk_handle, &mut g.pp_topk_scratch),
-                ] {
-                    if *h != 0 && cur != 0 {
-                        let _ = vccl_ffi::comm_deregister(cur as *mut std::os::raw::c_void, *h);
-                    }
-                    *h = 0;
-                    buf.clear();
-                }
-            }
+        if let Some(g) = self.laguna_gpu.as_mut() {
+            drop_pinned_scratch(cur, &mut g.pp_recv_handle, &mut g.pp_recv_scratch);
+            drop_pinned_scratch(cur, &mut g.pp_send_handle, &mut g.pp_send_scratch);
+            drop_pinned_scratch(cur, &mut g.pp_vocab_handle, &mut g.pp_vocab_scratch);
+            drop_pinned_scratch(cur, &mut g.pp_topk_handle, &mut g.pp_topk_scratch);
         }
-        // Kimi's PP-hop scratches (`pp_hop_recv` / `pp_hop_send`) are pinned
-        // against the current comm by `pin_pp_hop` and re-pinned only while their
-        // handle is 0 — the nemotron / laguna defect above, again. Drop them with
-        // the OLD comm so the next `pp_step_kimi*` call re-pins against the new one.
         #[cfg(feature = "kimi")]
-        {
-            let cur = self.collective_comm;
-            if let Some(km) = self.kimi.as_mut() {
-                for ring in [&mut km.pp_hop_recv, &mut km.pp_hop_send] {
-                    if ring.handle != 0 && cur != 0 {
-                        let _ = vccl_ffi::comm_deregister(cur as *mut std::os::raw::c_void, ring.handle);
-                    }
-                    ring.handle = 0;
-                    ring.buf.clear();
-                }
+        if let Some(km) = self.kimi.as_mut() {
+            for ring in [&mut km.pp_hop_recv, &mut km.pp_hop_send] {
+                drop_pinned_scratch(cur, &mut ring.handle, &mut ring.buf);
             }
         }
         self.collective_comm = handle;
@@ -4633,13 +4624,7 @@ impl VulkanModel {
             return;
         }
         let _g = vccl_ffi::comm_lock().lock().unwrap_or_else(|e| e.into_inner());
-        if self.reduce_scratch_handle != 0 && self.collective_comm != 0 {
-            let _ = vccl_ffi::comm_deregister(
-                self.collective_comm as *mut std::os::raw::c_void,
-                self.reduce_scratch_handle,
-            );
-            self.reduce_scratch_handle = 0;
-        }
+        drop_pinned_scratch(self.collective_comm, &mut self.reduce_scratch_handle, &mut self.reduce_scratch);
         self.reduce_scratch = vec![0.0f32; min_len];
         let addr = self.reduce_scratch.as_ptr() as usize;
         let bytes = min_len * std::mem::size_of::<f32>();
@@ -5326,7 +5311,7 @@ impl VulkanModel {
                 "prompt length {t} exceeds max_seq_len {} — construct VulkanModel with a larger max_seq_len",
                 self.max_seq_len)));
         }
-        self.reset_kv_cache();
+        self.reset_kv_cache()?;
 
         // Embed all T tokens → [T, h].
         let mut hidden: Vec<f32> = {
@@ -5445,12 +5430,12 @@ impl VulkanModel {
 
         // (a) serial: T per-token decode steps from a fresh cache.
         for _ in 0..warmup {
-            self.reset_kv_cache();
+            self.reset_kv_cache()?;
             for (i, &tok) in tokens.iter().enumerate() { self.forward(tok, i)?; }
         }
         let mut serial = std::time::Duration::ZERO;
         for _ in 0..iters {
-            self.reset_kv_cache();
+            self.reset_kv_cache()?;
             let t0 = std::time::Instant::now();
             for (i, &tok) in tokens.iter().enumerate() { self.forward(tok, i)?; }
             serial += t0.elapsed();
@@ -5489,10 +5474,10 @@ impl VulkanModel {
         // (it appends at the caller-given start_pos, trusting caller-managed
         // state — see truncate_kv/§5) so the harness resets explicitly before
         // every timed call, same as the serial loop above.
-        for _ in 0..warmup { self.reset_kv_cache(); self.forward_batched(tokens.clone(), 0)?; }
+        for _ in 0..warmup { self.reset_kv_cache()?; self.forward_batched(tokens.clone(), 0)?; }
         let mut batched = std::time::Duration::ZERO;
         for _ in 0..iters {
-            self.reset_kv_cache();
+            self.reset_kv_cache()?;
             let t0 = std::time::Instant::now();
             self.forward_batched(tokens.clone(), 0)?;
             batched += t0.elapsed();
@@ -5765,7 +5750,7 @@ impl VulkanModel {
         if prompt.is_empty() {
             return Err(PyRuntimeError::new_err("debug_mtp_draft_vs_greedy: empty prompt"));
         }
-        self.reset_kv_cache();
+        self.reset_kv_cache()?;
         let mut last = Vec::new();
         for (i, &tok) in prompt.iter().enumerate() {
             last = self.forward_pp_qwen35_impl(tok, Vec::new(), i)?;
@@ -5820,8 +5805,10 @@ impl VulkanModel {
         Ok(cos_maxd(&gpu, &cpu))
     }
 
-    /// Reset the KV cache (start a new sequence).
-    fn reset_kv_cache(&mut self) {
+    /// Reset the KV cache (start a new sequence). A failure (e.g. a GPU-resident
+    /// state that cannot be zeroed) is a `RuntimeError`: decoding on top of a
+    /// half-reset state would silently mix two requests (PR #96 review).
+    fn reset_kv_cache(&mut self) -> PyResult<()> {
         // Restart the Gemma 1-CB resident-KV watermark for the new sequence.
         // gpu_kv buffers stay allocated (each position is overwritten before it
         // is read, so no stale-read hazard); only the fill counter resets.
@@ -5832,10 +5819,8 @@ impl VulkanModel {
         // ling prefill seam also self-resets, so this is belt-and-suspenders.
         #[cfg(feature = "ling")]
         if let Some(m) = self.ling.as_mut() {
-            if let Err(e) = m.reset_decode_state() {
-                log::error!("reset_kv_cache: ling reset_decode_state failed: {e}");
-            }
-            return;
+            return m.reset_decode_state().map_err(|e| PyRuntimeError::new_err(
+                format!("reset_kv_cache: ling reset_decode_state failed: {e}")));
         }
         // Kimi-Linear: the same shape of state as Ling (KDA recurrence + conv
         // window + MLA KV, host and the GPU-resident stage). Without this branch a
@@ -5843,10 +5828,15 @@ impl VulkanModel {
         // previous one.
         #[cfg(feature = "kimi")]
         if let Some(m) = self.kimi.as_mut() {
-            if let Err(e) = m.reset_decode_state() {
-                log::error!("reset_kv_cache: kimi reset_decode_state failed: {e}");
-            }
-            return;
+            return m.reset_decode_state().map_err(|e| PyRuntimeError::new_err(
+                format!("reset_kv_cache: kimi reset_decode_state failed: {e}")));
+        }
+        // Step-3.7: the stateful decode (host KV + the GPU-resident stage's KV and
+        // attention buffers). Same gap as Kimi: without this an OP_RESET fell through.
+        #[cfg(feature = "step3p7")]
+        if let Some(m) = self.step3p7.as_mut() {
+            m.reset_decode_state();
+            return Ok(());
         }
         #[cfg(feature = "qwen35")]
         if let Some(m) = self.qwen35.as_mut() {
@@ -5855,10 +5845,12 @@ impl VulkanModel {
             // while VLLM_VULKAN_DN_GPU is on — zero it alongside the CPU state
             // (host-coherent buffers: a direct write is safe between submits).
             for l in self.dn_gpu.values() {
-                let _ = l.conv_state.write(&vec![0u8; l.conv_state.size as usize]);
-                let _ = l.state.write(&vec![0u8; l.state.size as usize]);
+                l.conv_state.write(&vec![0u8; l.conv_state.size as usize])
+                    .and_then(|_| l.state.write(&vec![0u8; l.state.size as usize]))
+                    .map_err(|e| PyRuntimeError::new_err(
+                        format!("reset_kv_cache: zeroing the GPU DeltaNet state failed: {e}")))?;
             }
-            return;
+            return Ok(());
         }
         // Nemotron-H: per-request Mamba2 recurrence (conv + ssm state, host AND
         // the GPU-resident scan state) plus the NoPE-attention KV. Without this
@@ -5870,7 +5862,7 @@ impl VulkanModel {
         #[cfg(feature = "nemotron")]
         if let Some(m) = self.nemotron.as_mut() {
             m.reset();
-            return;
+            return Ok(());
         }
         // Laguna: the only per-sequence state is the resident model's K/V — the
         // host `kv` map (per-op path) AND the device `kv_res` planes (1-CB path,
@@ -5887,10 +5879,11 @@ impl VulkanModel {
         #[cfg(feature = "laguna")]
         if let Some(g) = self.laguna_gpu.as_mut() {
             g.reset_kv();
-            return;
+            return Ok(());
         }
         #[cfg(feature = "gemma")]
         self.cpu_model_mut().reset_kv_cache();
+        Ok(())
     }
 
     /// P1 speculative-pipelining: snapshot ALL per-token mutable decode state

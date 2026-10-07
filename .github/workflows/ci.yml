@@ -578,3 +578,88 @@ jobs:
         cargo test --no-default-features \
           --features "multiple-pymethods,gemma,qwen35,mtp,kimi" --lib \
           -- --test-threads=1 --nocapture
+
+  # Step-3.7-Flash (REAP-pruned MoE, streamed per-layer loader, TP-2 x PP decode).
+  # Standalone is the smallest build that must keep working and the only one where
+  # this model's #[cfg(test)] parity gates compile; stacked catches a shared-
+  # foundation regression. The lavapipe step runs the GPU-vs-host decode-attention
+  # test (scalar kernel on a software device).
+  rust-test-step3p7:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v6
+      with:
+        submodules: recursive
+        # No job needs git credentials after checkout, so do not leave the
+        # job's GITHUB_TOKEN in .git/config where the shader compiler and
+        # cargo build scripts this job runs could read it.
+        persist-credentials: false
+
+    - name: Install build + link deps
+      run: |
+        source scripts/lib.sh
+        ensure_vulkan
+        sudo apt-get install -y libvulkan-dev libpython3.12-dev
+
+    - name: Build the standalone step3p7 slice
+      run: |
+        cargo build --no-default-features --features "multiple-pymethods,step3p7"
+
+    - name: Run step3p7-slice Rust tests (standalone)
+      env:
+        RUST_BACKTRACE: '1'
+      run: |
+        # The test binary embeds the interpreter; point it at the system Python.
+        PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
+        test -n "$PYTHONHOME" || { echo "python3.12 reported no base_prefix" >&2; exit 1; }
+        export PYTHONHOME
+        # Single-threaded: two GEMM-picker tests race on a process-global
+        # env/OnceLock snapshot under the parallel runner.
+        cargo test --no-default-features --features "multiple-pymethods,step3p7" --lib \
+          -- --test-threads=1 --nocapture
+
+    - name: Install Mesa lavapipe (software Vulkan device)
+      run: |
+        sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
+        # The lavapipe ICD filename varies with Mesa packaging -- noble ships
+        # lvp_icd.x86_64.json while noble-updates ships lvp_icd.json -- and the
+        # directory differs across distros too. Discover it instead of pinning
+        # one spelling, and fail loudly (listing what IS installed) if absent,
+        # so this never degrades into a silently device-less run.
+        icd=$(find /usr/share/vulkan/icd.d /usr/lib/x86_64-linux-gnu/vulkan/icd.d \
+                -name 'lvp_icd*.json' 2>/dev/null | head -1)
+        if [ -z "$icd" ]; then
+          echo "::error::lavapipe ICD not found. Installed Vulkan ICDs:"
+          find /usr -name '*_icd*.json' 2>/dev/null | sed 's/^/  /'
+          exit 1
+        fi
+        echo "lavapipe ICD: $icd"
+        echo "VK_ICD_FILENAMES=$icd" >> "$GITHUB_ENV"
+        VK_ICD_FILENAMES="$icd" vulkaninfo --summary | head -40
+
+    - name: Run the Step-3.7 GPU attention test on the software Vulkan device
+      env:
+        RUST_BACKTRACE: '1'
+      run: |
+        # VK_ICD_FILENAMES comes from the lavapipe step via GITHUB_ENV. The test
+        # is #[ignore] so device-less runs report it as ignored, not passed; here
+        # it is opted in and panics if the device is missing.
+        PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
+        test -n "$PYTHONHOME" || { echo "python3.12 reported no base_prefix" >&2; exit 1; }
+        export PYTHONHOME
+        cargo test --no-default-features --features "multiple-pymethods,step3p7" --lib \
+          step37_gpu_attn -- --ignored --nocapture
+
+    - name: Run the stacked gemma+qwen35+mtp+step3p7 slice
+      env:
+        RUST_BACKTRACE: '1'
+      run: |
+        PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
+        test -n "$PYTHONHOME" || { echo "python3.12 reported no base_prefix" >&2; exit 1; }
+        export PYTHONHOME
+        cargo test --no-default-features \
+          --features "multiple-pymethods,gemma,qwen35,mtp,step3p7" --lib \
+          -- --test-threads=1 --nocapture
