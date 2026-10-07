@@ -4516,6 +4516,23 @@ impl VulkanModel {
                 }
             }
         }
+        // Kimi's PP-hop scratches (`pp_hop_recv` / `pp_hop_send`) are pinned
+        // against the current comm by `pin_pp_hop` and re-pinned only while their
+        // handle is 0 — the nemotron / laguna defect above, again. Drop them with
+        // the OLD comm so the next `pp_step_kimi*` call re-pins against the new one.
+        #[cfg(feature = "kimi")]
+        {
+            let cur = self.collective_comm;
+            if let Some(km) = self.kimi.as_mut() {
+                for ring in [&mut km.pp_hop_recv, &mut km.pp_hop_send] {
+                    if ring.handle != 0 && cur != 0 {
+                        let _ = vccl_ffi::comm_deregister(cur as *mut std::os::raw::c_void, ring.handle);
+                    }
+                    ring.handle = 0;
+                    ring.buf.clear();
+                }
+            }
+        }
         self.collective_comm = handle;
         // TP=2×PP: nemotron's per-layer TP all-reduce uses the SAME flat comm.
         // Forward the handle (the TP-peer global rank is wired via set_tp_peer).
@@ -5817,6 +5834,17 @@ impl VulkanModel {
         if let Some(m) = self.ling.as_mut() {
             if let Err(e) = m.reset_decode_state() {
                 log::error!("reset_kv_cache: ling reset_decode_state failed: {e}");
+            }
+            return;
+        }
+        // Kimi-Linear: the same shape of state as Ling (KDA recurrence + conv
+        // window + MLA KV, host and the GPU-resident stage). Without this branch a
+        // serve OP_RESET fell through and the next request decoded on top of the
+        // previous one.
+        #[cfg(feature = "kimi")]
+        if let Some(m) = self.kimi.as_mut() {
+            if let Err(e) = m.reset_decode_state() {
+                log::error!("reset_kv_cache: kimi reset_decode_state failed: {e}");
             }
             return;
         }
