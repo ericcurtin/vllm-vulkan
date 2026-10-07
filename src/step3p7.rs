@@ -1344,7 +1344,7 @@ pub fn load_step3p7_weights_cpu(
     let lm = "model.language_model";
 
     let mut by_shard: HashMap<String, Vec<String>> = HashMap::new();
-    let mut want = |name: String, set: &mut HashMap<String, Vec<String>>| {
+    let want = |name: String, set: &mut HashMap<String, Vec<String>>| {
         if let Some(shard) = weight_map.get(&name).and_then(|x| x.as_str()) {
             set.entry(shard.to_string()).or_default().push(name);
         }

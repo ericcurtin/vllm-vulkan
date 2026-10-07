@@ -613,6 +613,11 @@ pub(crate) fn geom_combos_for(base: &str) -> &'static [(u32, u32)] {
         // (creation-vetted class). The e4m3-resident twin reuses the same combos.
         "mul_mat_vec_nvfp4repack_f32_f32" => &[(32, 2), (64, 2), (128, 2), (64, 4), (128, 4)],
         "mul_mat_vec_nvfp4_e4m3repack_f32_f32" => &[(32, 2), (64, 2), (128, 2), (64, 4), (128, 4)],
+        // NVFP4-e4m3 repack EXPERT-BATCHED (VLLM_VULKAN_STEP37_EXPERT_BATCH). Same
+        // single-subgroup combos as the e4m3-repack parent; bs64/r4 is the wired
+        // default for Step-3.7's routed experts. Per-workgroup geometry is identical
+        // to the single-expert e4m3 repack -- only the dispatch gains the expert (.y) axis.
+        "mul_mat_vec_nvfp4_e4m3repack_batched_f32_f32" => &[(32, 2), (64, 2), (128, 2), (64, 4), (128, 4)],
         // FP8 subgroup-reduction twin (VLLM_VULKAN_FP8_REPACK). Reduction-epilogue
         // swap only (fp8 is not address-gen-bound). Same combo set as the mlx4/
         // nvfp4 repack twins; bs64/r4 is the wired default, the rest for the

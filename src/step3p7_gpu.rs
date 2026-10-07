@@ -45,7 +45,7 @@ use crate::model::{cpu_matmul, cpu_sdpa_gqa};
 use crate::push_constants::{
     f32_slice_to_bytes, f32_to_f16_bytes, laguna_expert_repack_flag, matvec_f32_variant,
     matvec_nvfp4_e4m3_pc_off, matvec_nvfp4_e4m3_variant, matvec_pc13, matvec_variant_by_format,
-    nvfp4_repack_shape_ok, read_f32_buf,
+    nvfp4_repack_shape_ok, read_f32_buf, sdpa_pc,
 };
 use crate::step3p7::{
     bias_router, clamped_swiglu_prod, head_gate, load_experts_proj, partial_rope, rms_norm_plus1,
@@ -148,6 +148,9 @@ pub struct Step3p7GpuStage {
 
     // decode state (one growing KV cache per resident layer)
     kv: Vec<Step3p7KvCache>,
+    /// Board #308: per-layer GPU KV + attention scratch, created on the first
+    /// token when `VLLM_VULKAN_STEP37_GPU_ATTN` is on (else stays `None`).
+    gpu_attn: Vec<Option<Step3p7GpuAttn>>,
     pos: usize,
 
     // TP
@@ -364,6 +367,95 @@ fn mv_expert(eng: &mut compute::ComputeEngine, sw: &GpuSwitch, local_e: usize, x
     Ok(out)
 }
 
+/// Shader + rows-per-workgroup for the Step-3.7 expert-BATCHED nvfp4-e4m3 matvec
+/// (`VLLM_VULKAN_STEP37_EXPERT_BATCH`). The batched analog of the serial e4m3 repack
+/// (`step3p7_e4m3_expert_shader`): same per-(row,chunk) dequant+accumulate body, only
+/// the dispatch gains the expert (`gl_WorkGroupID.y`) axis. Requires the SAME repack
+/// shape guard (`nvfp4_repack_shape_ok`); `None` ⇒ shape fails ⇒ caller keeps the serial
+/// per-expert path. bs64/r4 is the wired default (== the single-expert repack pick).
+fn step3p7_batched_expert_shader(k: usize, n: usize, gs: usize) -> Option<(String, u32)> {
+    if nvfp4_repack_shape_ok(k, n, gs) {
+        return Some(("mul_mat_vec_nvfp4_e4m3repack_batched_f32_f32_bs64_r4".to_string(), 4));
+    }
+    None
+}
+
+/// Per-expert `meta[]` (uvec4 = packed_off, sb_off, x_off, dst_off) for one batched
+/// sub-projection over `local_experts` (their local slot indices into the concatenated
+/// switch). `x_shared` = true for gate/up (all experts read the same [k] activation,
+/// x_off=0) or false for down (x concatenated [n_ex,k], expert slot `e` reads x[e*k..]).
+/// Byte-for-byte the offset math the serial `mv_expert` threads (packed_off = le*pack_stride
+/// words, sb_off = le*sb_stride e4m3 elems), just laid out per-slot for the .y axis.
+fn step3p7_expert_meta_bytes(sw: &GpuSwitch, local_experts: &[usize], x_shared: bool) -> Vec<u8> {
+    let meta = step3p7_expert_meta_u32(
+        sw.pack_stride, sw.sb_stride, sw.inn, sw.out, local_experts, x_shared);
+    bytemuck::cast_slice::<u32, u8>(&meta).to_vec()
+}
+
+/// Pure (device-free) core of `step3p7_expert_meta_bytes` — the per-expert uvec4
+/// `meta[]` (packed_off words, sb_off e4m3 byte-elems, x_off floats, dst_off floats).
+/// Factored out so the batched-vs-serial offset math is unit-testable without a GPU.
+fn step3p7_expert_meta_u32(
+    pack_stride: usize, sb_stride: usize, k: usize, n: usize,
+    local_experts: &[usize], x_shared: bool,
+) -> Vec<u32> {
+    let mut meta: Vec<u32> = Vec::with_capacity(local_experts.len() * 4);
+    for (e, &le) in local_experts.iter().enumerate() {
+        meta.push((le * pack_stride) as u32);                 // packed_off (words)
+        meta.push((le * sb_stride) as u32);                   // sb_off (e4m3 byte-elems)
+        meta.push((if x_shared { 0 } else { e * k }) as u32); // x_off (floats)
+        meta.push((e * n) as u32);                            // dst_off (floats)
+    }
+    meta
+}
+
+/// Expert-BATCHED nvfp4-e4m3 routed-expert matvec: `out[e][r] = expert(local_experts[e]) · x_e`
+/// for ALL `local_experts` in ONE dispatch (the Step-3.7 "#3" dispatch-collapse lever).
+/// Numerically identical to calling `mv_expert` once per expert (same repack dequant body,
+/// same fma reduction order, each expert's own `sw.globals[le]`) but collapses the host
+/// record + submit. Returns the concatenated `[n_ex * n]` output. `x` is the shared `[k]`
+/// activation (`x_shared`) or the concatenated `[n_ex * k]` intermediate (down projection).
+fn mv_experts_batched(
+    eng: &mut compute::ComputeEngine,
+    sw: &GpuSwitch,
+    local_experts: &[usize],
+    x: &[f32],
+    x_shared: bool,
+    shader: &str,
+    r: u32,
+) -> Result<Vec<f32>, String> {
+    let (k, n) = (sw.inn, sw.out);
+    let n_ex = local_experts.len();
+    let expect_x = if x_shared { k } else { n_ex * k };
+    if x.len() != expect_x {
+        return Err(format!("mv_experts_batched: x {} != expected {} (x_shared={x_shared})", x.len(), expect_x));
+    }
+    let xb = f32_slice_to_bytes(x);
+    let xbuf = eng.alloc_host_coherent_storage(xb.len().max(4) as u64)?;
+    xbuf.write(&xb)?;
+    let meta_bytes = step3p7_expert_meta_bytes(sw, local_experts, x_shared);
+    let metabuf = eng.alloc_host_coherent_storage(meta_bytes.len().max(4) as u64)?;
+    metabuf.write(&meta_bytes)?;
+    let globals: Vec<f32> = local_experts.iter().map(|&le| sw.globals[le]).collect();
+    let gb = f32_slice_to_bytes(&globals);
+    let gbuf = eng.alloc_host_coherent_storage(gb.len().max(4) as u64)?;
+    gbuf.write(&gb)?;
+    let o = eng.alloc_host_coherent_storage((n_ex * n * 4).max(4) as u64)?;
+    let wg = (n as u32 + r - 1) / r;
+    // packed_off/sb_off/global in the push constant are UNUSED by the batched shader
+    // (per-expert values come from meta[]/globals[]); pass 0 to reuse the pc builder.
+    let pc = matvec_nvfp4_e4m3_pc_off(k, n, sw.group, 0, 0, 0.0);
+    let cb = eng.begin_batch()?;
+    eng.record_to(cb, shader, &[&sw.packed, &sw.scale, &xbuf, &o, &metabuf, &gbuf], &pc, (wg, n_ex as u32, 1))?;
+    eng.submit_batch(cb)?;
+    let out = read_f32_buf(&o, n_ex * n);
+    eng.return_to_pool(xbuf);
+    eng.return_to_pool(metabuf);
+    eng.return_to_pool(gbuf);
+    eng.return_to_pool(o);
+    Ok(out)
+}
+
 /// TP-2 all-reduce a `[hidden]` partial in place: a deadlock-safe PAIRWISE exchange with
 /// the tp_peer (even-`tp_rank`-sends-first), then `buf += peer_partial` — the SUM of the
 /// two ranks' partials. This is nemotron's TP=2 pattern (NOT a full-comm all_reduce, which
@@ -509,7 +601,7 @@ impl Step3p7GpuStage {
         // Pull ONE tensor to host f32 (bf16/f16/f32 decode) via the shard mmap cache.
         // Each call frees nothing persistent — the returned Vec is the only new host
         // allocation, and every caller drops it after upload.
-        let mut get_f32 = |name: &str,
+        let get_f32 = |name: &str,
                            mmaps: &mut HashMap<String, Mmap>|
          -> Result<Vec<f32>, String> {
             let shard = weight_map
@@ -695,6 +787,7 @@ impl Step3p7GpuStage {
             lm_head,
             layers,
             kv: vec![Step3p7KvCache::default(); n_layers],
+            gpu_attn: (0..n_layers).map(|_| None).collect(),
             pos: 0,
             tp_rank,
             tp_size,
@@ -797,6 +890,9 @@ impl Step3p7GpuStage {
             c.v.clear();
             c.len = 0;
         }
+        for g in self.gpu_attn.iter_mut().flatten() {
+            g.reset();
+        }
         self.pos = 0;
     }
 
@@ -830,6 +926,7 @@ impl Step3p7GpuStage {
                 &mut self.eng,
                 &self.layers[local],
                 &mut self.kv[local],
+                &mut self.gpu_attn[local],
                 &hidden,
                 global,
                 &self.cfg,
@@ -879,6 +976,137 @@ fn get_scales2(
     Ok(view.data().chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
 }
 
+/// Which decode-attention kernel a layer runs. Both read the same
+/// `[K plane | V plane]` KV buffer with the same addressing (`sdpa_pc` words 0..10);
+/// they differ only in how the work is split, so the choice changes the summation
+/// order, not the math. (A split-K variant comes with the shared split-K kernels.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Step3p7AttnKernel {
+    /// `paged_attn_decode_f32_sg`: one 64-lane workgroup per q head.
+    Sg,
+    /// `paged_attn_decode_f32`: one thread per output element. Portable (any
+    /// subgroup size) but slow; used for testing on non-wave64 devices.
+    Scalar,
+}
+
+/// `VLLM_VULKAN_STEP37_GPU_ATTN` (default ON): unset or `1` runs the decode
+/// attention on the GPU (`_sg` on a wave64 device; host SDPA if it is not compiled),
+/// `scalar` forces the portable scalar kernel (tests / non-wave64 devices), `0`
+/// keeps the host `cpu_sdpa_gqa`.
+fn step37_gpu_attn_mode() -> Option<bool> {
+    static MODE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VLLM_VULKAN_STEP37_GPU_ATTN").ok().as_deref() {
+        Some("0") => None,
+        Some("scalar") => Some(true),
+        _ => Some(false),
+    })
+}
+
+/// Pick the decode-attention kernel, or `None` when the device has no wave64
+/// kernel and the scalar one is not forced.
+pub(crate) fn pick_attn_kernel(eng: &compute::ComputeEngine, nq: usize, nkv: usize, hd: usize,
+                               force_scalar: bool) -> Option<Step3p7AttnKernel> {
+    if nkv == 0 || nq % nkv != 0 || hd > 512 {
+        return None;
+    }
+    if force_scalar {
+        return eng.has_pipeline("paged_attn_decode_f32").then_some(Step3p7AttnKernel::Scalar);
+    }
+    if eng.has_pipeline("paged_attn_decode_f32_sg") {
+        return Some(Step3p7AttnKernel::Sg);
+    }
+    None
+}
+
+/// GPU-resident decode KV + attention scratch for ONE layer (board #308). The KV is
+/// `[K plane | V plane]`, each `cap` token rows of `kv_dim = nkv_local * hd` f32,
+/// token-major (the paged-attention single-block layout). It replaces the host
+/// `Step3p7KvCache` k/v Vecs for that layer, so the attention no longer walks the
+/// whole context on the host every token. `cap` doubles on demand.
+pub(crate) struct Step3p7GpuAttn {
+    kv: compute::Buffer,
+    cap: usize,
+    /// Tokens held (the next row's index); equals the host cache's `len`.
+    t: usize,
+    nq: usize,
+    nkv: usize,
+    hd: usize,
+    idx: compute::Buffer,
+    q: compute::Buffer,
+    out: compute::Buffer,
+}
+
+impl Step3p7GpuAttn {
+    pub(crate) fn new(eng: &mut compute::ComputeEngine, nq: usize, nkv: usize, hd: usize) -> Result<Self, String> {
+        let cap = 256;
+        let kv = eng.alloc_host_coherent_storage((2 * cap * nkv * hd * 4) as u64)?;
+        let idx = eng.alloc_host_coherent_storage(8)?;
+        idx.write(&0u64.to_le_bytes())?;
+        Ok(Step3p7GpuAttn {
+            kv, cap, t: 0, nq, nkv, hd, idx,
+            q: eng.alloc_host_coherent_storage((nq * hd * 4) as u64)?,
+            out: eng.alloc_host_coherent_storage((nq * hd * 4) as u64)?,
+        })
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.t = 0;
+    }
+
+    /// Make room for one more row: double both planes, copying the held rows.
+    fn reserve_one(&mut self, eng: &mut compute::ComputeEngine) -> Result<(), String> {
+        if self.t < self.cap {
+            return Ok(());
+        }
+        let kv_dim = self.nkv * self.hd;
+        let (old_plane, cap2) = (self.cap * kv_dim, self.cap * 2);
+        let kv2 = eng.alloc_host_coherent_storage((2 * cap2 * kv_dim * 4) as u64)?;
+        let old = read_f32_buf(&self.kv, 2 * old_plane);
+        kv2.write_at(0, &f32_slice_to_bytes(&old[..old_plane]))?;
+        kv2.write_at((cap2 * kv_dim * 4) as u64, &f32_slice_to_bytes(&old[old_plane..]))?;
+        let prev = std::mem::replace(&mut self.kv, kv2);
+        eng.return_to_pool(prev);
+        self.cap = cap2;
+        Ok(())
+    }
+
+    /// Append this token's `k`/`v` rows (`[nkv*hd]` each, already q/k-normed and
+    /// RoPE'd) and attend `q` (`[nq*hd]`) over the held rows `[window_start, t)`.
+    /// Returns `[nq*hd]` — the same quantity `cpu_sdpa_gqa` returns.
+    pub(crate) fn append_and_attend(&mut self, eng: &mut compute::ComputeEngine, kernel: Step3p7AttnKernel,
+                                    q: &[f32], k: &[f32], v: &[f32], window: Option<usize>)
+        -> Result<Vec<f32>, String> {
+        let (nq, nkv, hd) = (self.nq, self.nkv, self.hd);
+        let kv_dim = nkv * hd;
+        if q.len() != nq * hd || k.len() != kv_dim || v.len() != kv_dim {
+            return Err(format!("step3p7 gpu attn: q/k/v {} {} {} != {} {kv_dim}", q.len(), k.len(), v.len(), nq * hd));
+        }
+        self.reserve_one(eng)?;
+        let plane = self.cap * kv_dim;
+        self.kv.write_at((self.t * kv_dim * 4) as u64, &f32_slice_to_bytes(k))?;
+        self.kv.write_at(((plane + self.t * kv_dim) * 4) as u64, &f32_slice_to_bytes(v))?;
+        self.q.write(&f32_slice_to_bytes(q))?;
+        self.t += 1;
+        let len = self.t;
+        let window_start = window.map(|w| len.saturating_sub(w)).unwrap_or(0);
+        let scale = 1.0 / (hd as f32).sqrt();
+        let cb = eng.begin_batch()?;
+        match kernel {
+            Step3p7AttnKernel::Sg => {
+                let pc = sdpa_pc(len, nq, nkv, hd, self.cap, plane, scale, window_start, 0);
+                eng.record_to(cb, "paged_attn_decode_f32_sg", &[&self.q, &self.idx, &self.kv, &self.out], &pc, (nq as u32, 1, 1))?;
+            }
+            Step3p7AttnKernel::Scalar => {
+                let pc = sdpa_pc(len, nq, nkv, hd, self.cap, plane, scale, window_start, 0);
+                let wg = ((nq * hd) as u32 + 255) / 256;
+                eng.record_to(cb, "paged_attn_decode_f32", &[&self.q, &self.idx, &self.kv, &self.out], &pc, (wg, 1, 1))?;
+            }
+        }
+        eng.submit_batch(cb)?;
+        Ok(read_f32_buf(&self.out, nq * hd))
+    }
+}
+
 /// One decoder layer for a single GPU decode token: pre-norm(+1) gated GQA attention +
 /// residual, then pre-norm(+1) MoE/dense MLP + residual. A free fn so the caller can
 /// hand it disjoint `&mut eng` / `&layer` / `&mut kv` borrows.
@@ -887,6 +1115,7 @@ fn decode_one_layer(
     eng: &mut compute::ComputeEngine,
     layer: &GpuLayerR,
     kv: &mut Step3p7KvCache,
+    ga: &mut Option<Step3p7GpuAttn>,
     hidden: &[f32],
     global_idx: usize,
     cfg: &Step3p7Config,
@@ -921,6 +1150,36 @@ fn decode_one_layer(
         let roped = partial_rope(&nrm, pos, &la, hd, &cfg.llama3);
         head.copy_from_slice(&roped);
     }
+    // Board #308: GPU decode attention when enabled and this device has a kernel
+    // for the shape; the layer's KV then lives on the GPU (`ga`) and the host cache
+    // only tracks the length. Otherwise the host SDPA below, as before.
+    let gpu_kernel = step37_gpu_attn_mode().and_then(|force_scalar| {
+        pick_attn_kernel(eng, a.nq_local, a.nkv_local, hd, force_scalar)
+    });
+    if let Some(kernel) = gpu_kernel {
+        if ga.is_none() {
+            if kv.len != 0 {
+                return Err("step3p7 gpu attn: enabled mid-sequence (host KV already holds tokens)".into());
+            }
+            *ga = Some(Step3p7GpuAttn::new(eng, a.nq_local, a.nkv_local, hd)?);
+        }
+        let g_attn = ga.as_mut().unwrap();
+        if g_attn.t != kv.len {
+            return Err(format!("step3p7 gpu attn: GPU KV holds {} tokens, host position {}", g_attn.t, kv.len));
+        }
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| eprintln!("[step3p7] GPU DECODE ATTENTION ENGAGED: {kernel:?} nq={} nkv={} hd={hd}",
+                                    a.nq_local, a.nkv_local));
+        let o = g_attn.append_and_attend(eng, kernel, &q, &k, &v, la.sliding_window)?;
+        kv.len += 1;
+        let g = mv_dense(eng, &a.g, &normed)?; // [nq_local]
+        let gated = head_gate(&o, &g, a.nq_local, hd);
+        let mut attn_out = mv_dense(eng, &a.o, &gated)?;
+        tp_all_reduce(comm, tp_rank, tp_size, tp_peer, &mut attn_out, tp_send_scratch, tp_recv_scratch, tp_registered)?;
+        let h1: Vec<f32> = hidden.iter().zip(&attn_out).map(|(&x, &y)| x + y).collect();
+        return finish_layer_mlp(eng, layer, &h1, cfg, eps, tp_rank, tp_size, tp_peer, comm,
+                                tp_send_scratch, tp_recv_scratch, tp_registered);
+    }
     kv.k.extend_from_slice(&k);
     kv.v.extend_from_slice(&v);
     kv.len += 1;
@@ -950,7 +1209,27 @@ fn decode_one_layer(
     let mut attn_out = mv_dense(eng, &a.o, &gated)?; // [hidden] (partial under TP)
     tp_all_reduce(comm, tp_rank, tp_size, tp_peer, &mut attn_out, tp_send_scratch, tp_recv_scratch, tp_registered)?;
     let h1: Vec<f32> = hidden.iter().zip(&attn_out).map(|(&x, &y)| x + y).collect();
+    finish_layer_mlp(eng, layer, &h1, cfg, eps, tp_rank, tp_size, tp_peer, comm,
+                     tp_send_scratch, tp_recv_scratch, tp_registered)
+}
 
+/// The MLP half of a decoder layer (shared by the GPU- and host-attention paths of
+/// [`decode_one_layer`]): pre-norm(+1) MoE/dense MLP on `h1` + residual.
+#[allow(clippy::too_many_arguments)]
+fn finish_layer_mlp(
+    eng: &mut compute::ComputeEngine,
+    layer: &GpuLayerR,
+    h1: &[f32],
+    cfg: &Step3p7Config,
+    eps: f32,
+    tp_rank: usize,
+    tp_size: usize,
+    tp_peer: i32,
+    comm: usize,
+    tp_send_scratch: &mut [f32],
+    tp_recv_scratch: &mut [f32],
+    tp_registered: bool,
+) -> Result<Vec<f32>, String> {
     // ── MLP ──
     let normed2 = rms_norm_plus1(&h1, &layer.post_ln, eps);
     let mut mlp_out = match &layer.mlp {
@@ -965,18 +1244,75 @@ fn decode_one_layer(
             let logits = cpu_matmul(&normed2, &m.router, 1, cfg.hidden_size, cfg.num_experts);
             let (indices, weights) = bias_router(&logits, &m.bias, cfg.num_experts_per_tok, cfg.router_scaling_factor);
             let mut routed = vec![0.0f32; cfg.hidden_size];
+            // Owned selected experts, in route order: (kth weight index, local slot).
+            let mut sel: Vec<(usize, usize)> = Vec::with_capacity(indices.len());
             for (kth, &e) in indices.iter().enumerate() {
                 if tp_size > 1 && !(e >= m.owned_lo && e < m.owned_lo + m.owned_cnt) {
                     continue; // another rank owns this expert; its partial arrives via all-reduce
                 }
-                let le = e - m.owned_lo;
-                let gp = mv_expert(eng, &m.gate, le, &normed2)?; // [inter]
-                let up = mv_expert(eng, &m.up, le, &normed2)?;
-                let act = clamped_swiglu_prod(&gp, &up, m.expert_limit);
-                let dn = mv_expert(eng, &m.down, le, &act)?; // [hidden]
-                let wk = weights[kth];
-                for (r, &o) in routed.iter_mut().zip(&dn) {
-                    *r += o * wk;
+                sel.push((kth, e - m.owned_lo));
+            }
+            // Step-3.7 "#3": expert-batched nvfp4-e4m3 matvec (VLLM_VULKAN_STEP37_EXPERT_BATCH,
+            // default OFF). Collapses the selected-experts × {gate,up,down} per-expert dispatches
+            // into 3 batched dispatches. Bit-exact vs the serial `mv_expert` loop below: same
+            // repack dequant body, same per-expert global, and `sel` preserves route order so
+            // the `routed` accumulation order is identical. Falls back to serial if any switch's
+            // shape misses the repack guard (step3p7 experts always clear it, so this is belt-and-
+            // suspenders). Off ⇒ the serial path runs byte-unchanged.
+            let use_batch = crate::flags::flags_global().step37_expert_batch
+                && !sel.is_empty()
+                && step3p7_batched_expert_shader(m.gate.inn, m.gate.out, m.gate.group).is_some()
+                && step3p7_batched_expert_shader(m.up.inn, m.up.out, m.up.group).is_some()
+                && step3p7_batched_expert_shader(m.down.inn, m.down.out, m.down.group).is_some();
+            // Engagement proof for the on-node A/B: the batched path is bit-exact by
+            // construction, so identical logits cannot tell "engaged" from "never ran".
+            // One banner per process either way (requested+eligible, or requested+not).
+            static BATCH_BANNER: std::sync::Once = std::sync::Once::new();
+            if crate::flags::flags_global().step37_expert_batch && !sel.is_empty() {
+                BATCH_BANNER.call_once(|| {
+                    if use_batch {
+                        eprintln!("[vllm-vulkan] STEP37_EXPERT_BATCH ENGAGED: {} routed experts/token \
+                                   -> 3 batched dispatches (gate {}x{}, down {}x{})",
+                                  sel.len(), m.gate.out, m.gate.inn, m.down.out, m.down.inn);
+                    } else {
+                        eprintln!("[vllm-vulkan] STEP37_EXPERT_BATCH requested but NOT eligible \
+                                   (no batched shader for these shapes); serial path kept");
+                    }
+                });
+            }
+            if use_batch {
+                let les: Vec<usize> = sel.iter().map(|&(_, le)| le).collect();
+                let inter = m.inter;
+                let h = cfg.hidden_size;
+                let (gu_sh, gu_r) = step3p7_batched_expert_shader(m.gate.inn, m.gate.out, m.gate.group).unwrap();
+                let gp_all = mv_experts_batched(eng, &m.gate, &les, &normed2, true, &gu_sh, gu_r)?; // [n_ex, inter]
+                let up_all = mv_experts_batched(eng, &m.up, &les, &normed2, true, &gu_sh, gu_r)?;
+                // Per-expert clamped SwiGLU (host — bit-identical to the serial path),
+                // concatenated into [n_ex, inter] to feed the batched down projection.
+                let mut act_all = vec![0.0f32; les.len() * inter];
+                for e in 0..les.len() {
+                    let a = clamped_swiglu_prod(&gp_all[e * inter..(e + 1) * inter],
+                                                &up_all[e * inter..(e + 1) * inter], m.expert_limit);
+                    act_all[e * inter..(e + 1) * inter].copy_from_slice(&a);
+                }
+                let (d_sh, d_r) = step3p7_batched_expert_shader(m.down.inn, m.down.out, m.down.group).unwrap();
+                let dn_all = mv_experts_batched(eng, &m.down, &les, &act_all, false, &d_sh, d_r)?; // [n_ex, hidden]
+                for (e, &(kth, _)) in sel.iter().enumerate() {
+                    let wk = weights[kth];
+                    for (r, &o) in routed.iter_mut().zip(&dn_all[e * h..(e + 1) * h]) {
+                        *r += o * wk;
+                    }
+                }
+            } else {
+                for &(kth, le) in &sel {
+                    let gp = mv_expert(eng, &m.gate, le, &normed2)?; // [inter]
+                    let up = mv_expert(eng, &m.up, le, &normed2)?;
+                    let act = clamped_swiglu_prod(&gp, &up, m.expert_limit);
+                    let dn = mv_expert(eng, &m.down, le, &act)?; // [hidden]
+                    let wk = weights[kth];
+                    for (r, &o) in routed.iter_mut().zip(&dn) {
+                        *r += o * wk;
+                    }
                 }
             }
             // ungated shared expert (partial under TP row-shard of down)
@@ -1111,5 +1447,233 @@ mod tests {
             assert_eq!(k % 32, 0, "k={k} must be a multiple of 32");
             assert!(k >= 1024 && n >= 1024, "shape [{k},{n}] below repack floor");
         }
+    }
+
+    #[test]
+    fn step37_batched_expert_shader_routes_only_on_shape() {
+        // The batched selector routes to the repack-batched kernel exactly when the
+        // shape clears the SAME guard as the serial e4m3 repack, else None (⇒ serial).
+        for &(k, n) in &[(4096usize, 1280usize), (1280usize, 4096usize)] {
+            assert_eq!(step3p7_batched_expert_shader(k, n, 16),
+                Some(("mul_mat_vec_nvfp4_e4m3repack_batched_f32_f32_bs64_r4".to_string(), 4)),
+                "real step3p7 expert shape [{k},{n}] must route to the batched repack kernel");
+        }
+        // Sub-floor shapes fall back to serial (None). (k<1024 / n<1024 miss the guard.)
+        assert_eq!(step3p7_batched_expert_shader(64, 8, 16), None);
+    }
+
+    // ── Step-3.7 "#3" expert-batched nvfp4-e4m3: bit-exact vs serial (host sim) ──
+    // The batched-shader math == serial-shader math is a pure REORG (same repack body,
+    // same per-expert global, only the dispatch schedule + offset source differ). We
+    // prove the offset math + accumulation are 0-diff by running a faithful host port of
+    // the shader body under BOTH schedules — the serial one (packed_off=le*stride, x_off=0)
+    // and the batched one driven by the PRODUCTION `step3p7_expert_meta_u32` offset builder.
+    // (GPU-execution equivalence of the compiled SPIR-V is the deferred on-node cos=1.0 gate,
+    // like every other repack A/B — no GPU device on the offline CI path.)
+
+    /// E2M1 (FP4) code -> value, matching the kE2M1[16] table in the shaders.
+    fn e2m1(code: u32) -> f32 {
+        const T: [f32; 16] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                              -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0];
+        T[(code & 0xF) as usize]
+    }
+
+    /// E4M3 code -> value, ARITHMETIC decode identical to kE4M3_decode() in the shaders.
+    fn e4m3_decode(b: u32) -> f32 {
+        let s = b & 0x80;
+        let e = (b >> 3) & 0xF;
+        let m = b & 0x7;
+        let mag = if e == 0 {
+            (m as f32) * 0.001953125
+        } else if e == 15 && m == 7 {
+            0.0
+        } else {
+            f32::from_bits(((e + 120) << 23) | (m << 20))
+        };
+        f32::from_bits(mag.to_bits() | (s << 24))
+    }
+
+    /// Faithful host port of ONE workgroup of mul_mat_vec_nvfp4_e4m3repack[_batched]:
+    /// out[r] for r in [0,n), reading weights from `packed` (u32 words) at word offset
+    /// `packed_off`, e4m3 scale bytes (4/u32) from `scaleb` at byte-elem offset `sb_off`,
+    /// activations from `x` at float offset `x_off`, folding per-expert `global`. group==16
+    /// (g0=2c, g1=2c+1). Same nibble→activation map and fma order as the GLSL — the test
+    /// drives it once with the serial offset scheme and once with the batched meta[] scheme.
+    fn expert_matvec_ref(
+        packed: &[u32], scaleb: &[u32], x: &[f32], k: usize, n: usize,
+        packed_off: usize, sb_off: usize, x_off: usize, global: f32,
+    ) -> Vec<f32> {
+        let groups = k / 16;
+        let words_per_row = k / 8;
+        let chunks_per_row = k / 32;
+        let dot16 = |wlo: u32, whi: u32, xbase: usize| -> f32 {
+            let mut s = 0.0f32;
+            for (i, w) in [wlo, whi].iter().enumerate() {
+                for j in 0..8usize {
+                    let code = (w >> (j * 4)) & 0xF;
+                    s += e2m1(code) * x[xbase + i * 8 + j];
+                }
+            }
+            s
+        };
+        let bscale = |abs_sidx: usize, global: f32| -> f32 {
+            let sword = scaleb[abs_sidx >> 2];
+            let sbyte = (sword >> ((abs_sidx & 3) * 8)) & 0xFF;
+            e4m3_decode(sbyte) * global
+        };
+        let mut out = vec![0.0f32; n];
+        for r in 0..n {
+            let mut acc = 0.0f32;
+            for c in 0..chunks_per_row {
+                let base_word = packed_off + r * words_per_row + c * 4;
+                let pw = [packed[base_word], packed[base_word + 1],
+                          packed[base_word + 2], packed[base_word + 3]];
+                let xb = x_off + c * 32;
+                let qxa = dot16(pw[0], pw[1], xb);
+                let qxb = dot16(pw[2], pw[3], xb + 16);
+                let sbase = sb_off + r * groups;
+                let scale_a = bscale(sbase + c * 2, global);
+                let scale_b = bscale(sbase + c * 2 + 1, global);
+                acc = scale_a.mul_add(qxa, scale_b.mul_add(qxb, acc)); // == GLSL fma order
+            }
+            out[r] = acc;
+        }
+        out
+    }
+
+    /// Build a deterministic concatenated nvfp4-e4m3 expert set + activations, then assert
+    /// the batched schedule (via `step3p7_expert_meta_u32`) is 0-diff vs the serial schedule.
+    fn assert_batched_eq_serial(k: usize, n: usize, les: &[usize], x_shared: bool) {
+        let n_experts = 4usize; // resident concatenated experts (les selects among these)
+        let pack_stride = n * (k / 8);
+        let sb_stride = n * (k / 16);
+        assert_eq!(pack_stride % 4, 0, "pack_stride must be 4-word aligned (k%32==0)");
+        // Deterministic LCG fill (avoids a rand dep; exercises the full nibble/byte range).
+        let mut st = 0x9E3779B1u32;
+        let mut next = || { st = st.wrapping_mul(1664525).wrapping_add(1013904223); st };
+        let packed: Vec<u32> = (0..n_experts * pack_stride).map(|_| next()).collect();
+        let scaleb: Vec<u32> = (0..(n_experts * sb_stride) / 4).map(|_| next()).collect();
+        let globals: Vec<f32> = (0..n_experts).map(|e| 0.5f32 + e as f32 * 0.37).collect();
+        let n_ex = les.len();
+        let x: Vec<f32> = {
+            let len = if x_shared { k } else { n_ex * k };
+            (0..len).map(|i| ((i % 13) as f32 - 6.0) * 0.25).collect()
+        };
+
+        // Serial: each selected expert dispatched on its own (packed_off=le*stride, x_off=0
+        // for gate/up or per-slot for down), reading its own global.
+        let mut serial = Vec::with_capacity(n_ex * n);
+        for (e, &le) in les.iter().enumerate() {
+            let x_off = if x_shared { 0 } else { e * k };
+            serial.extend(expert_matvec_ref(
+                &packed, &scaleb, &x, k, n, le * pack_stride, le * sb_stride, x_off, globals[le]));
+        }
+
+        // Batched: offsets from the PRODUCTION meta builder + per-expert globals[le].
+        let meta = step3p7_expert_meta_u32(pack_stride, sb_stride, k, n, les, x_shared);
+        let mut batched = vec![0.0f32; n_ex * n];
+        for (e, &le) in les.iter().enumerate() {
+            let packed_off = meta[e * 4] as usize;
+            let sb_off = meta[e * 4 + 1] as usize;
+            let x_off = meta[e * 4 + 2] as usize;
+            let dst_off = meta[e * 4 + 3] as usize;
+            let o = expert_matvec_ref(&packed, &scaleb, &x, k, n, packed_off, sb_off, x_off, globals[le]);
+            batched[dst_off..dst_off + n].copy_from_slice(&o);
+        }
+
+        assert_eq!(serial.len(), batched.len());
+        assert!(serial.iter().any(|&v| v != 0.0), "test is vacuous: serial output all-zero");
+        // 0-diff, bit-for-bit (the reorg preserves the exact arithmetic).
+        for (i, (&s, &b)) in serial.iter().zip(&batched).enumerate() {
+            assert_eq!(s.to_bits(), b.to_bits(),
+                "batched != serial at flat idx {i}: serial={s} batched={b} (k={k},n={n},x_shared={x_shared})");
+        }
+    }
+
+    #[test]
+    fn step37_expert_batched_bit_exact_vs_serial() {
+        // gate/up orientation (out=inter, in=hidden): shared activation across experts.
+        // down orientation (out=hidden, in=inter): per-expert concatenated activation.
+        // Small k (multiple of 32) + non-identity + non-contiguous slot selections to
+        // exercise the meta offset math (packed_off/sb_off/x_off/dst_off) end to end.
+        assert_batched_eq_serial(64, 8, &[0, 1, 2, 3], true);      // gate/up, all experts, identity
+        assert_batched_eq_serial(64, 8, &[2, 0, 3], true);          // gate/up, arbitrary order/subset
+        assert_batched_eq_serial(96, 6, &[3, 1], false);           // down, per-expert x_off
+        assert_batched_eq_serial(128, 4, &[1, 3, 0, 2], false);    // down, full reorder
+    }
+}
+
+/// Board #308: `Step3p7GpuAttn` against the host `cpu_sdpa_gqa` oracle, token by
+/// token, over 300 decode steps (crossing the 256-row KV doubling), for a full
+/// layer and a sliding-window layer, GQA ratio 8. Every kernel the device compiled
+/// is checked (the Mac / MoltenVK has only the portable scalar one; a BC-250 also
+/// runs sg and split-K). `#[ignore]`: needs a Vulkan device; panics without one.
+///   cargo test --lib step37_gpu_attn -- --ignored --nocapture
+#[cfg(test)]
+mod gpu_attn_tests {
+    use super::*;
+    use crate::model::cpu_sdpa_gqa;
+
+    fn engine() -> compute::ComputeEngine {
+        assert!(crate::device::is_vulkan_available(), "needs a Vulkan device (VK_ICD_FILENAMES)");
+        let dev = device::ComputeDevice::create(0).expect("device 0");
+        let spvs = crate::include_all_shaders();
+        let refs: HashMap<&str, &[u8]> = spvs.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect();
+        compute::ComputeEngine::new(dev.instance.clone(), dev.physical_device, dev.device.clone(),
+            dev.compute_queue, dev.compute_queue_family, dev.caps(), &refs).expect("engine")
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn f(&mut self) -> f32 {
+            self.0 ^= self.0 << 13; self.0 ^= self.0 >> 7; self.0 ^= self.0 << 17;
+            ((self.0 >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a Vulkan device; run with --ignored"]
+    fn step37_gpu_attn_matches_host_sdpa() {
+        let mut eng = engine();
+        let (nq, nkv, hd, steps) = (16usize, 2usize, 128usize, 300usize);
+        let kernels = [Step3p7AttnKernel::Scalar, Step3p7AttnKernel::Sg];
+        let mut checked = Vec::new();
+        for &kernel in &kernels {
+            let name = match kernel {
+                Step3p7AttnKernel::Scalar => "paged_attn_decode_f32",
+                Step3p7AttnKernel::Sg => "paged_attn_decode_f32_sg",
+            };
+            if !eng.has_pipeline(name) {
+                eprintln!("[step37_gpu_attn] {kernel:?}: {name} not compiled on this device");
+                continue;
+            }
+            for window in [None, Some(64usize)] {
+                let mut r = Rng(0x0308 ^ (window.unwrap_or(0) as u64));
+                let mut ga = Step3p7GpuAttn::new(&mut eng, nq, nkv, hd).unwrap();
+                let (mut hk, mut hv) = (Vec::new(), Vec::new());
+                let mut worst = 0f32;
+                for step in 0..steps {
+                    let q: Vec<f32> = (0..nq * hd).map(|_| r.f()).collect();
+                    let k: Vec<f32> = (0..nkv * hd).map(|_| r.f()).collect();
+                    let v: Vec<f32> = (0..nkv * hd).map(|_| r.f()).collect();
+                    hk.extend_from_slice(&k);
+                    hv.extend_from_slice(&v);
+                    let len = step + 1;
+                    let want = cpu_sdpa_gqa(&q, &hk, &hv, nq, nkv, hd, len, 1.0 / (hd as f32).sqrt(),
+                                            window, nq / nkv, 0);
+                    let got = ga.append_and_attend(&mut eng, kernel, &q, &k, &v, window).unwrap();
+                    let d = want.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+                    worst = worst.max(d);
+                    assert!(d < 1e-4, "{kernel:?} window {window:?} step {step}: max |gpu-host| {d}");
+                }
+                assert!(ga.cap >= steps, "KV did not grow past the first 256 rows");
+                eprintln!("[step37_gpu_attn] {kernel:?} window {window:?}: {steps} steps, max |gpu-host| {worst:.2e}, cap {}", ga.cap);
+                // reset restarts the sequence
+                ga.reset();
+                assert_eq!(ga.t, 0);
+            }
+            checked.push(kernel);
+        }
+        assert!(!checked.is_empty(), "no decode-attention kernel compiled on this device");
     }
 }

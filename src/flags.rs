@@ -714,6 +714,20 @@ pub struct Flags {
     /// reduces in the SAME order as the per-expert kernel, so the result is
     /// BIT-EXACT (gated by `debug_laguna_cbbatch`). No effect unless `laguna_1cb`.
     pub laguna_cbbatch: bool,
+    /// Step-3.7-Flash-148B "#3": expert-batched NVFP4-e4m3 routed-expert matvec
+    /// (`VLLM_VULKAN_STEP37_EXPERT_BATCH`, default ON since 2026-10-01, #31). When on (and the routed
+    /// experts clear the repack shape guard), `step3p7_gpu`'s MoE combine collapses
+    /// the selected-experts × {gate,up,down} per-expert `mul_mat_vec_nvfp4_e4m3`
+    /// dispatches into 3 expert-batched dispatches through
+    /// `mul_mat_vec_nvfp4_e4m3repack_batched_f32_f32` (`gl_WorkGroupID.y` = expert
+    /// slot; per-expert packed/scale/x/dst offsets from a `meta[]` buffer + per-
+    /// expert `weight_scale_2` global from a `globals[]` buffer). The per-(row,chunk)
+    /// dequant+accumulate body is byte-for-byte the single-expert e4m3-repack kernel,
+    /// so the batched result reduces in the SAME order → BIT-EXACT / argmax-exact vs
+    /// the serial path (the mv_expert loop). Off ⇒ the serial per-expert path is
+    /// byte-unchanged. GPU-execution A/B (cos=1.0) is the on-node gate. Only affects
+    /// `step3p7` MoE layers whose experts are e4m3-resident.
+    pub step37_expert_batch: bool,
     /// GPU per-layer attention MATH for Laguna decode
     /// (`VLLM_VULKAN_LAGUNA_GPU_ATTNMATH`, default OFF). When on (and
     /// `laguna_1cb`), `attn_cached_1cb` moves the two remaining host per-layer
@@ -1037,6 +1051,7 @@ impl Flags {
             laguna_scratch: bdef1("VLLM_VULKAN_LAGUNA_SCRATCH"), // default ON (2026-07-30 productionized: cluster PP-6 bit-exact 1.99x, zero footprint); =0 reverts to per-op alloc/free. Silent no-op unless laguna_1cb.
             laguna_expert_repack: bdef1("VLLM_VULKAN_LAGUNA_EXPERT_REPACK"), // default ON (2026-07-30 productionized: cluster PP-6 argmax-exact, 3.6-3.75x/op); =0 reverts to the v1 mul_mat_vec_nvfp4_e4m3 oracle. Silent no-op unless e4m3-resident experts (needs NVFP4_E4M3_SCALES).
             laguna_cbbatch: b1("VLLM_VULKAN_LAGUNA_CBBATCH"), // default OFF; MoE CB-batch dispatch fold (30 expert matvecs -> 3 batched)
+            step37_expert_batch: bdef1("VLLM_VULKAN_STEP37_EXPERT_BATCH"), // default ON since 2026-10-01 (board #31: TP-2xPP-5 on 10 nodes, -13.8% @8 tok / -6.9% @308 tok, tokens + step-0 logits byte-identical; =0 restores the per-expert path); Step-3.7 "#3" expert-batched NVFP4-e4m3 matvec (per-expert matvecs -> 3 batched dispatches via mul_mat_vec_nvfp4_e4m3repack_batched); bit-exact, on-node cos=1.0 gate
             laguna_gpu_attnmath: b1("VLLM_VULKAN_LAGUNA_GPU_ATTNMATH"), // default OFF; GPU qk-norm + GPU sliding-rope in attn_cached_1cb
             laguna_rust_argmax: b1("VLLM_VULKAN_LAGUNA_RUST_ARGMAX"), // default OFF; last-stage Rust argmax fusion (kills the [vocab] Vec<f32>→PyList marshal + py-argmax). Only affects the last PP rank.
             laguna_native_hop: b1("VLLM_VULKAN_LAGUNA_NATIVE_HOP"), // default OFF; fused native-vCCL PP hop (pp_step_laguna) vs the PyList marshal. Cluster PP-6 A/B pending.
