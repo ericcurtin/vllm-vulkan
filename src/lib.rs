@@ -412,10 +412,12 @@ fn pin_pp_hops(comm: *mut std::os::raw::c_void, want_reg: bool, recv: &mut PpTok
 }
 
 /// Receive the previous stage's `[len]` hidden: into the pinned `ring` (no per-call
-/// temp MR) when it is registered, else into a fresh `Vec`. Same bytes either way.
+/// temp MR) when it is registered and sized for `len`, else into a fresh `Vec`.
+/// Same bytes either way; a ring pinned at another length is never used, so the
+/// receive count always matches the sender's.
 fn pp_hop_recv(py: Python<'_>, comm: *mut std::os::raw::c_void, ring: &mut PpTokRing,
                len: usize, from: i32) -> PyResult<Vec<f32>> {
-    if ring.handle != 0 {
+    if ring.handle != 0 && ring.buf.len() == len {
         vccl_ffi::recv_f32_into(py, comm, &mut ring.buf, from).map_err(PyRuntimeError::new_err)?;
         Ok(ring.buf.clone())
     } else {

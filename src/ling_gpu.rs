@@ -269,10 +269,6 @@ pub struct LingGpuStage {
     resident_layer: bool,
 }
 
-/// Per-layer upload context: the resident-layout levers + dims needed to mirror
-/// ONE host `LingLayer` into GPU-resident buffers. Shared by `from_cpu` (consume a
-/// fully-loaded CPU window) and `from_ckpt_streamed` (per-layer read→upload→free),
-/// so both produce byte-identical GPU buffers from the same host `LingLayer`.
 /// One decoder layer through the host seam (op-by-op): host RMSNorms and
 /// residuals around the GPU attention (KDA or MLA) and MLP (dense or MoE)
 /// dispatches. Shared by the non-resident stage and the resident stage's
@@ -318,6 +314,10 @@ fn host_seam_layer(eng: &mut compute::ComputeEngine, layer: &mut LLayerR, x: &[f
     Ok(hres.iter().zip(&mlp).map(|(a, b)| a + b).collect())
 }
 
+/// Per-layer upload context: the resident-layout levers + dims needed to mirror
+/// ONE host `LingLayer` into GPU-resident buffers. Shared by `from_cpu` (consume a
+/// fully-loaded CPU window) and `from_ckpt_streamed` (per-layer read→upload→free),
+/// so both produce byte-identical GPU buffers from the same host `LingLayer`.
 struct UpCtx {
     f16_dense: bool,
     mla_resident: bool,

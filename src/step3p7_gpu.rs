@@ -48,8 +48,8 @@ use crate::push_constants::{
     nvfp4_repack_shape_ok, read_f32_buf, sdpa_pc,
 };
 use crate::step3p7::{
-    bias_router, clamped_swiglu_prod, head_gate, load_experts_proj, partial_rope, rms_norm_plus1,
-    ExpertStore, MoeStreamCfg, Step3p7Config, Step3p7KvCache,
+    bias_router, clamped_swiglu_prod, head_gate, partial_rope, rms_norm_plus1,
+    Step3p7Config, Step3p7KvCache,
 };
 use crate::vccl_ffi;
 use serde_json::Value;
@@ -224,56 +224,49 @@ fn row_shard(w: &[f32], in_f: usize, rank: usize, n: usize) -> Vec<f32> {
     o
 }
 
-/// Build the EP-owned NVFP4 experts of one proj into a resident `GpuSwitch`. CONSUMES
-/// the expert Vec, streaming each owned expert's packed nibbles + e4m3 scales STRAIGHT
-/// into the GTT buffer at its slot offset (via `write_at`) and freeing the host bytes
-/// as it goes — so peak host stays ~one expert (~9 MB), NOT the whole proj's ~1.88 GiB
-/// concat (the LOAD-OOM cure at proj granularity, on top of the per-layer one).
-fn build_switch(
+/// Upload the OWNED routed experts `[owned_lo, owned_lo + owned_cnt)` of one 3D
+/// NVFP4-e4m3 projection (`{base}.weight` + `{base}.weight_scale`) into one packed
+/// and one scale buffer, slot by slot, straight from the mapped checkpoint: no
+/// host copy of the projection, and none of the experts another TP rank owns
+/// (PR #98 review: the earlier path materialised all experts on the host first).
+#[allow(clippy::too_many_arguments)]
+fn upload_owned_experts(
     eng: &mut compute::ComputeEngine,
-    experts: Vec<crate::step3p7::Step3p7Expert>,
+    dir: &std::path::Path,
+    weight_map: &serde_json::Map<String, Value>,
+    mmaps: &mut HashMap<String, memmap2::Mmap>,
+    base: &str,
+    globals_all: &[f32],
+    num_experts: usize,
+    out: usize,
+    inn: usize,
+    group: usize,
     owned_lo: usize,
     owned_cnt: usize,
 ) -> Result<GpuSwitch, String> {
-    let out = experts[0].out_f;
-    let inn = experts[0].in_f;
-    let group = experts[0].group_size;
-    let pack_bytes = out * inn / 2; // u8 nibbles per expert
-    let sb_bytes = out * (inn / group); // e4m3 scale bytes per expert
+    if owned_lo + owned_cnt > num_experts {
+        return Err(format!("{base}: owned experts [{owned_lo}, +{owned_cnt}) past {num_experts}"));
+    }
+    let src = crate::step3p7::map_expert_proj(dir, weight_map, mmaps, base)?;
+    let stp = safetensors::SafeTensors::deserialize(&mmaps[&src.packed_shard])
+        .map_err(|e| format!("parse {}: {e}", src.packed_shard))?;
+    let sts = safetensors::SafeTensors::deserialize(&mmaps[&src.scale_shard])
+        .map_err(|e| format!("parse {}: {e}", src.scale_shard))?;
+    let pd = stp.tensor(&src.packed_name).map_err(|e| format!("{}: {e}", src.packed_name))?.data();
+    let sd = sts.tensor(&src.scale_name).map_err(|e| format!("{}: {e}", src.scale_name))?.data();
+    let (pack_bytes, sb_bytes) =
+        crate::step3p7::check_expert_proj(base, pd, sd, globals_all, num_experts, out, inn, group)?;
     let pbuf = eng.alloc_host_coherent_storage((owned_cnt * pack_bytes).max(4) as u64)?;
     let sbuf = eng.alloc_host_coherent_storage((owned_cnt * sb_bytes).max(4) as u64)?;
-    let mut globals: Vec<f32> = Vec::with_capacity(owned_cnt);
-    let mut slot = 0usize;
-    for (e, ex) in experts.into_iter().enumerate() {
-        if e < owned_lo || e >= owned_lo + owned_cnt {
-            continue; // another rank owns it (EP); dropped here
-        }
-        match ex.store {
-            ExpertStore::Resident { packed, scale } => {
-                if packed.len() != pack_bytes || scale.len() != sb_bytes {
-                    return Err(format!(
-                        "build_switch: expert {e} packed {} (want {pack_bytes}) scale {} (want {sb_bytes})",
-                        packed.len(), scale.len()
-                    ));
-                }
-                pbuf.write_at((slot * pack_bytes) as u64, &packed)?;
-                sbuf.write_at((slot * sb_bytes) as u64, &scale)?;
-                globals.push(ex.global);
-                slot += 1;
-                // packed/scale drop here → host bytes freed before the next expert.
-            }
-            ExpertStore::Streamed { .. } => {
-                return Err(format!(
-                    "build_switch: expert {e} is overflow-STREAMED; GPU-resident load requires \
-                     all owned experts resident (disable VLLM_VULKAN_MOE_STREAM_OVERFLOW)"
-                ));
-            }
-        }
+    for slot in 0..owned_cnt {
+        let e = owned_lo + slot;
+        pbuf.write_at((slot * pack_bytes) as u64, &pd[e * pack_bytes..(e + 1) * pack_bytes])?;
+        sbuf.write_at((slot * sb_bytes) as u64, &sd[e * sb_bytes..(e + 1) * sb_bytes])?;
     }
     Ok(GpuSwitch {
         packed: pbuf,
         scale: sbuf,
-        globals,
+        globals: globals_all[owned_lo..owned_lo + owned_cnt].to_vec(),
         out,
         inn,
         group,
@@ -456,12 +449,35 @@ fn mv_experts_batched(
     Ok(out)
 }
 
+/// With TP>1 this rank holds only a shard of o_proj / down, so the per-layer reduce is
+/// mandatory: `Err` unless the comm and TP peer are wired and the TP size is 2 (the only
+/// pairwise exchange implemented). `Ok` for TP=1. `decode_step` calls it before any layer
+/// runs, so a misconfigured rank fails before it advances the KV state.
+fn check_tp_wired(comm: usize, tp_size: usize, tp_peer: i32) -> Result<(), String> {
+    if tp_size <= 1 {
+        return Ok(());
+    }
+    if comm == 0 || tp_peer < 0 {
+        return Err(format!(
+            "step3p7 TP{tp_size}: weights are sharded but the TP reduce is not wired \
+             (comm={comm:#x}, peer={tp_peer}); call set_collective_comm and set_tp_peer \
+             before decoding"));
+    }
+    if tp_size != 2 {
+        return Err(format!(
+            "step3p7 TP reduce is TP=2 pairwise only (tp_size={tp_size}; TP>2 needs a vcclCommSplit sub-comm)"
+        ));
+    }
+    Ok(())
+}
+
 /// TP-2 all-reduce a `[hidden]` partial in place: a deadlock-safe PAIRWISE exchange with
 /// the tp_peer (even-`tp_rank`-sends-first), then `buf += peer_partial` — the SUM of the
 /// two ranks' partials. This is nemotron's TP=2 pattern (NOT a full-comm all_reduce, which
 /// on a flat PP+TP comm would wrongly reduce across every rank). Re-acquires the GIL —
 /// safe because `decode_step` is always reached from a pyo3 method that holds it. No-op
-/// when tp is off / the comm or peer is unset.
+/// when `tp_size <= 1`; an error when TP>1 and the comm or peer is unset
+/// (see [`check_tp_wired`]).
 ///
 /// When `send_scratch`/`recv_scratch` are RDMA-registered (both `>= buf.len()`), the
 /// partial is copied THROUGH them so vCCL's per-call `ScopedReg` short-circuits (no
@@ -479,14 +495,12 @@ fn tp_all_reduce(
     recv_scratch: &mut [f32],
     registered: bool,
 ) -> Result<(), String> {
-    if tp_size <= 1 || comm == 0 || tp_peer < 0 {
+    if tp_size <= 1 {
         return Ok(());
     }
-    if tp_size != 2 {
-        return Err(format!(
-            "step3p7 TP reduce is TP=2 pairwise only (tp_size={tp_size}; TP>2 needs a vcclCommSplit sub-comm)"
-        ));
-    }
+    // Skipping the reduce would add a half-sum to the residual and decode wrong tokens
+    // without an error.
+    check_tp_wired(comm, tp_size, tp_peer)?;
     let commp = comm as *mut c_void;
     let send_first = tp_rank % 2 == 0;
     let n = buf.len();
@@ -619,8 +633,6 @@ impl Step3p7GpuStage {
             crate::step3p7::decode_bf16_f32(&view)
         };
 
-        let stream_off = MoeStreamCfg { enabled: false, budget_bytes: u64::MAX };
-        let mut dummy_bytes: u64 = 0;
         let mut expert_mmaps: HashMap<String, Mmap> = HashMap::new();
 
         let (owned_lo, owned_cnt) = if tp_size > 1 {
@@ -679,17 +691,15 @@ impl Step3p7GpuStage {
                 let inter = cfg.moe_intermediate_size;
                 let sh = cfg.share_expert_dim;
                 // routed experts: EP whole-expert partition (nemotron pattern) — only
-                // owned experts resident. `load_experts_proj` slices per-expert from the
-                // mmap'd 3D tensors (no full-tensor slurp); we then keep [owned_lo, +cnt).
-                // Load + build + FREE one projection at a time (never hold all three
-                // projections' ~1.88 GiB expert sets host-resident at once).
-                let mut build_proj = |base: &str, out_f: usize, in_f: usize,
-                                      eng: &mut compute::ComputeEngine,
-                                      emm: &mut HashMap<String, memmap2::Mmap>|
+                // owned experts resident, uploaded slot by slot from the mmap'd 3D
+                // tensors (no host copy of the projection, nothing of the other rank's).
+                let build_proj = |base: &str, out_f: usize, in_f: usize,
+                                  eng: &mut compute::ComputeEngine,
+                                  emm: &mut HashMap<String, memmap2::Mmap>|
                  -> Result<GpuSwitch, String> {
                     let g = get_scales2(dir, &weight_map, emm, &format!("{base}.weight_scale_2"))?;
-                    let ex = load_experts_proj(dir, &weight_map, emm, base, &g, cfg.num_experts, out_f, in_f, group, stream_off, &mut dummy_bytes)?;
-                    build_switch(eng, ex, owned_lo, owned_cnt) // consumes ex → freed inside
+                    upload_owned_experts(eng, dir, &weight_map, emm, base, &g, cfg.num_experts,
+                                         out_f, in_f, group, owned_lo, owned_cnt)
                 };
                 let gate_sw = build_proj(&format!("{p}.moe.gate_proj"), inter, h, &mut eng, &mut expert_mmaps)?;
                 let up_sw = build_proj(&format!("{p}.moe.up_proj"), inter, h, &mut eng, &mut expert_mmaps)?;
@@ -802,7 +812,8 @@ impl Step3p7GpuStage {
 
     /// Wire the collective communicator (raw vcclComm_t as usize) + this rank's TP-2
     /// peer GLOBAL rank, used by the per-layer TP reduce. Called from
-    /// `set_collective_comm` / `set_tp_peer` in lib.rs. `peer < 0` disables the reduce.
+    /// `set_collective_comm` / `set_tp_peer` in lib.rs. With TP>1, `decode_step` errors
+    /// until both are set (`peer < 0` / `comm == 0` mean unwired).
     pub fn set_tp_comm(&mut self, comm: usize, peer: i32) {
         // A comm handle change invalidates any MR registered on the old comm — drop the
         // reduce scratch registrations so `ensure_tp_scratch` re-pins on the new comm.
@@ -900,6 +911,9 @@ impl Step3p7GpuStage {
     /// consumes the previous stage's `[hidden]`; the last stage returns `[vocab]` logits.
     pub fn decode_step(&mut self, token_id: u32, hidden_in: &[f32]) -> Result<Vec<f32>, String> {
         let h = self.h;
+        // Before any layer appends to the KV: a retry after wiring must not see a
+        // half-advanced session.
+        check_tp_wired(self.collective_comm, self.tp_size, self.tp_peer)?;
         let mut hidden: Vec<f32> = if self.first {
             let embed = self.embed.as_ref().ok_or("decode_step: first stage missing embed")?;
             if embed.len() < self.cfg.vocab_size * h {
@@ -1253,7 +1267,7 @@ fn finish_layer_mlp(
                 sel.push((kth, e - m.owned_lo));
             }
             // Step-3.7 "#3": expert-batched nvfp4-e4m3 matvec (VLLM_VULKAN_STEP37_EXPERT_BATCH,
-            // default OFF). Collapses the selected-experts × {gate,up,down} per-expert dispatches
+            // default ON; =0 restores the serial path). Collapses the selected-experts × {gate,up,down} per-expert dispatches
             // into 3 batched dispatches. Bit-exact vs the serial `mv_expert` loop below: same
             // repack dequant body, same per-expert global, and `sel` preserves route order so
             // the `routed` accumulation order is identical. Falls back to serial if any switch's
@@ -1333,6 +1347,24 @@ fn finish_layer_mlp(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PR #98 review: with sharded weights (TP>1) an unwired comm or peer must fail
+    /// the reduce instead of letting a half-sum through; single-TP is a no-op.
+    #[test]
+    fn tp_reduce_errors_when_sharded_but_unwired() {
+        let (mut b, mut s1, mut s2) = (vec![1f32; 4], vec![0f32; 4], vec![0f32; 4]);
+        assert!(tp_all_reduce(0, 0, 1, -1, &mut b, &mut s1, &mut s2, false).is_ok());
+        let e = tp_all_reduce(0, 0, 2, 1, &mut b, &mut s1, &mut s2, false).unwrap_err();
+        assert!(e.contains("not wired"), "{e}");
+        let e = tp_all_reduce(0x1000, 0, 2, -1, &mut b, &mut s1, &mut s2, false).unwrap_err();
+        assert!(e.contains("not wired"), "{e}");
+        assert_eq!(b, vec![1f32; 4], "a failed reduce must not touch the buffer");
+        // The decode_step pre-check shares the rule: wired TP=2 passes, TP>2 does not.
+        assert!(check_tp_wired(0, 1, -1).is_ok());
+        assert!(check_tp_wired(0x1000, 2, 1).is_ok());
+        assert!(check_tp_wired(0, 2, 1).is_err());
+        assert!(check_tp_wired(0x1000, 4, 1).is_err());
+    }
 
     // ── Phase-3 offline proof: TP shard math is a clean, lossless partition ──────
     // col_shard/row_shard + EP owned-range are the load-time TP pieces (the forward

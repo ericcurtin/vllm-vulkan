@@ -105,8 +105,20 @@ impl Step3p7Config {
             .and_then(|v| v.as_array())
             .ok_or("step3p7: missing layer_types")?
             .iter()
-            .map(|v| v.as_str().unwrap_or("full_attention").to_string())
+            .map(|v| v.as_str().unwrap_or("").to_string())
             .collect();
+        // A typo or a short array must not silently pick an attention kind: it sets
+        // the expected Q/O dims, and `cpu_matmul` does not bounds-check them.
+        if layer_types.len() < num_hidden_layers {
+            return Err(format!(
+                "step3p7: layer_types has {} entries < num_hidden_layers {num_hidden_layers}",
+                layer_types.len()));
+        }
+        if let Some((i, t)) = layer_types[..num_hidden_layers].iter().enumerate()
+            .find(|(_, t)| !matches!(t.as_str(), "full_attention" | "sliding_attention"))
+        {
+            return Err(format!("step3p7: layer_types[{i}] = {t:?} is not full_attention or sliding_attention"));
+        }
         let prfs: Vec<f32> = tc
             .get("partial_rotary_factors")
             .and_then(|v| v.as_array())
@@ -117,6 +129,11 @@ impl Step3p7Config {
             .and_then(|v| v.as_array())
             .map(|a| a.iter().map(|x| x.as_f64().unwrap_or(10000.0) as f32).collect())
             .unwrap_or_else(|| vec![f("rope_theta", 10000.0); layer_types.len()]);
+        for (name, len) in [("partial_rotary_factors", prfs.len()), ("rope_theta", thetas.len())] {
+            if len < num_hidden_layers {
+                return Err(format!("step3p7: {name} has {len} entries < num_hidden_layers {num_hidden_layers}"));
+            }
+        }
         let yarn_only: Vec<String> = tc
             .get("yarn_only_types")
             .and_then(|v| v.as_array())
@@ -125,7 +142,7 @@ impl Step3p7Config {
 
         let mut layers = Vec::with_capacity(num_hidden_layers);
         for i in 0..num_hidden_layers {
-            let full = layer_types.get(i).map(|s| s == "full_attention").unwrap_or(true);
+            let full = layer_types[i] == "full_attention";
             let kind = if full { AttnKind::Full } else { AttnKind::Sliding };
             // GROUND-TRUTH (modeling_step3p7.py Step3p7Attention.__init__, lines
             // 648-653): llama3 inv_freq scaling is GATED on `yarn_only_types`. For a
@@ -136,7 +153,7 @@ impl Step3p7Config {
             // inv_freq; sliding_attention layers use PLAIN NeoX RoPE with their per-layer
             // theta. (The earlier "scale every layer" reading was wrong; verified against
             // the real modeling file.)
-            let ltype = layer_types.get(i).map(String::as_str).unwrap_or("full_attention");
+            let ltype = layer_types[i].as_str();
             let use_llama3_scale = if yarn_only.is_empty() {
                 // No gating list → the modeling default keeps rope_parameters for all.
                 true
@@ -171,16 +188,30 @@ impl Step3p7Config {
                 .unwrap_or(131072.0) as f32,
         };
 
+        // Values that would otherwise panic (top-k past the expert count) or divide by
+        // zero / map GQA heads wrongly (KV heads) on the first token.
+        let num_key_value_heads = usz("num_attention_groups").or_else(|_| usz("num_key_value_heads"))?;
+        if num_key_value_heads == 0 || layers.iter().any(|l| l.num_heads % num_key_value_heads != 0) {
+            return Err(format!(
+                "step3p7: every layer's head count must be a non-zero multiple of the KV head \
+                 count (kv={num_key_value_heads})"));
+        }
+        let num_experts = usz("moe_num_experts")?;
+        let num_experts_per_tok = usz("moe_top_k")?;
+        if num_experts_per_tok == 0 || num_experts_per_tok > num_experts {
+            return Err(format!("step3p7: moe_top_k {num_experts_per_tok} not in 1..={num_experts}"));
+        }
+
         Ok(Step3p7Config {
             hidden_size: usz("hidden_size")?,
             num_hidden_layers,
             vocab_size: usz("vocab_size")?,
             rms_norm_eps: f("rms_norm_eps", 1e-5),
             head_dim,
-            num_key_value_heads: usz("num_attention_groups").or_else(|_| usz("num_key_value_heads"))?,
+            num_key_value_heads,
             intermediate_size: usz("intermediate_size")?,
-            num_experts: usz("moe_num_experts")?,
-            num_experts_per_tok: usz("moe_top_k")?,
+            num_experts,
+            num_experts_per_tok,
             moe_intermediate_size: usz("moe_intermediate_size")?,
             share_expert_dim: usz("share_expert_dim")?,
             router_scaling_factor: f("moe_router_scaling_factor", 1.0),
@@ -562,13 +593,17 @@ impl Step3p7Expert {
         let fp = std::fs::File::open(packed_path).map_err(|x| format!("stream open {packed_path}: {x}"))?;
         let mp = unsafe { Mmap::map(&fp) }.map_err(|x| format!("stream mmap {packed_path}: {x}"))?;
         let stp = SafeTensors::deserialize(&mp).map_err(|x| format!("stream deser {packed_path}: {x}"))?;
-        let packed = stp.tensor(packed_name).map_err(|x| format!("{packed_name}: {x}"))?
-            .data()[e * pb..(e + 1) * pb].to_vec();
+        let pd = stp.tensor(packed_name).map_err(|x| format!("{packed_name}: {x}"))?.data();
+        let packed = pd.get(e * pb..(e + 1) * pb)
+            .ok_or_else(|| format!("{packed_name}: expert {e} past the end ({} B)", pd.len()))?
+            .to_vec();
         let fs = std::fs::File::open(scale_path).map_err(|x| format!("stream open {scale_path}: {x}"))?;
         let ms = unsafe { Mmap::map(&fs) }.map_err(|x| format!("stream mmap {scale_path}: {x}"))?;
         let sts = SafeTensors::deserialize(&ms).map_err(|x| format!("stream deser {scale_path}: {x}"))?;
-        let scale = sts.tensor(scale_name).map_err(|x| format!("{scale_name}: {x}"))?
-            .data()[e * sb..(e + 1) * sb].to_vec();
+        let sd = sts.tensor(scale_name).map_err(|x| format!("{scale_name}: {x}"))?.data();
+        let scale = sd.get(e * sb..(e + 1) * sb)
+            .ok_or_else(|| format!("{scale_name}: expert {e} past the end ({} B)", sd.len()))?
+            .to_vec();
         Ok((packed, scale))
     }
 
@@ -630,6 +665,69 @@ impl OwnedExpertsPacked {
     }
 }
 
+/// Where one 3D expert projection (`{base}.weight` packed + `{base}.weight_scale`)
+/// lives: tensor names, shard names and paths. The two can sit in different shards.
+pub(crate) struct ExpertProjSrc {
+    pub packed_name: String,
+    pub scale_name: String,
+    pub packed_shard: String,
+    pub scale_shard: String,
+    pub packed_path: String,
+    pub scale_path: String,
+}
+
+/// Resolve both tensors of an expert projection in the index and make sure both
+/// shards are mapped in `mmaps` (lazily; only shards this stage touches).
+pub(crate) fn map_expert_proj(
+    dir: &std::path::Path,
+    weight_map: &serde_json::Map<String, Value>,
+    mmaps: &mut std::collections::HashMap<String, memmap2::Mmap>,
+    base: &str,
+) -> Result<ExpertProjSrc, String> {
+    let packed_name = format!("{base}.weight");
+    let scale_name = format!("{base}.weight_scale");
+    let resolve = |name: &str| -> Result<(String, String), String> {
+        let shard = weight_map
+            .get(name)
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| format!("index.json missing {name}"))?
+            .to_string();
+        let path = dir.join(&shard).to_string_lossy().to_string();
+        Ok((shard, path))
+    };
+    let (packed_shard, packed_path) = resolve(&packed_name)?;
+    let (scale_shard, scale_path) = resolve(&scale_name)?;
+    for (shard, path) in [(&packed_shard, &packed_path), (&scale_shard, &scale_path)] {
+        if !mmaps.contains_key(shard) {
+            let f = std::fs::File::open(path).map_err(|e| format!("open {shard}: {e}"))?;
+            let m = unsafe { memmap2::Mmap::map(&f).map_err(|e| format!("mmap {shard}: {e}"))? };
+            mmaps.insert(shard.clone(), m);
+        }
+    }
+    Ok(ExpertProjSrc { packed_name, scale_name, packed_shard, scale_shard, packed_path, scale_path })
+}
+
+/// Per-expert byte spans `(packed, scale)` of a projection, after checking that the
+/// packed / scale tensors and the `weight_scale_2` globals cover `num_experts`
+/// experts of `[out_f, in_f]`. A checkpoint that does not match the config (other
+/// expert count, TP-sharded, other intermediate size) is an `Err`, not a slice panic.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn check_expert_proj(
+    base: &str, pd: &[u8], sd: &[u8], globals: &[f32], num_experts: usize,
+    out_f: usize, in_f: usize, group: usize,
+) -> Result<(usize, usize), String> {
+    let (pb, sb) = Step3p7Expert::byte_spans(out_f, in_f, group);
+    if pd.len() < num_experts * pb || sd.len() < num_experts * sb {
+        return Err(format!(
+            "{base}: packed {} B / scale {} B < expected {} / {} for {num_experts} experts [{out_f},{in_f}]",
+            pd.len(), sd.len(), num_experts * pb, num_experts * sb));
+    }
+    if globals.len() < num_experts {
+        return Err(format!("{base}.weight_scale_2 has {} globals < {num_experts}", globals.len()));
+    }
+    Ok((pb, sb))
+}
+
 /// Load one MoE proj's `[E]` experts (resident or overflow-streamed per the budget)
 /// by slicing the 3D `{base}.weight`/`.weight_scale` tensors per expert. Keeps a live
 /// mmap cache so the big packed tensor is never fully copied to the heap — resident
@@ -649,39 +747,13 @@ pub(crate) fn load_experts_proj(
     stream_cfg: MoeStreamCfg,
     resident_bytes: &mut u64,
 ) -> Result<Vec<Step3p7Expert>, String> {
-    use memmap2::Mmap;
-    use safetensors::SafeTensors;
-    let packed_name = format!("{base}.weight");
-    let scale_name = format!("{base}.weight_scale");
-    // packed and scale can live in DIFFERENT shards — resolve each independently.
-    let resolve = |name: &str| -> Result<(String, String), String> {
-        let shard = weight_map
-            .get(name)
-            .and_then(|x| x.as_str())
-            .ok_or_else(|| format!("index.json missing {name}"))?
-            .to_string();
-        let path = dir.join(&shard).to_string_lossy().to_string();
-        Ok((shard, path))
-    };
-    let (packed_shard, packed_path) = resolve(&packed_name)?;
-    let (scale_shard, scale_path) = resolve(&scale_name)?;
-    for (shard, path) in [(&packed_shard, &packed_path), (&scale_shard, &scale_path)] {
-        if !mmaps.contains_key(shard) {
-            let f = std::fs::File::open(path).map_err(|e| format!("open {shard}: {e}"))?;
-            let m = unsafe { Mmap::map(&f).map_err(|e| format!("mmap {shard}: {e}"))? };
-            mmaps.insert(shard.clone(), m);
-        }
-    }
-    let stp = SafeTensors::deserialize(&mmaps[&packed_shard]).map_err(|e| format!("parse {packed_shard}: {e}"))?;
-    let sts = SafeTensors::deserialize(&mmaps[&scale_shard]).map_err(|e| format!("parse {scale_shard}: {e}"))?;
-    let pv = stp.tensor(&packed_name).map_err(|e| format!("{packed_name}: {e}"))?;
-    let sv = sts.tensor(&scale_name).map_err(|e| format!("{scale_name}: {e}"))?;
-    let pd = pv.data();
-    let sd = sv.data();
-    let (pb, sb) = Step3p7Expert::byte_spans(out_f, in_f, group);
-    if globals.len() < num_experts {
-        return Err(format!("{base}.weight_scale_2 has {} globals < {num_experts}", globals.len()));
-    }
+    let src = map_expert_proj(dir, weight_map, mmaps, base)?;
+    let ExpertProjSrc { packed_name, scale_name, packed_shard, scale_shard, packed_path, scale_path } = src;
+    let stp = safetensors::SafeTensors::deserialize(&mmaps[&packed_shard]).map_err(|e| format!("parse {packed_shard}: {e}"))?;
+    let sts = safetensors::SafeTensors::deserialize(&mmaps[&scale_shard]).map_err(|e| format!("parse {scale_shard}: {e}"))?;
+    let pd = stp.tensor(&packed_name).map_err(|e| format!("{packed_name}: {e}"))?.data();
+    let sd = sts.tensor(&scale_name).map_err(|e| format!("{scale_name}: {e}"))?.data();
+    let (pb, sb) = check_expert_proj(base, pd, sd, globals, num_experts, out_f, in_f, group)?;
     let est = MoeStreamCfg::expert_linear_bytes(out_f, in_f, group);
     let mut out = Vec::with_capacity(num_experts);
     for e in 0..num_experts {
@@ -881,6 +953,11 @@ impl Step3p7Model {
     /// advances the KV cache IN PLACE — bit-identical to the prefill of the same prefix.
     /// Dispatches to the GPU-resident stage when present.
     pub fn decode_step(&mut self, token_id: u32, hidden_in: &[f32]) -> Result<Vec<f32>, String> {
+        // Check the token before either path slices the embedding with it.
+        if self.pp_first && token_id as usize >= self.config.vocab_size {
+            return Err(format!(
+                "decode_step: token_id {token_id} >= vocab_size {}", self.config.vocab_size));
+        }
         if self.gpu.is_some() {
             let out = {
                 let g = self.gpu.as_mut().unwrap();
@@ -926,25 +1003,34 @@ impl Step3p7Model {
         Ok(cpu_matmul(&normed, lm, 1, h, cfg.vocab_size))
     }
 
-    /// Full CPU forward over a token-id sequence: last_hidden_state `[seq, hidden]`
-    /// when no `lm_head`, else last-position logits `[vocab]`.
-    pub fn forward(&self, tokens: &[u32]) -> Vec<f32> {
-        self.weights.forward(tokens, &self.config)
-    }
-
     /// PP-window prefill (the fleet fit-to-validate seam). Builds this stage's input
     /// `[seq, hidden]` — embed the tokens on the FIRST stage, else take the previous
     /// stage's hidden — runs the window's layers (global layer index = `pp_start +
     /// local`, so per-layer RoPE/attn-kind/MoE/swiglu stay correct for a window that
     /// does not start at layer 0), and on the LAST stage applies final_norm + lm_head
     /// on the last position → `[vocab]`. Middle stages return `[seq*hidden]` hidden.
-    /// This is bit-identical to the single-node `Step3p7Weights::forward` composed
-    /// across the PP split (same ops, same order), so a passing multi-node gate
-    /// certifies the whole-model forward.
+    /// Same ops, same order as the stateful `decode_step` run per position, so a
+    /// passing multi-node gate certifies the whole-model forward.
     pub fn pp_prefill(&self, tokens: &[u32], hidden_in: Vec<f32>, seq: usize) -> Result<Vec<f32>, String> {
         let h = self.config.hidden_size;
         if seq == 0 {
             return Err("pp_prefill: empty prompt".into());
+        }
+        // The GPU-resident loader keeps no host layer weights, so this stateless CPU
+        // prefill would skip every layer (middle stage) or fail (edges). The resident
+        // path prefills through the stateful decode seam instead.
+        if self.gpu.is_some() {
+            return Err("pp_prefill: not supported on a GPU-resident model; \
+                        use forward_pp_step3p7_decode_prefill".into());
+        }
+        if self.pp_first {
+            if tokens.len() < seq {
+                return Err(format!("pp_prefill: tokens.len()={} < seq={seq}", tokens.len()));
+            }
+            if let Some(&bad) = tokens[..seq].iter().find(|&&t| t as usize >= self.config.vocab_size) {
+                return Err(format!(
+                    "pp_prefill: token {bad} >= vocab_size {}", self.config.vocab_size));
+            }
         }
         let mut hidden = if self.pp_first {
             let embed = &self.weights.embed;
@@ -952,7 +1038,7 @@ impl Step3p7Model {
                 return Err("pp_prefill: first stage missing embed".into());
             }
             let mut hv = vec![0f32; seq * h];
-            for (t, &tok) in tokens.iter().enumerate().take(seq) {
+            for (t, &tok) in tokens[..seq].iter().enumerate() {
                 hv[t * h..(t + 1) * h]
                     .copy_from_slice(&embed[tok as usize * h..(tok as usize + 1) * h]);
             }
@@ -1222,30 +1308,6 @@ fn rms_norm_rows_plus1(x: &[f32], w: &[f32], seq: usize, hidden: usize, eps: f32
 }
 
 impl Step3p7Weights {
-    /// Full CPU forward over a token id sequence. Returns per-position
-    /// `[seq, hidden]` (last_hidden_state, pre-lm_head) when `lm_head` is None,
-    /// else logits for the LAST position only (`[vocab]`).
-    pub fn forward(&self, tokens: &[u32], cfg: &Step3p7Config) -> Vec<f32> {
-        let hs = cfg.hidden_size;
-        let seq = tokens.len();
-        let mut hidden = vec![0.0f32; seq * hs];
-        for (t, &tok) in tokens.iter().enumerate() {
-            let row = &self.embed[tok as usize * hs..(tok as usize + 1) * hs];
-            hidden[t * hs..(t + 1) * hs].copy_from_slice(row);
-        }
-        for (li, lw) in self.layers.iter().enumerate() {
-            hidden = step3p7_layer_forward(&hidden, seq, li, lw, cfg);
-        }
-        let normed = rms_norm_rows_plus1(&hidden, &self.final_norm, seq, hs, cfg.rms_norm_eps);
-        match &self.lm_head {
-            None => normed,
-            Some(lm) => {
-                let last = &normed[(seq - 1) * hs..seq * hs];
-                cpu_matmul(last, lm, 1, hs, cfg.vocab_size)
-            }
-        }
-    }
-
     /// Forward that dumps each layer's post-residual hidden as raw LE-f32 to
     /// `{dump_path}.{stage}.r0` when `dump_path` is Some — the bisect-ladder
     /// producer for the assembled-forward gate. Never applies lm_head.
@@ -1655,6 +1717,37 @@ mod tests {
         }
     }
 
+    /// PR #98 review: bad Python input is an `Err`, never a panic or zero rows.
+    #[test]
+    fn step3p7_rejects_bad_tokens_and_short_prompts() {
+        let cfg = fake_cfg();
+        let mut model = fake_model(&cfg);
+        let v = cfg.vocab_size as u32;
+        // pp_prefill: out-of-vocab token, and fewer tokens than `seq`.
+        let e = model.pp_prefill(&[1, v, 2], Vec::new(), 3).unwrap_err();
+        assert!(e.contains("vocab_size"), "{e}");
+        let e = model.pp_prefill(&[1, 2], Vec::new(), 3).unwrap_err();
+        assert!(e.contains("tokens.len()"), "{e}");
+        assert!(model.pp_prefill(&[1, 2, 3], Vec::new(), 3).is_ok());
+        // decode_step: out-of-vocab token, checked before the embedding slice.
+        let e = model.decode_step(v + 5, &[]).unwrap_err();
+        assert!(e.contains("vocab_size"), "{e}");
+        assert!(model.decode_step(1, &[]).is_ok());
+    }
+
+    /// PR #98 review: a checkpoint whose expert tensors do not cover the config is
+    /// an `Err` before any slice.
+    #[test]
+    fn check_expert_proj_rejects_short_tensors() {
+        let (out_f, in_f, group, n) = (8usize, 32usize, 16usize, 4usize);
+        let (pb, sb) = Step3p7Expert::byte_spans(out_f, in_f, group);
+        let (pd, sd, g) = (vec![0u8; n * pb], vec![0u8; n * sb], vec![1f32; n]);
+        assert_eq!(check_expert_proj("x", &pd, &sd, &g, n, out_f, in_f, group).unwrap(), (pb, sb));
+        assert!(check_expert_proj("x", &pd[..pd.len() - 1], &sd, &g, n, out_f, in_f, group).is_err());
+        assert!(check_expert_proj("x", &pd, &sd[..sb], &g, n, out_f, in_f, group).is_err());
+        assert!(check_expert_proj("x", &pd, &sd, &g[..n - 1], n, out_f, in_f, group).is_err());
+    }
+
     #[test]
     fn step3p7_decode_equals_prefill() {
         let cfg = fake_cfg();
@@ -1793,7 +1886,7 @@ mod tests {
         let j = serde_json::json!({
             "tie_word_embeddings": false,
             "text_config": {
-                "hidden_size": 4096, "num_hidden_layers": 45, "vocab_size": 128896,
+                "hidden_size": 4096, "num_hidden_layers": 5, "vocab_size": 128896,
                 "rms_norm_eps": 1e-5, "head_dim": 128, "num_attention_groups": 8,
                 "num_attention_heads": 64, "intermediate_size": 11264,
                 "moe_num_experts": 212, "moe_top_k": 8, "moe_intermediate_size": 1280,
@@ -1810,8 +1903,7 @@ mod tests {
                 "rope_parameters": {"factor":2.0,"low_freq_factor":1.0,"high_freq_factor":32.0,"original_max_position_embeddings":131072}
             }
         });
-        let mut c = Step3p7Config::from_json(&j).unwrap();
-        c.num_hidden_layers = 5; // the toy layer_types is length 5
+        let c = Step3p7Config::from_json(&j).unwrap();
         assert_eq!(c.hidden_size, 4096);
         assert_eq!(c.num_experts, 212);
         assert_eq!(c.num_experts_per_tok, 8);
@@ -1822,6 +1914,27 @@ mod tests {
         assert_eq!(c.layers[1].num_heads, 96);
         assert_eq!(c.layers[1].sliding_window, Some(512));
         assert!(!c.is_moe_layer(2) && c.is_moe_layer(3));
+
+        // PR #98 review: a typo or a short layer_types is an Err, not a guessed kind.
+        let mut bad = j.clone();
+        bad["text_config"]["layer_types"][1] = serde_json::json!("full_attenton");
+        let e = Step3p7Config::from_json(&bad).unwrap_err();
+        assert!(e.contains("layer_types[1]"), "{e}");
+        let mut short = j.clone();
+        short["text_config"]["num_hidden_layers"] = serde_json::json!(6);
+        let e = Step3p7Config::from_json(&short).unwrap_err();
+        assert!(e.contains("< num_hidden_layers"), "{e}");
+        // top-k past the expert count, a KV count that does not divide the heads, and
+        // a short per-layer rope array are Errs too (each would panic or mis-map later).
+        let mut topk = j.clone();
+        topk["text_config"]["moe_top_k"] = serde_json::json!(213);
+        assert!(Step3p7Config::from_json(&topk).unwrap_err().contains("moe_top_k"));
+        let mut kv = j.clone();
+        kv["text_config"]["num_attention_groups"] = serde_json::json!(5);
+        assert!(Step3p7Config::from_json(&kv).unwrap_err().contains("KV head"));
+        let mut rope = j.clone();
+        rope["text_config"]["rope_theta"] = serde_json::json!([1e4, 1e4]);
+        assert!(Step3p7Config::from_json(&rope).unwrap_err().contains("rope_theta"));
     }
 
     #[test]

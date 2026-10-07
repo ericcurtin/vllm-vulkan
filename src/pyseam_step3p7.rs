@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Per-model pyo3 seam for `step3p7` — moved verbatim out of the monolithic
-//! `VulkanModel` `#[pymethods]` block in `lib.rs` (Phase A upstream refactor).
-//! Behavior-preserving code motion: method bodies are byte-for-byte identical.
-//! Kept as separate `#[pymethods] impl VulkanModel` block(s) via pyo3's
+//! Per-model pyo3 seam for `step3p7`: the Python-facing prefill / decode / reset
+//! entry points. Kept as a separate `#[pymethods] impl VulkanModel` block via pyo3's
 //! `multiple-pymethods` feature so a per-model upstream PR can carve this file.
 #![allow(clippy::all)]
 
@@ -43,11 +41,11 @@ impl VulkanModel {
         hidden_in: Vec<f32>,
         seq: usize,
     ) -> PyResult<Vec<f32>> {
-        let (h, first, last) = {
+        let (h, vocab, first, last) = {
             let m = self.step3p7.as_ref().ok_or_else(|| {
                 PyRuntimeError::new_err("forward_pp_step3p7_decode_prefill needs a step3p7 model")
             })?;
-            (m.config.hidden_size, m.pp_first, m.pp_last)
+            (m.config.hidden_size, m.config.vocab_size, m.pp_first, m.pp_last)
         };
         if seq == 0 {
             return Err(PyRuntimeError::new_err("forward_pp_step3p7_decode_prefill: empty prompt"));
@@ -55,6 +53,14 @@ impl VulkanModel {
         if first && tokens.len() < seq {
             return Err(PyRuntimeError::new_err(format!(
                 "forward_pp_step3p7_decode_prefill: tokens.len()={} < seq={seq}", tokens.len())));
+        }
+        // Check every prompt token BEFORE the reset: a bad id found mid-loop would
+        // leave the session half advanced.
+        if first {
+            if let Some(&bad) = tokens[..seq].iter().find(|&&t| t as usize >= vocab) {
+                return Err(PyRuntimeError::new_err(format!(
+                    "forward_pp_step3p7_decode_prefill: token {bad} >= vocab_size {vocab}")));
+            }
         }
         if !first && hidden_in.len() != seq * h {
             return Err(PyRuntimeError::new_err(format!(
@@ -124,6 +130,7 @@ impl VulkanModel {
                 .ok_or_else(|| PyRuntimeError::new_err("pp_step_step3p7_logits needs a step3p7 model"))?;
             (m.config.hidden_size, m.config.vocab_size)
         };
+        self.step3p7_check_role(recv_from, send_to)?;
         let comm = self.collective_comm as *mut std::os::raw::c_void;
         let (do_recv, is_last) = pp_step_role(recv_from, send_to);
         let is_first = recv_from < 0;
@@ -154,4 +161,25 @@ impl VulkanModel {
     }
 
 
+}
+
+
+impl VulkanModel {
+    /// The `pp_step_step3p7_logits` ring role (`recv_from < 0` = first stage,
+    /// `send_to < 0` = last stage) must match the layer window this model loaded. A
+    /// mismatch would recv on the first stage (blocking forever) or send `[vocab]`
+    /// logits down the `[H]` hidden path from a mis-wired tail.
+    fn step3p7_check_role(&self, recv_from: i32, send_to: i32) -> PyResult<()> {
+        let m = match self.step3p7.as_ref() {
+            Some(m) => m,
+            None => return Ok(()), // the callers report the missing model themselves
+        };
+        let (first, last) = (recv_from < 0, send_to < 0);
+        if first != m.pp_first || last != m.pp_last {
+            return Err(PyRuntimeError::new_err(format!(
+                "pp_step_step3p7: ring role (recv_from={recv_from} -> first={first}, send_to={send_to} \
+                 -> last={last}) does not match this stage (first={}, last={})", m.pp_first, m.pp_last)));
+        }
+        Ok(())
+    }
 }

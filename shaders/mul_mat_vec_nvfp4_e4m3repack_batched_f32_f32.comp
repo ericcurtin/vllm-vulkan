@@ -1,6 +1,6 @@
 #version 450
 // NVFP4-e4m3 EXPERT-BATCHED matvec — the Step-3.7-Flash-148B "#3" MoE decode
-// dispatch-collapse lever (VLLM_VULKAN_STEP37_EXPERT_BATCH, default OFF). Computes
+// dispatch-collapse lever (VLLM_VULKAN_STEP37_EXPERT_BATCH, default ON). Computes
 // the SAME gate/up/down routed-expert projection over ALL selected owned experts
 // in ONE dispatch, each expert's slice processed through the EXACT per-group
 // e4m3 repack inner loop of mul_mat_vec_nvfp4_e4m3repack_f32_f32.comp (dwordx4
