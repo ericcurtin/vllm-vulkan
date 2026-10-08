@@ -511,16 +511,8 @@ fn tp_all_reduce(
         let sb = &mut send_scratch[..n];
         let rb = &mut recv_scratch[..n];
         sb.copy_from_slice(buf);
-        pyo3::Python::with_gil(|py| -> Result<(), String> {
-            if vccl_ffi::send_recv_available() {
-                vccl_ffi::send_recv_f32(py, commp, sb, tp_peer, rb, tp_peer)
-            } else if send_first {
-                vccl_ffi::send_f32(py, commp, sb, tp_peer)?;
-                vccl_ffi::recv_f32_into(py, commp, rb, tp_peer)
-            } else {
-                vccl_ffi::recv_f32_into(py, commp, rb, tp_peer)?;
-                vccl_ffi::send_f32(py, commp, sb, tp_peer)
-            }
+        pyo3::Python::with_gil(|py| {
+            vccl_ffi::pairwise_exchange_f32(py, commp, sb, rb, tp_peer, send_first, None)
         })?;
         for (b, r) in buf.iter_mut().zip(rb.iter()) {
             *b += *r;
@@ -528,16 +520,8 @@ fn tp_all_reduce(
         return Ok(());
     }
     let mut recv = vec![0f32; n];
-    pyo3::Python::with_gil(|py| -> Result<(), String> {
-        if vccl_ffi::send_recv_available() {
-            vccl_ffi::send_recv_f32(py, commp, buf, tp_peer, &mut recv, tp_peer)
-        } else if send_first {
-            vccl_ffi::send_f32(py, commp, buf, tp_peer)?;
-            vccl_ffi::recv_f32_into(py, commp, &mut recv, tp_peer)
-        } else {
-            vccl_ffi::recv_f32_into(py, commp, &mut recv, tp_peer)?;
-            vccl_ffi::send_f32(py, commp, buf, tp_peer)
-        }
+    pyo3::Python::with_gil(|py| {
+        vccl_ffi::pairwise_exchange_f32(py, commp, buf, &mut recv, tp_peer, send_first, None)
     })?;
     for (b, r) in buf.iter_mut().zip(&recv) {
         *b += *r;

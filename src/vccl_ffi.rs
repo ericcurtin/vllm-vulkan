@@ -648,6 +648,61 @@ pub fn send_recv_f32(
     Ok(())
 }
 
+/// Profiler bucket names for [`pairwise_exchange_f32`]: the duplex call, and the
+/// send and recv halves of the ordered fallback.
+pub struct ExchangeProf {
+    pub send_recv: &'static str,
+    pub send: &'static str,
+    pub recv: &'static str,
+}
+
+/// TP=2 pairwise exchange with `peer`: send `send`, and receive the peer's buffer
+/// into `recv`. Prefers one duplex `vcclSendRecv` ([`send_recv_f32`]); without it,
+/// an ordered `send_f32` + `recv_f32_into` in which the `send_first` rank (the
+/// even TP rank) sends first, so the pair cannot deadlock. The bytes exchanged are
+/// identical either way. Shared by the Nemotron and Step-3.7 TP-2 reduces; each
+/// phase is timed into `prof` when given.
+pub fn pairwise_exchange_f32(
+    py: pyo3::Python<'_>,
+    comm: *mut c_void,
+    send: &[f32],
+    recv: &mut [f32],
+    peer: i32,
+    send_first: bool,
+    prof: Option<&ExchangeProf>,
+) -> Result<(), String> {
+    let mark = |name: Option<&'static str>, t: std::time::Instant| {
+        if let Some(n) = name {
+            crate::prof_add(n, t);
+        }
+    };
+    if send_recv_available() {
+        let t = std::time::Instant::now();
+        send_recv_f32(py, comm, send, peer, recv, peer)?;
+        mark(prof.map(|p| p.send_recv), t);
+        return Ok(());
+    }
+    let do_send = |py| -> Result<(), String> {
+        let t = std::time::Instant::now();
+        send_f32(py, comm, send, peer)?;
+        mark(prof.map(|p| p.send), t);
+        Ok(())
+    };
+    let do_recv = |py, recv: &mut [f32]| -> Result<(), String> {
+        let t = std::time::Instant::now();
+        recv_f32_into(py, comm, recv, peer)?;
+        mark(prof.map(|p| p.recv), t);
+        Ok(())
+    };
+    if send_first {
+        do_send(py)?;
+        do_recv(py, recv)
+    } else {
+        do_recv(py, recv)?;
+        do_send(py)
+    }
+}
+
 /// True if libvccl exposes the pre-registration entry points.
 pub fn registration_available() -> bool {
     api()
@@ -1038,6 +1093,24 @@ mod alltoallv_tests {
                 "no lib loaded but send_recv_available() true"
             );
         }
+    }
+
+    /// The shared TP-2 exchange returns a clean Err for a null comm in both send
+    /// orders (duplex or ordered path, whichever this libvccl offers) -- never UB.
+    #[test]
+    fn pairwise_exchange_rejects_null_comm() {
+        pyo3::prepare_freethreaded_python();
+        pyo3::Python::with_gil(|py| {
+            let send = vec![1.0f32; 4];
+            for send_first in [true, false] {
+                let mut recv = vec![0.0f32; 4];
+                let err = pairwise_exchange_f32(py, std::ptr::null_mut(), &send, &mut recv, 1,
+                                                send_first, None)
+                    .expect_err("null comm must error");
+                assert!(!err.is_empty());
+                assert_eq!(recv, vec![0.0f32; 4], "a failed exchange must not write recv");
+            }
+        });
     }
 
     /// `send_recv_f32` with a null comm (or no library at all) must return a

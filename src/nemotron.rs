@@ -1251,39 +1251,19 @@ impl NemotronModel {
         // buffer and recv into the other simultaneously.
         let send = &self.tp_send_scratch;
         let recv = &mut self.tp_recv_scratch;
-        pyo3::Python::with_gil(|py| -> Result<(), String> {
-            // Comm-floor Lever 3: prefer the duplex exchange primitive. ONE
-            // `vcclSendRecv` sends our partial to the peer and recvs theirs in a
-            // single call; the library picks full-duplex overlap under
-            // `VCCL_DUPLEX_OVERLAP=1` (recovers the send-first rank's ~3.7 ms/tok
-            // block) vs a deadlock-free ordered half-duplex fallback when unset.
-            // Both modes exchange identical bytes → argmax-exact either way; only
-            // the send/recv wait order changes. `send`/`recv` are disjoint
-            // registered buffers (borrowed from separate fields above).
-            if crate::vccl_ffi::send_recv_available() {
-                let te = std::time::Instant::now();
-                crate::vccl_ffi::send_recv_f32(
-                    py, comm, &send[..hs], peer, &mut recv[..hs], peer,
-                )?;
-                prof_add("nem_tp_reduce_sendrecv", te);
-            } else if send_first {
-                // Legacy ordered fallback (libvccl without vcclSendRecv): lower
-                // rank sends first to stay deadlock-free.
-                let ts = std::time::Instant::now();
-                crate::vccl_ffi::send_f32(py, comm, &send[..hs], peer)?;
-                prof_add("nem_tp_reduce_send", ts);
-                let tr = std::time::Instant::now();
-                crate::vccl_ffi::recv_f32_into(py, comm, &mut recv[..hs], peer)?;
-                prof_add("nem_tp_reduce_recv", tr);
-            } else {
-                let tr = std::time::Instant::now();
-                crate::vccl_ffi::recv_f32_into(py, comm, &mut recv[..hs], peer)?;
-                prof_add("nem_tp_reduce_recv", tr);
-                let ts = std::time::Instant::now();
-                crate::vccl_ffi::send_f32(py, comm, &send[..hs], peer)?;
-                prof_add("nem_tp_reduce_send", ts);
-            }
-            Ok(())
+        // Comm-floor Lever 3: the shared exchange prefers ONE duplex `vcclSendRecv`
+        // (full-duplex overlap under `VCCL_DUPLEX_OVERLAP=1`, recovering the
+        // send-first rank's ~3.7 ms/tok block), else the ordered half-duplex pair.
+        // Identical bytes either way -> argmax-exact. `send`/`recv` are disjoint
+        // registered buffers (borrowed from separate fields above).
+        const PROF: crate::vccl_ffi::ExchangeProf = crate::vccl_ffi::ExchangeProf {
+            send_recv: "nem_tp_reduce_sendrecv",
+            send: "nem_tp_reduce_send",
+            recv: "nem_tp_reduce_recv",
+        };
+        pyo3::Python::with_gil(|py| {
+            crate::vccl_ffi::pairwise_exchange_f32(
+                py, comm, &send[..hs], &mut recv[..hs], peer, send_first, Some(&PROF))
         })
         .map_err(|e| log::error!("nemotron TP reduce exchange failed: {e}"))
         .ok()?;
