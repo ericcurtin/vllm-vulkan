@@ -160,30 +160,57 @@ jobs:
         echo "spirv-val: ${#mods[@]} module(s) checked, $fail failure(s)"
         [ "$fail" -eq 0 ]
 
-  # Run the Rust tests of the `gemma` model slice — the ~11.8k lines this
-  # branch adds. `rust-test-foundation` above runs
-  # `--no-default-features --features multiple-pymethods`, which compiles NONE
-  # of the gemma/qwen3-dense code, so every `#[cfg(test)]` module in
-  # gemma_forward / gemma_assistant / gemma_spec / unified_layer /
-  # batched_forward / pyseam_gemma was invisible to CI: green did not mean
-  # tested. As of this branch the foundation slice runs 134 tests and the gemma
-  # slice 178, so 44 tests run only here.
-  #
-  # Five of those are the checkpoint-free gemma_assistant gates. The EAGLE
-  # drafter's golden tests need a 939MB checkpoint via
-  # VLLM_TEST_GEMMA31B_ASSISTANT_DIR and print SKIP without it, which in CI is
-  # always -- so the whole drafter path was green-but-unrun. The synthetic
-  # fixture in `gemma_assistant.rs` is the unconditional twin; it must stay
-  # ungated by any env var or feature this job does not set.
-  #
-  # This also builds the standalone configuration the PR advertises
-  # (`--features multiple-pymethods,gemma`, i.e. gemma WITHOUT qwen35), which
-  # is where a model feature that silently depends on a sibling feature shows
-  # up as a compile error instead of as a silently-disengaged runtime lever.
-  rust-test-gemma:
+  # One job per model feature slice, as a matrix. The foundation job above compiles
+  # NONE of the model code, so every model's `#[cfg(test)]` gates run only here.
+  # Per slice:
+  # - `features`: the standalone build + test. It is the smallest configuration
+  #   that must keep working and the only one where the model's parity gates
+  #   compile; a model that quietly grows a sibling-feature dependency fails to
+  #   build here instead of silently disengaging a runtime lever. (gemma's
+  #   checkpoint-free gemma_assistant gates and qwen35's
+  #   push_constants::dispatch_tests -- the matvec routing contract -- run only
+  #   in their slices.)
+  # - `stacked`: the same tests stacked on the `default` model set, so a regression
+  #   in a shared foundation file shows up before it reaches a fleet. qwen35's
+  #   stacked set adds `mtp`, which is the only place src/mtp.rs compiles.
+  # - `gpu_test`: an #[ignore] device test run on Mesa lavapipe (a software Vulkan
+  #   device); without a device it would report "ignored", not passed.
+  # Tests run single-threaded: two GEMM-picker tests race on a process-global
+  # env/OnceLock snapshot under the parallel runner.
+  rust-test-models:
+    name: rust-test-${{ matrix.slice }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - slice: gemma
+            features: gemma
+          - slice: qwen35
+            features: gemma,qwen35
+            stacked: gemma,qwen35,mtp
+          - slice: nemotron
+            features: nemotron
+            stacked: gemma,qwen35,mtp,nemotron
+          - slice: laguna
+            features: laguna
+            stacked: gemma,qwen35,mtp,nemotron,laguna
+          - slice: dsv4
+            features: dsv4
+            stacked: gemma,qwen35,mtp,nemotron,laguna,dsv4
+          - slice: ling
+            features: ling
+            stacked: gemma,qwen35,mtp,ling
+          - slice: kimi
+            features: kimi
+            stacked: gemma,qwen35,mtp,kimi
+            gpu_test: kimi_gpu_stage
+          - slice: step3p7
+            features: step3p7
+            stacked: gemma,qwen35,mtp,step3p7
+            gpu_test: step37_gpu_attn
     steps:
     - name: Checkout code
       uses: actions/checkout@v6
@@ -203,13 +230,11 @@ jobs:
         ensure_vulkan
         sudo apt-get install -y libvulkan-dev libpython3.12-dev
 
-    - name: Build the standalone gemma slice
+    - name: Build the standalone ${{ matrix.slice }} slice
       run: |
-        # The PR's own stated claim. Keeping it in CI is what stops `gemma`
-        # from quietly acquiring a `qwen35` dependency.
-        cargo build --no-default-features --features "multiple-pymethods,gemma"
+        cargo build --no-default-features --features "multiple-pymethods,${{ matrix.features }}"
 
-    - name: Run gemma-slice Rust tests
+    - name: Run ${{ matrix.slice }}-slice Rust tests (standalone)
       env:
         RUST_BACKTRACE: '1'
       run: |
@@ -217,326 +242,11 @@ jobs:
         PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
         test -n "$PYTHONHOME" || { echo "python3.12 reported no base_prefix" >&2; exit 1; }
         export PYTHONHOME
-        # Single-threaded: two GEMM-picker tests race on a process-global
-        # env/OnceLock snapshot under the parallel runner.
-        cargo test --no-default-features --features "multiple-pymethods,gemma" --lib \
-          -- --test-threads=1 --nocapture
-
-  # The qwen35 slice. `rust-test-gemma` above cannot cover it: the
-  # `push_constants::dispatch_tests` module is `#[cfg(all(test, feature =
-  # "qwen35"))]`, so ~70 dispatch/picker tests — the matvec kernel-routing
-  # contract — compile out of every job that does not enable `qwen35`. This
-  # job is what executes them.
-  #
-  # It builds the stacked configuration the PR advertises (gemma + qwen35),
-  # because `qwen35` stacks on `model-gemma` and must not regress it.
-  rust-test-qwen35:
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v6
-      with:
-        submodules: recursive
-        # No job needs git credentials after checkout, so do not leave the
-        # job's GITHUB_TOKEN in .git/config where the shader compiler and
-        # cargo build scripts this job runs could read it.
-        persist-credentials: false
-
-    - name: Install build + link deps
-      run: |
-        # Same deps as rust-test-foundation: glslang via the project's own
-        # installer (build.rs runs scripts/compile_shaders.sh), libvulkan for
-        # the -lvulkan link, libpython for the pyo3 test binary.
-        source scripts/lib.sh
-        ensure_vulkan
-        sudo apt-get install -y libvulkan-dev libpython3.12-dev
-
-    - name: Build the stacked gemma+qwen35 slice
-      run: |
-        cargo build --no-default-features --features "multiple-pymethods,gemma,qwen35"
-
-    - name: Run qwen35-slice Rust tests
-      env:
-        RUST_BACKTRACE: '1'
-      run: |
-        # The test binary embeds the interpreter; point it at the system Python.
-        PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
-        test -n "$PYTHONHOME" || { echo "python3.12 reported no base_prefix" >&2; exit 1; }
-        export PYTHONHOME
-        # Single-threaded: two GEMM-picker tests race on a process-global
-        # env/OnceLock snapshot under the parallel runner.
-        cargo test --no-default-features --features "multiple-pymethods,gemma,qwen35" --lib \
-          -- --test-threads=1 --nocapture
-
-    # `mtp` ships in `default` (Cargo.toml), but every job above runs
-    # `--no-default-features`, so `src/mtp.rs` did not COMPILE anywhere in CI —
-    # its `#[cfg(test)]` parity gates included. `mtp` stacks on `qwen35`
-    # (the feature edge), so this is its cheapest home. Kept as a SEPARATE
-    # step rather than folded into the feature list above, so the stacked
-    # gemma+qwen35 configuration this PR advertises still gets built and
-    # tested on its own.
-    - name: Run the qwen35+mtp slice (adds src/mtp.rs and its parity gates)
-      env:
-        RUST_BACKTRACE: '1'
-      run: |
-        PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
-        test -n "$PYTHONHOME" || { echo "python3.12 reported no base_prefix" >&2; exit 1; }
-        export PYTHONHOME
-        cargo test --no-default-features --features "multiple-pymethods,gemma,qwen35,mtp" --lib \
-          -- --test-threads=1 --nocapture
-
-  # Nemotron-H ships its own kernels (SSD scan, SSM conv step, gated RMSNorm,
-  # MoE accum) and four Rust modules whose `#[cfg(test)]` parity gates compile
-  # ONLY under `--features nemotron`. Build it BOTH ways: standalone (the
-  # smallest configuration that must keep working on its own) and stacked on the
-  # gemma+qwen35+mtp set that `default` now carries, so a cross-model regression
-  # in the shared foundation files shows up here and not on a user's fleet.
-  rust-test-nemotron:
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v6
-      with:
-        submodules: recursive
-        # No job needs git credentials after checkout, so do not leave the
-        # job's GITHUB_TOKEN in .git/config where the shader compiler and
-        # cargo build scripts this job runs could read it.
-        persist-credentials: false
-
-    - name: Install build + link deps
-      run: |
-        source scripts/lib.sh
-        ensure_vulkan
-        sudo apt-get install -y libvulkan-dev libpython3.12-dev
-
-    - name: Build the standalone nemotron slice
-      run: |
-        cargo build --no-default-features --features "multiple-pymethods,nemotron"
-
-    - name: Run nemotron-slice Rust tests (standalone)
-      env:
-        RUST_BACKTRACE: '1'
-      run: |
-        # The test binary embeds the interpreter; point it at the system Python.
-        PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
-        test -n "$PYTHONHOME" || { echo "python3.12 reported no base_prefix" >&2; exit 1; }
-        export PYTHONHOME
-        # Single-threaded: two GEMM-picker tests race on a process-global
-        # env/OnceLock snapshot under the parallel runner.
-        cargo test --no-default-features --features "multiple-pymethods,nemotron" --lib \
-          -- --test-threads=1 --nocapture
-
-    - name: Run the stacked gemma+qwen35+mtp+nemotron slice
-      env:
-        RUST_BACKTRACE: '1'
-      run: |
-        PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
-        test -n "$PYTHONHOME" || { echo "python3.12 reported no base_prefix" >&2; exit 1; }
-        export PYTHONHOME
-        cargo test --no-default-features \
-          --features "multiple-pymethods,gemma,qwen35,mtp,nemotron" --lib \
-          -- --test-threads=1 --nocapture
-
-  # Laguna stacks on nemotron (`laguna = ["nemotron"]` in Cargo.toml: it reuses
-  # nemotron's MoE `router_forward`/`RouterDims` and its `NemGpuWeight`/`NemQuant`
-  # quant types), and adds six shaders of its own plus an e4m3 expert matvec.
-  # Both configurations for the same reason as the nemotron job.
-  rust-test-laguna:
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v6
-      with:
-        submodules: recursive
-        # No job needs git credentials after checkout, so do not leave the
-        # job's GITHUB_TOKEN in .git/config where the shader compiler and
-        # cargo build scripts this job runs could read it.
-        persist-credentials: false
-
-    - name: Install build + link deps
-      run: |
-        source scripts/lib.sh
-        ensure_vulkan
-        sudo apt-get install -y libvulkan-dev libpython3.12-dev
-
-    - name: Build the standalone laguna slice (pulls nemotron via the feature edge)
-      run: |
-        cargo build --no-default-features --features "multiple-pymethods,laguna"
-
-    - name: Run laguna-slice Rust tests (standalone)
-      env:
-        RUST_BACKTRACE: '1'
-      run: |
-        # The test binary embeds the interpreter; point it at the system Python.
-        PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
-        test -n "$PYTHONHOME" || { echo "python3.12 reported no base_prefix" >&2; exit 1; }
-        export PYTHONHOME
-        # Single-threaded: two GEMM-picker tests race on a process-global
-        # env/OnceLock snapshot under the parallel runner.
-        cargo test --no-default-features --features "multiple-pymethods,laguna" --lib \
-          -- --test-threads=1 --nocapture
-
-    - name: Run the stacked gemma+qwen35+mtp+nemotron+laguna slice
-      env:
-        RUST_BACKTRACE: '1'
-      run: |
-        PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
-        test -n "$PYTHONHOME" || { echo "python3.12 reported no base_prefix" >&2; exit 1; }
-        export PYTHONHOME
-        cargo test --no-default-features \
-          --features "multiple-pymethods,gemma,qwen35,mtp,nemotron,laguna" --lib \
-          -- --test-threads=1 --nocapture
-
-  # DeepSeek-V4-Flash ships the DSA indexer, the MLA compressor concat and an mHC block; its parity gates compile only under --features dsv4 and read the JSON fixtures this branch adds.
-  # Both configurations for the same reason as the other model slices: standalone
-  # is the smallest build that must keep working (and the only one where this
-  # model's `#[cfg(test)]` parity gates compile at all), stacked catches a
-  # shared-foundation regression before it reaches a fleet.
-  rust-test-dsv4:
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v6
-      with:
-        submodules: recursive
-        # No job needs git credentials after checkout, so do not leave the
-        # job's GITHUB_TOKEN in .git/config where the shader compiler and
-        # cargo build scripts this job runs could read it.
-        persist-credentials: false
-
-    - name: Install build + link deps
-      run: |
-        source scripts/lib.sh
-        ensure_vulkan
-        sudo apt-get install -y libvulkan-dev libpython3.12-dev
-
-    - name: Build the standalone dsv4 slice
-      run: |
-        cargo build --no-default-features --features "multiple-pymethods,dsv4"
-
-    - name: Run dsv4-slice Rust tests (standalone)
-      env:
-        RUST_BACKTRACE: '1'
-      run: |
-        # The test binary embeds the interpreter; point it at the system Python.
-        PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
-        test -n "$PYTHONHOME" || { echo "python3.12 reported no base_prefix" >&2; exit 1; }
-        export PYTHONHOME
-        # Single-threaded: two GEMM-picker tests race on a process-global
-        # env/OnceLock snapshot under the parallel runner.
-        cargo test --no-default-features --features "multiple-pymethods,dsv4" --lib \
-          -- --test-threads=1 --nocapture
-
-    - name: Run the stacked gemma+qwen35+mtp+nemotron+laguna+dsv4 slice
-      env:
-        RUST_BACKTRACE: '1'
-      run: |
-        PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
-        test -n "$PYTHONHOME" || { echo "python3.12 reported no base_prefix" >&2; exit 1; }
-        export PYTHONHOME
-        cargo test --no-default-features \
-          --features "multiple-pymethods,gemma,qwen35,mtp,nemotron,laguna,dsv4" --lib \
-          -- --test-threads=1 --nocapture
-
-  # Ling-3.0-flash (BailingMoeV3) ships a grouped-topk router, a GPU meta-builder and an expert-batched int4 matvec; its parity gates compile only under --features ling.
-  # Both configurations for the same reason as the other model slices: standalone
-  # is the smallest build that must keep working (and the only one where this
-  # model's `#[cfg(test)]` parity gates compile at all), stacked catches a
-  # shared-foundation regression before it reaches a fleet.
-  rust-test-ling:
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v6
-      with:
-        submodules: recursive
-        # No job needs git credentials after checkout, so do not leave the
-        # job's GITHUB_TOKEN in .git/config where the shader compiler and
-        # cargo build scripts this job runs could read it.
-        persist-credentials: false
-
-    - name: Install build + link deps
-      run: |
-        source scripts/lib.sh
-        ensure_vulkan
-        sudo apt-get install -y libvulkan-dev libpython3.12-dev
-
-    - name: Build the standalone ling slice
-      run: |
-        cargo build --no-default-features --features "multiple-pymethods,ling"
-
-    - name: Run ling-slice Rust tests (standalone)
-      env:
-        RUST_BACKTRACE: '1'
-      run: |
-        # The test binary embeds the interpreter; point it at the system Python.
-        PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
-        test -n "$PYTHONHOME" || { echo "python3.12 reported no base_prefix" >&2; exit 1; }
-        export PYTHONHOME
-        # Single-threaded: two GEMM-picker tests race on a process-global
-        # env/OnceLock snapshot under the parallel runner.
-        cargo test --no-default-features --features "multiple-pymethods,ling" --lib \
-          -- --test-threads=1 --nocapture
-
-    - name: Run the stacked gemma+qwen35+mtp+ling slice
-      env:
-        RUST_BACKTRACE: '1'
-      run: |
-        PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
-        test -n "$PYTHONHOME" || { echo "python3.12 reported no base_prefix" >&2; exit 1; }
-        export PYTHONHOME
-        cargo test --no-default-features \
-          --features "multiple-pymethods,gemma,qwen35,mtp,ling" --lib \
-          -- --test-threads=1 --nocapture
-
-  rust-test-kimi:
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v6
-      with:
-        submodules: recursive
-        # No job needs git credentials after checkout, so do not leave the
-        # job's GITHUB_TOKEN in .git/config where the shader compiler and
-        # cargo build scripts this job runs could read it.
-        persist-credentials: false
-
-    - name: Install build + link deps
-      run: |
-        source scripts/lib.sh
-        ensure_vulkan
-        sudo apt-get install -y libvulkan-dev libpython3.12-dev
-
-    - name: Build the standalone kimi slice
-      run: |
-        cargo build --no-default-features --features "multiple-pymethods,kimi"
-
-    - name: Run kimi-slice Rust tests (standalone)
-      env:
-        RUST_BACKTRACE: '1'
-      run: |
-        # The test binary embeds the interpreter; point it at the system Python.
-        PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
-        test -n "$PYTHONHOME" || { echo "python3.12 reported no base_prefix" >&2; exit 1; }
-        export PYTHONHOME
-        # Single-threaded: two GEMM-picker tests race on a process-global
-        # env/OnceLock snapshot under the parallel runner.
-        cargo test --no-default-features --features "multiple-pymethods,kimi" --lib \
+        cargo test --no-default-features --features "multiple-pymethods,${{ matrix.features }}" --lib \
           -- --test-threads=1 --nocapture
 
     - name: Install Mesa lavapipe (software Vulkan device)
+      if: matrix.gpu_test
       run: |
         sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
         # The lavapipe ICD filename varies with Mesa packaging -- noble ships
@@ -555,7 +265,8 @@ jobs:
         echo "VK_ICD_FILENAMES=$icd" >> "$GITHUB_ENV"
         VK_ICD_FILENAMES="$icd" vulkaninfo --summary | head -40
 
-    - name: Run the KimiGpuStage test on the software Vulkan device
+    - name: Run the ${{ matrix.gpu_test }} device test on the software Vulkan device
+      if: matrix.gpu_test
       env:
         RUST_BACKTRACE: '1'
       run: |
@@ -565,101 +276,16 @@ jobs:
         PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
         test -n "$PYTHONHOME" || { echo "python3.12 reported no base_prefix" >&2; exit 1; }
         export PYTHONHOME
-        cargo test --no-default-features --features "multiple-pymethods,kimi" --lib \
-          kimi_gpu_stage -- --ignored --nocapture
+        cargo test --no-default-features --features "multiple-pymethods,${{ matrix.features }}" --lib \
+          ${{ matrix.gpu_test }} -- --ignored --nocapture
 
-    - name: Run the stacked gemma+qwen35+mtp+kimi slice
+    - name: Run the stacked ${{ matrix.stacked }} slice
+      if: matrix.stacked
       env:
         RUST_BACKTRACE: '1'
       run: |
         PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
         test -n "$PYTHONHOME" || { echo "python3.12 reported no base_prefix" >&2; exit 1; }
         export PYTHONHOME
-        cargo test --no-default-features \
-          --features "multiple-pymethods,gemma,qwen35,mtp,kimi" --lib \
-          -- --test-threads=1 --nocapture
-
-  # Step-3.7-Flash (REAP-pruned MoE, streamed per-layer loader, TP-2 x PP decode).
-  # Standalone is the smallest build that must keep working and the only one where
-  # this model's #[cfg(test)] parity gates compile; stacked catches a shared-
-  # foundation regression. The lavapipe step runs the GPU-vs-host decode-attention
-  # test (scalar kernel on a software device).
-  rust-test-step3p7:
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v6
-      with:
-        submodules: recursive
-        # No job needs git credentials after checkout, so do not leave the
-        # job's GITHUB_TOKEN in .git/config where the shader compiler and
-        # cargo build scripts this job runs could read it.
-        persist-credentials: false
-
-    - name: Install build + link deps
-      run: |
-        source scripts/lib.sh
-        ensure_vulkan
-        sudo apt-get install -y libvulkan-dev libpython3.12-dev
-
-    - name: Build the standalone step3p7 slice
-      run: |
-        cargo build --no-default-features --features "multiple-pymethods,step3p7"
-
-    - name: Run step3p7-slice Rust tests (standalone)
-      env:
-        RUST_BACKTRACE: '1'
-      run: |
-        # The test binary embeds the interpreter; point it at the system Python.
-        PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
-        test -n "$PYTHONHOME" || { echo "python3.12 reported no base_prefix" >&2; exit 1; }
-        export PYTHONHOME
-        # Single-threaded: two GEMM-picker tests race on a process-global
-        # env/OnceLock snapshot under the parallel runner.
-        cargo test --no-default-features --features "multiple-pymethods,step3p7" --lib \
-          -- --test-threads=1 --nocapture
-
-    - name: Install Mesa lavapipe (software Vulkan device)
-      run: |
-        sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
-        # The lavapipe ICD filename varies with Mesa packaging -- noble ships
-        # lvp_icd.x86_64.json while noble-updates ships lvp_icd.json -- and the
-        # directory differs across distros too. Discover it instead of pinning
-        # one spelling, and fail loudly (listing what IS installed) if absent,
-        # so this never degrades into a silently device-less run.
-        icd=$(find /usr/share/vulkan/icd.d /usr/lib/x86_64-linux-gnu/vulkan/icd.d \
-                -name 'lvp_icd*.json' 2>/dev/null | head -1)
-        if [ -z "$icd" ]; then
-          echo "::error::lavapipe ICD not found. Installed Vulkan ICDs:"
-          find /usr -name '*_icd*.json' 2>/dev/null | sed 's/^/  /'
-          exit 1
-        fi
-        echo "lavapipe ICD: $icd"
-        echo "VK_ICD_FILENAMES=$icd" >> "$GITHUB_ENV"
-        VK_ICD_FILENAMES="$icd" vulkaninfo --summary | head -40
-
-    - name: Run the Step-3.7 GPU attention test on the software Vulkan device
-      env:
-        RUST_BACKTRACE: '1'
-      run: |
-        # VK_ICD_FILENAMES comes from the lavapipe step via GITHUB_ENV. The test
-        # is #[ignore] so device-less runs report it as ignored, not passed; here
-        # it is opted in and panics if the device is missing.
-        PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
-        test -n "$PYTHONHOME" || { echo "python3.12 reported no base_prefix" >&2; exit 1; }
-        export PYTHONHOME
-        cargo test --no-default-features --features "multiple-pymethods,step3p7" --lib \
-          step37_gpu_attn -- --ignored --nocapture
-
-    - name: Run the stacked gemma+qwen35+mtp+step3p7 slice
-      env:
-        RUST_BACKTRACE: '1'
-      run: |
-        PYTHONHOME="$(python3.12 -c 'import sys; print(sys.base_prefix)')"
-        test -n "$PYTHONHOME" || { echo "python3.12 reported no base_prefix" >&2; exit 1; }
-        export PYTHONHOME
-        cargo test --no-default-features \
-          --features "multiple-pymethods,gemma,qwen35,mtp,step3p7" --lib \
+        cargo test --no-default-features --features "multiple-pymethods,${{ matrix.stacked }}" --lib \
           -- --test-threads=1 --nocapture
