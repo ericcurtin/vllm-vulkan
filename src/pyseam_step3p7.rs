@@ -135,8 +135,13 @@ impl VulkanModel {
         let (do_recv, is_last) = pp_step_role(recv_from, send_to);
         let is_first = recv_from < 0;
 
-        let hidden_in: Vec<f32> = if do_recv {
-            vccl_ffi::recv_f32(py, comm, h, recv_from).map_err(PyRuntimeError::new_err)?
+        // [H] hops through the registered scratch rings (no per-call temp MR); the
+        // helpers fall back to a fresh Vec when registration is off or unavailable.
+        let want_reg = self.flags.reg_reduce && vccl_ffi::registration_available();
+        pin_pp_hops(comm, want_reg, &mut self.pp_hop_recv, &mut self.pp_hop_send, h, do_recv,
+                    !is_last, "pp_step_step3p7_logits");
+        let hidden_in = if do_recv {
+            pp_hop_recv(py, comm, &mut self.pp_hop_recv, h, recv_from)?
         } else {
             Vec::new()
         };
@@ -147,7 +152,7 @@ impl VulkanModel {
             return Ok(Some(out));
         }
         if !is_last {
-            vccl_ffi::send_f32(py, comm, &out, send_to).map_err(PyRuntimeError::new_err)?;
+            pp_hop_send(py, comm, &mut self.pp_hop_send, &out, send_to)?;
             if is_first {
                 let logits = self.pp_recv_vocab(py, vocab, last_rank)?;
                 Ok(Some(logits))

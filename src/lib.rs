@@ -394,8 +394,10 @@ fn pin_pp_hop(comm: *mut std::os::raw::c_void, ring: &mut PpTokRing, len: usize,
 
 /// Pin a PP stage's `[len]` hop scratches once: the recv side when the stage has a
 /// previous stage (`do_recv`), the send side when it has a next one (`do_send`).
-/// Only when `want_reg` (registration on + libvccl exports it); an already pinned
-/// ring is left as is. A failed pin leaves `handle == 0`, and [`pp_hop_recv`] /
+/// Only when `want_reg` (registration on + libvccl exports it); a ring already
+/// pinned at `len` is left as is, one pinned at another length is re-pinned (the
+/// rings are shared with `pp_send_hidden` / `pp_recv_hidden`, which do the same).
+/// A failed pin leaves `handle == 0`, and [`pp_hop_recv`] /
 /// [`pp_hop_send`] then fall back to a fresh `Vec`.
 #[allow(clippy::too_many_arguments)]
 fn pin_pp_hops(comm: *mut std::os::raw::c_void, want_reg: bool, recv: &mut PpTokRing,
@@ -403,10 +405,10 @@ fn pin_pp_hops(comm: *mut std::os::raw::c_void, want_reg: bool, recv: &mut PpTok
     if !want_reg || comm.is_null() {
         return;
     }
-    if do_recv && recv.handle == 0 {
+    if do_recv && (recv.handle == 0 || recv.buf.len() != len) {
         pin_pp_hop(comm, recv, len, &format!("{tag} recv"));
     }
-    if do_send && send.handle == 0 {
+    if do_send && (send.handle == 0 || send.buf.len() != len) {
         pin_pp_hop(comm, send, len, &format!("{tag} send"));
     }
 }
