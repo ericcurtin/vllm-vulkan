@@ -308,28 +308,176 @@ fn pool_budget_bytes() -> u64 {
     })
 }
 
-/// A simple pool of reusable host-coherent storage buffers keyed by capacity.
-/// Avoids per-activation malloc/mmap pressure during inference. Requests are
-/// size-classed (`size_class`) so a monotonically growing request length reuses
-/// a bounded set of buckets, and the retained idle set is capped by
+/// Allocation/reuse decisions of the [`BufferPool`], kept free of Vulkan so the
+/// rules can be unit-tested.
+///
+/// THE PROBLEM IT FIXES (board #275): `286cfaa` sized EVERY miss above 64 KiB at
+/// `size_class(size)` (next power of two) to bound the DSV4 growing-scratch leak.
+/// But loaders allocate RESIDENT weights through the same call and never return
+/// them, so every weight paid up to 2x (~1.4x on average) in GTT: the validated
+/// Step-3.7 PP-5 window went from 9.51 GB to an allocation failure at 13.18 GB.
+///
+/// THE RULE: a miss is allocated at the EXACT size, unless the request's class
+/// has a pending RETURN — a buffer of that class came back to the pool since the
+/// last miss in it. A return means a reused-scratch pattern (DSV4: return length
+/// t, ask for t+1), and that one miss is rounded up to the class so the next
+/// lengths reuse it. The flag is consumed by the miss it rounds, so a load that
+/// returns one temporary between thousands of weight uploads rounds at most ONE
+/// weight. Weights (never returned) are exact.
+///
+/// The exact first miss of each growing stream leaves a smaller buffer behind in
+/// its class that the stream can no longer use. So when a return would break the
+/// idle-byte budget or the per-class cap, idle buffers SMALLER than the returned
+/// one are evicted first (least recently returned first), instead of freeing the returned
+/// buffer. Without that, the dead buffers filled the budget and a two-buffer
+/// growing pattern (DSV4 `gpu_matvec_rows`) re-allocated every step from ctx
+/// ~8192 (Fable review of #275); with it, growth settles as it did under the
+/// all-rounding pool.
+///
+/// Idle buffers are indexed by their REAL capacity, and a request reuses the
+/// smallest idle buffer with `size <= capacity <= size_class(size)`. That serves
+/// exact and rounded buffers alike, and can never hand out a buffer smaller than
+/// the request.
+#[derive(Default)]
+struct PoolPolicy {
+    /// Idle capacity -> return stamps of the idle buffers of exactly that
+    /// capacity, oldest first (the BufferPool keeps its Vec<Buffer> in the same
+    /// order: reuse takes the newest = last, eviction the oldest = first).
+    idle: std::collections::BTreeMap<u64, std::collections::VecDeque<u64>>,
+    /// Idle buffers per CLASS (the per-class cap, `POOL_MAX`).
+    idle_per_class: std::collections::HashMap<u64, usize>,
+    /// Classes with a return since their last miss.
+    pending_return: std::collections::HashSet<u64>,
+    /// Sum of idle capacities (the byte budget).
+    idle_bytes: u64,
+    /// Monotonic return counter (least-recently-returned eviction order).
+    stamp: u64,
+}
+
+/// What [`PoolPolicy::on_get`] decided.
+#[derive(Debug, PartialEq, Eq)]
+enum PoolGet {
+    /// Reuse the NEWEST idle buffer of exactly this capacity.
+    Reuse(u64),
+    /// Allocate a new buffer of this capacity.
+    Alloc(u64),
+}
+
+impl PoolPolicy {
+    fn on_get(&mut self, size: u64) -> PoolGet {
+        let cls = size_class(size);
+        if let Some(cap) = self.idle.range(size..=cls).next().map(|(&c, _)| c) {
+            self.take_idle(cap, false);
+            return PoolGet::Reuse(cap);
+        }
+        // Sub-64 KiB requests keep their 256 B class (negligible waste, cheap reuse).
+        if size <= 64 * 1024 {
+            return PoolGet::Alloc(cls);
+        }
+        if self.pending_return.remove(&cls) {
+            PoolGet::Alloc(cls)
+        } else {
+            PoolGet::Alloc(size)
+        }
+    }
+
+    /// A buffer of `cap` came back. Returns whether to keep it idle (`false` =
+    /// free it), plus the idle buffers to free first to make room: each entry is
+    /// the capacity of one buffer, and it is the OLDEST idle buffer of that
+    /// capacity.
+    fn on_put(&mut self, cap: u64, budget: u64) -> (bool, Vec<u64>) {
+        let cls = size_class(cap);
+        if cap > 64 * 1024 {
+            self.pending_return.insert(cls);
+        }
+        let mut evict = Vec::new();
+        // Preflight: evict nothing unless evicting smaller idle buffers can make
+        // room for the returned one. Otherwise a return that cannot fit would
+        // still free every smaller idle buffer and then be dropped itself.
+        let need = self.idle_bytes.saturating_add(cap).saturating_sub(budget);
+        let evictable = self
+            .idle
+            .range(..cap)
+            .fold(0u64, |s, (&c, q)| s.saturating_add(c.saturating_mul(q.len() as u64)));
+        let class_full = self.idle_per_class.get(&cls).copied().unwrap_or(0) >= POOL_MAX;
+        if need > evictable || (class_full && self.oldest_below(cap, Some(cls)).is_none()) {
+            return (false, evict);
+        }
+        // Per-class cap: evict the least-recently-returned SMALLER buffer of this
+        // class (the returned buffer serves everything it could).
+        if class_full {
+            match self.oldest_below(cap, Some(cls)) {
+                Some(c) => {
+                    self.take_idle(c, true);
+                    evict.push(c);
+                }
+                None => return (false, evict),
+            }
+        }
+        // Byte budget: evict least-recently-returned idle buffers smaller than
+        // `cap` until the returned buffer fits.
+        while self.idle_bytes.saturating_add(cap) > budget {
+            match self.oldest_below(cap, None) {
+                Some(c) => {
+                    self.take_idle(c, true);
+                    evict.push(c);
+                }
+                None => return (false, evict),
+            }
+        }
+        self.stamp += 1;
+        self.idle.entry(cap).or_default().push_back(self.stamp);
+        *self.idle_per_class.entry(cls).or_default() += 1;
+        self.idle_bytes += cap;
+        (true, evict)
+    }
+
+    /// The capacity whose oldest idle buffer is the least recently returned among
+    /// idle buffers smaller than `cap` (optionally only in class `in_class`).
+    fn oldest_below(&self, cap: u64, in_class: Option<u64>) -> Option<u64> {
+        self.idle
+            .range(..cap)
+            .filter(|(&c, _)| in_class.map_or(true, |k| size_class(c) == k))
+            .filter_map(|(&c, q)| q.front().map(|&st| (st, c)))
+            .min()
+            .map(|(_, c)| c)
+    }
+
+    /// Remove one idle buffer of `cap`: the oldest when `oldest`, else the newest.
+    fn take_idle(&mut self, cap: u64, oldest: bool) {
+        if let Some(q) = self.idle.get_mut(&cap) {
+            if oldest { q.pop_front(); } else { q.pop_back(); }
+            if q.is_empty() {
+                self.idle.remove(&cap);
+            }
+        }
+        if let Some(n) = self.idle_per_class.get_mut(&size_class(cap)) {
+            *n = n.saturating_sub(1);
+        }
+        self.idle_bytes = self.idle_bytes.saturating_sub(cap);
+    }
+}
+
+/// A pool of reusable host-coherent storage buffers. Avoids per-activation
+/// malloc/mmap pressure during inference. Allocation and reuse follow
+/// [`PoolPolicy`]: weights get exact sizes, recurring scratch is rounded to a
+/// bounded set of size classes, and the idle set is capped by
 /// `pool_budget_bytes()` so it cannot grow without bound over a long decode.
 struct BufferPool {
-    /// Maps CLASSED capacity → list of idle buffers of that capacity.
+    /// Idle buffers by their real capacity.
     buckets: std::collections::HashMap<u64, Vec<Buffer>>,
-    /// Sum of the capacities of all idle buffers currently held (bookkeeping for
-    /// the byte budget).
-    idle_bytes: u64,
+    policy: PoolPolicy,
 }
 
 impl BufferPool {
     fn new() -> Self {
-        BufferPool { buckets: std::collections::HashMap::new(), idle_bytes: 0 }
+        BufferPool { buckets: std::collections::HashMap::new(), policy: PoolPolicy::default() }
     }
 
-    /// Return a buffer of at least `size` bytes, reusing one from the pool if
-    /// available, otherwise allocating a fresh one at the classed capacity. The
-    /// returned buffer's `size` is set to the exact logical request; its
-    /// `capacity` may be larger (the class).
+    /// Return a buffer of at least `size` bytes, reusing an idle one when the
+    /// policy finds a fit, otherwise allocating one at the policy's capacity
+    /// (exact for weights, the class for recurring scratch). The returned
+    /// buffer's `size` is the exact logical request; `capacity` may be larger.
     fn get(
         &mut self,
         device: &ash::Device,
@@ -337,14 +485,18 @@ impl BufferPool {
         instance: &ash::Instance,
         size: u64,
     ) -> Result<Buffer, String> {
-        let cap = size_class(size);
-        let bucket = self.buckets.entry(cap).or_default();
-        if let Some(mut buf) = bucket.pop() {
-            // buf.capacity == cap; present the caller's exact logical size.
-            self.idle_bytes = self.idle_bytes.saturating_sub(cap);
-            buf.size = size;
-            return Ok(buf);
-        }
+        let cap = match self.policy.on_get(size) {
+            PoolGet::Reuse(cap) => {
+                if let Some(mut buf) = self.buckets.get_mut(&cap).and_then(|v| v.pop()) {
+                    debug_assert!(buf.capacity >= size);
+                    buf.size = size;
+                    return Ok(buf);
+                }
+                // Bookkeeping says idle but none is stored: allocate instead.
+                size
+            }
+            PoolGet::Alloc(cap) => cap,
+        };
         let mut buf = Buffer::alloc(
             device, pd, instance, cap,
             vk::BufferUsageFlags::STORAGE_BUFFER
@@ -353,25 +505,32 @@ impl BufferPool {
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
             vk::MemoryPropertyFlags::HOST_CACHED,
         )?;
-        // Allocated at the class capacity; expose the exact logical size.
         buf.size = size;
         Ok(buf)
     }
 
-    /// Return a buffer to the pool for reuse, keyed by its (classed) capacity.
-    /// Discards it (freeing the Vulkan memory) if the per-bucket cap OR the
-    /// global idle-byte budget would be exceeded.
+    /// Return a buffer to the pool for reuse. Freed instead (dropping it frees
+    /// the Vulkan memory) when the per-class cap or the idle-byte budget would be
+    /// exceeded.
     fn put(&mut self, buf: Buffer) {
-        let cap = buf.capacity;
-        if self.idle_bytes.saturating_add(cap) <= pool_budget_bytes() {
-            let bucket = self.buckets.entry(cap).or_default();
-            if bucket.len() < POOL_MAX {
-                bucket.push(buf);
-                self.idle_bytes += cap;
-                return;
+        // Only host-visible pool buffers may come back: the pool now REUSES any
+        // idle buffer that fits, so a staging or device-local buffer put here
+        // would later be handed out as host-coherent storage.
+        debug_assert!(buf.mapped_ptr.is_some(), "return_to_pool of a non-host-visible buffer");
+        let (keep, evict) = self.policy.on_put(buf.capacity, pool_budget_bytes());
+        for cap in evict {
+            // The OLDEST idle buffer of that capacity (front); dropping it frees
+            // its memory. Reuse pops the newest (back), matching the policy.
+            if let Some(v) = self.buckets.get_mut(&cap) {
+                if !v.is_empty() {
+                    drop(v.remove(0));
+                }
             }
         }
-        // Over budget or bucket full: buf is dropped here, freeing the memory.
+        if keep {
+            self.buckets.entry(buf.capacity).or_default().push(buf);
+        }
+        // else: dropped here, freeing the memory.
     }
 }
 
@@ -1324,6 +1483,177 @@ mod pool_tests {
             (1..=2048u64).map(|t| size_class(t * row)).collect();
         // 2048 distinct exact sizes must collapse to a small (log-scale) set.
         assert!(classes.len() <= 24, "buckets not bounded: {}", classes.len());
+    }
+
+    #[test]
+    fn weights_never_returned_get_exact_sizes() {
+        // #275: a loader uploading resident weights (never returned) must not pay
+        // the power-of-two rounding.
+        use super::{PoolGet, PoolPolicy};
+        let mut p = PoolPolicy::default();
+        for &w in &[139u64 << 20, 3_345_000, 12 << 20, 70_000, 1 << 30] {
+            assert_eq!(p.on_get(w), PoolGet::Alloc(w), "weight {w} was rounded");
+        }
+    }
+
+    #[test]
+    fn one_returned_temporary_rounds_at_most_one_weight() {
+        use super::{PoolGet, PoolPolicy};
+        let mut p = PoolPolicy::default();
+        let budget = 1u64 << 40;
+        // A 3 MiB temporary is returned during load (class 4 MiB) ...
+        assert_eq!(p.on_get(3 << 20), PoolGet::Alloc(3 << 20));
+        assert!(p.on_put(3 << 20, budget).0);
+        // ... the next miss in that class (a 3.5 MiB weight, too big to reuse the
+        // idle 3 MiB) is the ONE rounded allocation ...
+        assert_eq!(p.on_get(3_670_016), PoolGet::Alloc(4 << 20));
+        // ... and every later weight of the class is exact again.
+        for &w in &[3_600_000u64, 3_700_000, 3_345_000, 4_000_000] {
+            assert_eq!(p.on_get(w), PoolGet::Alloc(w), "weight {w} rounded after the flag was consumed");
+        }
+        // A weight that fits the idle temporary reuses it (no new allocation).
+        assert_eq!(p.on_get(2_500_000), PoolGet::Reuse(3 << 20));
+    }
+
+    #[test]
+    fn growing_scratch_is_still_bounded() {
+        // The DSV4 leak shape through the POLICY: get length t, return it, get t+1.
+        // Distinct allocations must stay O(log) and idle bytes bounded.
+        use super::{PoolGet, PoolPolicy};
+        let mut p = PoolPolicy::default();
+        let budget = 1u64 << 30;
+        let row = 4096u64 * 4;
+        let mut allocs = 0usize;
+        for t in 1..=2048u64 {
+            let size = t * row;
+            let cap = match p.on_get(size) {
+                PoolGet::Reuse(c) => c,
+                PoolGet::Alloc(c) => { allocs += 1; c }
+            };
+            assert!(cap >= size, "handed out {cap} < request {size}");
+            let _ = p.on_put(cap, budget);
+        }
+        assert!(allocs <= 40, "growing scratch made {allocs} allocations (not bounded)");
+        assert!(p.idle_bytes <= budget);
+    }
+
+    /// Growth with `k` buffers in flight per step (k gets, then k puts), the DSV4
+    /// `gpu_matvec_rows` (k=2) and `dsa_trio_onecb` (k=4) shapes. Returns
+    /// (total allocations, allocations in the last 100 steps, frees).
+    fn grow_fanout(k: u64, steps: u64, row: u64, budget: u64) -> (usize, usize, usize) {
+        use super::{PoolGet, PoolPolicy};
+        let mut p = PoolPolicy::default();
+        let (mut allocs, mut late, mut frees) = (0usize, 0usize, 0usize);
+        for t in 1..=steps {
+            let mut held = Vec::new();
+            for j in 0..k {
+                let size = t * row * (j + 1);
+                let cap = match p.on_get(size) {
+                    PoolGet::Reuse(c) => c,
+                    PoolGet::Alloc(c) => {
+                        allocs += 1;
+                        if t > steps - 100 { late += 1; }
+                        c
+                    }
+                };
+                assert!(cap >= size);
+                held.push(cap);
+            }
+            for cap in held {
+                let (keep, evict) = p.on_put(cap, budget);
+                frees += evict.len() + usize::from(!keep);
+            }
+            assert!(p.idle_bytes <= budget);
+        }
+        (allocs, late, frees)
+    }
+
+    /// The 286cfaa all-rounding pool on the same pattern, as the reference:
+    /// (total allocations, allocations in the last 100 steps).
+    fn grow_fanout_rounding_pool(k: u64, steps: u64, row: u64, budget: u64) -> (usize, usize) {
+        use super::size_class;
+        let mut idle: std::collections::HashMap<u64, usize> = Default::default();
+        let (mut idle_bytes, mut allocs, mut late) = (0u64, 0usize, 0usize);
+        for t in 1..=steps {
+            let mut held = Vec::new();
+            for j in 0..k {
+                let c = size_class(t * row * (j + 1));
+                match idle.get_mut(&c) {
+                    Some(n) if *n > 0 => { *n -= 1; idle_bytes -= c; }
+                    _ => { allocs += 1; if t > steps - 100 { late += 1; } }
+                }
+                held.push(c);
+            }
+            for c in held {
+                if idle_bytes + c <= budget { *idle.entry(c).or_default() += 1; idle_bytes += c; }
+            }
+        }
+        (allocs, late)
+    }
+
+    #[test]
+    fn fanout_growth_settles_like_the_rounding_pool() {
+        // Fable review of #275: without least-recently-returned eviction, k=2
+        // re-allocated every step from ~8192 rows (the dead exact first-miss
+        // buffers filled the budget). H=7168 f32 rows, 1 GiB budget. Shapes where
+        // the old all-rounding pool settles must settle here too, with no more
+        // allocations than ~2x it (one exact first miss per class per stream).
+        let row = 7168u64 * 4;
+        for &(k, steps) in &[(1u64, 16384u64), (2, 8192), (4, 2048)] {
+            let (old_allocs, old_late) = grow_fanout_rounding_pool(k, steps, row, 1 << 30);
+            assert_eq!(old_late, 0, "test shape k={k} should settle under the old pool");
+            let (allocs, late, frees) = grow_fanout(k, steps, row, 1 << 30);
+            assert_eq!(late, 0, "k={k}: still allocating in the last 100 steps ({allocs} total, {frees} frees)");
+            assert!(allocs <= 2 * old_allocs + 2 * k as usize,
+                "k={k}: {allocs} allocations vs {old_allocs} for the rounding pool");
+        }
+        // A shape too big for the budget churns under BOTH pools (pre-existing):
+        // the new pool must not churn more than the old one there.
+        let (old_allocs, _) = grow_fanout_rounding_pool(4, 4096, row, 1 << 30);
+        let (allocs, _, _) = grow_fanout(4, 4096, row, 1 << 30);
+        assert!(allocs <= old_allocs + 64, "over-budget k=4: {allocs} vs {old_allocs}");
+    }
+
+    #[test]
+    fn return_that_cannot_fit_evicts_nothing() {
+        // Smaller idle buffers are freed only when that makes room for the returned
+        // one. 100 MiB of small idle + 600 MiB larger idle + a 512 MiB return does
+        // not fit a 1 GiB budget even with every small buffer gone: the return is
+        // dropped and the small idle buffers stay reusable (as in the old pool).
+        use super::{PoolGet, PoolPolicy};
+        let mut p = PoolPolicy::default();
+        let budget = 1u64 << 30;
+        assert!(p.on_put(100 << 20, budget).0);
+        assert!(p.on_put(600 << 20, budget).0);
+        let (keep, evict) = p.on_put(512 << 20, budget);
+        assert!(!keep, "a return that cannot fit must be dropped");
+        assert!(evict.is_empty(), "evicted {evict:?} for a return that was dropped anyway");
+        assert_eq!(p.idle_bytes, 700 << 20);
+        assert_eq!(p.on_get(100 << 20), PoolGet::Reuse(100 << 20));
+        // When evicting does make room, it still happens: 300 + 400 MiB idle, a
+        // 500 MiB return frees only the oldest smaller buffer (300 MiB).
+        let mut p = PoolPolicy::default();
+        assert!(p.on_put(300 << 20, budget).0);
+        assert!(p.on_put(400 << 20, budget).0);
+        let (keep, evict) = p.on_put(500 << 20, budget);
+        assert!(keep);
+        assert_eq!(evict, vec![300u64 << 20]);
+        assert_eq!(p.idle_bytes, 900 << 20);
+    }
+
+    #[test]
+    fn reuse_never_hands_out_a_smaller_buffer() {
+        use super::{size_class, PoolGet, PoolPolicy};
+        let mut p = PoolPolicy::default();
+        let budget = 1u64 << 40;
+        for &c in &[100_000u64, 139 << 20, 200 << 20, 3 << 20] {
+            let _ = p.on_put(c, budget);
+        }
+        for &req in &[150u64 << 20, 210 << 20, 2 << 20, 99_999, 139 << 20] {
+            if let PoolGet::Reuse(c) = p.on_get(req) {
+                assert!(c >= req && c <= size_class(req), "reuse {c} for {req}");
+            }
+        }
     }
 
     #[test]
