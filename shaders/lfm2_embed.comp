@@ -1,0 +1,10 @@
+// SPDX-License-Identifier: Apache-2.0
+#version 450
+layout(local_size_x=64) in;
+#include "lfm2_weights.glsl"
+layout(binding=3) writeonly buffer O { float o[]; };
+void main() {
+    uint j=gl_GlobalInvocationID.x;
+    if(j>=p.width) return;
+    o[j]=weight_at(p.token,j);
+}

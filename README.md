@@ -32,6 +32,50 @@ alongside a real GPU is skipped automatically. Check what Vulkan sees with
 Validated on AMD RX 7900 XTX (gfx1100), RX 6900 XT (gfx1030), and NVIDIA GB10
 (Blackwell, aarch64).
 
+### Native LFM2.5 forward
+
+`vllm_vulkan._rs.Lfm2Model` runs LFM2 checkpoints, including LFM2.5-2.6B,
+with floating, MLX affine, GGML Q4/Q8, FP8 and NVFP4 weights through a
+standalone, single-sequence Vulkan forward engine. Activations, KV cache and
+convolution state stay on the GPU; FP16 arithmetic and subgroup extensions
+are not required.
+
+The generation script requires `transformers` for `AutoTokenizer`, included
+in the package dependencies.
+
+```bash
+PYO3_PYTHON=python3 bash scripts/build_lfm2.sh
+PYTHONPATH=. python3 scripts/run_lfm2.py /path/to/checkpoint --device 1
+```
+
+```python
+from vllm_vulkan._rs import Lfm2Model
+
+model = Lfm2Model("/path/to/checkpoint", device_idx=1, max_seq_len=512)
+logits = model.forward_prefill([1, 9, 17])
+logits = model.forward(31, position=3)
+model.reset_kv_cache()
+```
+
+Enumerate devices before selecting an index. Each instance owns one sequence
+and stays on its creating thread. Empty chunks, invalid token IDs, nonconsecutive
+positions and capacity overflow fail before cache mutation. Recreate the model
+after a GPU recording/submission failure.
+
+`quant="auto"` preserves native F32/F16/BF16, MLX affine 2/4/6/8-bit (groups
+32/64/128), GGML Q4_0/Q4_K/Q8_0, FP8 E4M3 or NVFP4 storage. Explicit `quant`
+accepts `f32`, `f16`, `bf16`, `mlx2`, `mlx4`, `mlx6`, `mlx8`, `q4_0`, `q4_k`
+and `q8_0`; `group_size` selects the MLX group size. Checkpoints may use mixed
+formats and indexed safetensors shards. `weight_formats()` reports residency,
+and `scripts/convert_lfm2.py` exports packed weights for reuse. Q4_K CPU
+conversion can be slow; export once and reload with `auto`.
+
+The loader requires tied embeddings, bias-free convolutions and default
+unscaled RoPE. GGUF loading, scheduler integration and batched/tiled prefill
+are outside this API. Full F32/F16/BF16 2.6B weights exceed the RX 560X's 4 GiB.
+`tests/python/test_lfm2.py` and `scripts/validate_lfm2.py` compare full logits
+against independent Transformers forwards; validation reports are local outputs.
+
 ### In a container
 
 **AMD (RADV).** Pass the render node and the device groups:

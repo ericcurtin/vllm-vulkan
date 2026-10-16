@@ -797,6 +797,11 @@ compile "paged_attn_decode_f16_sg" "paged_attn_decode_f16_sg.comp"
 # `cutover_guard_registry_len` intentionally pins the lean shader set — so
 # they are deliberately NOT compiled here.
 
+# LFM2 uses FP32/uint32 only; no narrow arithmetic or subgroup operations.
+for op in embed matvec norm elementwise rope attention; do
+  compile "lfm2_${op}" "lfm2_${op}.comp"
+done
+
 # ── Summary ────────────────────────────────────────────────────────────────────
 echo ""
 if [ "${FAILED}" -gt 0 ]; then

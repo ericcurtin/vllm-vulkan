@@ -188,6 +188,8 @@ jobs:
         include:
           - slice: gemma
             features: gemma
+          - slice: lfm2
+            features: lfm2
           - slice: qwen35
             features: gemma,qwen35
             stacked: gemma,qwen35,mtp

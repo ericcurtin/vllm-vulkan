@@ -1,0 +1,28 @@
+// SPDX-License-Identifier: Apache-2.0
+#version 450
+layout(local_size_x=64) in;
+layout(binding=0) readonly buffer X { float x[]; };
+layout(binding=1) readonly buffer Y { float y[]; };
+layout(binding=2) writeonly buffer O { float o[]; };
+layout(binding=3) buffer State { float state[]; };
+layout(push_constant) uniform P { uint mode; uint width; uint taps; uint position; } p;
+void main() {
+    uint j=gl_GlobalInvocationID.x;
+    if(j>=p.width) return;
+    if(p.mode==0) o[j]=x[j]+y[j];
+    else if(p.mode==1) o[j]=(x[j]/(1.0+exp(-x[j])))*y[j];
+    else {
+        // MLX/HF order: B,C,x. Conv1d cross-correlation, oldest tap first.
+        uint base=j*(p.taps-1);
+        float bx=x[j]*x[2*p.width+j];
+        float v=bx*y[j*p.taps+p.taps-1];
+        for(uint i=0;i+1<p.taps;i++) {
+            float old=p.position==0 ? 0.0 : state[base+i];
+            v+=old*y[j*p.taps+i];
+        }
+        for(uint i=0;i+2<p.taps;i++)
+            state[base+i]=p.position==0 ? 0.0 : state[base+i+1];
+        if(p.taps>1) state[base+p.taps-2]=bx;
+        o[j]=x[p.width+j]*v;
+    }
+}

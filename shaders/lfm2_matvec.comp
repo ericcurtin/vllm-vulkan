@@ -1,0 +1,24 @@
+// SPDX-License-Identifier: Apache-2.0
+#version 450
+layout(local_size_x=64) in;
+#include "lfm2_weights.glsl"
+layout(binding=3) readonly buffer X { float x[]; };
+layout(binding=4) writeonly buffer O { float o[]; };
+shared float sums[4][64];
+void main() {
+    uint lane=gl_LocalInvocationID.x;
+    uint first=(gl_WorkGroupID.x+256*gl_WorkGroupID.y)*4;
+    for(uint r=0;r<4;r++) {
+        float v=0;
+        if(first+r<p.rows)
+            for(uint j=lane;j<p.width;j+=64) v+=weight_at(first+r,j)*x[j];
+        sums[r][lane]=v;
+    }
+    barrier();
+    for(uint step=32;step>0;step/=2) {
+        if(lane<step) for(uint r=0;r<4;r++) sums[r][lane]+=sums[r][lane+step];
+        barrier();
+    }
+    if(lane==0) for(uint r=0;r<4;r++)
+        if(first+r<p.rows) o[p.row_offset+first+r]=sums[r][0];
+}

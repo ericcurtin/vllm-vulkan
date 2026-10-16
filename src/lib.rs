@@ -15,6 +15,10 @@
 mod device;
 mod pipeline;
 mod compute;
+#[cfg(feature = "lfm2")]
+mod lfm2;
+#[cfg(feature = "lfm2")]
+mod lfm2_quant;
 pub mod model;
 // Foundation-level host decode-state snapshot (moved out of qwen35 — Phase A2).
 mod host_state;
@@ -9228,6 +9232,8 @@ fn _rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<VulkanContext>()?;
     m.add_class::<GpuTensor>()?;
     m.add_class::<VulkanModel>()?;
+    #[cfg(feature = "lfm2")]
+    m.add_class::<lfm2::Lfm2Model>()?;
     #[cfg(feature = "gemma")]
     m.add_class::<gemma_assistant::GemmaAssistant>()?;
     #[cfg(feature = "mtp")]

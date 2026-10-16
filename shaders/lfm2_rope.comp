@@ -1,0 +1,26 @@
+// SPDX-License-Identifier: Apache-2.0
+#version 450
+layout(local_size_x=64) in;
+layout(binding=0) readonly buffer Q { float q[]; };
+layout(binding=1) readonly buffer K { float k[]; };
+layout(binding=2) readonly buffer V { float v[]; };
+layout(binding=3) writeonly buffer QO { float qo[]; };
+layout(binding=4) writeonly buffer KC { float kc[]; };
+layout(binding=5) writeonly buffer VC { float vc[]; };
+layout(push_constant) uniform P { uint dim; uint heads; uint kvheads; uint position; float theta; } p;
+void main() {
+    uint j=gl_GlobalInvocationID.x;
+    uint halfdim=p.dim/2;
+    if(j>=p.heads*halfdim) return;
+    uint h=j/halfdim, d=j%halfdim, a=h*p.dim+d, b=a+halfdim;
+    float angle=float(p.position)*pow(p.theta,-float(2*d)/float(p.dim));
+    float c=cos(angle), s=sin(angle);
+    qo[a]=q[a]*c-q[b]*s;
+    qo[b]=q[b]*c+q[a]*s;
+    if(h<p.kvheads) {
+        uint off=p.position*p.kvheads*p.dim;
+        kc[off+a]=k[a]*c-k[b]*s;
+        kc[off+b]=k[b]*c+k[a]*s;
+        vc[off+a]=v[a]; vc[off+b]=v[b];
+    }
+}

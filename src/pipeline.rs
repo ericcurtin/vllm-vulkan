@@ -1168,6 +1168,40 @@ mod tests {
     use super::{cols_block_size, read_shader_spirv, unsupported_shader_capability};
 
 
+    /// Verify LFM2 kernels remain usable without narrow storage or subgroup features.
+    #[cfg(feature = "lfm2")]
+    #[test]
+    fn shaders_require_no_narrow_or_subgroup_features() {
+        let caps = crate::device::DeviceCaps {
+            subgroup_size: 32,
+            shader_float16: false,
+            shader_float64: false,
+            shader_int8: false,
+            shader_int16: false,
+            shader_int64: false,
+            shader_integer_dot_product: false,
+            shader_subgroup_extended_types: false,
+            storage_buffer_16_bit_access: false,
+            storage_buffer_8_bit_access: false,
+        };
+        let shaders = crate::include_all_shaders();
+        for name in [
+            "lfm2_embed",
+            "lfm2_matvec",
+            "lfm2_norm",
+            "lfm2_elementwise",
+            "lfm2_rope",
+            "lfm2_attention",
+            "mul_mat_vec_mlx4_f32_f32",
+        ] {
+            assert_eq!(
+                unsupported_shader_capability(&shaders[name], caps).unwrap(),
+                None,
+                "{name}"
+            );
+        }
+    }
+
     fn storage_only_caps() -> crate::device::DeviceCaps {
         crate::device::DeviceCaps {
             subgroup_size: 32,

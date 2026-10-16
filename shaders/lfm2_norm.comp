@@ -1,0 +1,17 @@
+// SPDX-License-Identifier: Apache-2.0
+#version 450
+layout(local_size_x=64) in;
+layout(binding=0) readonly buffer X { float x[]; };
+layout(binding=1) readonly buffer W { float w[]; };
+layout(binding=2) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform P { uint width; float eps; } p;
+shared float sums[64];
+void main() {
+    uint t=gl_LocalInvocationID.x, base=gl_WorkGroupID.x*p.width;
+    float v=0;
+    for(uint j=t;j<p.width;j+=64) v+=x[base+j]*x[base+j];
+    sums[t]=v; barrier();
+    for(uint d=32;d>0;d/=2) { if(t<d) sums[t]+=sums[t+d]; barrier(); }
+    float scale=inversesqrt(sums[0]/float(p.width)+p.eps);
+    for(uint j=t;j<p.width;j+=64) y[base+j]=x[base+j]*scale*w[j];
+}

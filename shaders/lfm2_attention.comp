@@ -1,0 +1,32 @@
+// SPDX-License-Identifier: Apache-2.0
+#version 450
+layout(local_size_x=64) in;
+layout(binding=0) readonly buffer Q { float q[]; };
+layout(binding=1) readonly buffer K { float k[]; };
+layout(binding=2) readonly buffer V { float v[]; };
+layout(binding=3) writeonly buffer O { float o[]; };
+layout(push_constant) uniform P { uint dim; uint heads; uint kvheads; uint position; } p;
+shared float sums[64];
+void main() {
+    uint lane=gl_LocalInvocationID.x, head=gl_WorkGroupID.x;
+    uint kvhead=head/(p.heads/p.kvheads);
+    float acc[4]; for(uint i=0;i<4;i++) acc[i]=0;
+    float maximum=-3.402823466e38, denom=0;
+    // Online stable softmax; memory does not grow with the context length.
+    for(uint pos=0;pos<=p.position;pos++) {
+        uint base=(pos*p.kvheads+kvhead)*p.dim;
+        float dot=0;
+        for(uint d=lane;d<p.dim;d+=64) dot+=q[head*p.dim+d]*k[base+d];
+        sums[lane]=dot; barrier();
+        for(uint step=32;step>0;step/=2) { if(lane<step) sums[lane]+=sums[lane+step]; barrier(); }
+        float score=sums[0]*inversesqrt(float(p.dim));
+        float nextmax=max(maximum,score);
+        float alpha=exp(maximum-nextmax), beta=exp(score-nextmax);
+        denom=denom*alpha+beta;
+        for(uint i=0,d=lane;d<p.dim;i++,d+=64) acc[i]=acc[i]*alpha+beta*v[base+d];
+        maximum=nextmax;
+        // Nobody may overwrite sums[0] for the next token before all read it.
+        barrier();
+    }
+    for(uint i=0,d=lane;d<p.dim;i++,d+=64) o[head*p.dim+d]=acc[i]/denom;
+}
